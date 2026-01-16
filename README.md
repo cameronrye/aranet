@@ -1,4 +1,4 @@
-# aranet
+# ARANET
 
 Rust implementation for Aranet environmental sensors. Connect to your Aranet devices via Bluetooth LE to read measurements, download history, and monitor air quality.
 
