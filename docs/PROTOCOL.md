@@ -137,16 +137,20 @@ Status flags: `bits[0:1]` = humidity status, `bits[2:3]` = temperature status
 
 ### Aranet Radon Current Readings (GATT)
 
+18 bytes minimum (extended format includes averages):
+
 | Offset | Name | Type | Transform |
 |--------|------|------|-----------|
-| 0-5 | Unknown | 6 bytes | - |
+| 0-1 | Device Type | u16LE | 0x0003 = Radon |
+| 2-3 | Interval (s) | u16LE | none |
+| 4-5 | Age (s) | u16LE | none |
 | 6 | Battery (%) | u8 | none |
 | 7-8 | Temperature | u16LE | ÷ 20.0 → °C |
 | 9-10 | Pressure | u16LE | ÷ 10 → hPa |
 | 11-12 | Humidity | u16LE | ÷ 10.0 → % |
 | 13-16 | Radon (Bq/m³) | u32LE | none |
-| 17 | Status | u8 | - |
-| ... | Averages | u64LE × 3 | 24h, 7d, 30d |
+| 17 | Status | u8 | See Color enum |
+| 18+ | Averages | u64LE × 3 | 24h, 7d, 30d (optional) |
 
 ---
 
@@ -201,18 +205,21 @@ SS:SS = Start index (u16LE)
 
 ## Parameter Enum
 
-| Value | Name |
-|-------|------|
-| 1 | TEMPERATURE |
-| 2 | HUMIDITY |
-| 3 | PRESSURE |
-| 4 | CO2 |
-| 5 | HUMIDITY2 |
-| 6 | PULSES |
-| 7 | RADIATION_DOSE |
-| 8 | RADIATION_DOSE_RATE |
-| 9 | RADIATION_DOSE_INTEGRAL |
-| 10 | RADON_CONCENTRATION |
+| Value | Name | Data Size | Notes |
+|-------|------|-----------|-------|
+| 1 | TEMPERATURE | u16 | Raw ÷ 20 = °C |
+| 2 | HUMIDITY | u16 | Percentage (0-100) |
+| 3 | PRESSURE | u16 | Raw ÷ 10 = hPa |
+| 4 | CO2 | u16 | ppm |
+| 5 | HUMIDITY2 | u16 | Tenths of % (for AranetRn+) |
+| 6 | PULSES | u16 | Radiation pulses |
+| 7 | RADIATION_DOSE | u32 | Total dose (nSv) |
+| 8 | RADIATION_DOSE_RATE | u32 | Dose rate (nSv/h) |
+| 9 | RADIATION_DOSE_INTEGRAL | u64 | Integral dose |
+| 10 | RADON_CONCENTRATION | u32 | Bq/m³ (4 bytes) |
+
+**Note**: Parameters 1-6 use 2-byte values. Parameters 7-10 use 4-byte values (u32).
+For history download, each parameter type must be downloaded separately.
 
 ---
 

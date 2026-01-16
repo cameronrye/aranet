@@ -87,20 +87,24 @@ Service UUID before v1.2.0: `f0cd1400-95da-4f4b-9ac8-aa55d312af0c`
 
 ### AranetRn readings (GATT)
 
+18 bytes minimum (extended format includes averages):
+
 | Parameter | Name                            | Type  | Maths        |
 |-----------|---------------------------------|-------|--------------|
-| NN:NN:NN:NN:NN:NN | _Unknown_               |       |              |
-| OO        | Battery                         | u8    | not required |
-| PP:PP     | Temperature                     | uLE16 | /20          |
-| QQ:QQ     | Pressure                        | uLE16 | /10          |
-| RR:RR     | Humidity                        | uLE16 | /10          |
-| SS:SS:SS:SS | Radon Concentration           | uLE32 | not required |
-| TT        | Status                          | u8    |              |
-| VV:VV:VV:VV:VV:VV:VV:VV | Average 1         | uLE64 |              |
-| WW:WW:WW:WW:WW:WW:WW:WW | Average 2         | uLE64 |              |
-| XX:XX:XX:XX:XX:XX:XX:XX | Average 3         | uLE64 |              |
-| YY:YY:YY:YY | Initial progress              | uLE64 |              |
-| ZZ        | Display Type                    | u8    |              |
+| AA:AA     | Device Type (0x0003 = Radon)    | uLE16 | not required |
+| BB:BB     | Interval in seconds             | uLE16 | not required |
+| CC:CC     | Age (seconds ago)               | uLE16 | not required |
+| DD        | Battery                         | u8    | not required |
+| EE:EE     | Temperature                     | uLE16 | /20          |
+| FF:FF     | Pressure                        | uLE16 | /10          |
+| GG:GG     | Humidity                        | uLE16 | /10          |
+| HH:HH:HH:HH | Radon Concentration           | uLE32 | not required |
+| II        | Status                          | u8    |              |
+| JJ:JJ:JJ:JJ:JJ:JJ:JJ:JJ | Average 24h       | uLE64 | optional     |
+| KK:KK:KK:KK:KK:KK:KK:KK | Average 7d        | uLE64 | optional     |
+| LL:LL:LL:LL:LL:LL:LL:LL | Average 30d       | uLE64 | optional     |
+| MM:MM:MM:MM | Initial progress              | uLE32 | optional     |
+| NN        | Display Type                    | u8    | optional     |
 
 ### AranetRn readings (Advertisement)
 
