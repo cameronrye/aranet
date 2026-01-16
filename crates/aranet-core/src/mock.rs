@@ -196,7 +196,7 @@ impl MockDevice {
         self.check_should_fail().await?;
 
         self.read_count.fetch_add(1, Ordering::Relaxed);
-        Ok(self.current_reading.read().await.clone())
+        Ok(*self.current_reading.read().await)
     }
 
     /// Read battery level.

@@ -381,14 +381,14 @@ impl DeviceManager {
         // Emit reading event
         self.events.send(DeviceEvent::Reading {
             device: DeviceId::new(identifier),
-            reading: reading.clone(),
+            reading,
         });
 
         // Update cached reading
         {
             let mut devices = self.devices.write().await;
             if let Some(managed) = devices.get_mut(identifier) {
-                managed.last_reading = Some(reading.clone());
+                managed.last_reading = Some(reading);
             }
         }
 
@@ -428,7 +428,7 @@ impl DeviceManager {
             if let Ok(reading) = result {
                 self.events.send(DeviceEvent::Reading {
                     device: DeviceId::new(id),
-                    reading: reading.clone(),
+                    reading: *reading,
                 });
             }
         }
@@ -440,7 +440,7 @@ impl DeviceManager {
                 if let Ok(reading) = result
                     && let Some(managed) = devices.get_mut(id)
                 {
-                    managed.last_reading = Some(reading.clone());
+                    managed.last_reading = Some(*reading);
                 }
             }
         }
@@ -552,7 +552,7 @@ impl DeviceManager {
     /// Get the last cached reading for a device.
     pub async fn get_last_reading(&self, identifier: &str) -> Option<CurrentReading> {
         let devices = self.devices.read().await;
-        devices.get(identifier).and_then(|m| m.last_reading.clone())
+        devices.get(identifier).and_then(|m| m.last_reading)
     }
 
     /// Start a background health check task that monitors connection status.
