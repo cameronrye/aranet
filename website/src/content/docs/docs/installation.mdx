@@ -1,0 +1,124 @@
+---
+title: Installation
+description: How to install the Aranet CLI and library from source.
+---
+
+import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+## Build from Source
+
+The Aranet tools are currently distributed via source. Once published to crates.io, installation will be simpler.
+
+<Steps>
+1. **Clone the repository**
+
+   ```bash
+   git clone https://github.com/cameronrye/aranet.git
+   cd aranet
+   ```
+
+2. **Build all crates**
+
+   ```bash
+   cargo build --release
+   ```
+
+3. **Run the CLI**
+
+   ```bash
+   ./target/release/aranet --help
+   ```
+</Steps>
+
+## Platform-Specific Notes
+
+<Tabs>
+  <TabItem label="macOS">
+    No additional dependencies required. Bluetooth access will prompt for permission on first use.
+  </TabItem>
+  <TabItem label="Linux">
+    Install the D-Bus development library:
+    ```bash
+    # Debian/Ubuntu
+    sudo apt-get install libdbus-1-dev
+
+    # Fedora
+    sudo dnf install dbus-devel
+
+    # Arch
+    sudo pacman -S dbus
+    ```
+  </TabItem>
+  <TabItem label="Windows">
+    No additional dependencies required. Ensure Bluetooth is enabled in Windows settings.
+  </TabItem>
+</Tabs>
+
+## Installing the CLI Globally
+
+To install the CLI to your Cargo bin directory:
+
+```bash
+cargo install --path crates/aranet-cli
+```
+
+This allows you to run `aranet` from anywhere:
+
+```bash
+aranet scan
+```
+
+## Shell Completions
+
+Generate shell completions for your shell:
+
+<Tabs>
+  <TabItem label="Bash">
+    ```bash
+    aranet completions bash > ~/.local/share/bash-completion/completions/aranet
+    ```
+  </TabItem>
+  <TabItem label="Zsh">
+    ```bash
+    aranet completions zsh > ~/.zfunc/_aranet
+    ```
+  </TabItem>
+  <TabItem label="Fish">
+    ```bash
+    aranet completions fish > ~/.config/fish/completions/aranet.fish
+    ```
+  </TabItem>
+</Tabs>
+
+## Using as a Library
+
+Add `aranet-core` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+aranet-core = { git = "https://github.com/cameronrye/aranet.git" }
+```
+
+<Aside>
+  Once published to crates.io, you'll be able to use:
+  ```toml
+  aranet-core = "0.1"
+  ```
+</Aside>
+
+## Verify Installation
+
+Check that everything is working:
+
+```bash
+# Show version
+aranet --version
+
+# Scan for devices (requires Bluetooth)
+aranet scan --timeout 5
+```
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

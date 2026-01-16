@@ -1,0 +1,195 @@
+---
+title: CLI Commands
+description: Complete reference for all Aranet CLI commands.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+## scan
+
+Discover nearby Aranet devices via Bluetooth.
+
+```bash
+aranet scan [OPTIONS]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-t, --timeout <SECONDS>` | `10` | Scan duration in seconds |
+
+### Example
+
+```bash
+$ aranet scan --timeout 15
+
+Scanning for Aranet devices (timeout: 15s)...
+
+Found 2 devices:
+  Aranet4 17C3C    AA:BB:CC:DD:EE:FF    RSSI: -45 dBm
+  AranetRn+ 306B8  11:22:33:44:55:66    RSSI: -52 dBm
+```
+
+---
+
+## read
+
+Read current sensor measurements from a device.
+
+```bash
+aranet read [OPTIONS]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-d, --device <ADDRESS>` | auto-detect | Device address (MAC or UUID) |
+| `-f, --format <FORMAT>` | `text` | Output format: `text`, `json` |
+
+### Example
+
+<Tabs>
+  <TabItem label="Text">
+```bash
+$ aranet read --device AA:BB:CC:DD:EE:FF
+
+CO₂:         847 ppm   [GREEN]
+Temperature: 22.4°C
+Humidity:    45%
+Pressure:    1013.2 hPa
+Battery:     87%
+```
+  </TabItem>
+  <TabItem label="JSON">
+```bash
+$ aranet read --device AA:BB:CC:DD:EE:FF --format json
+
+{
+  "co2": 847,
+  "temperature": 22.4,
+  "humidity": 45,
+  "pressure": 1013.2,
+  "battery": 87,
+  "status": "green",
+  "interval": 300,
+  "age": 135
+}
+```
+  </TabItem>
+</Tabs>
+
+---
+
+## history
+
+Download historical measurements from a device.
+
+```bash
+aranet history [OPTIONS]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-d, --device <ADDRESS>` | auto-detect | Device address |
+| `-c, --count <N>` | `0` (all) | Number of records to retrieve |
+| `-f, --format <FORMAT>` | `text` | Output format: `text`, `json`, `csv` |
+
+### Example
+
+```bash
+$ aranet history --device AA:BB:CC:DD:EE:FF --output history.csv --format csv
+
+Downloaded 1440 records to history.csv
+```
+
+---
+
+## info
+
+Display device information.
+
+```bash
+aranet info [OPTIONS]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-d, --device <ADDRESS>` | auto-detect | Device address |
+
+### Example
+
+```bash
+$ aranet info --device AA:BB:CC:DD:EE:FF
+
+Device Information
+────────────────────────────────────
+Name:         Aranet4 17C3C
+Model:        Aranet4
+Serial:       12345678
+Firmware:     v1.4.19
+Hardware:     v1.0
+Manufacturer: SAF Tehnika
+```
+
+---
+
+## set
+
+Modify device settings.
+
+```bash
+aranet set [OPTIONS] <SETTING> <VALUE>
+```
+
+### Settings
+
+| Setting | Values | Description |
+|---------|--------|-------------|
+| `interval` | `1`, `2`, `5`, `10` | Measurement interval in minutes |
+| `range` | `standard`, `extended` | Bluetooth range |
+
+### Example
+
+```bash
+# Set measurement interval to 2 minutes
+aranet set --device AA:BB:CC:DD:EE:FF interval 2
+
+# Enable extended Bluetooth range
+aranet set --device AA:BB:CC:DD:EE:FF range extended
+```
+
+<Aside type="caution">
+  Changing the measurement interval affects battery life. Shorter intervals use more power.
+</Aside>
+
+---
+
+## completions
+
+Generate shell completion scripts.
+
+```bash
+aranet completions <SHELL>
+```
+
+### Shells
+
+`bash`, `zsh`, `fish`, `powershell`, `elvish`
+
+### Example
+
+```bash
+# Generate and install zsh completions
+aranet completions zsh > ~/.zfunc/_aranet
+```
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

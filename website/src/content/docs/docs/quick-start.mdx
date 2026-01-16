@@ -1,0 +1,135 @@
+---
+title: Quick Start
+description: Get up and running with Aranet sensors in minutes.
+---
+
+import { Steps, Aside, Code } from '@astrojs/starlight/components';
+
+This guide walks you through scanning for devices, reading sensor data, and downloading history.
+
+## Scan for Devices
+
+First, find Aranet sensors nearby:
+
+```bash
+aranet scan --timeout 10
+```
+
+Example output:
+
+```
+Scanning for Aranet devices (timeout: 10s)...
+
+Found 2 devices:
+  Aranet4 17C3C    AA:BB:CC:DD:EE:FF    RSSI: -45 dBm
+  AranetRn+ 306B8  11:22:33:44:55:66    RSSI: -52 dBm
+```
+
+<Aside>
+  The device address (MAC address on Linux/Windows, UUID on macOS) is used for all subsequent commands.
+</Aside>
+
+## Read Current Values
+
+Read the current sensor measurements:
+
+```bash
+aranet read --device AA:BB:CC:DD:EE:FF
+```
+
+Example output for Aranet4:
+
+```
+Device: Aranet4 17C3C
+────────────────────────────────────
+CO₂:         847 ppm   [GREEN]
+Temperature: 22.4°C
+Humidity:    45%
+Pressure:    1013.2 hPa
+Battery:     87%
+Last Update: 2m 15s ago
+Interval:    5 minutes
+```
+
+## Read Device Information
+
+Get detailed device information:
+
+```bash
+aranet info --device AA:BB:CC:DD:EE:FF
+```
+
+```
+Device Information
+────────────────────────────────────
+Name:         Aranet4 17C3C
+Model:        Aranet4
+Serial:       12345678
+Firmware:     v1.4.19
+Hardware:     v1.0
+Manufacturer: SAF Tehnika
+```
+
+## Download History
+
+Download historical measurements to a CSV file:
+
+```bash
+aranet history --device AA:BB:CC:DD:EE:FF --output history.csv
+```
+
+```
+Downloading history from Aranet4 17C3C...
+Retrieved 1,440 records (7 days at 5-minute intervals)
+Saved to: history.csv
+```
+
+The CSV file contains timestamped sensor readings:
+
+```csv
+timestamp,co2,temperature,humidity,pressure
+2025-01-16T10:00:00Z,847,22.4,45,1013.2
+2025-01-16T10:05:00Z,823,22.5,44,1013.1
+...
+```
+
+## Using the Library
+
+For programmatic access, use `aranet-core` in your Rust code:
+
+```rust
+use aranet_core::{Device, scan};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Scan for devices
+    let devices = scan::scan_for_devices().await?;
+    println!("Found {} devices", devices.len());
+
+    // Connect to a device
+    let device = Device::connect("Aranet4 17C3C").await?;
+
+    // Read current values
+    let reading = device.read_current().await?;
+    println!("CO₂: {} ppm", reading.co2);
+    println!("Temperature: {:.1}°C", reading.temperature);
+    println!("Humidity: {}%", reading.humidity);
+
+    // Download history
+    let history = device.read_history().await?;
+    println!("Downloaded {} records", history.len());
+
+    Ok(())
+}
+```
+
+## Next Steps
+
+- Learn about all [CLI commands](/aranet/docs/cli/commands/)
+- Understand the [BLE protocol](/aranet/docs/protocol/overview/)
+- Check the [API documentation](/aranet/api/aranet_core/)
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

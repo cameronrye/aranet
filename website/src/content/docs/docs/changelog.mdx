@@ -1,0 +1,88 @@
+---
+title: Changelog
+description: Version history and release notes for the Aranet Rust ecosystem.
+---
+
+import { Badge, Aside } from '@astrojs/starlight/components';
+
+All notable changes to this project are documented here.
+
+This project follows [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Added
+- Full AranetRn+ (Radon) sensor support with 4-byte radon history values
+- History V2 protocol parsing with 10-byte header format
+- `aranet-types` crate for platform-agnostic shared types
+- WebAssembly module foundation (`aranet-wasm`)
+
+### Fixed
+- UUID mappings for history characteristics
+- V2 history parsing header format
+
+### Changed
+- `HistoryRecord` now includes optional `radon: Option<u32>` field
+- Improved error messages for BLE connection failures
+
+---
+
+## [0.1.0] - 2026-01-16 <Badge text="Current" variant="success" />
+
+### Core Library (aranet-core)
+
+- **Device Discovery** — Scan for nearby Aranet devices via BLE
+- **Current Readings** — CO₂, temperature, pressure, humidity, radon, radiation
+- **Historical Data** — Download measurement history with timestamps (V1 + V2 protocols)
+- **Device Settings** — Read/write measurement interval, Bluetooth range
+- **Auto-reconnection** — Configurable backoff and retry logic
+- **Real-time Streaming** — Subscribe to sensor value changes via notifications
+- **Multi-device Manager** — Manage multiple sensors simultaneously
+- **Event System** — Connect/disconnect/reading event dispatcher
+- **Data Validation** — Bounds checking with `ReadingValidator`
+- **CO₂ Thresholds** — Helpers for green/amber/red status
+- **Mock Device** — For testing without hardware
+
+### Supported Devices
+
+| Device | Status |
+|--------|--------|
+| Aranet4 | <Badge text="Full Support" variant="success" /> |
+| Aranet2 | <Badge text="Full Support" variant="success" /> |
+| AranetRn+ (Radon) | <Badge text="Full Support" variant="success" /> |
+| Aranet Radiation | <Badge text="Full Support" variant="success" /> |
+
+### CLI Tool (aranet-cli)
+
+- Command scaffolding with clap v4
+- Shell completions (bash, zsh, fish, PowerShell)
+- Quiet mode (`--quiet`) for scripting
+- Output file option (`--output`)
+
+<Aside>
+  CLI commands are defined but core integration is pending. Full functionality coming in v0.2.0.
+</Aside>
+
+### Testing
+
+- 179 workspace tests (168 run, 15 ignored for hardware-dependent tests)
+- Hardware tested: Aranet4 17C3C (FW v1.4.19), AranetRn+ 306B8 (FW v1.12.0)
+- CI running on Ubuntu, macOS, Windows
+
+---
+
+## Dependencies
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| btleplug | 0.11 | Cross-platform BLE |
+| tokio | 1.x | Async runtime |
+| thiserror | 2.x | Error handling |
+| clap | 4.x | CLI argument parsing |
+| time | 0.3 | Date/time handling |
+| serde | 1.x | Serialization |
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

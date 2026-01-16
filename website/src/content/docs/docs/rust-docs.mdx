@@ -1,0 +1,76 @@
+---
+title: Rust Documentation
+description: API documentation for the Aranet Rust crates
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The Aranet project provides comprehensive Rust API documentation generated from inline doc comments using `rustdoc`.
+
+## Viewing Documentation Locally
+
+<Steps>
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/cameronrye/aranet.git
+   cd aranet
+   ```
+
+2. **Generate the documentation**
+   ```bash
+   cargo doc --workspace --no-deps --open
+   ```
+
+3. **Browse the docs**
+   
+   Your browser will open automatically with the documentation for all crates.
+
+</Steps>
+
+## Available Crates
+
+| Crate | Description |
+|-------|-------------|
+| `aranet-types` | Platform-agnostic types shared between native and WASM |
+| `aranet-core` | Core BLE library with device discovery, readings, and settings |
+| `aranet-cli` | Command-line interface for quick readings and data export |
+| `aranet-tui` | Terminal UI dashboard for real-time monitoring |
+| `aranet-gui` | Desktop GUI application |
+| `aranet-wasm` | WebAssembly module for browser-based sensor access |
+
+## Documentation Conventions
+
+All public APIs are documented with:
+
+- **Function/method descriptions** - What the function does
+- **Parameters** - Description of each parameter
+- **Return values** - What the function returns
+- **Examples** - Usage examples where applicable
+- **Errors** - Possible error conditions
+
+## Example: Reading from a Device
+
+```rust
+use aranet_core::{scan_for_devices, connect, read_current};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Scan for nearby Aranet devices
+    let devices = scan_for_devices(Duration::from_secs(5)).await?;
+    
+    // Connect to the first device found
+    if let Some(device) = devices.first() {
+        let connection = connect(device).await?;
+        
+        // Read current sensor values
+        let reading = read_current(&connection).await?;
+        println!("CO₂: {} ppm", reading.co2);
+    }
+    
+    Ok(())
+}
+```
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

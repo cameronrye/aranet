@@ -1,0 +1,94 @@
+---
+title: CLI Overview
+description: Overview of the Aranet command-line interface.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The `aranet` CLI provides a fast, scriptable interface for interacting with Aranet environmental sensors.
+
+## Features
+
+- **Device Discovery** — Scan for nearby Aranet devices via Bluetooth
+- **Current Readings** — Read live sensor values (CO₂, temperature, humidity, pressure, radon, radiation)
+- **Historical Data** — Download measurement history with timestamps
+- **Device Info** — Query device metadata (serial, firmware, model)
+- **Settings** — Read and modify device configuration
+- **Export** — Output in text, JSON, or CSV formats
+- **Shell Completions** — Auto-complete for bash, zsh, fish, PowerShell
+
+## Installation
+
+```bash
+# Build from source
+git clone https://github.com/cameronrye/aranet.git
+cd aranet
+cargo install --path crates/aranet-cli
+```
+
+## Basic Usage
+
+```bash
+# Show help
+aranet --help
+
+# Scan for devices
+aranet scan
+
+# Read current values
+aranet read --device <ADDRESS>
+
+# Download history
+aranet history --device <ADDRESS> --output data.csv
+```
+
+## Global Options
+
+| Option | Description |
+|--------|-------------|
+| `-v, --verbose` | Enable verbose/debug output |
+| `-q, --quiet` | Suppress non-essential output |
+| `-o, --output <FILE>` | Write output to file instead of stdout |
+| `-h, --help` | Show help information |
+| `--version` | Show version number |
+
+## Output Formats
+
+Most commands support multiple output formats:
+
+```bash
+# Text (default, human-readable)
+aranet read --device <ADDRESS> --format text
+
+# JSON (for scripting/APIs)
+aranet read --device <ADDRESS> --format json
+
+# CSV (for spreadsheets)
+aranet history --device <ADDRESS> --format csv
+```
+
+<Aside type="tip">
+  Use `--quiet` mode in scripts to suppress informational messages and only output data.
+</Aside>
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `ARANET_DEVICE` | Default device address |
+| `ARANET_LOG` | Log level (debug, info, warn, error) |
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | General error |
+| `2` | Device not found |
+| `3` | Connection failed |
+| `4` | Bluetooth unavailable |
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

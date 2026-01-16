@@ -1,0 +1,268 @@
+/* Custom styles for Aranet documentation */
+
+:root {
+  /* Brand colors - CO2 status inspired */
+  --sl-color-accent-low: #166534;
+  --sl-color-accent: #22c55e;
+  --sl-color-accent-high: #86efac;
+  
+  /* Status colors */
+  --aranet-green: #22c55e;
+  --aranet-amber: #eab308;
+  --aranet-red: #ef4444;
+  
+  /* Sensor type colors */
+  --aranet-co2: #3b82f6;
+  --aranet-temp: #f97316;
+  --aranet-humidity: #06b6d4;
+  --aranet-pressure: #8b5cf6;
+  --aranet-radon: #a855f7;
+  --aranet-radiation: #ec4899;
+}
+
+/* Dark mode adjustments */
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #166534;
+  --sl-color-accent: #22c55e;
+  --sl-color-accent-high: #4ade80;
+}
+
+/* Hero section enhancements */
+.hero {
+  padding-block: 2rem;
+}
+
+@media (min-width: 50rem) {
+  .hero {
+    padding-block: 4rem;
+  }
+}
+
+/* Landing page cards */
+.sl-card {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.sl-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
+}
+
+/* Sensor status badge styles */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.75rem;
+  border-radius: 9999px;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.status-green {
+  background-color: color-mix(in srgb, var(--aranet-green) 20%, transparent);
+  color: var(--aranet-green);
+}
+
+.status-amber {
+  background-color: color-mix(in srgb, var(--aranet-amber) 20%, transparent);
+  color: var(--aranet-amber);
+}
+
+.status-red {
+  background-color: color-mix(in srgb, var(--aranet-red) 20%, transparent);
+  color: var(--aranet-red);
+}
+
+/* Code block enhancements */
+.expressive-code pre {
+  border-radius: 0.5rem;
+}
+
+/* Device cards on landing page */
+.device-grid.not-content {
+  display: grid !important;
+  grid-template-columns: repeat(2, 1fr) !important;
+  gap: 0.75rem !important;
+  margin-block: 1.5rem !important;
+}
+
+@media (min-width: 30rem) {
+  .device-grid.not-content {
+    gap: 1rem !important;
+  }
+}
+
+@media (min-width: 50rem) {
+  .device-grid.not-content {
+    grid-template-columns: repeat(4, 1fr) !important;
+    gap: 1.5rem !important;
+    margin-block: 2rem !important;
+  }
+}
+
+.device-grid .device-card {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  background: var(--sl-color-bg-nav) !important;
+  border: 1px solid var(--sl-color-hairline) !important;
+  border-radius: 0.75rem !important;
+  padding: 1.25rem 1rem !important;
+  text-align: center !important;
+  transition: border-color 0.2s ease !important;
+  height: 140px !important;
+  box-sizing: border-box !important;
+}
+
+@media (min-width: 50rem) {
+  .device-grid .device-card {
+    padding: 1.5rem !important;
+    height: 160px !important;
+  }
+}
+
+.device-grid .device-card:hover {
+  border-color: var(--sl-color-accent) !important;
+}
+
+.device-grid .device-icon {
+  font-size: 2rem !important;
+  line-height: 1 !important;
+  flex-shrink: 0 !important;
+  display: block !important;
+}
+
+@media (min-width: 50rem) {
+  .device-grid .device-icon {
+    font-size: 2.5rem !important;
+  }
+}
+
+.device-grid .device-name {
+  display: block !important;
+  margin-top: 0.5rem !important;
+  margin-bottom: 0.25rem !important;
+  font-size: 1rem !important;
+  font-weight: 600 !important;
+  color: var(--sl-color-white) !important;
+  flex-shrink: 0 !important;
+}
+
+@media (min-width: 50rem) {
+  .device-grid .device-name {
+    font-size: 1.125rem !important;
+  }
+}
+
+.device-grid .device-desc {
+  display: block !important;
+  font-size: 0.75rem !important;
+  color: var(--sl-color-gray-3) !important;
+  margin: 0 !important;
+  line-height: 1.4 !important;
+  flex-grow: 1 !important;
+}
+
+@media (min-width: 50rem) {
+  .device-grid .device-desc {
+    font-size: 0.875rem !important;
+  }
+}
+
+/* Feature grid */
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1.5rem;
+  margin-block: 2rem;
+}
+
+/* Stats section */
+.stats-row.not-content {
+  display: grid !important;
+  grid-template-columns: repeat(2, 1fr) !important;
+  gap: 1.5rem !important;
+  margin-block: 1.5rem !important;
+  padding: 1.25rem !important;
+  background: var(--sl-color-bg-nav) !important;
+  border-radius: 0.75rem !important;
+}
+
+@media (min-width: 50rem) {
+  .stats-row.not-content {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    justify-content: center !important;
+    align-items: center !important;
+    gap: 3rem !important;
+    margin-block: 2rem !important;
+    padding: 1.5rem !important;
+  }
+}
+
+.stats-row .stat-item {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  text-align: center !important;
+  min-width: 70px !important;
+}
+
+@media (min-width: 50rem) {
+  .stats-row .stat-item {
+    min-width: 80px !important;
+  }
+}
+
+.stats-row .stat-value {
+  display: block !important;
+  font-size: 1.5rem !important;
+  font-weight: 700 !important;
+  color: var(--sl-color-accent) !important;
+  line-height: 1.2 !important;
+  margin: 0 !important;
+}
+
+@media (min-width: 50rem) {
+  .stats-row .stat-value {
+    font-size: 2rem !important;
+  }
+}
+
+.stats-row .stat-label {
+  display: block !important;
+  font-size: 0.75rem !important;
+  color: var(--sl-color-gray-3) !important;
+  line-height: 1.4 !important;
+  margin: 0 !important;
+}
+
+@media (min-width: 50rem) {
+  .stats-row .stat-label {
+    font-size: 0.875rem !important;
+  }
+}
+
+/* Terminal/CLI preview styling */
+.cli-preview {
+  background: #1a1a2e;
+  border-radius: 0.75rem;
+  padding: 1rem;
+  font-family: ui-monospace, monospace;
+  overflow-x: auto;
+}
+
+.cli-preview .prompt {
+  color: #22c55e;
+}
+
+.cli-preview .command {
+  color: #e2e8f0;
+}
+
+.cli-preview .output {
+  color: #94a3b8;
+}
+

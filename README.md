@@ -1,6 +1,14 @@
-# ARANET
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/aranet-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/aranet-logo-light.svg">
+    <img alt="Aranet" src="assets/aranet-logo-light.svg" height="60">
+  </picture>
+</p>
 
-Rust implementation for Aranet environmental sensors.
+<p align="center">
+  Rust implementation for Aranet environmental sensors.
+</p>
 Connect to your Aranet devices via Bluetooth LE to read measurements, download history, and monitor air quality.
 
 [![CI](https://github.com/cameronrye/aranet/workflows/CI/badge.svg)](https://github.com/cameronrye/aranet/actions)

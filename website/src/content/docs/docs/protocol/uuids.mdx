@@ -1,0 +1,99 @@
+---
+title: UUID Reference
+description: Complete list of BLE characteristic UUIDs for Aranet sensors.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Service UUIDs
+
+| Service | UUID | Notes |
+|---------|------|-------|
+| SAF Tehnika (NEW) | `0000fce0-0000-1000-8000-00805f9b34fb` | Firmware v1.2.0+ |
+| SAF Tehnika (OLD) | `f0cd1400-95da-4f4b-9ac8-aa55d312af0c` | Pre-v1.2.0 |
+| GAP Service | `00001800-0000-1000-8000-00805f9b34fb` | Standard BLE |
+| Device Information | `0000180a-0000-1000-8000-00805f9b34fb` | Standard BLE |
+| Battery Service | `0000180f-0000-1000-8000-00805f9b34fb` | Standard BLE |
+| Nordic DFU | `0000fe59-0000-1000-8000-00805f9b34fb` | Firmware updates |
+
+## GAP Service (0x1800)
+
+| Characteristic | UUID | Type |
+|----------------|------|------|
+| Device Name | `00002a00-0000-1000-8000-00805f9b34fb` | String |
+| Appearance | `00002a01-0000-1000-8000-00805f9b34fb` | u16 |
+
+## Device Information Service (0x180a)
+
+| Characteristic | Short UUID | Type |
+|----------------|------------|------|
+| System ID | `0x2a23` | raw |
+| Model Number | `0x2a24` | String |
+| Serial Number | `0x2a25` | String |
+| Firmware Revision | `0x2a26` | String |
+| Hardware Revision | `0x2a27` | String |
+| Software Revision | `0x2a28` | String |
+| Manufacturer Name | `0x2a29` | String |
+
+## Battery Service (0x180f)
+
+| Characteristic | Short UUID | Type |
+|----------------|------------|------|
+| Battery Level | `0x2a19` | u8 (0-100%) |
+
+## SAF Tehnika Service
+
+### Read Characteristics
+
+| Characteristic | UUID | Purpose |
+|----------------|------|---------|
+| Sensor Settings State | `f0cd1401-95da-4f4b-9ac8-aa55d312af0c` | Device settings |
+| Calibration Data | `f0cd1502-95da-4f4b-9ac8-aa55d312af0c` | Calibration values |
+| Current Readings (Basic) | `f0cd1503-95da-4f4b-9ac8-aa55d312af0c` | Basic readings |
+| Current Readings (Aranet2) | `f0cd1504-95da-4f4b-9ac8-aa55d312af0c` | Aranet2/Radiation |
+| Total Readings | `f0cd2001-95da-4f4b-9ac8-aa55d312af0c` | History count |
+| Read Interval | `f0cd2002-95da-4f4b-9ac8-aa55d312af0c` | Interval in seconds |
+| History V1 | `f0cd2003-95da-4f4b-9ac8-aa55d312af0c` | History (notify) |
+| Seconds Since Update | `f0cd2004-95da-4f4b-9ac8-aa55d312af0c` | Last update age |
+| History V2 | `f0cd2005-95da-4f4b-9ac8-aa55d312af0c` | History (read) |
+| Current Readings (Detail) | `f0cd3001-95da-4f4b-9ac8-aa55d312af0c` | Extended readings |
+| Current Readings A | `f0cd3002-95da-4f4b-9ac8-aa55d312af0c` | Alternative format |
+| Current Readings A (Aranet2) | `f0cd3003-95da-4f4b-9ac8-aa55d312af0c` | Aranet2 only |
+
+### Write Characteristic
+
+| Characteristic | UUID | Purpose |
+|----------------|------|---------|
+| Command | `f0cd1402-95da-4f4b-9ac8-aa55d312af0c` | Write commands |
+
+## Nordic DFU Service (0xfe59)
+
+| Characteristic | UUID | Purpose |
+|----------------|------|---------|
+| Secure DFU | `8ec90003-f315-4f60-9fb8-838830daea50` | Firmware update |
+
+## Rust UUID Helper
+
+```rust
+use uuid::{uuid, Uuid};
+
+// Convert 16-bit short UUID to full 128-bit UUID
+fn normalize_uuid_16(short: u16) -> Uuid {
+    Uuid::from_u128(
+        (short as u128) << 96 | 0x0000_1000_8000_00805f9b34fb
+    )
+}
+
+// Define UUIDs as constants
+const SERVICE_SAF_TEHNIKA: Uuid = uuid!("0000fce0-0000-1000-8000-00805f9b34fb");
+const CHAR_CURRENT_READINGS: Uuid = uuid!("f0cd3001-95da-4f4b-9ac8-aa55d312af0c");
+```
+
+<Aside>
+  The `aranet-types` crate provides all UUIDs as constants in the `uuid` module.
+</Aside>
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

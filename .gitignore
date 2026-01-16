@@ -39,3 +39,7 @@ tarpaulin-report.html
 # Debugging
 *.log
 
+# Website (Astro)
+website/node_modules/
+website/dist/
+website/.astro/

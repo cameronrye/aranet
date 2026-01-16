@@ -1,0 +1,62 @@
+---
+title: Getting Started
+description: Learn how to set up and use the Aranet Rust ecosystem for environmental sensor monitoring.
+---
+
+import { Steps, Aside, Badge, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The Aranet Rust ecosystem provides a complete solution for interacting with Aranet environmental sensors via Bluetooth Low Energy (BLE).
+
+## Prerequisites
+
+Before you begin, ensure you have:
+
+- **Rust 1.90+** installed ([rustup.rs](https://rustup.rs))
+- A Bluetooth-enabled computer (macOS, Windows, or Linux)
+- An Aranet sensor device
+
+<Aside type="tip">
+  On Linux, you'll need `libdbus-1-dev` installed for BLE support:
+  ```bash
+  sudo apt-get install libdbus-1-dev
+  ```
+</Aside>
+
+## Supported Devices
+
+| Device | Sensors | Status |
+|--------|---------|--------|
+| Aranet4 | CO₂, Temperature, Humidity, Pressure | <Badge text="Full Support" variant="success" /> |
+| Aranet2 | Temperature, Humidity | <Badge text="Full Support" variant="success" /> |
+| AranetRn+ | Radon, Temperature, Pressure, Humidity | <Badge text="Full Support" variant="success" /> |
+| Aranet Radiation | Dose Rate, Total Dose | <Badge text="Full Support" variant="success" /> |
+
+## Project Structure
+
+The Aranet ecosystem consists of five crates:
+
+```
+aranet/
+├── crates/
+│   ├── aranet-core/     # Core BLE library
+│   ├── aranet-types/    # Shared types (platform-agnostic)
+│   ├── aranet-cli/      # Command-line interface
+│   ├── aranet-tui/      # Terminal UI dashboard
+│   ├── aranet-gui/      # Desktop GUI (egui)
+│   └── aranet-wasm/     # WebAssembly module
+└── docs/                # Protocol documentation
+```
+
+## Next Steps
+
+<Steps>
+1. [Install the CLI](/aranet/docs/installation/) from source
+2. [Scan for devices](/aranet/docs/quick-start/) nearby
+3. [Read sensor data](/aranet/docs/cli/commands/) from your Aranet device
+4. Explore the [BLE Protocol](/aranet/docs/protocol/overview/) documentation
+</Steps>
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

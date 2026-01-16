@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../../assets/aranet-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="../../assets/aranet-logo-light.svg">
+    <img alt="Aranet" src="../../assets/aranet-logo-light.svg" height="60">
+  </picture>
+</p>
+
 # aranet-core
 
 Core BLE library for Aranet environmental sensors.

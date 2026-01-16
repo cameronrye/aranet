@@ -1,0 +1,141 @@
+---
+title: Data Parsing
+description: Byte-level data format specifications for Aranet sensor readings.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+This page documents the binary data formats used by Aranet sensors for current readings, historical data, and advertisements.
+
+## Aranet4 Current Readings
+
+**Characteristic:** `f0cd3001-95da-4f4b-9ac8-aa55d312af0c`  
+**Total Length:** 13 bytes
+
+| Offset | Bytes | Name | Type | Transform |
+|--------|-------|------|------|-----------|
+| 0-1 | `SS:SS` | CO₂ (ppm) | u16LE | none |
+| 2-3 | `TT:TT` | Temperature | u16LE | ÷ 20.0 → °C |
+| 4-5 | `UU:UU` | Pressure | u16LE | ÷ 10 → hPa |
+| 6 | `VV` | Humidity (%) | u8 | none |
+| 7 | `WW` | Battery (%) | u8 | none |
+| 8 | `XX` | Status | u8 | See color enum |
+| 9-10 | `YY:YY` | Interval (s) | u16LE | none |
+| 11-12 | `ZZ:ZZ` | Age (s) | u16LE | none |
+
+### Rust Parsing Example
+
+```rust
+use byteorder::{LittleEndian, ReadBytesExt};
+use std::io::Cursor;
+
+fn parse_aranet4_reading(data: &[u8]) -> Result<CurrentReading, Error> {
+    let mut cursor = Cursor::new(data);
+    
+    Ok(CurrentReading {
+        co2: cursor.read_u16::<LittleEndian>()?,
+        temperature: cursor.read_u16::<LittleEndian>()? as f32 / 20.0,
+        pressure: cursor.read_u16::<LittleEndian>()? as f32 / 10.0,
+        humidity: cursor.read_u8()?,
+        battery: cursor.read_u8()?,
+        status: Status::try_from(cursor.read_u8()?)?,
+        interval: cursor.read_u16::<LittleEndian>()?,
+        age: cursor.read_u16::<LittleEndian>()?,
+    })
+}
+```
+
+## Aranet2 Current Readings
+
+**Characteristic:** `f0cd1504-95da-4f4b-9ac8-aa55d312af0c`
+
+| Offset | Name | Type | Transform |
+|--------|------|------|-----------|
+| 0-1 | Unknown | u16LE | — |
+| 2-3 | Interval (s) | u16LE | none |
+| 4-5 | Age (s) | u16LE | none |
+| 6 | Battery (%) | u8 | none |
+| 7-8 | Temperature | u16LE | ÷ 20.0 → °C |
+| 9-10 | Humidity | u16LE | ÷ 10.0 → % |
+| 11 | Status Flags | u8 | bits[0:1]=humidity, bits[2:3]=temp |
+
+## AranetRn+ (Radon) Readings
+
+**Characteristic:** `f0cd3001-95da-4f4b-9ac8-aa55d312af0c`  
+**Minimum Length:** 18 bytes (extended format includes averages)
+
+| Offset | Name | Type | Transform |
+|--------|------|------|-----------|
+| 0-1 | Device Type | u16LE | 0x0003 = Radon |
+| 2-3 | Interval (s) | u16LE | none |
+| 4-5 | Age (s) | u16LE | none |
+| 6 | Battery (%) | u8 | none |
+| 7-8 | Temperature | u16LE | ÷ 20.0 → °C |
+| 9-10 | Pressure | u16LE | ÷ 10 → hPa |
+| 11-12 | Humidity | u16LE | ÷ 10.0 → % |
+| 13-16 | Radon (Bq/m³) | u32LE | none |
+| 17 | Status | u8 | color enum |
+| 18+ | Averages | u64LE × 3 | 24h, 7d, 30d (optional) |
+
+## Aranet Radiation Readings
+
+| Offset | Name | Type | Transform |
+|--------|------|------|-----------|
+| 0-1 | Unknown | u16LE | — |
+| 2-3 | Interval (s) | u16LE | none |
+| 4-5 | Age (s) | u16LE | none |
+| 6 | Battery (%) | u8 | none |
+| 7-10 | Dose Rate | u32LE | ÷ 1000 → µSv/h |
+| 11-18 | Dose Total | u64LE | ÷ 1,000,000 → mSv |
+| 19-26 | Duration (s) | u64LE | none |
+| 27 | Status | u8 | — |
+
+## History Parameters
+
+When downloading historical data, each parameter type must be requested separately:
+
+| Value | Name | Data Size | Notes |
+|-------|------|-----------|-------|
+| 1 | TEMPERATURE | u16 | Raw ÷ 20 = °C |
+| 2 | HUMIDITY | u16 | Percentage (0-100) |
+| 3 | PRESSURE | u16 | Raw ÷ 10 = hPa |
+| 4 | CO2 | u16 | ppm |
+| 5 | HUMIDITY2 | u16 | Tenths of % (AranetRn+) |
+| 6 | PULSES | u16 | Radiation pulses |
+| 7 | RADIATION_DOSE | u32 | Total dose (nSv) |
+| 8 | RADIATION_DOSE_RATE | u32 | Dose rate (nSv/h) |
+| 9 | RADIATION_DOSE_INTEGRAL | u64 | Integral dose |
+| 10 | RADON_CONCENTRATION | u32 | Bq/m³ (4 bytes) |
+
+<Aside type="note">
+  Parameters 1-6 use 2-byte values. Parameters 7-10 use 4-byte values (u32).
+</Aside>
+
+## Command Bytes
+
+### Set Interval (`0x90`)
+
+```
+Bytes: 90:XX
+XX = Interval in minutes (01, 02, 05, 0A)
+```
+
+### Set Bluetooth Range (`0x92`)
+
+```
+Bytes: 92:XX
+XX = 00 (standard) or 01 (extended)
+```
+
+### Request History V2 (`0x61`)
+
+```
+Bytes: 61:PP:SS:SS
+PP = Parameter (see table above)
+SS:SS = Start index (u16LE)
+```
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+

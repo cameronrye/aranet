@@ -1,0 +1,101 @@
+---
+title: BLE Protocol Overview
+description: Understanding the Aranet Bluetooth Low Energy protocol.
+---
+
+import { Aside, Badge } from '@astrojs/starlight/components';
+
+This document describes the BLE GATT protocol used by Aranet environmental sensors, extracted and documented from the [Aranet4-Python](https://github.com/Anrijs/Aranet4-Python) reference implementation.
+
+## Device Types
+
+Aranet sensors identify themselves via manufacturer data in BLE advertisements:
+
+| Type Code | Name | Model |
+|-----------|------|-------|
+| `0xF1` | ARANET4 | Aranet4 (CO₂ Monitor) |
+| `0xF2` | ARANET2 | Aranet2 (Temp/Humidity) |
+| `0xF3` | ARANET_RADON | Aranet Radon Plus |
+| `0xF4` | ARANET_RADIATION | Aranet Radiation |
+
+## Manufacturer ID
+
+All Aranet devices use SAF Tehnika's Bluetooth SIG-assigned manufacturer ID:
+
+```rust
+const MANUFACTURER_ID: u16 = 0x0702;  // SAF Tehnika
+```
+
+## Service UUIDs
+
+Aranet devices expose two service UUIDs depending on firmware version:
+
+| Service | UUID | Notes |
+|---------|------|-------|
+| **SAF Tehnika (NEW)** | `0000fce0-0000-1000-8000-00805f9b34fb` | Firmware v1.2.0+ |
+| **SAF Tehnika (OLD)** | `f0cd1400-95da-4f4b-9ac8-aa55d312af0c` | Pre-v1.2.0 |
+
+<Aside type="tip">
+  Always check for both service UUIDs when scanning to ensure compatibility with all firmware versions.
+</Aside>
+
+## Standard BLE Services
+
+In addition to the custom SAF Tehnika service, Aranet devices expose standard BLE services:
+
+| Service | UUID | Purpose |
+|---------|------|---------|
+| GAP Service | `0x1800` | Device name, appearance |
+| Device Information | `0x180a` | Model, serial, firmware, manufacturer |
+| Battery Service | `0x180f` | Battery level (0-100%) |
+| Nordic DFU | `0xfe59` | Firmware updates |
+
+## Communication Patterns
+
+### Reading Data
+
+1. **Scan** for devices advertising the SAF Tehnika service
+2. **Connect** to the device
+3. **Discover** services and characteristics
+4. **Read** characteristic values directly
+
+### Historical Data
+
+Two protocols exist for downloading measurement history:
+
+| Version | Method | Characteristic | Firmware |
+|---------|--------|----------------|----------|
+| V1 | Notification-based | `f0cd2003` | Older devices |
+| V2 | Read-based | `f0cd2005` | Newer devices |
+
+### Writing Settings
+
+Settings are modified by writing command bytes to the command characteristic (`f0cd1402`):
+
+| Command | Byte | Purpose |
+|---------|------|---------|
+| Set Interval | `0x90` | Change measurement interval |
+| Toggle Smart Home | `0x91` | Enable/disable integrations |
+| Set BT Range | `0x92` | Standard or extended range |
+
+## CO₂ Status Colors
+
+Aranet4 devices report CO₂ status as a color indicator:
+
+| Value | Color | CO₂ Range | Meaning |
+|-------|-------|-----------|---------|
+| 0 | <Badge text="ERROR" variant="danger" /> | — | Sensor error |
+| 1 | <Badge text="GREEN" variant="success" /> | < 1000 ppm | Good air quality |
+| 2 | <Badge text="AMBER" variant="caution" /> | 1000-1400 ppm | Moderate, ventilate soon |
+| 3 | <Badge text="RED" variant="danger" /> | > 1400 ppm | Poor, ventilate now |
+
+## Further Reading
+
+- [UUID Reference](/aranet/docs/protocol/uuids/) — Complete characteristic UUID list
+- [Data Parsing](/aranet/docs/protocol/data-parsing/) — Byte-level data formats
+- [Aranet4-Python Docs](https://github.com/Anrijs/Aranet4-Python/blob/master/docs/UUIDs.md) — Original reference
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
+
