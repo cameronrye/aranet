@@ -10,7 +10,12 @@ Rust implementation for Aranet environmental sensors. Connect to your Aranet dev
 
 ## Features
 
-- **aranet-core** — Core BLE library supporting Aranet4, Aranet2, Aranet Radon, and Aranet Radiation sensors
+- **aranet-core** — Core BLE library supporting Aranet4, Aranet2, AranetRn+ (Radon), and Aranet Radiation sensors
+  - Current readings (CO₂, temperature, pressure, humidity, radon, radiation)
+  - Historical data download with timestamps
+  - Device settings (measurement interval, Bluetooth range)
+  - Auto-reconnection with configurable backoff
+  - Real-time streaming and event system
 - **aranet-cli** — Command-line interface for quick readings and data export
 - **aranet-tui** — Terminal UI dashboard for real-time monitoring
 - **aranet-gui** — Desktop application built with egui
@@ -73,12 +78,12 @@ aranet/
 
 ## Supported Devices
 
-| Device | Status |
-|--------|--------|
-| Aranet4 | Supported |
-| Aranet2 | Supported |
-| Aranet Radon | Supported |
-| Aranet Radiation | Supported |
+| Device | Sensors | Current | History | Status |
+|--------|---------|---------|---------|--------|
+| Aranet4 | CO₂, Temperature, Pressure, Humidity | ✅ | ✅ | Fully tested |
+| Aranet2 | Temperature, Humidity | ✅ | ✅ | Supported |
+| AranetRn+ (Radon) | Radon, Temperature, Pressure, Humidity | ✅ | ✅ | Fully tested |
+| Aranet Radiation | Dose Rate, Total Dose | ✅ | ⚠️ | Supported (history not yet implemented) |
 
 ## Requirements
 

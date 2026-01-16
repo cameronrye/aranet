@@ -51,8 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust 1.90 stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps
