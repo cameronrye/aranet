@@ -23,7 +23,15 @@ pub mod types;
 pub mod uuid;
 
 pub use error::{ParseError, ParseResult};
-pub use types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord, Status};
+pub use types::{
+    CurrentReading, CurrentReadingBuilder, DeviceInfo, DeviceInfoBuilder, DeviceType,
+    HistoryRecord, HistoryRecordBuilder, Status, MIN_CURRENT_READING_BYTES,
+};
+
+// Re-export uuid module with a clearer name to avoid confusion with the `uuid` crate.
+// The `uuids` alias is kept for backwards compatibility.
+pub use uuid as ble;
+#[doc(hidden)]
 pub use uuid as uuids;
 
 #[cfg(test)]
@@ -74,7 +82,15 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("requires 13 bytes"));
+        assert_eq!(
+            err,
+            ParseError::InsufficientBytes {
+                expected: 13,
+                actual: 10
+            }
+        );
+        assert!(err.to_string().contains("expected 13"));
+        assert!(err.to_string().contains("got 10"));
     }
 
     #[test]
@@ -235,6 +251,65 @@ mod tests {
         assert_eq!(device_type, cloned);
     }
 
+    #[test]
+    fn test_device_type_try_from_u8() {
+        assert_eq!(DeviceType::try_from(0xF1), Ok(DeviceType::Aranet4));
+        assert_eq!(DeviceType::try_from(0xF2), Ok(DeviceType::Aranet2));
+        assert_eq!(DeviceType::try_from(0xF3), Ok(DeviceType::AranetRadon));
+        assert_eq!(DeviceType::try_from(0xF4), Ok(DeviceType::AranetRadiation));
+    }
+
+    #[test]
+    fn test_device_type_try_from_u8_invalid() {
+        let result = DeviceType::try_from(0x00);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ParseError::UnknownDeviceType(0x00));
+
+        let result = DeviceType::try_from(0xFF);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ParseError::UnknownDeviceType(0xFF));
+    }
+
+    #[test]
+    fn test_device_type_display() {
+        assert_eq!(format!("{}", DeviceType::Aranet4), "Aranet4");
+        assert_eq!(format!("{}", DeviceType::Aranet2), "Aranet2");
+        assert_eq!(format!("{}", DeviceType::AranetRadon), "Aranet Radon");
+        assert_eq!(format!("{}", DeviceType::AranetRadiation), "Aranet Radiation");
+    }
+
+    #[test]
+    fn test_device_type_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(DeviceType::Aranet4);
+        set.insert(DeviceType::Aranet2);
+        set.insert(DeviceType::Aranet4); // duplicate
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&DeviceType::Aranet4));
+        assert!(set.contains(&DeviceType::Aranet2));
+    }
+
+    #[test]
+    fn test_status_display() {
+        assert_eq!(format!("{}", Status::Error), "Error");
+        assert_eq!(format!("{}", Status::Green), "Good");
+        assert_eq!(format!("{}", Status::Yellow), "Moderate");
+        assert_eq!(format!("{}", Status::Red), "High");
+    }
+
+    #[test]
+    fn test_status_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(Status::Green);
+        set.insert(Status::Yellow);
+        set.insert(Status::Green); // duplicate
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&Status::Green));
+        assert!(set.contains(&Status::Yellow));
+    }
+
     // --- DeviceInfo tests ---
 
     #[test]
@@ -287,6 +362,38 @@ mod tests {
         assert!(debug_str.contains("Aranet4"));
     }
 
+    #[test]
+    fn test_device_info_default() {
+        let info = types::DeviceInfo::default();
+        assert_eq!(info.name, "");
+        assert_eq!(info.model, "");
+        assert_eq!(info.serial, "");
+        assert_eq!(info.firmware, "");
+        assert_eq!(info.hardware, "");
+        assert_eq!(info.software, "");
+        assert_eq!(info.manufacturer, "");
+    }
+
+    #[test]
+    fn test_device_info_equality() {
+        let info1 = types::DeviceInfo {
+            name: "Test".to_string(),
+            model: "Model".to_string(),
+            serial: "123".to_string(),
+            firmware: "1.0".to_string(),
+            hardware: "1.0".to_string(),
+            software: "1.0".to_string(),
+            manufacturer: "Mfg".to_string(),
+        };
+        let info2 = info1.clone();
+        let info3 = types::DeviceInfo {
+            name: "Different".to_string(),
+            ..info1.clone()
+        };
+        assert_eq!(info1, info2);
+        assert_ne!(info1, info3);
+    }
+
     // --- HistoryRecord tests ---
 
     #[test]
@@ -336,20 +443,108 @@ mod tests {
         assert_eq!(cloned.radiation_total, Some(1.5));
     }
 
+    #[test]
+    fn test_history_record_equality() {
+        use time::OffsetDateTime;
+
+        let record1 = types::HistoryRecord {
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            co2: 800,
+            temperature: 22.5,
+            pressure: 1013.2,
+            humidity: 45,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        };
+        let record2 = record1.clone();
+        assert_eq!(record1, record2);
+    }
+
+    #[test]
+    fn test_current_reading_equality() {
+        let reading1 = CurrentReading {
+            co2: 800,
+            temperature: 22.5,
+            pressure: 1013.2,
+            humidity: 45,
+            battery: 85,
+            status: Status::Green,
+            interval: 300,
+            age: 120,
+            captured_at: None,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        };
+        let reading2 = reading1.clone();
+        assert_eq!(reading1, reading2);
+    }
+
+    #[test]
+    fn test_min_current_reading_bytes_const() {
+        assert_eq!(MIN_CURRENT_READING_BYTES, 13);
+        // Ensure buffer of exact size works
+        let bytes = [0u8; MIN_CURRENT_READING_BYTES];
+        assert!(CurrentReading::from_bytes(&bytes).is_ok());
+        // Ensure buffer one byte short fails
+        let short_bytes = [0u8; MIN_CURRENT_READING_BYTES - 1];
+        assert!(CurrentReading::from_bytes(&short_bytes).is_err());
+    }
+
     // --- ParseError tests ---
 
     #[test]
     fn test_parse_error_display() {
-        let err = ParseError::InvalidData("test message".to_string());
-        assert_eq!(err.to_string(), "Invalid data: test message");
+        let err = ParseError::invalid_value("test message");
+        assert_eq!(err.to_string(), "Invalid value: test message");
+    }
+
+    #[test]
+    fn test_parse_error_insufficient_bytes() {
+        let err = ParseError::InsufficientBytes {
+            expected: 13,
+            actual: 5,
+        };
+        assert_eq!(err.to_string(), "Insufficient bytes: expected 13, got 5");
+    }
+
+    #[test]
+    fn test_parse_error_unknown_device_type() {
+        let err = ParseError::UnknownDeviceType(0xAB);
+        assert_eq!(err.to_string(), "Unknown device type: 0xAB");
+    }
+
+    #[test]
+    fn test_parse_error_invalid_value() {
+        let err = ParseError::InvalidValue("bad value".to_string());
+        assert_eq!(err.to_string(), "Invalid value: bad value");
     }
 
     #[test]
     fn test_parse_error_debug() {
-        let err = ParseError::InvalidData("debug test".to_string());
+        let err = ParseError::invalid_value("debug test");
         let debug_str = format!("{:?}", err);
-        assert!(debug_str.contains("InvalidData"));
+        assert!(debug_str.contains("InvalidValue"));
         assert!(debug_str.contains("debug test"));
+    }
+
+    #[test]
+    fn test_parse_error_equality() {
+        let err1 = ParseError::InsufficientBytes {
+            expected: 10,
+            actual: 5,
+        };
+        let err2 = ParseError::InsufficientBytes {
+            expected: 10,
+            actual: 5,
+        };
+        let err3 = ParseError::InsufficientBytes {
+            expected: 10,
+            actual: 6,
+        };
+        assert_eq!(err1, err2);
+        assert_ne!(err1, err3);
     }
 
     // --- Serialization tests ---
@@ -365,6 +560,7 @@ mod tests {
             status: Status::Green,
             interval: 300,
             age: 120,
+            captured_at: None,
             radon: None,
             radiation_rate: None,
             radiation_total: None,
@@ -425,5 +621,214 @@ mod tests {
         assert_eq!(deserialized.name, info.name);
         assert_eq!(deserialized.serial, info.serial);
         assert_eq!(deserialized.manufacturer, info.manufacturer);
+    }
+
+    // --- New feature tests ---
+
+    #[test]
+    fn test_status_ordering() {
+        // Status should be ordered by severity
+        assert!(Status::Error < Status::Green);
+        assert!(Status::Green < Status::Yellow);
+        assert!(Status::Yellow < Status::Red);
+
+        // Test comparison operators
+        assert!(Status::Red > Status::Yellow);
+        assert!(Status::Yellow >= Status::Yellow);
+        assert!(Status::Green <= Status::Yellow);
+    }
+
+    #[test]
+    fn test_device_type_readings_characteristic() {
+        use crate::ble;
+
+        // Aranet4 uses the original characteristic
+        assert_eq!(
+            DeviceType::Aranet4.readings_characteristic(),
+            ble::CURRENT_READINGS_DETAIL
+        );
+
+        // Other devices use the alternate characteristic
+        assert_eq!(
+            DeviceType::Aranet2.readings_characteristic(),
+            ble::CURRENT_READINGS_DETAIL_ALT
+        );
+        assert_eq!(
+            DeviceType::AranetRadon.readings_characteristic(),
+            ble::CURRENT_READINGS_DETAIL_ALT
+        );
+        assert_eq!(
+            DeviceType::AranetRadiation.readings_characteristic(),
+            ble::CURRENT_READINGS_DETAIL_ALT
+        );
+    }
+
+    #[test]
+    fn test_device_type_from_name_word_boundary() {
+        // Should match at word boundaries
+        assert_eq!(
+            DeviceType::from_name("Aranet4 12345"),
+            Some(DeviceType::Aranet4)
+        );
+        assert_eq!(
+            DeviceType::from_name("My Aranet4"),
+            Some(DeviceType::Aranet4)
+        );
+
+        // Should match case-insensitively
+        assert_eq!(
+            DeviceType::from_name("ARANET4"),
+            Some(DeviceType::Aranet4)
+        );
+        assert_eq!(
+            DeviceType::from_name("aranet2"),
+            Some(DeviceType::Aranet2)
+        );
+    }
+
+    #[test]
+    fn test_byte_size_constants() {
+        assert_eq!(MIN_CURRENT_READING_BYTES, 13);
+        assert_eq!(types::MIN_ARANET2_READING_BYTES, 7);
+        assert_eq!(types::MIN_RADON_READING_BYTES, 15);
+        assert_eq!(types::MIN_RADON_GATT_READING_BYTES, 18);
+        assert_eq!(types::MIN_RADIATION_READING_BYTES, 28);
+    }
+
+    #[test]
+    fn test_from_bytes_aranet2() {
+        // 7 bytes: temp(2), humidity(1), battery(1), status(1), interval(2)
+        let data = [
+            0x90, 0x01, // temp = 400 -> 20.0°C
+            0x32,       // humidity = 50
+            0x55,       // battery = 85
+            0x01,       // status = Green
+            0x2C, 0x01, // interval = 300
+        ];
+
+        let reading = CurrentReading::from_bytes_aranet2(&data).unwrap();
+        assert_eq!(reading.co2, 0); // Aranet2 has no CO2
+        assert!((reading.temperature - 20.0).abs() < 0.1);
+        assert_eq!(reading.humidity, 50);
+        assert_eq!(reading.battery, 85);
+        assert_eq!(reading.status, Status::Green);
+        assert_eq!(reading.interval, 300);
+        assert_eq!(reading.pressure, 0.0); // Aranet2 has no pressure
+    }
+
+    #[test]
+    fn test_from_bytes_aranet2_insufficient() {
+        let data = [0u8; 6]; // Too short
+        let result = CurrentReading::from_bytes_aranet2(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_bytes_for_device() {
+        // Test dispatch to correct parser
+        let aranet4_data = [0u8; 13];
+        let result = CurrentReading::from_bytes_for_device(&aranet4_data, DeviceType::Aranet4);
+        assert!(result.is_ok());
+
+        let aranet2_data = [0u8; 7];
+        let result = CurrentReading::from_bytes_for_device(&aranet2_data, DeviceType::Aranet2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_builder_with_captured_at() {
+        use time::OffsetDateTime;
+
+        let now = OffsetDateTime::now_utc();
+        let reading = CurrentReading::builder()
+            .co2(800)
+            .temperature(22.5)
+            .captured_at(now)
+            .build();
+
+        assert_eq!(reading.co2, 800);
+        assert_eq!(reading.captured_at, Some(now));
+    }
+
+    #[test]
+    fn test_builder_try_build_valid() {
+        let result = CurrentReading::builder()
+            .co2(800)
+            .temperature(22.5)
+            .pressure(1013.0)
+            .humidity(50)
+            .battery(85)
+            .try_build();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_builder_try_build_invalid_humidity() {
+        let result = CurrentReading::builder()
+            .humidity(150) // Invalid: > 100
+            .try_build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("humidity"));
+    }
+
+    #[test]
+    fn test_builder_try_build_invalid_battery() {
+        let result = CurrentReading::builder()
+            .battery(120) // Invalid: > 100
+            .try_build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("battery"));
+    }
+
+    #[test]
+    fn test_builder_try_build_invalid_temperature() {
+        let result = CurrentReading::builder()
+            .temperature(-50.0) // Invalid: < -40
+            .try_build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("temperature"));
+    }
+
+    #[test]
+    fn test_builder_try_build_invalid_pressure() {
+        let result = CurrentReading::builder()
+            .temperature(22.0) // Valid temperature
+            .pressure(500.0)   // Invalid: < 800
+            .try_build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("pressure"));
+    }
+
+    #[test]
+    fn test_with_captured_at() {
+        use time::OffsetDateTime;
+
+        let reading = CurrentReading::builder()
+            .age(60)
+            .build();
+
+        let now = OffsetDateTime::now_utc();
+        let reading_with_time = reading.with_captured_at(now);
+
+        assert!(reading_with_time.captured_at.is_some());
+        // The captured_at should be approximately now - 60 seconds
+        let captured = reading_with_time.captured_at.unwrap();
+        let expected = now - time::Duration::seconds(60);
+        assert!((captured - expected).whole_seconds().abs() < 2);
+    }
+
+    #[test]
+    fn test_parse_error_invalid_value_helper() {
+        let err = ParseError::invalid_value("test error");
+        assert_eq!(err.to_string(), "Invalid value: test error");
     }
 }

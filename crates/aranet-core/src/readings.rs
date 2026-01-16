@@ -73,6 +73,7 @@ pub fn parse_aranet2_reading(data: &[u8]) -> Result<CurrentReading> {
         status,
         interval,
         age: 0,
+        captured_at: None,
         radon: None,
         radiation_rate: None,
         radiation_total: None,
@@ -114,6 +115,7 @@ pub fn parse_aranet_radon_reading(data: &[u8]) -> Result<ExtendedReading> {
         status,
         interval,
         age,
+        captured_at: None,
         radon: Some(radon),
         radiation_rate: None,
         radiation_total: None,
@@ -174,6 +176,7 @@ pub fn parse_aranet_radon_gatt(data: &[u8]) -> Result<CurrentReading> {
         status,
         interval,
         age,
+        captured_at: None,
         radon: Some(radon),
         radiation_rate: None,
         radiation_total: None,
@@ -234,6 +237,7 @@ pub fn parse_aranet_radiation_gatt(data: &[u8]) -> Result<ExtendedReading> {
         status,
         interval,
         age,
+        captured_at: None,
         radon: None,
         radiation_rate: Some(dose_rate_usv),
         radiation_total: Some(total_dose_msv),
@@ -446,7 +450,9 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("requires 13 bytes"));
+        // The error message format changed: "Insufficient bytes: expected 13, got 10"
+        assert!(err.to_string().contains("expected 13"));
+        assert!(err.to_string().contains("got 10"));
     }
 
     // --- Aranet Radon parsing tests ---
@@ -611,6 +617,7 @@ mod tests {
             status: Status::Green,
             interval: 300,
             age: 60,
+            captured_at: None,
             radon: Some(150),
             radiation_rate: None,
             radiation_total: None,
@@ -637,6 +644,7 @@ mod tests {
             status: Status::Green,
             interval: 60,
             age: 30,
+            captured_at: None,
             radon: None,
             radiation_rate: Some(0.15),
             radiation_total: Some(0.001),
@@ -663,6 +671,7 @@ mod tests {
             status: Status::Green,
             interval: 300,
             age: 60,
+            captured_at: None,
             radon: Some(100),
             radiation_rate: None,
             radiation_total: None,
@@ -689,6 +698,7 @@ mod tests {
             status: Status::Green,
             interval: 300,
             age: 60,
+            captured_at: None,
             radon: Some(100),
             radiation_rate: Some(0.1),
             radiation_total: Some(0.001),

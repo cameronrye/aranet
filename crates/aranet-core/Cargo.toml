@@ -6,9 +6,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Core BLE library for Aranet environmental sensors"
+readme = "README.md"
+keywords = ["aranet", "ble", "bluetooth", "sensors", "iot"]
+categories = ["hardware-support", "asynchronous"]
 
 [dependencies]
-aranet-types = { path = "../aranet-types" }
+aranet-types = { version = "0.1", path = "../aranet-types" }
 btleplug.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

@@ -113,3 +113,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - [Aranet4-Python](https://github.com/Anrijs/Aranet4-Python) - Python implementation that inspired this project
 - [btleplug](https://github.com/deviceplug/btleplug) - Cross-platform Bluetooth LE library for Rust
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)

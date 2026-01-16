@@ -180,6 +180,7 @@ fn test_types_are_serializable() {
         status: Status::Green,
         interval: 300,
         age: 120,
+        captured_at: None,
         radon: None,
         radiation_rate: None,
         radiation_total: None,

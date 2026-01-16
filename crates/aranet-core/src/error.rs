@@ -223,8 +223,14 @@ impl Error {
 impl From<aranet_types::ParseError> for Error {
     fn from(err: aranet_types::ParseError) -> Self {
         match err {
-            aranet_types::ParseError::InvalidData(msg) => Error::InvalidData(msg),
-            // Handle future ParseError variants
+            aranet_types::ParseError::InsufficientBytes { expected, actual } => {
+                Error::InvalidReadingFormat { expected, actual }
+            }
+            aranet_types::ParseError::InvalidValue(msg) => Error::InvalidData(msg),
+            aranet_types::ParseError::UnknownDeviceType(byte) => {
+                Error::InvalidData(format!("Unknown device type: 0x{:02X}", byte))
+            }
+            // Handle future ParseError variants (non_exhaustive)
             _ => Error::InvalidData(format!("Parse error: {}", err)),
         }
     }

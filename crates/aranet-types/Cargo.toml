@@ -6,9 +6,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Platform-agnostic types for Aranet environmental sensors"
+readme = "README.md"
+keywords = ["aranet", "ble", "bluetooth", "sensors", "iot"]
+categories = ["embedded", "hardware-support", "no-std"]
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "time/serde"]
 
 [dependencies]
-serde.workspace = true
+serde = { workspace = true, optional = true }
 thiserror.workspace = true
 bytes.workspace = true
 time.workspace = true
