@@ -25,7 +25,7 @@ pub mod uuid;
 pub use error::{ParseError, ParseResult};
 pub use types::{
     CurrentReading, CurrentReadingBuilder, DeviceInfo, DeviceInfoBuilder, DeviceType,
-    HistoryRecord, HistoryRecordBuilder, Status, MIN_CURRENT_READING_BYTES,
+    HistoryRecord, HistoryRecordBuilder, MIN_CURRENT_READING_BYTES, Status,
 };
 
 // Re-export uuid module with a clearer name to avoid confusion with the `uuid` crate.
@@ -275,7 +275,10 @@ mod tests {
         assert_eq!(format!("{}", DeviceType::Aranet4), "Aranet4");
         assert_eq!(format!("{}", DeviceType::Aranet2), "Aranet2");
         assert_eq!(format!("{}", DeviceType::AranetRadon), "Aranet Radon");
-        assert_eq!(format!("{}", DeviceType::AranetRadiation), "Aranet Radiation");
+        assert_eq!(
+            format!("{}", DeviceType::AranetRadiation),
+            "Aranet Radiation"
+        );
     }
 
     #[test]
@@ -676,14 +679,8 @@ mod tests {
         );
 
         // Should match case-insensitively
-        assert_eq!(
-            DeviceType::from_name("ARANET4"),
-            Some(DeviceType::Aranet4)
-        );
-        assert_eq!(
-            DeviceType::from_name("aranet2"),
-            Some(DeviceType::Aranet2)
-        );
+        assert_eq!(DeviceType::from_name("ARANET4"), Some(DeviceType::Aranet4));
+        assert_eq!(DeviceType::from_name("aranet2"), Some(DeviceType::Aranet2));
     }
 
     #[test]
@@ -700,9 +697,9 @@ mod tests {
         // 7 bytes: temp(2), humidity(1), battery(1), status(1), interval(2)
         let data = [
             0x90, 0x01, // temp = 400 -> 20.0°C
-            0x32,       // humidity = 50
-            0x55,       // battery = 85
-            0x01,       // status = Green
+            0x32, // humidity = 50
+            0x55, // battery = 85
+            0x01, // status = Green
             0x2C, 0x01, // interval = 300
         ];
 
@@ -800,7 +797,7 @@ mod tests {
     fn test_builder_try_build_invalid_pressure() {
         let result = CurrentReading::builder()
             .temperature(22.0) // Valid temperature
-            .pressure(500.0)   // Invalid: < 800
+            .pressure(500.0) // Invalid: < 800
             .try_build();
 
         assert!(result.is_err());
@@ -812,9 +809,7 @@ mod tests {
     fn test_with_captured_at() {
         use time::OffsetDateTime;
 
-        let reading = CurrentReading::builder()
-            .age(60)
-            .build();
+        let reading = CurrentReading::builder().age(60).build();
 
         let now = OffsetDateTime::now_utc();
         let reading_with_time = reading.with_captured_at(now);

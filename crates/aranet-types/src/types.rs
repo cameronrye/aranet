@@ -567,8 +567,7 @@ impl CurrentReading {
     /// This is useful for setting the timestamp when reading from a device.
     #[must_use]
     pub fn with_captured_at(mut self, now: time::OffsetDateTime) -> Self {
-        self.captured_at =
-            Some(now - time::Duration::seconds(i64::from(self.age)));
+        self.captured_at = Some(now - time::Duration::seconds(i64::from(self.age)));
         self
     }
 
