@@ -825,9 +825,10 @@ mod tests {
     // format_scan_* tests
     // ========================================================================
 
-    // Note: DiscoveredDevice tests are skipped on Linux because bluez-async's
-    // DeviceId/AdapterId constructors are private, making it impossible to create
-    // test PeripheralIds. The formatting logic is still tested on macOS and Windows.
+    // Note: DiscoveredDevice tests only run on macOS because:
+    // - Linux: bluez-async's DeviceId/AdapterId constructors are private
+    // - Windows: btleplug's PeripheralId constructor is not publicly accessible
+    // The formatting logic is still tested on macOS where PeripheralId can be created from UUID.
 
     /// Create a test PeripheralId for macOS (uses UUID)
     #[cfg(target_os = "macos")]
@@ -835,13 +836,7 @@ mod tests {
         btleplug::platform::PeripheralId::from(uuid::Uuid::nil())
     }
 
-    /// Create a test PeripheralId for Windows (uses u64 address)
-    #[cfg(target_os = "windows")]
-    fn make_test_peripheral_id() -> btleplug::platform::PeripheralId {
-        btleplug::platform::PeripheralId(0xAABBCCDDEEFF)
-    }
-
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     fn make_test_device(
         name: Option<&str>,
         address: &str,
@@ -869,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     fn test_format_scan_text_single_device() {
         let devices = vec![make_test_device(
             Some("Aranet4 12345"),
@@ -894,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     fn test_format_scan_csv_no_header() {
         let devices = vec![make_test_device(
             Some("Aranet4 12345"),
@@ -910,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     fn test_format_scan_json_structure() {
         let devices = vec![make_test_device(
             Some("Aranet4 12345"),
