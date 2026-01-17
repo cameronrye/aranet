@@ -11,7 +11,7 @@ description = "WebAssembly module for Aranet sensors via Web Bluetooth"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-aranet-types = { path = "../aranet-types" }
+aranet-types = { version = "0.1", path = "../aranet-types" }
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = ["console"] }
 js-sys = "0.3"

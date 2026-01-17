@@ -12,8 +12,8 @@ name = "aranet"
 path = "src/main.rs"
 
 [dependencies]
-aranet-core = { path = "../aranet-core" }
-aranet-types = { path = "../aranet-types" }
+aranet-core = { version = "0.1", path = "../aranet-core" }
+aranet-types = { version = "0.1", path = "../aranet-types" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }
 clap_complete = "4"

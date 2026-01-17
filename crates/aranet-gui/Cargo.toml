@@ -12,7 +12,7 @@ name = "aranet-gui"
 path = "src/main.rs"
 
 [dependencies]
-aranet-core = { path = "../aranet-core" }
+aranet-core = { version = "0.1", path = "../aranet-core" }
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
