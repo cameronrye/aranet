@@ -50,7 +50,10 @@ impl Check {
 }
 
 pub async fn cmd_doctor(verbose: bool, no_color: bool) -> Result<()> {
-    println!("{}", style::format_title("Aranet Doctor - BLE Diagnostics", no_color));
+    println!(
+        "{}",
+        style::format_title("Aranet Doctor - BLE Diagnostics", no_color)
+    );
     println!();
 
     let mut checks: Vec<Check> = Vec::new();
@@ -80,7 +83,10 @@ pub async fn cmd_doctor(verbose: bool, no_color: bool) -> Result<()> {
     let failed = checks.iter().filter(|c| !c.passed).count();
 
     let summary = if no_color {
-        format!("Summary: {} passed, {} warnings, {} failed", passed, warnings, failed)
+        format!(
+            "Summary: {} passed, {} warnings, {} failed",
+            passed, warnings, failed
+        )
     } else {
         format!(
             "Summary: {} passed, {} warnings, {} failed",
@@ -128,13 +134,19 @@ fn print_check_result(check: &Check, no_color: bool) {
         if no_color {
             ("[!!]".to_string(), check.message.clone())
         } else {
-            (format!("{}", "[!!]".yellow()), format!("{}", check.message.yellow()))
+            (
+                format!("{}", "[!!]".yellow()),
+                format!("{}", check.message.yellow()),
+            )
         }
     } else {
         if no_color {
             ("[FAIL]".to_string(), check.message.clone())
         } else {
-            (format!("{}", "[FAIL]".red()), format!("{}", check.message.red()))
+            (
+                format!("{}", "[FAIL]".red()),
+                format!("{}", check.message.red()),
+            )
         }
     };
     println!("{} {}", icon, msg);

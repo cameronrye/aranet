@@ -25,7 +25,10 @@ pub fn scanning_spinner(timeout_secs: u64) -> ProgressBar {
             .expect("valid template")
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
     );
-    pb.set_message(format!("Scanning for Aranet devices... ({}s)", timeout_secs));
+    pb.set_message(format!(
+        "Scanning for Aranet devices... ({}s)",
+        timeout_secs
+    ));
     pb.enable_steady_tick(Duration::from_millis(80));
     pb
 }
@@ -64,38 +67,38 @@ pub fn operation_spinner(message: &str) -> ProgressBar {
 
 /// CO2 thresholds (ppm) based on indoor air quality guidelines.
 pub mod co2 {
-    pub const GOOD: u16 = 800;      // Green: < 800 ppm
+    pub const GOOD: u16 = 800; // Green: < 800 ppm
     pub const MODERATE: u16 = 1000; // Yellow: 800-1000 ppm
-    pub const POOR: u16 = 1500;     // Orange: 1000-1500 ppm
+    pub const POOR: u16 = 1500; // Orange: 1000-1500 ppm
     // Red: > 1500 ppm
 }
 
 /// Radon thresholds (Bq/m³) based on EPA guidelines.
 /// EPA action level is 4 pCi/L = ~148 Bq/m³
 pub mod radon {
-    pub const GOOD: u32 = 74;       // Green: < 2 pCi/L (74 Bq/m³)
-    pub const MODERATE: u32 = 148;  // Yellow: 2-4 pCi/L (74-148 Bq/m³)
+    pub const GOOD: u32 = 74; // Green: < 2 pCi/L (74 Bq/m³)
+    pub const MODERATE: u32 = 148; // Yellow: 2-4 pCi/L (74-148 Bq/m³)
     // Red: > 4 pCi/L (148 Bq/m³)
 }
 
 /// Battery thresholds (percentage).
 pub mod battery {
-    pub const LOW: u8 = 20;         // Red: < 20%
-    pub const MEDIUM: u8 = 40;      // Yellow: 20-40%
+    pub const LOW: u8 = 20; // Red: < 20%
+    pub const MEDIUM: u8 = 40; // Yellow: 20-40%
     // Green: > 40%
 }
 
 /// Humidity thresholds (percentage) for comfort.
 pub mod humidity {
-    pub const LOW: u8 = 30;         // Yellow: < 30% (too dry)
-    pub const HIGH: u8 = 70;        // Yellow: > 70% (too humid)
+    pub const LOW: u8 = 30; // Yellow: < 30% (too dry)
+    pub const HIGH: u8 = 70; // Yellow: > 70% (too humid)
     // Green: 30-70%
 }
 
 /// Temperature thresholds (Celsius) for comfort.
 pub mod temperature {
-    pub const COLD: f32 = 18.0;     // Blue: < 18°C
-    pub const WARM: f32 = 26.0;     // Orange: > 26°C
+    pub const COLD: f32 = 18.0; // Blue: < 18°C
+    pub const WARM: f32 = 26.0; // Orange: > 26°C
     // Green: 18-26°C
 }
 
@@ -367,4 +370,3 @@ pub fn format_title(title: &str, no_color: bool) -> String {
         format!("{}\n{}", title.bold(), "━".repeat(title.len()).dimmed())
     }
 }
-

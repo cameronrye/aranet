@@ -145,11 +145,9 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
                         out.push_str(&format_watch_csv_line(&reading, opts));
                         out
                     }
-                    OutputFormat::Text => format_watch_line_with_trend(
-                        &reading,
-                        previous_reading.as_ref(),
-                        opts,
-                    ),
+                    OutputFormat::Text => {
+                        format_watch_line_with_trend(&reading, previous_reading.as_ref(), opts)
+                    }
                 };
                 write_output(output, &content)?;
                 previous_reading = Some(reading);

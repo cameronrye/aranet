@@ -301,7 +301,10 @@ pub fn format_scan_text(devices: &[DiscoveredDevice], opts: &FormatOptions) -> S
 
 /// Rich table formatting for scan results
 fn format_scan_text_rich(devices: &[DiscoveredDevice], opts: &FormatOptions) -> String {
-    use tabled::{Table, Tabled, settings::{Style, object::Columns, Modify, Width}};
+    use tabled::{
+        Table, Tabled,
+        settings::{Modify, Style, Width, object::Columns},
+    };
 
     #[derive(Tabled)]
     struct DeviceRow {
@@ -343,11 +346,7 @@ fn format_scan_text_rich(devices: &[DiscoveredDevice], opts: &FormatOptions) -> 
     table.with(Style::rounded());
     table.with(Modify::new(Columns::new(0..1)).with(Width::truncate(20)));
 
-    format!(
-        "Found {} Aranet device(s)\n\n{}\n",
-        devices.len(),
-        table
-    )
+    format!("Found {} Aranet device(s)\n\n{}\n", devices.len(), table)
 }
 
 #[must_use]
@@ -828,7 +827,11 @@ pub fn format_history_text(history: &[HistoryRecord], opts: &FormatOptions) -> S
     // Detect device type from first record
     let is_radon = history.first().is_some_and(|r| r.radon.is_some());
 
-    let temp_header = if opts.fahrenheit { "Temp (°F)" } else { "Temp (°C)" };
+    let temp_header = if opts.fahrenheit {
+        "Temp (°F)"
+    } else {
+        "Temp (°C)"
+    };
 
     let mut output = format!("History ({} records):\n\n", history.len());
 

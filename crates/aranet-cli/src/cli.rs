@@ -146,7 +146,13 @@ pub struct Cli {
     pub no_color: bool,
 
     /// Visual styling mode (minimal, rich, plain)
-    #[arg(long, global = true, value_enum, default_value = "rich", env = "ARANET_STYLE")]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "rich",
+        env = "ARANET_STYLE"
+    )]
     pub style: StyleMode,
 
     /// Write output to file instead of stdout
