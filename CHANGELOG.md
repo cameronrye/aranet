@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-01-17
+
+### Fixed
+
+- Fix clippy warnings for Rust 2024 edition compliance
+- Resolve collapsible if/else-if blocks in CLI styling code
+- Remove unnecessary `.clone()` on Copy types in tests
+- Fix manual range contains and clamp patterns
+
 ## [0.1.3] - 2026-01-17
 
 ### Added
