@@ -391,18 +391,18 @@ pub fn format_reading_text_with_name(
     let mut output = String::new();
 
     // Add device header if name is provided and rich mode is enabled
-    if let Some(name) = device_name {
-        if opts.is_rich() {
-            output.push_str(&style::format_device_header(name, opts.no_color));
-            output.push('\n');
+    if let Some(name) = device_name
+        && opts.is_rich()
+    {
+        output.push_str(&style::format_device_header(name, opts.no_color));
+        output.push('\n');
 
-            // Add air quality summary for CO2 devices
-            if reading.co2 > 0 {
-                let summary = style::air_quality_summary_colored(reading.co2, opts.no_color);
-                output.push_str(&format!("Air Quality: {}\n", summary));
-            }
-            output.push('\n');
+        // Add air quality summary for CO2 devices
+        if reading.co2 > 0 {
+            let summary = style::air_quality_summary_colored(reading.co2, opts.no_color);
+            output.push_str(&format!("Air Quality: {}\n", summary));
         }
+        output.push('\n');
     }
 
     // CO2 (Aranet4) - with colored value

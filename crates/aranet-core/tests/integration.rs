@@ -19,7 +19,6 @@ use tokio::time::timeout;
 
 // Suppress unused warnings for test-only items
 #[allow(dead_code)]
-
 /// Default timeout for BLE operations.
 const BLE_TIMEOUT: Duration = Duration::from_secs(30);
 

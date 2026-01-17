@@ -212,7 +212,8 @@ mod tests {
     #[test]
     fn test_status_clone() {
         let status = Status::Green;
-        let cloned = status.clone();
+        // Status implements Copy, so we can just copy it
+        let cloned = status;
         assert_eq!(status, cloned);
     }
 
@@ -247,7 +248,8 @@ mod tests {
     #[test]
     fn test_device_type_clone() {
         let device_type = DeviceType::Aranet4;
-        let cloned = device_type.clone();
+        // DeviceType implements Copy, so we can just copy it
+        let cloned = device_type;
         assert_eq!(device_type, cloned);
     }
 
@@ -483,7 +485,8 @@ mod tests {
             radon_avg_7d: None,
             radon_avg_30d: None,
         };
-        let reading2 = reading1.clone();
+        // CurrentReading implements Copy, so we can just copy it
+        let reading2 = reading1;
         assert_eq!(reading1, reading2);
     }
 

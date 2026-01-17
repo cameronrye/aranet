@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
                 .with_compact(compact)
                 .with_bq(out.resolve_bq(config_bq))
                 .with_inhg(out.resolve_inhg(config_inhg))
-                .with_style(cli.style.into());
+                .with_style(cli.style);
             cmd_status(dev, timeout, format, output, &opts, brief).await?;
         }
         Commands::History {

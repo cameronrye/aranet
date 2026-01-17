@@ -159,7 +159,7 @@ pub fn format_humidity_colored(percent: u8, no_color: bool) -> String {
         return format!("{}%", percent);
     }
 
-    if percent < humidity::LOW || percent > humidity::HIGH {
+    if !(humidity::LOW..=humidity::HIGH).contains(&percent) {
         format!("{}%", percent.yellow())
     } else {
         format!("{}%", percent.green())
@@ -195,7 +195,7 @@ pub fn format_signal_bar(rssi: Option<i16>, no_color: bool) -> String {
 
     // Normalize RSSI to 0-10 scale
     // -30 dBm = excellent (10), -100 dBm = very weak (0)
-    let strength = ((rssi + 100).max(0).min(70) as f32 / 7.0).round() as usize;
+    let strength = ((rssi + 100).clamp(0, 70) as f32 / 7.0).round() as usize;
     let filled = strength.min(10);
     let empty = 10 - filled;
 
@@ -236,9 +236,7 @@ pub fn air_quality_summary_colored(co2: u16, no_color: bool) -> String {
         return summary.to_string();
     }
 
-    if co2 < co2::GOOD {
-        format!("{}", summary.green())
-    } else if co2 < co2::MODERATE {
+    if co2 < co2::MODERATE {
         format!("{}", summary.green())
     } else if co2 < co2::POOR {
         format!("{}", summary.yellow())
@@ -331,8 +329,10 @@ pub fn trend_indicator(current: f32, previous: f32, no_color: bool) -> &'static 
         "-"
     } else if diff > 0.0 {
         if no_color { "^" } else { "↑" }
+    } else if no_color {
+        "v"
     } else {
-        if no_color { "v" } else { "↓" }
+        "↓"
     }
 }
 
@@ -343,8 +343,10 @@ pub fn trend_indicator_int(current: i32, previous: i32, no_color: bool) -> &'sta
         "-"
     } else if diff > 0 {
         if no_color { "^" } else { "↑" }
+    } else if no_color {
+        "v"
     } else {
-        if no_color { "v" } else { "↓" }
+        "↓"
     }
 }
 

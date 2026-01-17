@@ -31,84 +31,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identifier_lower = identifier.to_lowercase();
 
     for p in peripherals {
-        if let Some(props) = p.properties().await? {
-            if let Some(name) = &props.local_name {
-                if name.to_lowercase().contains(&identifier_lower) {
-                    println!("\nFound: {}", name);
-                    println!("Connecting...");
+        if let Some(props) = p.properties().await?
+            && let Some(name) = &props.local_name
+            && name.to_lowercase().contains(&identifier_lower)
+        {
+            println!("\nFound: {}", name);
+            println!("Connecting...");
 
-                    p.connect().await?;
-                    println!("Connected!");
+            p.connect().await?;
+            println!("Connected!");
 
-                    println!("Discovering services...");
-                    p.discover_services().await?;
+            println!("Discovering services...");
+            p.discover_services().await?;
 
-                    println!("\n=== SERVICES AND CHARACTERISTICS ===\n");
+            println!("\n=== SERVICES AND CHARACTERISTICS ===\n");
 
-                    for service in p.services() {
-                        println!("Service: {}", service.uuid);
-                        for char in &service.characteristics {
-                            let mut flags = Vec::new();
-                            if char.properties.contains(CharPropFlags::READ) {
-                                flags.push("R");
-                            }
-                            if char.properties.contains(CharPropFlags::WRITE) {
-                                flags.push("W");
-                            }
-                            if char
-                                .properties
-                                .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
-                            {
-                                flags.push("Wn");
-                            }
-                            if char.properties.contains(CharPropFlags::NOTIFY) {
-                                flags.push("N");
-                            }
-                            if char.properties.contains(CharPropFlags::INDICATE) {
-                                flags.push("I");
-                            }
-
-                            println!("  Char: {} [{}]", char.uuid, flags.join(","));
-
-                            // Try to read if readable
-                            if char.properties.contains(CharPropFlags::READ) {
-                                match p.read(char).await {
-                                    Ok(data) => {
-                                        if data.len() <= 20 {
-                                            // Try as string
-                                            if let Ok(s) = String::from_utf8(data.clone()) {
-                                                let s = s.trim_end_matches('\0');
-                                                if !s.is_empty()
-                                                    && s.chars()
-                                                        .all(|c| c.is_ascii_graphic() || c == ' ')
-                                                {
-                                                    println!("        -> \"{}\"", s);
-                                                } else {
-                                                    println!("        -> {:02X?}", data);
-                                                }
-                                            } else {
-                                                println!("        -> {:02X?}", data);
-                                            }
-                                        } else {
-                                            println!(
-                                                "        -> [{} bytes] {:02X?}...",
-                                                data.len(),
-                                                &data[..20.min(data.len())]
-                                            );
-                                        }
-                                    }
-                                    Err(e) => println!("        -> (read error: {})", e),
-                                }
-                            }
-                        }
-                        println!();
+            for service in p.services() {
+                println!("Service: {}", service.uuid);
+                for char in &service.characteristics {
+                    let mut flags = Vec::new();
+                    if char.properties.contains(CharPropFlags::READ) {
+                        flags.push("R");
+                    }
+                    if char.properties.contains(CharPropFlags::WRITE) {
+                        flags.push("W");
+                    }
+                    if char
+                        .properties
+                        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+                    {
+                        flags.push("Wn");
+                    }
+                    if char.properties.contains(CharPropFlags::NOTIFY) {
+                        flags.push("N");
+                    }
+                    if char.properties.contains(CharPropFlags::INDICATE) {
+                        flags.push("I");
                     }
 
-                    p.disconnect().await?;
-                    println!("Disconnected.");
-                    return Ok(());
+                    println!("  Char: {} [{}]", char.uuid, flags.join(","));
+
+                    // Try to read if readable
+                    if char.properties.contains(CharPropFlags::READ) {
+                        match p.read(char).await {
+                            Ok(data) => {
+                                if data.len() <= 20 {
+                                    // Try as string
+                                    if let Ok(s) = String::from_utf8(data.clone()) {
+                                        let s = s.trim_end_matches('\0');
+                                        if !s.is_empty()
+                                            && s.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+                                        {
+                                            println!("        -> \"{}\"", s);
+                                        } else {
+                                            println!("        -> {:02X?}", data);
+                                        }
+                                    } else {
+                                        println!("        -> {:02X?}", data);
+                                    }
+                                } else {
+                                    println!(
+                                        "        -> [{} bytes] {:02X?}...",
+                                        data.len(),
+                                        &data[..20.min(data.len())]
+                                    );
+                                }
+                            }
+                            Err(e) => println!("        -> (read error: {})", e),
+                        }
+                    }
                 }
+                println!();
             }
+
+            p.disconnect().await?;
+            println!("Disconnected.");
+            return Ok(());
         }
     }
 

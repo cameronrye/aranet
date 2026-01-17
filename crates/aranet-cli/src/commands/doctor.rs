@@ -139,15 +139,13 @@ fn print_check_result(check: &Check, no_color: bool) {
                 format!("{}", check.message.yellow()),
             )
         }
+    } else if no_color {
+        ("[FAIL]".to_string(), check.message.clone())
     } else {
-        if no_color {
-            ("[FAIL]".to_string(), check.message.clone())
-        } else {
-            (
-                format!("{}", "[FAIL]".red()),
-                format!("{}", check.message.red()),
-            )
-        }
+        (
+            format!("{}", "[FAIL]".red()),
+            format!("{}", check.message.red()),
+        )
     };
     println!("{} {}", icon, msg);
 }
