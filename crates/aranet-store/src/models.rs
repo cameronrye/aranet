@@ -168,4 +168,3 @@ pub struct SyncState {
     /// When last synced.
     pub last_sync_at: Option<OffsetDateTime>,
 }
-

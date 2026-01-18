@@ -30,8 +30,7 @@ pub async fn cmd_sync(args: SyncArgs, config: &Config) -> Result<()> {
     let store = Store::open_default().context("Failed to open database")?;
 
     // Connect to device
-    let device =
-        crate::util::connect_device_with_progress(&device_address, timeout, true).await?;
+    let device = crate::util::connect_device_with_progress(&device_address, timeout, true).await?;
 
     // Get device info for display
     let device_info = device.read_device_info().await?;
@@ -130,4 +129,3 @@ pub async fn cmd_sync(args: SyncArgs, config: &Config) -> Result<()> {
 
     Ok(())
 }
-

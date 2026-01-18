@@ -44,11 +44,15 @@ fn list_devices(store: &Store) -> Result<()> {
         println!("  {} - {} ({})", device.id, name, device_type);
         println!(
             "    First seen: {}",
-            device.first_seen.format(&time::format_description::well_known::Rfc3339)?
+            device
+                .first_seen
+                .format(&time::format_description::well_known::Rfc3339)?
         );
         println!(
             "    Last seen:  {}",
-            device.last_seen.format(&time::format_description::well_known::Rfc3339)?
+            device
+                .last_seen
+                .format(&time::format_description::well_known::Rfc3339)?
         );
         println!();
     }
@@ -170,4 +174,3 @@ fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
 
     anyhow::bail!("Invalid date/time format: {}. Use RFC3339 or YYYY-MM-DD", s)
 }
-

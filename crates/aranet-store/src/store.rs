@@ -319,7 +319,10 @@ impl Store {
             inserted += result;
         }
 
-        info!("Inserted {} new history records for {}", inserted, device_id);
+        info!(
+            "Inserted {} new history records for {}",
+            inserted, device_id
+        );
         Ok(inserted)
     }
 
@@ -493,7 +496,10 @@ impl Store {
             }
             _ => {
                 // First sync - download all
-                debug!("First sync for {}: downloading all {} readings", device_id, current_total);
+                debug!(
+                    "First sync for {}: downloading all {} readings",
+                    device_id, current_total
+                );
                 Ok(1)
             }
         }
@@ -541,7 +547,9 @@ mod tests {
         assert_eq!(device.name, Some("Test".to_string()));
 
         // Update name
-        let device = store.upsert_device("test-device", Some("New Name")).unwrap();
+        let device = store
+            .upsert_device("test-device", Some("New Name"))
+            .unwrap();
         assert_eq!(device.name, Some("New Name".to_string()));
     }
 
@@ -650,4 +658,3 @@ mod tests {
         assert_eq!(start, 101);
     }
 }
-

@@ -179,4 +179,3 @@ impl HistoryQuery {
         self
     }
 }
-

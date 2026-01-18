@@ -36,7 +36,8 @@ fn get_schema_version(conn: &Connection) -> Result<i32> {
         return Ok(0);
     }
 
-    let version: i32 = conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))?;
+    let version: i32 =
+        conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))?;
 
     Ok(version)
 }
@@ -168,4 +169,3 @@ mod tests {
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }
-

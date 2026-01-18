@@ -48,4 +48,3 @@ pub fn default_db_path() -> std::path::PathBuf {
         .join("aranet")
         .join("data.db")
 }
-
