@@ -36,8 +36,8 @@ use clap::{CommandFactory, Parser};
 use cli::{AliasSubcommand, Cli, Commands, ConfigAction, ConfigKey, OutputFormat};
 #[cfg(feature = "cli")]
 use commands::{
-    AliasAction, HistoryArgs, WatchArgs, cmd_alias, cmd_doctor, cmd_history, cmd_info, cmd_read,
-    cmd_scan, cmd_set, cmd_status, cmd_watch,
+    AliasAction, HistoryArgs, SyncArgs, WatchArgs, cmd_alias, cmd_cache, cmd_doctor, cmd_history,
+    cmd_info, cmd_read, cmd_scan, cmd_set, cmd_status, cmd_sync, cmd_watch,
 };
 #[cfg(feature = "cli")]
 use config::{Config, get_device_source, resolve_devices, resolve_timeout};
@@ -267,6 +267,25 @@ async fn main() -> Result<()> {
         }
         Commands::Doctor => {
             cmd_doctor(cli.verbose, no_color).await?;
+        }
+        Commands::Sync {
+            device,
+            format,
+            full,
+        } => {
+            let format = resolve_format_with_config(cli.json, format, config_format);
+            cmd_sync(
+                SyncArgs {
+                    device,
+                    format,
+                    full,
+                },
+                &config,
+            )
+            .await?;
+        }
+        Commands::Cache { action } => {
+            cmd_cache(action, &config)?;
         }
         Commands::Config { .. } => unreachable!(),
         Commands::Alias { .. } => unreachable!(),

@@ -31,6 +31,11 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - Passive reading from BLE advertisements
   - Progress bars for history download
   - `--since`/`--until` date filters, `--inhg` pressure unit
+  - Local data caching with `sync` and `cache` commands
+- **aranet-store** — Local SQLite-based data persistence
+  - Incremental history sync (download only new records)
+  - Query cached data without device connection
+  - Automatic deduplication of history records
 - **aranet-tui** — Terminal UI dashboard for real-time monitoring
 - **aranet-gui** — Desktop application built with egui
 - **aranet-wasm** — WebAssembly module for browser integration *(planned)*
@@ -114,6 +119,7 @@ aranet/
 ├── crates/
 │   ├── aranet-types/    # Platform-agnostic types (shared)
 │   ├── aranet-core/     # Core BLE library
+│   ├── aranet-store/    # Local SQLite data persistence
 │   ├── aranet-cli/      # CLI tool
 │   ├── aranet-tui/      # Terminal dashboard
 │   ├── aranet-gui/      # Desktop GUI (egui)

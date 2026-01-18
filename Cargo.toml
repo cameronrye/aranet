@@ -2,6 +2,7 @@
 members = [
     "crates/aranet-types",
     "crates/aranet-core",
+    "crates/aranet-store",
     "crates/aranet-cli",
     "crates/aranet-tui",
     "crates/aranet-gui",
@@ -13,6 +14,7 @@ members = [
 default-members = [
     "crates/aranet-types",
     "crates/aranet-core",
+    "crates/aranet-store",
     "crates/aranet-cli",
     "crates/aranet-tui",
 ]

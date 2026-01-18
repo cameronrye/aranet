@@ -33,13 +33,14 @@ Before you begin, ensure you have:
 
 ## Project Structure
 
-The Aranet ecosystem consists of five crates:
+The Aranet ecosystem consists of six crates:
 
 ```
 aranet/
 ├── crates/
-│   ├── aranet-core/     # Core BLE library
 │   ├── aranet-types/    # Shared types (platform-agnostic)
+│   ├── aranet-core/     # Core BLE library
+│   ├── aranet-store/    # Local SQLite data persistence
 │   ├── aranet-cli/      # Command-line interface
 │   ├── aranet-tui/      # Terminal UI dashboard
 │   ├── aranet-gui/      # Desktop GUI (egui)

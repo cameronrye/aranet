@@ -19,6 +19,7 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 | 3 | TUI Dashboard | WIP | App shell + quit key; sensor integration pending |
 | 4 | GUI Application | WIP | egui shell works; sensor integration pending |
 | 5 | WASM Module | WIP | Basic init/log; Web Bluetooth pending |
+| 6 | Data Persistence & API | WIP | aranet-store complete; aranet-service pending |
 
 **Legend**: [ ] Not started - [~] In progress/partial - [x] Complete
 
@@ -65,6 +66,8 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 1. Add sensor data display to TUI shell
 2. Add sensor data display to GUI shell
 3. Implement Web Bluetooth in WASM module
+4. ~~**Data persistence layer (aranet-store)**~~ - Complete (v0.1.7)
+5. **Background service (aranet-service)** - Data collector + REST API
 
 ## Vision
 
@@ -72,6 +75,8 @@ Build the definitive Rust ecosystem for Aranet devices:
 
 - **aranet-types** - Platform-agnostic data types (shared by all crates)
 - **aranet-core** - Native BLE client via btleplug
+- **aranet-store** - Local data persistence with SQLite
+- **aranet-service** - Background data collector and HTTP REST API
 - **aranet-cli** - Feature-complete command-line interface
 - **aranet-tui** - Real-time terminal UI for monitoring
 - **aranet-gui** - Native desktop app (egui-based)
@@ -392,6 +397,206 @@ Manufacturer ID: 0x0702 (SAF Tehnika)
 
 ---
 
+## Phase 6: Data Persistence & API (v0.6.0)
+
+### Milestone: Local Storage + HTTP API for Integrations
+
+This phase adds two new crates for data persistence, caching, and external integrations.
+
+### Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Database location | `~/.local/share/aranet/data.db` | XDG Base Directory spec compliance |
+| History sync strategy | Incremental | Only download new records since last sync |
+| API authentication | None | Local-first design; bind to localhost by default |
+| Data retention | No pruning | Users manage their own data; no automatic deletion |
+
+### aranet-store (Data Persistence)
+
+| Feature | Priority | Status |
+|---------|----------|--------|
+| SQLite database with schema migrations | P0 | [x] |
+| Store current readings with timestamps | P0 | [x] |
+| Cache history records (avoid re-downloading) | P0 | [x] |
+| Track sync state per device | P0 | [x] |
+| Query by device, time range | P0 | [x] |
+| Aggregate queries (min, max, avg) | P1 | [ ] |
+| Export to CSV/JSON | P1 | [ ] |
+| Import from CSV/JSON backup | P2 | [ ] |
+
+### aranet-service (Background Collector + HTTP API)
+
+| Feature | Priority | Status |
+|---------|----------|--------|
+| REST API endpoints | P0 | [ ] |
+| Background device polling | P0 | [ ] |
+| Configurable poll intervals per device | P0 | [ ] |
+| WebSocket real-time updates | P1 | [ ] |
+| Health check endpoint | P1 | [ ] |
+| Foreground server mode | P0 | [ ] |
+| Daemon mode (background service) | P1 | [ ] |
+| systemd/launchd service files | P2 | [ ] |
+
+### REST API Endpoints
+
+```
+GET  /api/health                     # Service health check
+GET  /api/devices                    # List all known devices
+GET  /api/devices/:id                # Get device info
+GET  /api/devices/:id/current        # Latest reading for device
+GET  /api/devices/:id/readings       # Query readings (?since, ?until, ?limit)
+GET  /api/devices/:id/history        # Query cached history
+POST /api/devices/:id/sync           # Trigger manual history sync
+GET  /api/readings                   # All readings across devices (paginated)
+WS   /api/ws                         # Real-time readings stream (WebSocket)
+```
+
+### CLI Integration
+
+| Feature | Priority | Status |
+|---------|----------|--------|
+| `aranet server` - Start HTTP server | P0 | [ ] |
+| `aranet server --daemon` - Background mode | P1 | [ ] |
+| `aranet sync` - One-shot sync to database | P0 | [x] |
+| `aranet sync --all` - Sync all configured devices | P0 | [ ] |
+| `aranet cache` - Query cached data | P0 | [x] |
+| `history --cache` - Read from local cache first | P1 | [ ] |
+
+### Database Schema
+
+```sql
+-- Devices table
+CREATE TABLE devices (
+    id TEXT PRIMARY KEY,           -- device address/UUID
+    name TEXT,
+    device_type TEXT,              -- Aranet4, Aranet2, etc.
+    serial TEXT,
+    firmware TEXT,
+    hardware TEXT,
+    first_seen INTEGER NOT NULL,   -- Unix timestamp
+    last_seen INTEGER NOT NULL
+);
+
+-- Current readings (polled values)
+CREATE TABLE readings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(id),
+    captured_at INTEGER NOT NULL,  -- Unix timestamp
+    co2 INTEGER,
+    temperature REAL,
+    pressure REAL,
+    humidity INTEGER,
+    battery INTEGER,
+    status TEXT,
+    radon INTEGER,
+    radiation_rate REAL,
+    radiation_total REAL
+);
+CREATE INDEX idx_readings_device_time ON readings(device_id, captured_at);
+
+-- History records (downloaded from device memory)
+CREATE TABLE history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(id),
+    timestamp INTEGER NOT NULL,    -- Reading timestamp from device
+    synced_at INTEGER NOT NULL,    -- When we downloaded it
+    co2 INTEGER,
+    temperature REAL,
+    pressure REAL,
+    humidity INTEGER,
+    radon INTEGER,
+    radiation_rate REAL,
+    radiation_total REAL,
+    UNIQUE(device_id, timestamp)   -- Deduplicate by device + time
+);
+CREATE INDEX idx_history_device_time ON history(device_id, timestamp);
+
+-- Sync state tracking (for incremental sync)
+CREATE TABLE sync_state (
+    device_id TEXT PRIMARY KEY REFERENCES devices(id),
+    last_history_index INTEGER,    -- Last downloaded history index
+    total_readings INTEGER,        -- Total readings on device at last sync
+    last_sync_at INTEGER           -- When last synced
+);
+```
+
+### Configuration (`~/.config/aranet/server.toml`)
+
+```toml
+# Server settings
+[server]
+bind = "127.0.0.1:8080"           # Listen address (localhost only by default)
+
+# Database location
+[storage]
+path = "~/.local/share/aranet/data.db"
+
+# Devices to monitor (background collector)
+[[devices]]
+address = "Aranet4 17C3C"
+alias = "office"
+poll_interval = 60                 # seconds between readings
+
+[[devices]]
+address = "AranetRn+ 306B8"
+alias = "basement"
+poll_interval = 300                # radon changes slowly
+```
+
+### Architecture
+
+```
+                      External Clients
+        (Web apps, scripts, Home Assistant, Grafana)
+                            |
+                            | HTTP/WebSocket
+                            v
++---------------------------------------------------------------+
+|                      aranet-service                            |
+|  +----------------+  +---------------+  +-------------------+  |
+|  |   REST API     |  |   WebSocket   |  | Background        |  |
+|  |   (axum)       |  |   (real-time) |  | Collector         |  |
+|  +-------+--------+  +-------+-------+  +--------+----------+  |
++-----------|--------------------|-----------------|-------------+
+            |                    |                 |
+            v                    v                 v
++---------------------------------------------------------------+
+|                       aranet-store                             |
+|  +----------------------------------------------------------+  |
+|  |  SQLite: ~/.local/share/aranet/data.db                   |  |
+|  |  - devices, readings, history, sync_state                |  |
+|  +----------------------------------------------------------+  |
++---------------------------------------------------------------+
+                            ^
+                            | (read/write)
++---------------------------------------------------------------+
+|                       aranet-core                              |
+|  +----------------+  +---------------+  +-------------------+  |
+|  |   Device       |  |   History     |  |   DeviceManager   |  |
+|  |   (BLE conn)   |  |   (download)  |  |   (multi-device)  |  |
+|  +----------------+  +---------------+  +-------------------+  |
++---------------------------------------------------------------+
+                            ^
+                            | Bluetooth LE
+                            v
++---------------------------------------------------------------+
+|          Aranet4 / Aranet2 / AranetRn+ / Radiation            |
++---------------------------------------------------------------+
+```
+
+### Phase 6 Dependencies (use latest versions)
+
+| Dependency | Purpose | Crate | Check Latest |
+|------------|---------|-------|--------------|
+| `rusqlite` | SQLite bindings | aranet-store | [crates.io/crates/rusqlite](https://crates.io/crates/rusqlite) |
+| `refinery` | Schema migrations | aranet-store | [crates.io/crates/refinery](https://crates.io/crates/refinery) |
+| `axum` | HTTP framework | aranet-service | [crates.io/crates/axum](https://crates.io/crates/axum) |
+| `tower-http` | HTTP middleware | aranet-service | [crates.io/crates/tower-http](https://crates.io/crates/tower-http) |
+| `tokio-tungstenite` | WebSocket | aranet-service | [crates.io/crates/tokio-tungstenite](https://crates.io/crates/tokio-tungstenite) |
+
+---
+
 ## Existing Rust Crates Analysis
 
 Before building, learn from existing implementations:
@@ -497,6 +702,22 @@ aranet/
 │   │   │   ├── scan_devices.rs
 │   │   │   └── download_history.rs
 │   │   └── Cargo.toml
+│   ├── aranet-store/       # Data persistence layer (SQLite)
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── store.rs    # Database operations
+│   │   │   ├── models.rs   # Stored data types
+│   │   │   ├── queries.rs  # Query builders
+│   │   │   └── migrations/ # Schema migrations
+│   │   └── Cargo.toml
+│   ├── aranet-service/     # Background collector + HTTP API
+│   │   ├── src/
+│   │   │   ├── main.rs
+│   │   │   ├── api.rs      # REST endpoints
+│   │   │   ├── ws.rs       # WebSocket handler
+│   │   │   ├── collector.rs # Background polling
+│   │   │   └── config.rs   # Server configuration
+│   │   └── Cargo.toml
 │   ├── aranet-cli/         # CLI application
 │   │   ├── src/main.rs
 │   │   └── Cargo.toml
@@ -521,11 +742,12 @@ aranet/
 | Phase | Scope | Est. Time | Key Dependencies (latest) |
 |-------|-------|-----------|---------------------------|
 | 0 | Foundation | Done | README, LICENSE, CI, examples |
-| 1 | Core Library | 2-3 weeks | btleplug, tokio, thiserror |
-| 2 | CLI Tool | 1 week | Phase 1 + clap, serde |
+| 1 | Core Library | Done | btleplug, tokio, thiserror |
+| 2 | CLI Tool | Done | Phase 1 + clap, serde |
 | 3 | TUI Dashboard | 1-2 weeks | Phase 1 + ratatui, crossterm |
 | 4 | GUI App | 2-3 weeks | Phase 1 + egui/iced |
 | 5 | WASM Web | 2-3 weeks | aranet-types + wasm-bindgen |
+| 6 | Data Persistence & API | 1-2 weeks | Phase 1 + rusqlite, axum |
 
 ---
 
@@ -535,6 +757,8 @@ aranet/
 
 - **aranet-types**: Test data parsing, serialization, type conversions, proptest fuzz testing
 - **aranet-core**: Test with mock BLE adapter, proptest for parsers
+- **aranet-store**: Test database operations with in-memory SQLite
+- **aranet-service**: Test API endpoints with mock store
 - **aranet-gui**: Component tests for AppState
 - **aranet-tui**: Component tests for App key handling
 - Run with: `cargo test --workspace`

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-01-18
+
+### Added
+
+- **aranet-store crate** - New SQLite-based local data persistence layer
+  - Store current readings and device metadata
+  - Cache history records from devices for offline access
+  - Incremental sync support (only download new records)
+  - Query by device, time range, with pagination
+  - Automatic deduplication of history records
+  - Platform-specific database locations:
+    - Linux: `~/.local/share/aranet/data.db`
+    - macOS: `~/Library/Application Support/aranet/data.db`
+    - Windows: `C:\Users\<user>\AppData\Local\aranet\data.db`
+
+- **CLI sync command** - Download device history to local database
+  - `aranet sync --device <ADDRESS>` for incremental sync
+  - `aranet sync --device <ADDRESS> --full` for complete re-download
+  - Progress bar during history download
+
+- **CLI cache command** - Query cached data without device connection
+  - `aranet cache devices` - List all cached devices
+  - `aranet cache stats` - Show cache statistics (readings, history counts)
+  - `aranet cache history` - Query cached history with filters
+  - `aranet cache info` - Show database path and size
+
+### Changed
+
+- All crate versions bumped to 0.1.7
+
 ## [0.1.6] - 2026-01-18
 
 ### Added

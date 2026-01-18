@@ -442,6 +442,110 @@ Removed alias 'bedroom'
 
 ---
 
+## sync
+
+Download device history to the local database for offline access.
+
+```bash
+aranet sync [OPTIONS]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-d, --device <ADDRESS>` | required | Device address or alias |
+| `--full` | false | Re-download all history (instead of incremental) |
+
+### Example
+
+```bash
+# Incremental sync (only new records since last sync)
+$ aranet sync --device AA:BB:CC:DD:EE:FF
+
+Syncing history from Aranet4 17C3C...
+[==========] 100% Downloaded 42 new records
+Sync complete. Total cached: 1482 records
+
+# Full sync (re-download everything)
+$ aranet sync --device living-room --full
+
+Syncing history from Aranet4 17C3C (full)...
+[==========] 100% Downloaded 1482 records
+Sync complete.
+```
+
+<Aside>
+  History is stored in a local SQLite database. Use `aranet cache info` to see the database location.
+</Aside>
+
+---
+
+## cache
+
+Query cached data from the local database without connecting to a device.
+
+```bash
+aranet cache <SUBCOMMAND>
+```
+
+### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `devices` | List all cached devices |
+| `stats` | Show cache statistics |
+| `history` | Query cached history records |
+| `info` | Show database path and size |
+
+### Examples
+
+**List cached devices:**
+
+```bash
+$ aranet cache devices
+
+Cached Devices:
+╭─────────────────┬───────────────────┬──────────────┬─────────────╮
+│ Name            │ Address           │ Last Sync    │ Records     │
+├─────────────────┼───────────────────┼──────────────┼─────────────┤
+│ Aranet4 17C3C   │ AA:BB:CC:DD:EE:FF │ 2 hours ago  │ 1482        │
+│ AranetRn+ 306B8 │ 11:22:33:44:55:66 │ 1 day ago    │ 720         │
+╰─────────────────┴───────────────────┴──────────────┴─────────────╯
+```
+
+**Show cache statistics:**
+
+```bash
+$ aranet cache stats
+
+Cache Statistics:
+  Devices:  2
+  Readings: 156
+  History:  2202
+  Database: 1.2 MB
+```
+
+**Query cached history:**
+
+```bash
+$ aranet cache history --device AA:BB:CC:DD:EE:FF --count 10
+
+# With date filters
+$ aranet cache history --device living-room --since 2026-01-15 --until 2026-01-16
+```
+
+**Show database info:**
+
+```bash
+$ aranet cache info
+
+Database Path: /Users/you/Library/Application Support/aranet/data.db
+Database Size: 1.2 MB
+```
+
+---
+
 ## doctor
 
 Run BLE diagnostics and permission checks to troubleshoot connectivity issues.

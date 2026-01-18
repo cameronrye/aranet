@@ -304,9 +304,68 @@ pub enum Commands {
     /// Show common usage examples
     Examples,
 
+    /// Sync device history to local database
+    Sync {
+        #[command(flatten)]
+        device: DeviceArgs,
+
+        /// Output format
+        #[arg(short, long, value_enum, default_value = "text")]
+        format: OutputFormat,
+
+        /// Force full sync (re-download all history)
+        #[arg(long)]
+        full: bool,
+    },
+
+    /// Query cached data from local database
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
     /// Launch interactive terminal dashboard
     #[cfg(feature = "tui")]
     Tui,
+}
+
+/// Cache subcommands for querying local database
+#[derive(Debug, Clone, Subcommand)]
+pub enum CacheAction {
+    /// List cached devices
+    Devices,
+
+    /// Show cache statistics
+    Stats {
+        /// Device address to show stats for (optional)
+        #[arg(short, long)]
+        device: Option<String>,
+    },
+
+    /// Query cached history
+    History {
+        /// Device address (required)
+        #[arg(short, long)]
+        device: String,
+
+        /// Number of records to show (0 for all)
+        #[arg(short, long, default_value = "100")]
+        count: u32,
+
+        /// Filter records since this date/time
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter records until this date/time
+        #[arg(long)]
+        until: Option<String>,
+
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+
+    /// Show database path and info
+    Info,
 }
 
 /// Alias subcommands

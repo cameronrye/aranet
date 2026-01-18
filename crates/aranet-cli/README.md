@@ -115,6 +115,32 @@ aranet alias remove living-room
 aranet doctor
 ```
 
+### Sync history to local database
+
+```bash
+# Sync device history (incremental - only new records)
+aranet sync --device <DEVICE_ADDRESS>
+
+# Full sync (re-download all history)
+aranet sync --device <DEVICE_ADDRESS> --full
+```
+
+### Query cached data
+
+```bash
+# List cached devices
+aranet cache devices
+
+# Show cache statistics
+aranet cache stats
+
+# Query cached history
+aranet cache history --device <DEVICE_ADDRESS> --count 100
+
+# Show database info
+aranet cache info
+```
+
 ### Pressure units
 
 ```bash
@@ -227,6 +253,7 @@ This CLI is part of the [aranet](https://github.com/cameronrye/aranet) workspace
 |-------|-----------|-------------|
 | [aranet-core](../aranet-core/) | [![crates.io](https://img.shields.io/crates/v/aranet-core.svg)](https://crates.io/crates/aranet-core) | Core BLE library for device communication |
 | [aranet-types](../aranet-types/) | [![crates.io](https://img.shields.io/crates/v/aranet-types.svg)](https://crates.io/crates/aranet-types) | Shared types for sensor data |
+| [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local data persistence |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
 | [aranet-gui](../aranet-gui/) | [![crates.io](https://img.shields.io/crates/v/aranet-gui.svg)](https://crates.io/crates/aranet-gui) | Desktop application (egui) |
 

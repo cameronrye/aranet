@@ -1,6 +1,6 @@
 [package]
 name = "aranet-core"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +11,7 @@ keywords = ["aranet", "ble", "bluetooth", "sensors", "iot"]
 categories = ["hardware-support", "asynchronous"]
 
 [dependencies]
-aranet-types = { version = "0.1.6", path = "../aranet-types" }
+aranet-types = { version = "0.1.7", path = "../aranet-types" }
 btleplug.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
