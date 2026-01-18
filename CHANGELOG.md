@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-01-18
+
+### Added
+
+- **Multi-device passive watch mode**
+  - `aranet watch --passive` now monitors ALL devices broadcasting advertisements
+  - Each reading clearly shows device name: `[AranetRn+ 306B8]`
+  - No longer defaults to last connected device when watching all devices
+  - Supports CSV, JSON, and text output formats with device identification
+
+### Changed
+
+- Improved watch output formatting with clearer device identification
+- Passive mode header now shows "Watching: all devices (passive)"
+- Consistent separator line formatting across watch modes
+
 ## [0.1.4] - 2026-01-17
 
 ### Fixed

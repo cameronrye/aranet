@@ -16,8 +16,9 @@ use owo_colors::OwoColorize;
 
 use crate::cli::OutputFormat;
 use crate::format::{
-    FormatOptions, format_reading_json, format_watch_csv_header, format_watch_csv_line,
-    format_watch_line,
+    FormatOptions, format_reading_json, format_reading_json_with_device, format_watch_csv_header,
+    format_watch_csv_header_with_device, format_watch_csv_line, format_watch_csv_line_with_device,
+    format_watch_line_with_device,
 };
 use crate::style;
 use crate::util::{require_device_interactive, write_output};
@@ -193,22 +194,25 @@ async fn cmd_watch_passive(
 ) -> Result<()> {
     let target = device.as_deref();
     let mode_desc = if let Some(t) = target {
-        format!("{} (passive)", t)
+        if opts.no_color {
+            format!("{} (passive)", t)
+        } else {
+            format!("{} (passive)", t.cyan())
+        }
     } else {
-        "any device (passive)".to_string()
+        "all devices (passive)".to_string()
     };
 
+    eprintln!("Watching: {}", mode_desc);
     if count > 0 {
         eprintln!(
-            "Watching {} (interval: {}s, count: {}) - Press Ctrl+C to stop",
-            mode_desc, interval, count
+            "Interval: {}s | Count: {} | Press Ctrl+C to stop",
+            interval, count
         );
     } else {
-        eprintln!(
-            "Watching {} (interval: {}s) - Press Ctrl+C to stop",
-            mode_desc, interval
-        );
+        eprintln!("Interval: {}s | Press Ctrl+C to stop", interval);
     }
+    eprintln!("{}", "-".repeat(60));
 
     let mut header_written = opts.no_header;
     let mut readings_taken: u32 = 0;
@@ -228,70 +232,94 @@ async fn cmd_watch_passive(
 
         match scan_with_options(options).await {
             Ok(devices) => {
-                // Find the target device or first with advertisement data
-                let found = devices.iter().find(|d| {
+                // Filter devices based on target or get all with advertisement data
+                let matching_devices: Vec<_> = devices
+                    .iter()
+                    .filter(|d| {
+                        if let Some(t) = target {
+                            d.name.as_deref() == Some(t) || d.address == t || d.identifier == t
+                        } else {
+                            d.manufacturer_data.is_some()
+                        }
+                    })
+                    .collect();
+
+                if matching_devices.is_empty() {
                     if let Some(t) = target {
-                        d.name.as_deref() == Some(t) || d.address == t || d.identifier == t
+                        eprintln!("Device '{}' not found. Retrying...", t);
                     } else {
-                        d.manufacturer_data.is_some()
+                        eprintln!("No Aranet devices with advertisement data found. Retrying...");
                     }
-                });
+                } else {
+                    // Process ALL matching devices
+                    for discovered in matching_devices {
+                        if let Some(mfr_data) = &discovered.manufacturer_data {
+                            let device_name = discovered.name.as_deref();
+                            match parse_advertisement_with_name(mfr_data, device_name) {
+                                Ok(adv) => {
+                                    // Convert to CurrentReading
+                                    let mut builder = CurrentReading::builder()
+                                        .co2(adv.co2.unwrap_or(0))
+                                        .temperature(adv.temperature.unwrap_or(0.0))
+                                        .pressure(adv.pressure.unwrap_or(0.0))
+                                        .humidity(adv.humidity.unwrap_or(0))
+                                        .battery(adv.battery)
+                                        .status(adv.status)
+                                        .interval(adv.interval)
+                                        .age(adv.age);
 
-                if let Some(discovered) = found {
-                    if let Some(mfr_data) = &discovered.manufacturer_data {
-                        let device_name = discovered.name.as_deref();
-                        match parse_advertisement_with_name(mfr_data, device_name) {
-                            Ok(adv) => {
-                                // Convert to CurrentReading
-                                let mut builder = CurrentReading::builder()
-                                    .co2(adv.co2.unwrap_or(0))
-                                    .temperature(adv.temperature.unwrap_or(0.0))
-                                    .pressure(adv.pressure.unwrap_or(0.0))
-                                    .humidity(adv.humidity.unwrap_or(0))
-                                    .battery(adv.battery)
-                                    .status(adv.status)
-                                    .interval(adv.interval)
-                                    .age(adv.age);
-
-                                if let Some(radon) = adv.radon {
-                                    builder = builder.radon(radon);
-                                }
-                                if let Some(rate) = adv.radiation_dose_rate {
-                                    builder = builder.radiation_rate(rate);
-                                }
-
-                                let reading = builder.build();
-                                readings_taken += 1;
-
-                                let content = match format {
-                                    OutputFormat::Json => format_reading_json(&reading, opts)?,
-                                    OutputFormat::Csv => {
-                                        let mut out = String::new();
-                                        if !header_written {
-                                            out.push_str(&format_watch_csv_header(opts));
-                                            header_written = true;
-                                        }
-                                        out.push_str(&format_watch_csv_line(&reading, opts));
-                                        out
+                                    if let Some(radon) = adv.radon {
+                                        builder = builder.radon(radon);
                                     }
-                                    OutputFormat::Text => format_watch_line(&reading, opts),
-                                };
-                                write_output(output, &content)?;
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to parse advertisement: {}", e);
+                                    if let Some(rate) = adv.radiation_dose_rate {
+                                        builder = builder.radiation_rate(rate);
+                                    }
+
+                                    let reading = builder.build();
+                                    readings_taken += 1;
+
+                                    // Get a short device name for display
+                                    let display_name = device_name.unwrap_or(&discovered.address);
+
+                                    let content = match format {
+                                        OutputFormat::Json => {
+                                            format_reading_json_with_device(
+                                                &reading,
+                                                display_name,
+                                                opts,
+                                            )?
+                                        }
+                                        OutputFormat::Csv => {
+                                            let mut out = String::new();
+                                            if !header_written {
+                                                out.push_str(&format_watch_csv_header_with_device(
+                                                    opts,
+                                                ));
+                                                header_written = true;
+                                            }
+                                            out.push_str(&format_watch_csv_line_with_device(
+                                                &reading,
+                                                display_name,
+                                                opts,
+                                            ));
+                                            out
+                                        }
+                                        OutputFormat::Text => {
+                                            format_watch_line_with_device(&reading, display_name, opts)
+                                        }
+                                    };
+                                    write_output(output, &content)?;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Failed to parse advertisement from {}: {}",
+                                        discovered.name.as_deref().unwrap_or(&discovered.address),
+                                        e
+                                    );
+                                }
                             }
                         }
-                    } else {
-                        eprintln!(
-                            "Device found but no advertisement data. \
-                             Ensure Smart Home mode is enabled."
-                        );
                     }
-                } else if let Some(t) = target {
-                    eprintln!("Device '{}' not found. Retrying...", t);
-                } else {
-                    eprintln!("No Aranet devices with advertisement data found. Retrying...");
                 }
             }
             Err(e) => {

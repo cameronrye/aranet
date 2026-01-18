@@ -15,6 +15,29 @@ use crate::util::{create_identifier, format_peripheral_id};
 use crate::uuid::{MANUFACTURER_ID, SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD};
 use aranet_types::DeviceType;
 
+/// Progress update for device finding operations.
+#[derive(Debug, Clone)]
+pub enum FindProgress {
+    /// Found device in cache, no scan needed.
+    CacheHit,
+    /// Starting scan attempt.
+    ScanAttempt {
+        /// Current attempt number (1-based).
+        attempt: u32,
+        /// Total number of attempts.
+        total: u32,
+        /// Duration of this scan attempt.
+        duration_secs: u64,
+    },
+    /// Device found on specific attempt.
+    Found { attempt: u32 },
+    /// Attempt failed, will retry.
+    RetryNeeded { attempt: u32 },
+}
+
+/// Callback type for progress updates during device finding.
+pub type ProgressCallback = Box<dyn Fn(FindProgress) + Send + Sync>;
+
 /// Information about a discovered Aranet device.
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {
@@ -299,21 +322,102 @@ pub async fn find_device(identifier: &str) -> Result<(Adapter, Peripheral)> {
 }
 
 /// Find a specific device by name or address with custom options.
+///
+/// This function uses a retry strategy to improve reliability:
+/// 1. First checks if the device is already known (cached from previous scans)
+/// 2. Performs up to 3 scan attempts with increasing durations
+///
+/// This helps with BLE reliability issues where devices may not appear
+/// on every scan due to advertisement timing.
 pub async fn find_device_with_options(
     identifier: &str,
     options: ScanOptions,
 ) -> Result<(Adapter, Peripheral)> {
+    find_device_with_progress(identifier, options, None).await
+}
+
+/// Find a specific device with progress callback for UI feedback.
+///
+/// The progress callback is called with updates about the search progress,
+/// including cache hits, scan attempts, and retry information.
+pub async fn find_device_with_progress(
+    identifier: &str,
+    options: ScanOptions,
+    progress: Option<ProgressCallback>,
+) -> Result<(Adapter, Peripheral)> {
     let adapter = get_adapter().await?;
     let identifier_lower = identifier.to_lowercase();
 
-    info!("Scanning for device: {}", identifier);
+    info!("Looking for device: {}", identifier);
 
-    // Start scanning
-    adapter.start_scan(ScanFilter::default()).await?;
-    sleep(options.duration).await;
-    adapter.stop_scan().await?;
+    // First, check if device is already known (cached from previous scans)
+    if let Some(peripheral) = find_peripheral_by_identifier(&adapter, &identifier_lower).await? {
+        info!("Found device in cache (no scan needed)");
+        if let Some(ref cb) = progress {
+            cb(FindProgress::CacheHit);
+        }
+        return Ok((adapter, peripheral));
+    }
 
-    // Search through peripherals
+    // Retry with multiple scan attempts for better reliability
+    // BLE advertisements can be missed due to timing, so we try multiple times
+    let max_attempts: u32 = 3;
+    let base_duration = options.duration.as_millis() as u64 / 2;
+    let base_duration = Duration::from_millis(base_duration.max(2000)); // At least 2 seconds
+
+    for attempt in 1..=max_attempts {
+        let scan_duration = base_duration * attempt;
+        let duration_secs = scan_duration.as_secs();
+
+        info!(
+            "Scan attempt {}/{} ({}s)...",
+            attempt, max_attempts, duration_secs
+        );
+
+        if let Some(ref cb) = progress {
+            cb(FindProgress::ScanAttempt {
+                attempt,
+                total: max_attempts,
+                duration_secs,
+            });
+        }
+
+        // Start scanning
+        adapter.start_scan(ScanFilter::default()).await?;
+        sleep(scan_duration).await;
+        adapter.stop_scan().await?;
+
+        // Check if we found the device
+        if let Some(peripheral) =
+            find_peripheral_by_identifier(&adapter, &identifier_lower).await?
+        {
+            info!("Found device on attempt {}", attempt);
+            if let Some(ref cb) = progress {
+                cb(FindProgress::Found { attempt });
+            }
+            return Ok((adapter, peripheral));
+        }
+
+        if attempt < max_attempts {
+            warn!("Device not found, retrying...");
+            if let Some(ref cb) = progress {
+                cb(FindProgress::RetryNeeded { attempt });
+            }
+        }
+    }
+
+    warn!(
+        "Device not found after {} attempts: {}",
+        max_attempts, identifier
+    );
+    Err(Error::device_not_found(identifier))
+}
+
+/// Search through known peripherals to find one matching the identifier.
+async fn find_peripheral_by_identifier(
+    adapter: &Adapter,
+    identifier_lower: &str,
+) -> Result<Option<Peripheral>> {
     let peripherals = adapter.peripherals().await?;
 
     for peripheral in peripherals {
@@ -322,9 +426,9 @@ pub async fn find_device_with_options(
             let peripheral_id = format_peripheral_id(&peripheral.id()).to_lowercase();
 
             // Check peripheral ID match (macOS uses UUIDs)
-            if peripheral_id.contains(&identifier_lower) {
-                info!("Found device by peripheral ID");
-                return Ok((adapter, peripheral));
+            if peripheral_id.contains(identifier_lower) {
+                debug!("Matched by peripheral ID: {}", peripheral_id);
+                return Ok(Some(peripheral));
             }
 
             // Check address match (Linux/Windows use MAC addresses)
@@ -332,20 +436,19 @@ pub async fn find_device_with_options(
                 && (address == identifier_lower
                     || address.replace(':', "") == identifier_lower.replace(':', ""))
             {
-                info!("Found device by address: {}", address);
-                return Ok((adapter, peripheral));
+                debug!("Matched by address: {}", address);
+                return Ok(Some(peripheral));
             }
 
             // Check name match (partial match supported)
             if let Some(name) = &props.local_name
-                && name.to_lowercase().contains(&identifier_lower)
+                && name.to_lowercase().contains(identifier_lower)
             {
-                info!("Found device by name: {}", name);
-                return Ok((adapter, peripheral));
+                debug!("Matched by name: {}", name);
+                return Ok(Some(peripheral));
             }
         }
     }
 
-    warn!("Device not found: {}", identifier);
-    Err(Error::device_not_found(identifier))
+    Ok(None)
 }

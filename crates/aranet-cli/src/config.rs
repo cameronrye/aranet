@@ -33,6 +33,14 @@ pub struct Config {
     /// Device aliases (friendly name -> device address)
     #[serde(default)]
     pub aliases: HashMap<String, String>,
+
+    /// Last successfully connected device (auto-updated)
+    #[serde(default)]
+    pub last_device: Option<String>,
+
+    /// Name of the last connected device (for display)
+    #[serde(default)]
+    pub last_device_name: Option<String>,
 }
 
 impl Config {
@@ -80,10 +88,13 @@ impl Config {
 
 /// Resolve device from arg, env var, or config.
 /// Also resolves aliases: if the device matches an alias name, returns the address.
+/// Falls back to last_device if no default device is set.
+#[allow(dead_code)]
 pub fn resolve_device(device: Option<String>, config: &Config) -> Option<String> {
     device
         .map(|d| resolve_alias(&d, config))
         .or_else(|| config.device.clone())
+        .or_else(|| config.last_device.clone())
 }
 
 /// Resolve multiple devices, applying alias resolution to each.
@@ -102,6 +113,32 @@ pub fn resolve_alias(device: &str, config: &Config) -> String {
         .get(device)
         .cloned()
         .unwrap_or_else(|| device.to_string())
+}
+
+/// Update the last connected device in config.
+/// This is called after a successful connection.
+pub fn update_last_device(identifier: &str, name: Option<&str>) -> Result<()> {
+    let mut config = Config::load();
+    config.last_device = Some(identifier.to_string());
+    config.last_device_name = name.map(|n| n.to_string());
+    config.save()
+}
+
+/// Get info about whether we're using a fallback device.
+/// Returns (device_identifier, fallback_source) where fallback_source is:
+/// - None if device was explicitly provided
+/// - Some("default") if using default device
+/// - Some("last") if using last connected device
+pub fn get_device_source(device: Option<&str>, config: &Config) -> (Option<String>, Option<&'static str>) {
+    if let Some(d) = device {
+        (Some(resolve_alias(d, config)), None)
+    } else if let Some(d) = &config.device {
+        (Some(d.clone()), Some("default"))
+    } else if let Some(d) = &config.last_device {
+        (Some(d.clone()), Some("last"))
+    } else {
+        (None, None)
+    }
 }
 
 /// Resolve timeout: use provided value, fall back to config, then default

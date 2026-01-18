@@ -4,61 +4,107 @@
 //! - Spinners for long-running operations
 //! - Color themes and thresholds
 //! - Table formatting
+//! - Box drawing for panels (Rich mode)
 //! - Error message boxes
 
 use std::time::Duration;
 
-use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
 
+use crate::cli::StyleMode;
+
 // ============================================================================
-// Spinners
+// Progress Indicators (Spinners and Progress Bars)
 // ============================================================================
+
+/// Standard spinner tick characters (Braille dots animation)
+const SPINNER_TICK_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+/// Standard spinner tick interval
+const SPINNER_TICK_MS: u64 = 80;
+
+/// Standard progress bar characters
+const PROGRESS_CHARS: &str = "###";
+
+/// Get the standard spinner style.
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::default_spinner()
+        .template("{spinner:.cyan} {msg}")
+        .expect("valid template")
+        .tick_chars(SPINNER_TICK_CHARS)
+}
+
+/// Get the standard progress bar style.
+pub fn progress_bar_style() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}% {msg}")
+        .expect("valid template")
+        .progress_chars(PROGRESS_CHARS)
+}
 
 /// Create a spinner for scanning operations.
 pub fn scanning_spinner(timeout_secs: u64) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .expect("valid template")
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-    );
+    pb.set_style(spinner_style());
     pb.set_message(format!(
         "Scanning for Aranet devices... ({}s)",
         timeout_secs
     ));
-    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
     pb
 }
 
 /// Create a spinner for connecting to a device.
 pub fn connecting_spinner(device: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .expect("valid template")
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-    );
+    pb.set_style(spinner_style());
     pb.set_message(format!("Connecting to {}...", device));
-    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
     pb
 }
 
 /// Create a spinner for generic operations.
+#[allow(dead_code)]
 pub fn operation_spinner(message: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .expect("valid template")
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-    );
+    pb.set_style(spinner_style());
     pb.set_message(message.to_string());
-    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
     pb
+}
+
+/// Create a progress bar for download operations.
+pub fn download_progress_bar() -> ProgressBar {
+    let pb = ProgressBar::new(100);
+    pb.set_style(progress_bar_style());
+    pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+    pb
+}
+
+/// Print a message while suspending a spinner to prevent visual glitches.
+/// If no spinner is provided, just prints normally.
+#[allow(dead_code)]
+pub fn print_suspended(spinner: Option<&ProgressBar>, message: &str) {
+    if let Some(pb) = spinner {
+        pb.suspend(|| {
+            eprintln!("{}", message);
+        });
+    } else {
+        eprintln!("{}", message);
+    }
+}
+
+/// Print a message to stdout while suspending a spinner.
+#[allow(dead_code)]
+pub fn print_suspended_stdout(spinner: Option<&ProgressBar>, message: &str) {
+    if let Some(pb) = spinner {
+        pb.suspend(|| {
+            println!("{}", message);
+        });
+    } else {
+        println!("{}", message);
+    }
 }
 
 // ============================================================================
@@ -117,7 +163,8 @@ pub fn format_co2_colored(ppm: u16, no_color: bool) -> String {
     } else if ppm < co2::MODERATE {
         format!("{}", ppm.yellow())
     } else if ppm < co2::POOR {
-        format!("{}", style(ppm).color256(208)) // Orange
+        // Orange color (RGB: 255, 165, 0)
+        format!("{}", ppm.truecolor(255, 165, 0))
     } else {
         format!("{}", ppm.red())
     }
@@ -172,12 +219,14 @@ pub fn format_temp_colored(celsius: f32, no_color: bool) -> String {
         return format!("{:.1}", celsius);
     }
 
+    let formatted = format!("{:.1}", celsius);
     if celsius < temperature::COLD {
-        format!("{:.1}", style(celsius).cyan())
+        format!("{}", formatted.cyan())
     } else if celsius > temperature::WARM {
-        format!("{:.1}", style(celsius).color256(208)) // Orange
+        // Orange color (RGB: 255, 165, 0)
+        format!("{}", formatted.truecolor(255, 165, 0))
     } else {
-        format!("{:.1}", style(celsius).green())
+        format!("{}", formatted.green())
     }
 }
 
@@ -355,6 +404,7 @@ pub fn trend_indicator_int(current: i32, previous: i32, no_color: bool) -> &'sta
 // ============================================================================
 
 /// Format a section header with device name.
+#[allow(dead_code)]
 pub fn format_device_header(name: &str, no_color: bool) -> String {
     let line = "─".repeat(40);
     if no_color {
@@ -370,5 +420,93 @@ pub fn format_title(title: &str, no_color: bool) -> String {
         format!("{}\n{}", title, "━".repeat(title.len()))
     } else {
         format!("{}\n{}", title.bold(), "━".repeat(title.len()).dimmed())
+    }
+}
+
+// ============================================================================
+// Rich Mode Panel Formatting
+// ============================================================================
+
+/// Get terminal width, defaulting to 80 if detection fails.
+pub fn terminal_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(80)
+}
+
+
+
+/// Format a status badge (Rich mode)
+#[allow(dead_code)]
+pub fn format_status_badge(
+    label: &str,
+    status: aranet_types::Status,
+    style: StyleMode,
+    no_color: bool,
+) -> String {
+    if style == StyleMode::Plain || no_color {
+        return format!("[{}]", label);
+    }
+
+    // Rich mode: use colored background for emphasis
+    match status {
+        aranet_types::Status::Green => format!("[{}]", label.green().bold()),
+        aranet_types::Status::Yellow => format!("[{}]", label.yellow().bold()),
+        aranet_types::Status::Red => format!("[{}]", label.red().bold()),
+        _ => format!("[{}]", label.dimmed()),
+    }
+}
+
+/// Format a large value display (Rich mode) - for key metrics
+#[allow(dead_code)]
+pub fn format_large_value(value: &str, unit: &str, no_color: bool) -> String {
+    if no_color {
+        format!("{} {}", value, unit)
+    } else {
+        format!("{} {}", value.bold(), unit.dimmed())
+    }
+}
+
+/// Format air quality indicator (Rich mode) - visual bar
+pub fn format_air_quality_bar(co2: u16, no_color: bool) -> String {
+    // Create a visual indicator based on CO2 level
+    // Scale: 0-400 excellent, 400-800 good, 800-1000 moderate, 1000-1500 poor, >1500 bad
+    let level = if co2 < 400 {
+        5
+    } else if co2 < 800 {
+        4
+    } else if co2 < 1000 {
+        3
+    } else if co2 < 1500 {
+        2
+    } else {
+        1
+    };
+
+    let filled = "█".repeat(level);
+    let empty = "░".repeat(5 - level);
+    let bar = format!("{}{}", filled, empty);
+
+    if no_color {
+        bar
+    } else if level >= 4 {
+        format!("{}", bar.green())
+    } else if level >= 3 {
+        format!("{}", bar.yellow())
+    } else {
+        format!("{}", bar.red())
+    }
+}
+
+/// Apply table style based on StyleMode.
+pub fn apply_table_style(table: &mut tabled::Table, style: StyleMode) {
+    use tabled::settings::Style;
+    match style {
+        StyleMode::Rich | StyleMode::Minimal => {
+            table.with(Style::rounded());
+        }
+        StyleMode::Plain => {
+            table.with(Style::blank());
+        }
     }
 }

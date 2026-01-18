@@ -95,7 +95,10 @@ pub use device::Device;
 pub use error::{ConnectionFailureReason, DeviceNotFoundReason, Error, Result};
 pub use history::{HistoryInfo, HistoryOptions, HistoryParam};
 pub use readings::ExtendedReading;
-pub use scan::{DiscoveredDevice, ScanOptions, scan_with_retry};
+pub use scan::{
+    DiscoveredDevice, FindProgress, ProgressCallback, ScanOptions, find_device_with_progress,
+    scan_with_retry,
+};
 pub use settings::{BluetoothRange, CalibrationData, DeviceSettings, MeasurementInterval};
 pub use traits::AranetDevice;
 

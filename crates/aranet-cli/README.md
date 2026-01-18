@@ -70,7 +70,14 @@ aranet read --device <DEVICE_ADDRESS> --passive
 ### Watch real-time data
 
 ```bash
+# Watch a specific device
 aranet watch --device <DEVICE_ADDRESS> --interval 60
+
+# Watch all devices passively (requires Smart Home enabled)
+aranet watch --passive
+
+# Watch a specific device passively
+aranet watch --passive --device <DEVICE_ADDRESS>
 ```
 
 ### View device information

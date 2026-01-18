@@ -14,8 +14,7 @@ use crate::format::{
     FormatOptions, format_multi_reading_csv, format_multi_reading_json, format_multi_reading_text,
     format_reading_csv, format_reading_json, format_reading_text, format_reading_text_with_name,
 };
-use crate::style;
-use crate::util::{connect_device, require_device_interactive, write_output};
+use crate::util::{require_device_interactive, write_output};
 
 /// Result of reading from a device
 pub struct DeviceReading {
@@ -62,20 +61,10 @@ async fn cmd_read_single(
     quiet: bool,
     opts: &FormatOptions,
 ) -> Result<()> {
-    // Show spinner while connecting (unless quiet or non-text format)
-    let spinner = if !quiet && matches!(format, OutputFormat::Text) {
-        Some(style::connecting_spinner(identifier))
-    } else {
-        None
-    };
-
-    let device = connect_device(identifier, timeout).await?;
-
-    // Clear spinner before reading
-    if let Some(sp) = &spinner {
-        sp.set_message("Reading sensor data...");
-    }
-
+    // Use connect_device_with_progress which has its own spinner
+    // Don't create a separate spinner here to avoid duplication
+    let show_progress = !quiet && matches!(format, OutputFormat::Text);
+    let device = crate::util::connect_device_with_progress(identifier, timeout, show_progress).await?;
     let device_name = device.name().map(|s| s.to_string());
     let reading = device
         .read_current()
@@ -83,11 +72,6 @@ async fn cmd_read_single(
         .context("Failed to read current values")?;
 
     device.disconnect().await.ok();
-
-    // Clear spinner before output
-    if let Some(sp) = spinner {
-        sp.finish_and_clear();
-    }
 
     let content = match format {
         OutputFormat::Json => format_reading_json(&reading, opts)?,
@@ -153,7 +137,9 @@ async fn read_device(
     identifier: String,
     timeout: Duration,
 ) -> Result<DeviceReading, (String, anyhow::Error)> {
-    let device = connect_device(&identifier, timeout)
+    // Don't show progress for individual devices in multi-read mode
+    // to avoid multiple spinners running in parallel
+    let device = crate::util::connect_device_with_progress(&identifier, timeout, false)
         .await
         .map_err(|e| (identifier.clone(), e))?;
 

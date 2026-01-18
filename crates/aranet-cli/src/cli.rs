@@ -178,6 +178,10 @@ pub enum Commands {
         /// Omit header row in CSV output (useful for appending)
         #[arg(long)]
         no_header: bool,
+
+        /// Interactively save aliases for discovered devices
+        #[arg(short, long)]
+        alias: bool,
     },
 
     /// Read current sensor values from one or more devices
@@ -292,6 +296,13 @@ pub enum Commands {
 
     /// Run BLE diagnostics and permission checks
     Doctor,
+
+    /// Show common usage examples
+    Examples,
+
+    /// Launch interactive terminal dashboard
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 /// Alias subcommands

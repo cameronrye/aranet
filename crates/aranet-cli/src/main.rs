@@ -1,27 +1,68 @@
 //! Aranet CLI - Command-line interface for Aranet environmental sensors.
+//!
+//! This binary supports multiple feature configurations:
+//! - `cli` feature: Provides command-line interface with subcommands
+//! - `tui` feature: Provides interactive terminal dashboard
+//! - Both features: CLI with `tui` subcommand to launch dashboard
+//! - Neither feature: Compile error (at least one required)
 
+// Ensure at least one feature is enabled
+#[cfg(not(any(feature = "cli", feature = "tui")))]
+compile_error!("At least one of 'cli' or 'tui' features must be enabled");
+
+// CLI modules (conditionally compiled)
+#[cfg(feature = "cli")]
 mod cli;
+#[cfg(feature = "cli")]
 mod commands;
+#[cfg(feature = "cli")]
 mod config;
+#[cfg(feature = "cli")]
 mod format;
+#[cfg(feature = "cli")]
 mod style;
+#[cfg(feature = "cli")]
 mod util;
 
-use std::io;
-use std::time::Duration;
+// TUI module (conditionally compiled)
+#[cfg(feature = "tui")]
+mod tui;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
-use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "cli")]
+use std::io;
+#[cfg(feature = "cli")]
+use std::time::Duration;
+#[cfg(feature = "cli")]
+use clap::{CommandFactory, Parser};
+#[cfg(feature = "cli")]
+use tracing_subscriber::EnvFilter;
+#[cfg(feature = "cli")]
 use cli::{AliasSubcommand, Cli, Commands, ConfigAction, ConfigKey, OutputFormat};
+#[cfg(feature = "cli")]
 use commands::{
     AliasAction, HistoryArgs, WatchArgs, cmd_alias, cmd_doctor, cmd_history, cmd_info, cmd_read,
     cmd_scan, cmd_set, cmd_status, cmd_watch,
 };
-use config::{Config, resolve_device, resolve_devices, resolve_timeout};
+#[cfg(feature = "cli")]
+use config::{Config, get_device_source, resolve_devices, resolve_timeout};
+#[cfg(feature = "cli")]
 use format::FormatOptions;
 
+// =============================================================================
+// Main Entry Point
+// =============================================================================
+
+/// TUI-only mode: Launch the dashboard directly
+#[cfg(all(feature = "tui", not(feature = "cli")))]
+#[tokio::main]
+async fn main() -> Result<()> {
+    tui::run().await
+}
+
+/// CLI mode (with or without TUI): Parse commands and dispatch
+#[cfg(feature = "cli")]
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -41,6 +82,12 @@ async fn main() -> Result<()> {
     // Handle alias commands early
     if let Commands::Alias { ref action } = cli.command {
         return handle_alias_command(action, cli.quiet);
+    }
+
+    // Handle TUI command early (when both features enabled)
+    #[cfg(feature = "tui")]
+    if let Commands::Tui = cli.command {
+        return tui::run().await;
     }
 
     // Load config for device resolution
@@ -64,6 +111,7 @@ async fn main() -> Result<()> {
     let no_color = cli.no_color || config.no_color;
     let quiet = cli.quiet;
     let compact = cli.compact;
+    let style = cli.style;
     // Base fahrenheit from config (can be overridden per-command)
     let config_fahrenheit = config.fahrenheit;
     // Base bq from config (currently always false, but future-proofed)
@@ -78,13 +126,17 @@ async fn main() -> Result<()> {
             timeout,
             format,
             no_header,
+            alias,
         } => {
             let format = resolve_format_with_config(cli.json, format, config_format);
             let timeout = resolve_timeout(timeout, &config, 10);
-            let opts = FormatOptions::new(no_color, config_fahrenheit)
+            let opts = FormatOptions::new(no_color, config_fahrenheit, style)
                 .with_no_header(no_header)
                 .with_compact(compact);
-            cmd_scan(timeout, format, output, quiet, &opts).await?;
+            cmd_scan(timeout, format, output, quiet, alias, &opts, &config).await?;
+        }
+        Commands::Examples => {
+            print_examples();
         }
         Commands::Read {
             device,
@@ -92,9 +144,18 @@ async fn main() -> Result<()> {
             passive,
         } => {
             let format = resolve_format_with_config(cli.json, out.format, config_format);
-            let devices = resolve_devices(device.device, &config);
+            // If no devices specified, try last device before falling back to interactive
+            let devices = if device.device.is_empty() {
+                if let Some(dev) = resolve_device_with_hint(None, &config, quiet) {
+                    vec![dev]
+                } else {
+                    vec![]
+                }
+            } else {
+                resolve_devices(device.device, &config)
+            };
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
-            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit))
+            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit), style)
                 .with_no_header(out.no_header)
                 .with_compact(compact)
                 .with_bq(out.resolve_bq(config_bq))
@@ -107,14 +168,13 @@ async fn main() -> Result<()> {
             brief,
         } => {
             let format = resolve_format_with_config(cli.json, out.format, config_format);
-            let dev = resolve_device(device.device, &config);
+            let dev = resolve_device_with_hint(device.device, &config, quiet);
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
-            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit))
+            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit), style)
                 .with_no_header(out.no_header)
                 .with_compact(compact)
                 .with_bq(out.resolve_bq(config_bq))
-                .with_inhg(out.resolve_inhg(config_inhg))
-                .with_style(cli.style);
+                .with_inhg(out.resolve_inhg(config_inhg));
             cmd_status(dev, timeout, format, output, &opts, brief).await?;
         }
         Commands::History {
@@ -125,10 +185,10 @@ async fn main() -> Result<()> {
             until,
         } => {
             let format = resolve_format_with_config(cli.json, out.format, config_format);
-            let dev = resolve_device(device.device, &config);
+            let dev = resolve_device_with_hint(device.device, &config, quiet);
             // History uses a longer default timeout (60s)
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
-            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit))
+            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit), style)
                 .with_no_header(out.no_header)
                 .with_compact(compact)
                 .with_bq(out.resolve_bq(config_bq))
@@ -152,15 +212,15 @@ async fn main() -> Result<()> {
             no_header,
         } => {
             let format = resolve_format_with_config(cli.json, format, config_format);
-            let dev = resolve_device(device.device, &config);
+            let dev = resolve_device_with_hint(device.device, &config, quiet);
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
-            let opts = FormatOptions::new(no_color, config_fahrenheit)
+            let opts = FormatOptions::new(no_color, config_fahrenheit, style)
                 .with_no_header(no_header)
                 .with_compact(compact);
             cmd_info(dev, timeout, format, output, quiet, &opts).await?;
         }
         Commands::Set { device, setting } => {
-            let dev = resolve_device(device.device, &config);
+            let dev = resolve_device_with_hint(device.device, &config, quiet);
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
             cmd_set(dev, timeout, setting, quiet).await?;
         }
@@ -172,9 +232,15 @@ async fn main() -> Result<()> {
             passive,
         } => {
             let format = resolve_format_with_config(cli.json, out.format, config_format);
-            let dev = resolve_device(device.device, &config);
+            // For passive mode without explicit device, don't resolve to last device
+            // This allows watching ALL devices via advertisements
+            let dev = if passive && device.device.is_none() {
+                None
+            } else {
+                resolve_device_with_hint(device.device, &config, quiet)
+            };
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
-            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit))
+            let opts = FormatOptions::new(no_color, out.resolve_fahrenheit(config_fahrenheit), style)
                 .with_no_header(out.no_header)
                 .with_compact(compact)
                 .with_bq(out.resolve_bq(config_bq))
@@ -197,11 +263,14 @@ async fn main() -> Result<()> {
         Commands::Config { .. } => unreachable!(),
         Commands::Alias { .. } => unreachable!(),
         Commands::Completions { .. } => unreachable!(),
+        #[cfg(feature = "tui")]
+        Commands::Tui => unreachable!(), // Handled above
     }
 
     Ok(())
 }
 
+#[cfg(feature = "cli")]
 fn handle_alias_command(action: &AliasSubcommand, quiet: bool) -> Result<()> {
     let alias_action = match action {
         AliasSubcommand::List => AliasAction::List,
@@ -214,6 +283,7 @@ fn handle_alias_command(action: &AliasSubcommand, quiet: bool) -> Result<()> {
     cmd_alias(alias_action, quiet)
 }
 
+#[cfg(feature = "cli")]
 fn handle_config_command(action: &ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => {
@@ -300,6 +370,7 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
 }
 
 /// Parse a boolean value from a string, supporting common representations.
+#[cfg(feature = "cli")]
 fn parse_bool(s: &str) -> std::result::Result<bool, ()> {
     match s.to_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Ok(true),
@@ -309,6 +380,7 @@ fn parse_bool(s: &str) -> std::result::Result<bool, ()> {
 }
 
 /// Parse an output format from a config string.
+#[cfg(feature = "cli")]
 fn parse_format(s: &str) -> Option<OutputFormat> {
     match s.to_lowercase().as_str() {
         "text" => Some(OutputFormat::Text),
@@ -320,6 +392,7 @@ fn parse_format(s: &str) -> Option<OutputFormat> {
 
 /// Resolve output format with config fallback.
 /// Priority: --json flag > --format arg (if not default) > config format > default (text)
+#[cfg(feature = "cli")]
 fn resolve_format_with_config(
     cli_json: bool,
     cmd_format: OutputFormat,
@@ -336,11 +409,91 @@ fn resolve_format_with_config(
     }
 }
 
+/// Show a message about which device source is being used.
+/// Returns the resolved device identifier.
+#[cfg(feature = "cli")]
+fn resolve_device_with_hint(
+    device: Option<String>,
+    config: &Config,
+    quiet: bool,
+) -> Option<String> {
+    let (resolved, source) = get_device_source(device.as_deref(), config);
+
+    // Show hint about device source (unless quiet mode)
+    if !quiet {
+        if let Some(source) = source {
+            if let Some(ref dev) = resolved {
+                let name = config
+                    .last_device_name
+                    .as_deref()
+                    .filter(|_| source == "last");
+                match (source, name) {
+                    ("last", Some(name)) => {
+                        eprintln!("Using last connected device: {} ({})", name, dev);
+                    }
+                    ("last", None) => {
+                        eprintln!("Using last connected device: {}", dev);
+                    }
+                    ("default", _) => {
+                        // Don't show message for default device - user explicitly configured it
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    resolved
+}
+
+/// Print common usage examples.
+#[cfg(feature = "cli")]
+fn print_examples() {
+    use owo_colors::OwoColorize;
+
+    println!("{}", "Aranet CLI Examples".bold().underline());
+    println!();
+    println!("{}", "Getting Started:".bold());
+    println!("  aranet scan                      # Find nearby Aranet devices");
+    println!("  aranet scan --alias              # Scan and save device aliases interactively");
+    println!("  aranet doctor                    # Check Bluetooth connectivity");
+    println!();
+    println!("{}", "Reading Data:".bold());
+    println!("  aranet read                      # Read from default/last device");
+    println!("  aranet read -d living-room       # Read using device alias");
+    println!("  aranet status                    # Quick one-line status");
+    println!("  aranet status --brief            # Super-compact status for scripting");
+    println!();
+    println!("{}", "Monitoring:".bold());
+    println!("  aranet watch                     # Continuously monitor (60s intervals)");
+    println!("  aranet watch -i 30               # Monitor every 30 seconds");
+    println!("  aranet watch -n 5                # Take 5 readings then exit");
+    println!();
+    println!("{}", "History & Export:".bold());
+    println!("  aranet history                   # Show all stored readings");
+    println!("  aranet history --since 2024-01-01");
+    println!("  aranet history -f csv > data.csv # Export to CSV file");
+    println!("  aranet history -f json           # Export as JSON");
+    println!();
+    println!("{}", "Device Management:".bold());
+    println!("  aranet alias list                # Show saved aliases");
+    println!("  aranet alias set office <uuid>   # Create an alias");
+    println!("  aranet config set device <uuid>  # Set default device");
+    println!("  aranet config show               # Show current configuration");
+    println!();
+    println!("{}", "Output Options:".bold());
+    println!("  aranet read --json               # Output as JSON");
+    println!("  aranet read --fahrenheit         # Use Fahrenheit for temperature");
+    println!("  aranet read --bq                 # Use Bq/m3 for radon (instead of pCi/L)");
+    println!("  aranet read --no-color           # Disable colored output");
+    println!();
+}
+
 // ============================================================================
 // CLI Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
 

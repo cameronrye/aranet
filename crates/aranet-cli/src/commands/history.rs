@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use aranet_core::HistoryOptions;
-use indicatif::{ProgressBar, ProgressStyle};
 use time::OffsetDateTime;
 
 use crate::cli::OutputFormat;
 use crate::format::{FormatOptions, format_history_csv, format_history_json, format_history_text};
-use crate::util::{connect_device, require_device_interactive, write_output};
+use crate::style;
+use crate::util::{require_device_interactive, write_output};
 
 /// Parse a date/time string in RFC3339 or YYYY-MM-DD format.
 fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
@@ -63,22 +63,16 @@ pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
     let since_dt = since.as_ref().map(|s| parse_datetime(s)).transpose()?;
     let until_dt = until.as_ref().map(|s| parse_datetime(s)).transpose()?;
 
-    if !quiet && matches!(format, OutputFormat::Text) {
-        eprintln!("Connecting to {}...", identifier);
-    }
-
-    let device = connect_device(&identifier, timeout).await?;
-
     // Set up progress bar for text output
     let show_progress = !quiet && matches!(format, OutputFormat::Text);
+
+    // Connect to device (with its own spinner if show_progress is true)
+    let device =
+        crate::util::connect_device_with_progress(&identifier, timeout, show_progress).await?;
+
+    // Create progress bar for download phase
     let pb = if show_progress {
-        let pb = ProgressBar::new(100);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}% {msg}")
-                .expect("valid template")
-                .progress_chars("█▓░"),
-        );
+        let pb = style::download_progress_bar();
         pb.set_message("Downloading history...");
         Some(pb)
     } else {

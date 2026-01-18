@@ -1,5 +1,6 @@
 //! Scan command implementation.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,7 +8,8 @@ use anyhow::{Context, Result};
 use aranet_core::{ScanOptions, scan};
 
 use crate::cli::OutputFormat;
-use crate::format::{FormatOptions, format_scan_csv, format_scan_json, format_scan_text};
+use crate::config::Config;
+use crate::format::{FormatOptions, format_scan_csv, format_scan_json, format_scan_text_with_aliases};
 use crate::style;
 use crate::util::write_output;
 
@@ -16,7 +18,9 @@ pub async fn cmd_scan(
     format: OutputFormat,
     output: Option<&PathBuf>,
     quiet: bool,
+    save_alias: bool,
     opts: &FormatOptions,
+    config: &Config,
 ) -> Result<()> {
     // Show spinner for text output (unless quiet)
     let spinner = if !quiet && matches!(format, OutputFormat::Text) {
@@ -39,12 +43,75 @@ pub async fn cmd_scan(
         sp.finish_and_clear();
     }
 
+    // For text format, show aliases and tips
     let content = match format {
         OutputFormat::Json => format_scan_json(&devices, opts)?,
-        OutputFormat::Text => format_scan_text(&devices, opts),
+        OutputFormat::Text => {
+            // Show aliases column if any devices have aliases, and show tips
+            format_scan_text_with_aliases(&devices, opts, Some(&config.aliases), !quiet)
+        }
         OutputFormat::Csv => format_scan_csv(&devices, opts),
     };
 
     write_output(output, &content)?;
+
+    // Handle --alias flag for interactive alias saving
+    if save_alias && !devices.is_empty() && matches!(format, OutputFormat::Text) {
+        save_aliases_interactive(&devices, config)?;
+    }
+
+    Ok(())
+}
+
+/// Interactively prompt user to save aliases for discovered devices.
+fn save_aliases_interactive(
+    devices: &[aranet_core::scan::DiscoveredDevice],
+    config: &Config,
+) -> Result<()> {
+    use std::io::BufRead;
+
+    let mut config = config.clone();
+    let mut saved_count = 0;
+
+    println!("\nSave device aliases:");
+    for device in devices {
+        let name = device.name.as_deref().unwrap_or("Unknown");
+        let id_lower = device.identifier.to_lowercase();
+
+        // Check if already has an alias
+        let existing_alias = config
+            .aliases
+            .iter()
+            .find(|(_, v)| v.to_lowercase() == id_lower)
+            .map(|(k, _)| k.clone());
+
+        if let Some(alias) = existing_alias {
+            println!("  {} - already aliased as '{}'", name, alias);
+            continue;
+        }
+
+        print!("  {} - alias (enter to skip): ", name);
+        io::stdout().flush()?;
+
+        let stdin = io::stdin();
+        let mut input = String::new();
+        stdin.lock().read_line(&mut input)?;
+        let alias = input.trim();
+
+        if !alias.is_empty() {
+            config
+                .aliases
+                .insert(alias.to_string(), device.identifier.clone());
+            saved_count += 1;
+        }
+    }
+
+    if saved_count > 0 {
+        config.save()?;
+        println!("\nSaved {} alias(es).", saved_count);
+    } else {
+        println!("\nNo aliases saved.");
+    }
+
     Ok(())
 }

@@ -2,11 +2,16 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use aranet_core::{Device, ScanOptions, scan};
+use aranet_core::{Device, FindProgress, ScanOptions, find_device_with_progress, scan};
 use dialoguer::{Select, theme::ColorfulTheme};
+use indicatif::ProgressBar;
+
+use crate::config::update_last_device;
+use crate::style;
 
 /// Get device identifier, with helpful error message.
 /// Used for non-interactive contexts (e.g., scripts, piped input).
@@ -79,18 +84,116 @@ pub async fn require_device_interactive(device: Option<String>) -> Result<String
 }
 
 /// Connect to a device with timeout and improved error messages.
+/// Shows progress feedback for connection attempts.
+#[allow(dead_code)]
 pub async fn connect_device(identifier: &str, timeout: Duration) -> Result<Device> {
-    Device::connect_with_timeout(identifier, timeout)
+    connect_device_with_progress(identifier, timeout, true).await
+}
+
+/// Connect to a device with optional progress display.
+pub async fn connect_device_with_progress(
+    identifier: &str,
+    timeout: Duration,
+    show_progress: bool,
+) -> Result<Device> {
+    // Create spinner for visual feedback
+    let spinner: Option<Arc<ProgressBar>> = if show_progress && io::stderr().is_terminal() {
+        Some(Arc::new(style::connecting_spinner(identifier)))
+    } else {
+        None
+    };
+
+    // Create progress callback
+    let spinner_clone = spinner.clone();
+    let progress_callback: Option<aranet_core::ProgressCallback> = if show_progress {
+        Some(Box::new(move |progress: FindProgress| {
+            if let Some(ref sp) = spinner_clone {
+                match progress {
+                    FindProgress::CacheHit => {
+                        sp.set_message("Found device (cached)".to_string());
+                    }
+                    FindProgress::ScanAttempt {
+                        attempt,
+                        total,
+                        duration_secs,
+                    } => {
+                        sp.set_message(format!(
+                            "Scanning... (attempt {}/{}, {}s)",
+                            attempt, total, duration_secs
+                        ));
+                    }
+                    FindProgress::Found { attempt } => {
+                        if attempt > 1 {
+                            sp.set_message(format!("Found on attempt {}", attempt));
+                        } else {
+                            sp.set_message("Found device".to_string());
+                        }
+                    }
+                    FindProgress::RetryNeeded { attempt } => {
+                        sp.set_message(format!("Not found, retrying... (attempt {})", attempt + 1));
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let options = ScanOptions {
+        duration: timeout,
+        filter_aranet_only: false,
+    };
+
+    // Find the device with progress
+    let result = find_device_with_progress(identifier, options, progress_callback).await;
+
+    // Update spinner based on result
+    if let Some(ref sp) = spinner {
+        match &result {
+            Ok(_) => {
+                sp.set_message("Connecting...".to_string());
+            }
+            Err(_) => {
+                sp.finish_and_clear();
+            }
+        }
+    }
+
+    // Now create Device from peripheral
+    let (adapter, peripheral) = result.map_err(|e| {
+        let base_msg = format!("Failed to find device: {}", identifier);
+        let suggestion = "\n\nPossible causes:\n  \
+            - Bluetooth may be disabled -- check system settings\n  \
+            - Device may be out of range -- try moving closer\n  \
+            - Device may be connected to another host\n  \
+            - Device address may be incorrect -- run 'aranet scan' to verify\n\n\
+            Tip: Run 'aranet doctor' to diagnose Bluetooth issues";
+        anyhow::anyhow!("{}\n\nCause: {}{}", base_msg, e, suggestion)
+    })?;
+
+    let device = Device::from_peripheral(adapter, peripheral)
         .await
         .map_err(|e| {
             let base_msg = format!("Failed to connect to device: {}", identifier);
             let suggestion = "\n\nPossible causes:\n  \
-                • Bluetooth may be disabled — check system settings\n  \
-                • Device may be out of range — try moving closer\n  \
-                • Device may be connected to another host\n  \
-                • Device address may be incorrect — run 'aranet scan' to verify";
+                - Device may have gone out of range\n  \
+                - Device may be connected to another host\n  \
+                - Bluetooth connection was interrupted\n\n\
+                Tip: Run 'aranet doctor' to diagnose Bluetooth issues";
             anyhow::anyhow!("{}\n\nCause: {}{}", base_msg, e, suggestion)
-        })
+        })?;
+
+    // Finish spinner
+    if let Some(sp) = spinner {
+        sp.finish_and_clear();
+    }
+
+    // Save last connected device (ignore errors - this is a convenience feature)
+    let device_name = device.name().map(|s| s.to_string());
+    let device_address = device.address().to_string();
+    let _ = update_last_device(&device_address, device_name.as_deref());
+
+    Ok(device)
 }
 
 /// Write output to file or stdout

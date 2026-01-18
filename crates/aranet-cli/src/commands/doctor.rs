@@ -113,14 +113,15 @@ pub async fn cmd_doctor(verbose: bool, no_color: bool) -> Result<()> {
 }
 
 fn print_check_start(num: usize, total: usize, name: &str, no_color: bool) {
-    let spinner = style::operation_spinner(&format!("[{}/{}] Checking {}...", num, total, name));
-    // We can't easily use async spinners here, so just print and clear
-    spinner.finish_and_clear();
+    // Use simple static output instead of a spinner that can't animate during sync blocking
+    use std::io::{Write, stdout};
     if no_color {
-        print!("[{}/{}] {} ", num, total, name);
+        print!("[{}/{}] {} ... ", num, total, name);
     } else {
-        print!("{} {} ", format!("[{}/{}]", num, total).dimmed(), name);
+        print!("{} {} ... ", format!("[{}/{}]", num, total).dimmed(), name);
     }
+    // Flush to ensure the message appears before the blocking operation
+    let _ = stdout().flush();
 }
 
 fn print_check_result(check: &Check, no_color: bool) {

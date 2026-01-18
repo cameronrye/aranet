@@ -6,7 +6,7 @@ use anyhow::Result;
 use aranet_core::{BluetoothRange, MeasurementInterval};
 
 use crate::cli::{BluetoothRangeSetting, DeviceSetting};
-use crate::util::{connect_device, require_device_interactive};
+use crate::util::{connect_device_with_progress, require_device_interactive};
 
 pub async fn cmd_set(
     device: Option<String>,
@@ -16,11 +16,8 @@ pub async fn cmd_set(
 ) -> Result<()> {
     let identifier = require_device_interactive(device).await?;
 
-    if !quiet {
-        eprintln!("Connecting to {}...", identifier);
-    }
-
-    let device = connect_device(&identifier, timeout).await?;
+    // Use connect_device_with_progress which has its own spinner
+    let device = connect_device_with_progress(&identifier, timeout, !quiet).await?;
 
     match setting {
         DeviceSetting::Interval { minutes } => {

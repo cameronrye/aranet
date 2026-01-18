@@ -264,20 +264,47 @@ aranet watch [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-d, --device <ADDRESS>` | auto-detect | Device address (MAC or UUID) |
-| `-i, --interval <SECONDS>` | device interval | Polling interval in seconds |
+| `-d, --device <ADDRESS>` | all devices | Device address (MAC or UUID) |
+| `-i, --interval <SECONDS>` | 60 | Polling interval in seconds |
+| `-n, --count <N>` | unlimited | Number of readings before exiting |
+| `--passive` | false | Read from BLE advertisements (requires Smart Home enabled) |
 
-### Example
+### Examples
+
+**Watch a specific device (active connection):**
 
 ```bash
 $ aranet watch --device AA:BB:CC:DD:EE:FF
 
-Watching Aranet4 17C3C (Ctrl+C to stop)...
-
-[10:00:00] CO₂: 847 ppm [GREEN] 22.4°C 45% 1013 hPa
-[10:05:00] CO₂: 823 ppm [GREEN] 22.5°C 44% 1013 hPa
-[10:10:00] CO₂: 891 ppm [GREEN] 22.3°C 45% 1012 hPa
+Watching: AA:BB:CC:DD:EE:FF
+Interval: 60s | Press Ctrl+C to stop
+--------------------------------------------------
+[10:00:00] 847 ppm | 22.4 C | 45% | 95%
+[10:05:00] 823 ppm | 22.5 C | 44% | 95%
 ```
+
+**Watch all devices passively (no connection required):**
+
+```bash
+$ aranet watch --passive
+
+Watching: all devices (passive)
+Interval: 60s | Press Ctrl+C to stop
+------------------------------------------------------------
+[10:00:00]  [Aranet4 17C3C]   [GREEN]  523 ppm   22.1C  45%  1013.2 hPa  BAT 87%
+[10:00:00]  [AranetRn+ 306B8] [AMBER]  101 pCi/L 14.6C  32%  981.4 hPa   BAT 95%
+[10:01:30]  [Aranet4 17C3C]   [GREEN]  518 ppm   22.2C  44%  1013.1 hPa  BAT 87%
+```
+
+**Watch a specific device passively:**
+
+```bash
+$ aranet watch --passive --device "AranetRn+ 306B8"
+```
+
+:::note
+Passive mode requires **Smart Home integration** to be enabled on the device. This broadcasts sensor data in BLE advertisements, allowing readings without connecting.
+:::
 
 ---
 

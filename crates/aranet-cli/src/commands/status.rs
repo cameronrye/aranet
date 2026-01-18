@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::cli::OutputFormat;
 use crate::format::{FormatOptions, bq_to_pci, csv_escape, format_status};
 use crate::style;
-use crate::util::{connect_device, require_device_interactive, write_output};
+use crate::util::{connect_device_with_progress, require_device_interactive, write_output};
 
 pub async fn cmd_status(
     device: Option<String>,
@@ -22,10 +22,8 @@ pub async fn cmd_status(
 ) -> Result<()> {
     let identifier = require_device_interactive(device).await?;
 
-    // Show spinner while connecting
-    let spinner = style::connecting_spinner(&identifier);
-    let device = connect_device(&identifier, timeout).await?;
-    spinner.finish_and_clear();
+    // Use connect_device_with_progress which has its own spinner
+    let device = connect_device_with_progress(&identifier, timeout, true).await?;
 
     let name = device.name().map(|s| s.to_string());
     let reading = device
