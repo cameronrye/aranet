@@ -124,3 +124,69 @@ pub async fn run() -> Result<()> {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_new() {
+        let app = App::new();
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn test_app_default() {
+        let app = App::default();
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn test_app_handle_key_q_quits() {
+        let mut app = App::new();
+        assert!(!app.should_quit());
+
+        app.handle_key(KeyCode::Char('q'));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn test_app_handle_key_other_does_not_quit() {
+        let mut app = App::new();
+
+        app.handle_key(KeyCode::Char('a'));
+        assert!(!app.should_quit());
+
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.should_quit());
+
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.should_quit());
+
+        app.handle_key(KeyCode::Up);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn test_app_handle_key_uppercase_q_does_not_quit() {
+        let mut app = App::new();
+
+        // Only lowercase 'q' should quit
+        app.handle_key(KeyCode::Char('Q'));
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn test_app_should_quit_returns_correct_state() {
+        let mut app = App::new();
+
+        // Initial state
+        assert!(!app.should_quit);
+        assert!(!app.should_quit());
+
+        // After setting manually
+        app.should_quit = true;
+        assert!(app.should_quit);
+        assert!(app.should_quit());
+    }
+}

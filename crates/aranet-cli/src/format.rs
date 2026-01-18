@@ -153,10 +153,20 @@ impl FormatOptions {
         if self.bq { "radon_bq" } else { "radon_pci" }
     }
 
-    /// Get radon display unit string.
+    /// Get radon unit string for CSV/JSON output (ASCII-only).
     #[must_use]
     pub fn radon_unit(&self) -> &'static str {
         if self.bq { "Bq/m3" } else { "pCi/L" }
+    }
+
+    /// Get radon unit string for display output (uses superscript when not in plain mode).
+    #[must_use]
+    pub fn radon_display_unit(&self) -> &'static str {
+        if self.bq {
+            if self.is_plain() { "Bq/m3" } else { "Bq/m³" }
+        } else {
+            "pCi/L"
+        }
     }
 
     /// Convert radon value for CSV/JSON output.
@@ -518,23 +528,12 @@ pub fn format_reading_text_with_name(
         let radon_display = if opts.bq {
             style::format_radon_colored(radon, opts.no_color)
         } else {
-            // Convert to pCi/L for display
-            let pci = radon as f32 / 37.0;
-            if opts.no_color {
-                format!("{:.2}", pci)
-            } else if radon < style::radon::GOOD {
-                format!("{}", format!("{:.2}", pci).green())
-            } else if radon < style::radon::MODERATE {
-                format!("{}", format!("{:.2}", pci).yellow())
-            } else {
-                format!("{}", format!("{:.2}", pci).red())
-            }
+            style::format_radon_pci_colored(radon, bq_to_pci(radon), opts.no_color)
         };
-        let unit = if opts.bq { "Bq/m3" } else { "pCi/L" };
         output.push_str(&format!(
             "Radon:       {:>6} {}  {}\n",
             radon_display,
-            unit,
+            opts.radon_display_unit(),
             format_status(reading.status, opts.no_color)
         ));
     }
@@ -566,7 +565,7 @@ pub fn format_reading_text_with_name(
 
     // Common fields - with colored values
     if reading.temperature != 0.0 {
-        let unit = if opts.fahrenheit { "F" } else { "C" };
+        let unit = if opts.fahrenheit { "°F" } else { "°C" };
         let temp_value = opts.convert_temp(reading.temperature);
         let temp_display = if opts.no_color {
             format!("{:.1}", temp_value)
@@ -645,22 +644,12 @@ fn format_reading_rich(
         let radon_display = if opts.bq {
             style::format_radon_colored(radon, opts.no_color)
         } else {
-            let pci = radon as f32 / 37.0;
-            if opts.no_color {
-                format!("{:.2}", pci)
-            } else if radon < style::radon::GOOD {
-                format!("{}", format!("{:.2}", pci).green())
-            } else if radon < style::radon::MODERATE {
-                format!("{}", format!("{:.2}", pci).yellow())
-            } else {
-                format!("{}", format!("{:.2}", pci).red())
-            }
+            style::format_radon_pci_colored(radon, bq_to_pci(radon), opts.no_color)
         };
-        let unit = if opts.bq { "Bq/m3" } else { "pCi/L" };
         let status = format_status(reading.status, opts.no_color);
         output.push_str(&kv(
             "Radon",
-            &format!("{} {} {}", radon_display, unit, status),
+            &format!("{} {} {}", radon_display, opts.radon_display_unit(), status),
         ));
 
         // Radon averages
@@ -685,7 +674,7 @@ fn format_reading_rich(
 
     // Common fields
     if reading.temperature != 0.0 {
-        let unit = if opts.fahrenheit { "F" } else { "C" };
+        let unit = if opts.fahrenheit { "°F" } else { "°C" };
         let temp_value = opts.convert_temp(reading.temperature);
         let temp_display = style::format_temp_colored(temp_value, opts.no_color);
         output.push_str(&kv("Temperature", &format!("{} {}", temp_display, unit)));
@@ -1322,7 +1311,12 @@ pub fn format_watch_line_with_device(
 
     // Format the primary reading based on device type
     let primary = if let Some(radon) = reading.radon {
-        let radon_display = style::format_radon_colored(radon, opts.no_color);
+        // Format radon with proper unit conversion and coloring
+        let radon_display = if opts.bq {
+            style::format_radon_colored(radon, opts.no_color)
+        } else {
+            style::format_radon_pci_colored(radon, bq_to_pci(radon), opts.no_color)
+        };
         format!("{} {}", radon_display, opts.radon_unit())
     } else if let Some(rate) = reading.radiation_rate {
         format!("{:.3} uSv/h", rate)
@@ -1344,7 +1338,7 @@ pub fn format_watch_line_with_device(
     if reading.temperature != 0.0 {
         let temp_display =
             style::format_temp_colored(opts.convert_temp(reading.temperature), opts.no_color);
-        let unit = if opts.fahrenheit { "F" } else { "C" };
+        let unit = if opts.fahrenheit { "°F" } else { "°C" };
         parts.push(format!("{}{}", temp_display, unit));
     }
 

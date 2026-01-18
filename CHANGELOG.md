@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-01-18
+
+### Added
+
+- **Code coverage with cargo-llvm-cov** - CI now reports test coverage via Codecov
+- **Property-based testing with proptest** - Fuzz testing for all byte parsers
+  - aranet-types: CurrentReading parser fuzzing
+  - aranet-core: All device parsers (Aranet4, Aranet2, Radon, Radiation)
+  - aranet-core: Advertisement parsing fuzzing
+- **GUI tests** - Component tests for AppState (6 new tests)
+- **TUI tests** - Component tests for App key handling (6 new tests)
+- **Expanded MockDevice tests** - Comprehensive coverage for history, settings, calibration
+
+### Fixed
+
+- **Aranet Radiation advertisement parser panic** - Fixed crash on malformed data (found by proptest)
+  - Corrected minimum byte length check from 19 to 21 bytes
+
+### Changed
+
+- Test count increased from 268 to 310+ tests
+- All test modules now have comprehensive inline documentation
+
 ## [0.1.5] - 2026-01-18
 
 ### Added

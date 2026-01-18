@@ -359,9 +359,10 @@ fn parse_aranet_radon_advertisement_v2(data: &[u8]) -> Result<AdvertisementData>
 /// - bytes 20-21: Age (u16 LE, seconds)
 /// - byte 22: Counter (u8)
 fn parse_aranet_radiation_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
-    if data.len() < 19 {
+    // Need at least 21 bytes: 5 header + 4 total + 4 duration + 2 rate + 1 battery + 1 status + 2 interval + 2 age
+    if data.len() < 21 {
         return Err(Error::InvalidData(format!(
-            "Aranet Radiation advertisement requires at least 19 bytes, got {}",
+            "Aranet Radiation advertisement requires at least 21 bytes, got {}",
             data.len()
         )));
     }
@@ -681,7 +682,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires at least 19 bytes"),
+            err_msg.contains("requires at least 21 bytes"),
             "Expected insufficient bytes error, got: {}",
             err_msg
         );
@@ -710,5 +711,75 @@ mod tests {
             "Expected Smart Home error, got: {}",
             err_msg
         );
+    }
+}
+
+/// Property-based tests for BLE advertisement parsing.
+///
+/// These tests verify that advertisement parsing is safe with any input,
+/// including malformed or random data that might be received from BLE scans.
+///
+/// # Test Categories
+///
+/// ## Panic Safety Tests
+/// - `parse_advertisement_never_panics`: Any random bytes
+/// - `parse_aranet4_advertisement_never_panics`: 22-byte sequences
+/// - `parse_aranet2_advertisement_never_panics`: Aranet2 device type
+/// - `parse_aranet_radon_advertisement_never_panics`: Radon device type
+/// - `parse_aranet_radiation_advertisement_never_panics`: Radiation device type
+///
+/// # Running Tests
+///
+/// ```bash
+/// cargo test -p aranet-core advertisement::proptests
+/// ```
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Parsing random advertisement bytes should never panic.
+        /// It may return an error, but should always be safe.
+        #[test]
+        fn parse_advertisement_never_panics(data: Vec<u8>) {
+            let _ = parse_advertisement(&data);
+        }
+
+        /// Parsing with valid Aranet4 length (22 bytes) should not panic.
+        #[test]
+        fn parse_aranet4_advertisement_never_panics(data in proptest::collection::vec(any::<u8>(), 22)) {
+            let _ = parse_advertisement(&data);
+        }
+
+        /// Parsing with Aranet2 format (device type 0x01) should not panic.
+        #[test]
+        fn parse_aranet2_advertisement_never_panics(data in proptest::collection::vec(any::<u8>(), 19..=30)) {
+            let mut modified = data.clone();
+            if !modified.is_empty() {
+                modified[0] = 0x01; // Set device type to Aranet2
+            }
+            let _ = parse_advertisement(&modified);
+        }
+
+        /// Parsing with Aranet Radon format should not panic.
+        #[test]
+        fn parse_aranet_radon_advertisement_never_panics(data in proptest::collection::vec(any::<u8>(), 23..=30)) {
+            let mut modified = data.clone();
+            if !modified.is_empty() {
+                modified[0] = 0x03; // Set device type to Radon
+            }
+            let _ = parse_advertisement(&modified);
+        }
+
+        /// Parsing with Aranet Radiation format should not panic.
+        #[test]
+        fn parse_aranet_radiation_advertisement_never_panics(data in proptest::collection::vec(any::<u8>(), 19..=30)) {
+            let mut modified = data.clone();
+            if !modified.is_empty() {
+                modified[0] = 0x02; // Set device type to Radiation
+            }
+            let _ = parse_advertisement(&modified);
+        }
     }
 }

@@ -1,6 +1,8 @@
 //! Read command implementation.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -93,12 +95,36 @@ async fn cmd_read_multi(
     quiet: bool,
     opts: &FormatOptions,
 ) -> Result<()> {
-    if !quiet && matches!(format, OutputFormat::Text) {
-        eprintln!("Reading from {} devices...", devices.len());
+    let total_devices = devices.len();
+    let show_progress = !quiet && matches!(format, OutputFormat::Text);
+
+    if show_progress {
+        eprintln!("Reading from {} devices...", total_devices);
     }
 
-    // Read from all devices in parallel
-    let futures = devices.iter().map(|id| read_device(id.clone(), timeout));
+    // Track progress with atomic counter
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    // Read from all devices in parallel with progress updates
+    let futures = devices.iter().map(|id| {
+        let completed = Arc::clone(&completed);
+        let id = id.clone();
+        async move {
+            let result = read_device(id.clone(), timeout).await;
+            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+            if show_progress {
+                match &result {
+                    Ok(reading) => {
+                        eprintln!("  [{}/{}] {} - OK", done, total_devices, reading.identifier);
+                    }
+                    Err((id, _)) => {
+                        eprintln!("  [{}/{}] {} - FAILED", done, total_devices, id);
+                    }
+                }
+            }
+            result
+        }
+    });
     let results: Vec<Result<DeviceReading, (String, anyhow::Error)>> = join_all(futures).await;
 
     // Collect successful readings and errors
@@ -112,8 +138,9 @@ async fn cmd_read_multi(
         }
     }
 
-    // Report errors
-    if !quiet {
+    // Report detailed errors
+    if !quiet && !errors.is_empty() {
+        eprintln!();
         for (id, err) in &errors {
             eprintln!("Error reading {}: {}", id, err);
         }

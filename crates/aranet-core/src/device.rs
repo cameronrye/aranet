@@ -3,13 +3,14 @@
 //! This module provides the main interface for connecting to and
 //! communicating with Aranet sensors over Bluetooth Low Energy.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use btleplug::api::{Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::{Adapter, Peripheral};
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -33,6 +34,12 @@ use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
 /// handlers, etc.). Cloning would create ambiguity about connection ownership and
 /// could lead to resource conflicts. If you need to share a device across multiple
 /// tasks, wrap it in `Arc<Device>`.
+///
+/// # Cleanup
+///
+/// You MUST call [`Device::disconnect`] before dropping the device to properly
+/// release BLE resources. If a Device is dropped without calling disconnect,
+/// a warning will be logged.
 pub struct Device {
     /// The BLE adapter used for connection.
     ///
@@ -53,6 +60,8 @@ pub struct Device {
     services_discovered: bool,
     /// Handles for spawned notification tasks (for cleanup).
     notification_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Whether disconnect has been called (for Drop warning).
+    disconnected: AtomicBool,
 }
 
 impl std::fmt::Debug for Device {
@@ -154,6 +163,7 @@ impl Device {
             device_type,
             services_discovered: true,
             notification_handles: tokio::sync::Mutex::new(Vec::new()),
+            disconnected: AtomicBool::new(false),
         })
     }
 
@@ -173,6 +183,7 @@ impl Device {
     #[tracing::instrument(level = "info", skip(self), fields(device_name = ?self.name))]
     pub async fn disconnect(&self) -> Result<()> {
         info!("Disconnecting from device...");
+        self.disconnected.store(true, Ordering::SeqCst);
 
         // Abort all notification handlers
         {
@@ -433,16 +444,27 @@ impl Device {
     }
 }
 
-// NOTE: We intentionally do NOT implement Drop for Device.
-//
-// The previous implementation spawned a thread and used `futures::executor::block_on`
-// which can panic if called from within an async runtime. This is problematic because:
-// 1. Device is typically used in async contexts
+// NOTE: Drop logs a warning if disconnect() was not called, but does NOT attempt
+// to disconnect. This is because:
+// 1. Device is typically used in async contexts (Drop cannot be async)
 // 2. Spawning threads in Drop is unpredictable and can cause issues during shutdown
 // 3. Cleanup should be explicit, not implicit
 //
 // Callers MUST explicitly call `device.disconnect().await` before dropping the Device.
 // For automatic cleanup, consider using `ReconnectingDevice` which manages the lifecycle.
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        if !self.disconnected.load(Ordering::SeqCst) {
+            warn!(
+                device_name = ?self.name,
+                device_address = %self.address,
+                "Device dropped without calling disconnect() - BLE resources may not be properly released. \
+                 Call device.disconnect().await before dropping."
+            );
+        }
+    }
+}
 
 #[async_trait]
 impl AranetDevice for Device {

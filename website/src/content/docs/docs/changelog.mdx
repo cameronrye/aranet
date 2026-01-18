@@ -13,7 +13,41 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [0.1.4] - 2026-01-17 <Badge text="Current" variant="success" />
+## [0.1.6] - 2026-01-18 <Badge text="Current" variant="success" />
+
+### Added
+
+- **Code coverage with cargo-llvm-cov** - CI now reports test coverage via Codecov
+- **Property-based testing with proptest** - Fuzz testing for all byte parsers
+  - aranet-types: CurrentReading parser fuzzing
+  - aranet-core: All device parsers (Aranet4, Aranet2, Radon, Radiation)
+  - aranet-core: Advertisement parsing fuzzing
+- **GUI tests** - Component tests for AppState (6 new tests)
+- **TUI tests** - Component tests for App key handling (6 new tests)
+- **Expanded MockDevice tests** - Comprehensive coverage for history, settings, calibration
+
+### Fixed
+
+- **Aranet Radiation advertisement parser panic** - Fixed crash on malformed data (found by proptest)
+
+### Changed
+
+- Test count increased from 268 to 310+ tests
+- All test modules now have comprehensive inline documentation
+
+---
+
+## [0.1.5] - 2026-01-18
+
+### Added
+
+- **Multi-device passive watch mode** - `aranet watch --passive` monitors ALL devices broadcasting advertisements
+- Device name identification in watch output: `[AranetRn+ 306B8]`
+- CSV, JSON, and text output formats with device identification
+
+---
+
+## [0.1.4] - 2026-01-17
 
 ### Fixed
 
@@ -133,7 +167,9 @@ Features:
 
 ### Testing
 
-- 239 workspace tests (236 run, 3 ignored for hardware-dependent tests)
+- 310+ workspace tests (295+ run, 15 ignored for hardware-dependent tests)
+- Property-based testing with proptest for all byte parsers
+- Code coverage with cargo-llvm-cov (Codecov integration)
 - Hardware tested: Aranet4 17C3C (FW v1.4.19), AranetRn+ 306B8 (FW v1.12.0)
 - CI running on Ubuntu, macOS, Windows
 

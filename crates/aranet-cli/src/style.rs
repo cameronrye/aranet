@@ -171,6 +171,7 @@ pub fn format_co2_colored(ppm: u16, no_color: bool) -> String {
 }
 
 /// Format radon value with appropriate color based on EPA thresholds.
+/// This formats the raw Bq/m³ value with color coding.
 pub fn format_radon_colored(bq: u32, no_color: bool) -> String {
     if no_color {
         return format!("{}", bq);
@@ -182,6 +183,24 @@ pub fn format_radon_colored(bq: u32, no_color: bool) -> String {
         format!("{}", bq.yellow())
     } else {
         format!("{}", bq.red())
+    }
+}
+
+/// Format radon value in pCi/L with appropriate color based on EPA thresholds.
+/// Takes raw Bq/m³ value, converts to pCi/L, and applies color coding.
+/// The color thresholds are based on the original Bq/m³ values.
+pub fn format_radon_pci_colored(bq: u32, pci: f32, no_color: bool) -> String {
+    if no_color {
+        return format!("{:.2}", pci);
+    }
+
+    let formatted = format!("{:.2}", pci);
+    if bq < radon::GOOD {
+        format!("{}", formatted.green())
+    } else if bq < radon::MODERATE {
+        format!("{}", formatted.yellow())
+    } else {
+        format!("{}", formatted.red())
     }
 }
 

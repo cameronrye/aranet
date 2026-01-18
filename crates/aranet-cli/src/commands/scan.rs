@@ -65,6 +65,20 @@ pub async fn cmd_scan(
     Ok(())
 }
 
+/// Generate a suggested alias from a device name.
+/// Converts "Aranet4 12ABC" to "aranet4-12abc" style.
+fn suggest_alias(device_name: &str) -> String {
+    device_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Interactively prompt user to save aliases for discovered devices.
 fn save_aliases_interactive(
     devices: &[aranet_core::scan::DiscoveredDevice],
@@ -74,6 +88,14 @@ fn save_aliases_interactive(
 
     let mut config = config.clone();
     let mut saved_count = 0;
+
+    // Show existing aliases first
+    if !config.aliases.is_empty() {
+        println!("\nExisting aliases:");
+        for (alias, address) in &config.aliases {
+            println!("  {} -> {}", alias, address);
+        }
+    }
 
     println!("\nSave device aliases:");
     for device in devices {
@@ -92,7 +114,15 @@ fn save_aliases_interactive(
             continue;
         }
 
-        print!("  {} - alias (enter to skip): ", name);
+        // Generate a suggested alias
+        let suggested = suggest_alias(name);
+        let suggestion_hint = if suggested.is_empty() || suggested == "-" {
+            String::new()
+        } else {
+            format!(" [suggested: {}]", suggested)
+        };
+
+        print!("  {} - alias (enter to skip){}: ", name, suggestion_hint);
         io::stdout().flush()?;
 
         let stdin = io::stdin();

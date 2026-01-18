@@ -161,25 +161,35 @@ pub async fn connect_device_with_progress(
 
     // Now create Device from peripheral
     let (adapter, peripheral) = result.map_err(|e| {
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let base_msg = format!("Failed to find device: {}", identifier);
-        let suggestion = "\n\nPossible causes:\n  \
+        let suggestion = format!(
+            "\n\nPossible causes:\n  \
             - Bluetooth may be disabled -- check system settings\n  \
             - Device may be out of range -- try moving closer\n  \
             - Device may be connected to another host\n  \
             - Device address may be incorrect -- run 'aranet scan' to verify\n\n\
-            Tip: Run 'aranet doctor' to diagnose Bluetooth issues";
+            Tip: Run 'aranet doctor' to diagnose Bluetooth issues\n\
+            Time: {}",
+            timestamp
+        );
         anyhow::anyhow!("{}\n\nCause: {}{}", base_msg, e, suggestion)
     })?;
 
     let device = Device::from_peripheral(adapter, peripheral)
         .await
         .map_err(|e| {
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             let base_msg = format!("Failed to connect to device: {}", identifier);
-            let suggestion = "\n\nPossible causes:\n  \
+            let suggestion = format!(
+                "\n\nPossible causes:\n  \
                 - Device may have gone out of range\n  \
                 - Device may be connected to another host\n  \
                 - Bluetooth connection was interrupted\n\n\
-                Tip: Run 'aranet doctor' to diagnose Bluetooth issues";
+                Tip: Run 'aranet doctor' to diagnose Bluetooth issues\n\
+                Time: {}",
+                timestamp
+            );
             anyhow::anyhow!("{}\n\nCause: {}{}", base_msg, e, suggestion)
         })?;
 

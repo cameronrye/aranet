@@ -1,6 +1,6 @@
 [package]
 name = "aranet-core"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +11,7 @@ keywords = ["aranet", "ble", "bluetooth", "sensors", "iot"]
 categories = ["hardware-support", "asynchronous"]
 
 [dependencies]
-aranet-types = { version = "0.1.5", path = "../aranet-types" }
+aranet-types = { version = "0.1.6", path = "../aranet-types" }
 btleplug.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
@@ -29,6 +29,7 @@ tokio-util.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
 serde_json.workspace = true
 tracing-subscriber.workspace = true
+proptest = "1.9.0"
 
 [[example]]
 name = "scan_devices"

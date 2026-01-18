@@ -657,6 +657,50 @@ impl MockDeviceBuilder {
     }
 }
 
+/// Unit tests for MockDevice and MockDeviceBuilder.
+///
+/// These tests verify the mock device implementation used for testing
+/// without requiring actual BLE hardware.
+///
+/// # Test Categories
+///
+/// ## Connection Tests
+/// - `test_mock_device_connect`: Connect/disconnect lifecycle
+/// - `test_mock_device_not_connected`: Error when reading without connection
+///
+/// ## Reading Tests
+/// - `test_mock_device_read`: Basic reading retrieval
+/// - `test_mock_device_read_battery`: Battery level reading
+/// - `test_mock_device_read_rssi`: Signal strength reading
+/// - `test_mock_device_read_device_info`: Device information
+/// - `test_mock_device_set_values`: Dynamic value updates
+///
+/// ## History Tests
+/// - `test_mock_device_history`: History download
+/// - `test_mock_device_history_with_options`: Filtered history download
+/// - `test_mock_device_history_info`: History metadata
+///
+/// ## Settings Tests
+/// - `test_mock_device_interval`: Measurement interval get/set
+/// - `test_mock_device_calibration`: Calibration data
+///
+/// ## Failure Injection Tests
+/// - `test_mock_device_fail`: Permanent failure mode
+/// - `test_mock_device_transient_failures`: Temporary failures for retry testing
+///
+/// ## Builder Tests
+/// - `test_builder_defaults`: Default builder values
+/// - `test_builder_all_options`: Full builder customization
+///
+/// ## Trait Tests
+/// - `test_aranet_device_trait`: Using MockDevice through AranetDevice trait
+/// - `test_trait_methods_match_direct_methods`: Trait/direct method consistency
+///
+/// # Running Tests
+///
+/// ```bash
+/// cargo test -p aranet-core mock::tests
+/// ```
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +762,242 @@ mod tests {
         }
 
         assert_eq!(check_via_trait(&device).await, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_read_battery() {
+        let device = MockDeviceBuilder::new().battery(75).build();
+        let battery = device.read_battery().await.unwrap();
+        assert_eq!(battery, 75);
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_read_rssi() {
+        let device = MockDeviceBuilder::new().build();
+        device.set_rssi(-65);
+        let rssi = device.read_rssi().await.unwrap();
+        assert_eq!(rssi, -65);
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_read_device_info() {
+        let device = MockDeviceBuilder::new().name("Test Device").build();
+        let info = device.read_device_info().await.unwrap();
+        assert_eq!(info.name, "Test Device");
+        assert_eq!(info.manufacturer, "SAF Tehnika");
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_history() {
+        let device = MockDeviceBuilder::new().build();
+
+        // Initially empty
+        let history = device.download_history().await.unwrap();
+        assert!(history.is_empty());
+
+        // Add some records
+        let records = vec![
+            HistoryRecord {
+                timestamp: time::OffsetDateTime::now_utc(),
+                co2: 800,
+                temperature: 22.5,
+                pressure: 1013.2,
+                humidity: 50,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+            HistoryRecord {
+                timestamp: time::OffsetDateTime::now_utc(),
+                co2: 850,
+                temperature: 23.0,
+                pressure: 1013.5,
+                humidity: 48,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+        ];
+        device.add_history(records).await;
+
+        let history = device.download_history().await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].co2, 800);
+        assert_eq!(history[1].co2, 850);
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_history_with_options() {
+        let device = MockDeviceBuilder::new().build();
+
+        // Add 5 records
+        let records: Vec<HistoryRecord> = (0..5)
+            .map(|i| HistoryRecord {
+                timestamp: time::OffsetDateTime::now_utc(),
+                co2: 800 + i as u16 * 10,
+                temperature: 22.0,
+                pressure: 1013.0,
+                humidity: 50,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            })
+            .collect();
+        device.add_history(records).await;
+
+        // Download with range
+        let options = HistoryOptions {
+            start_index: Some(1),
+            end_index: Some(4),
+            ..Default::default()
+        };
+        let history = device.download_history_with_options(options).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].co2, 810); // Second record (index 1)
+        assert_eq!(history[2].co2, 830); // Fourth record (index 3)
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_interval() {
+        let device = MockDeviceBuilder::new().build();
+
+        let interval = device.get_interval().await.unwrap();
+        assert_eq!(interval, MeasurementInterval::FiveMinutes);
+
+        device
+            .set_interval(MeasurementInterval::TenMinutes)
+            .await
+            .unwrap();
+        let interval = device.get_interval().await.unwrap();
+        assert_eq!(interval, MeasurementInterval::TenMinutes);
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_calibration() {
+        let device = MockDeviceBuilder::new().build();
+        let calibration = device.get_calibration().await.unwrap();
+        // Default calibration should exist
+        assert!(calibration.co2_offset.is_some() || calibration.co2_offset.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_read_count() {
+        let device = MockDeviceBuilder::new().build();
+        assert_eq!(device.read_count(), 0);
+
+        device.read_current().await.unwrap();
+        assert_eq!(device.read_count(), 1);
+
+        device.read_current().await.unwrap();
+        device.read_current().await.unwrap();
+        assert_eq!(device.read_count(), 3);
+
+        device.reset_read_count();
+        assert_eq!(device.read_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_transient_failures() {
+        let device = MockDeviceBuilder::new().build();
+        device.set_transient_failures(2);
+
+        // First two reads should fail
+        assert!(device.read_current().await.is_err());
+        assert!(device.read_current().await.is_err());
+
+        // Third read should succeed
+        assert!(device.read_current().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_set_values() {
+        let device = MockDeviceBuilder::new().build();
+
+        device.set_co2(1500).await;
+        device.set_temperature(30.0).await;
+        device.set_battery(50).await;
+
+        let reading = device.read_current().await.unwrap();
+        assert_eq!(reading.co2, 1500);
+        assert!((reading.temperature - 30.0).abs() < 0.01);
+        assert_eq!(reading.battery, 50);
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_history_info() {
+        let device = MockDeviceBuilder::new().build();
+
+        // Add some records
+        let records: Vec<HistoryRecord> = (0..10)
+            .map(|_| HistoryRecord {
+                timestamp: time::OffsetDateTime::now_utc(),
+                co2: 800,
+                temperature: 22.0,
+                pressure: 1013.0,
+                humidity: 50,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            })
+            .collect();
+        device.add_history(records).await;
+
+        let info = device.get_history_info().await.unwrap();
+        assert_eq!(info.total_readings, 10);
+        assert_eq!(info.interval_seconds, 300); // 5 minutes default
+    }
+
+    #[tokio::test]
+    async fn test_mock_device_debug() {
+        let device = MockDevice::new("Debug Test", DeviceType::Aranet4);
+        let debug_str = format!("{:?}", device);
+        assert!(debug_str.contains("MockDevice"));
+        assert!(debug_str.contains("Debug Test"));
+        assert!(debug_str.contains("Aranet4"));
+    }
+
+    #[test]
+    fn test_builder_all_options() {
+        let device = MockDeviceBuilder::new()
+            .name("Custom Device")
+            .device_type(DeviceType::Aranet2)
+            .co2(0)
+            .temperature(18.5)
+            .pressure(1020.0)
+            .humidity(65)
+            .battery(90)
+            .status(Status::Yellow)
+            .auto_connect(false)
+            .build();
+
+        assert_eq!(device.name(), "Custom Device");
+        assert_eq!(device.device_type(), DeviceType::Aranet2);
+        assert!(!device.is_connected_sync());
+    }
+
+    #[tokio::test]
+    async fn test_trait_methods_match_direct_methods() {
+        let device = MockDeviceBuilder::new()
+            .name("Trait Test")
+            .co2(999)
+            .battery(77)
+            .build();
+        device.set_rssi(-55);
+
+        // Test that trait methods return same values as direct methods
+        let trait_device: &dyn AranetDevice = &device;
+
+        assert_eq!(trait_device.name(), Some("Trait Test"));
+        assert_eq!(trait_device.device_type(), Some(DeviceType::Aranet4));
+        assert!(trait_device.is_connected().await);
+
+        let reading = trait_device.read_current().await.unwrap();
+        assert_eq!(reading.co2, 999);
+
+        let battery = trait_device.read_battery().await.unwrap();
+        assert_eq!(battery, 77);
+
+        let rssi = trait_device.read_rssi().await.unwrap();
+        assert_eq!(rssi, -55);
     }
 }

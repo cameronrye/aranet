@@ -16,9 +16,9 @@ use owo_colors::OwoColorize;
 
 use crate::cli::OutputFormat;
 use crate::format::{
-    FormatOptions, format_reading_json, format_reading_json_with_device, format_watch_csv_header,
-    format_watch_csv_header_with_device, format_watch_csv_line, format_watch_csv_line_with_device,
-    format_watch_line_with_device,
+    FormatOptions, bq_to_pci, format_reading_json, format_reading_json_with_device,
+    format_watch_csv_header, format_watch_csv_header_with_device, format_watch_csv_line,
+    format_watch_csv_line_with_device, format_watch_line_with_device,
 };
 use crate::style;
 use crate::util::{require_device_interactive, write_output};
@@ -58,28 +58,12 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
 
     let identifier = require_device_interactive(device).await?;
 
-    // Print header with device info
-    let header = if opts.no_color {
-        format!("Watching: {}", identifier)
-    } else {
-        format!("Watching: {}", identifier.cyan())
-    };
-    eprintln!("{}", header);
-    if count > 0 {
-        eprintln!(
-            "Interval: {}s | Count: {} | Press Ctrl+C to stop",
-            interval, count
-        );
-    } else {
-        eprintln!("Interval: {}s | Press Ctrl+C to stop", interval);
-    }
-    eprintln!("{}", "-".repeat(50));
-
     let mut header_written = opts.no_header;
     let mut current_device: Option<Device> = None;
     let mut readings_taken: u32 = 0;
     let mut backoff_secs = MIN_BACKOFF_SECS;
     let mut previous_reading: Option<CurrentReading> = None;
+    let mut header_printed = false;
 
     loop {
         // Check if we've reached the count limit
@@ -92,44 +76,68 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
         }
 
         // Connect if we don't have a connection
-        let device = match &current_device {
-            Some(d) if d.is_connected().await => {
-                // Reset backoff on successful connection
-                backoff_secs = MIN_BACKOFF_SECS;
-                d
-            }
-            _ => {
-                // Need to connect (or reconnect)
-                if current_device.is_some() {
-                    eprintln!("Connection lost. Reconnecting...");
-                }
-                match Device::connect_with_timeout(&identifier, timeout).await {
-                    Ok(d) => {
-                        // Reset backoff on successful connection
-                        backoff_secs = MIN_BACKOFF_SECS;
-                        current_device = Some(d);
-                        current_device.as_ref().unwrap()
-                    }
-                    Err(e) => {
-                        eprintln!("Connection failed: {}. Retrying in {}s...", e, backoff_secs);
-                        current_device = None;
-
-                        // Wait with graceful shutdown support using exponential backoff
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {
-                                eprintln!("\nShutting down...");
-                                return Ok(());
-                            }
-                            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
-                        }
-
-                        // Increase backoff for next attempt (exponential with cap)
-                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                        continue;
-                    }
-                }
-            }
+        let is_connected = match &current_device {
+            Some(d) => d.is_connected().await,
+            None => false,
         };
+
+        if !is_connected {
+            // Need to connect (or reconnect)
+            if current_device.is_some() {
+                eprintln!("Connection lost. Reconnecting...");
+            }
+            match Device::connect_with_timeout(&identifier, timeout).await {
+                Ok(d) => {
+                    // Reset backoff on successful connection
+                    backoff_secs = MIN_BACKOFF_SECS;
+                    current_device = Some(d);
+                }
+                Err(e) => {
+                    eprintln!("Connection failed: {}. Retrying in {}s...", e, backoff_secs);
+                    current_device = None;
+
+                    // Wait with graceful shutdown support using exponential backoff
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            eprintln!("\nShutting down...");
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                    }
+
+                    // Increase backoff for next attempt (exponential with cap)
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+            }
+        } else {
+            // Reset backoff on successful connection check
+            backoff_secs = MIN_BACKOFF_SECS;
+        }
+
+        // At this point we're guaranteed to have a device
+        let device = current_device.as_ref().expect("device should be connected");
+
+        // Print header with device info (after first successful connection)
+        if !header_printed {
+            let device_name = device.name().unwrap_or("Unknown");
+            let header = if opts.no_color {
+                format!("Watching: {} ({})", device_name, identifier)
+            } else {
+                format!("Watching: {} ({})", device_name.green(), identifier.cyan())
+            };
+            eprintln!("{}", header);
+            if count > 0 {
+                eprintln!(
+                    "Interval: {}s | Count: {} | Press Ctrl+C to stop",
+                    interval, count
+                );
+            } else {
+                eprintln!("Interval: {}s | Press Ctrl+C to stop", interval);
+            }
+            eprintln!("{}", "-".repeat(50));
+            header_printed = true;
+        }
 
         // Read current values
         match device.read_current().await {
@@ -354,12 +362,13 @@ fn format_watch_line_with_trend(
     let timestamp = Local::now().format("%H:%M:%S").to_string();
 
     // Get trend indicators if we have a previous reading
+    // Use "~" for first reading to indicate "no change data yet" rather than "-" which could be confused with "decreasing"
     let co2_trend = previous
         .map(|p| style::trend_indicator_int(reading.co2 as i32, p.co2 as i32, opts.no_color))
-        .unwrap_or("-");
+        .unwrap_or("~");
     let temp_trend = previous
         .map(|p| style::trend_indicator(reading.temperature, p.temperature, opts.no_color))
-        .unwrap_or("-");
+        .unwrap_or("~");
 
     // Format values with colors
     let co2_display = if reading.co2 > 0 {
@@ -375,7 +384,7 @@ fn format_watch_line_with_trend(
     let temp_display = format!(
         "{} {} {}",
         style::format_temp_colored(opts.convert_temp(reading.temperature), opts.no_color),
-        if opts.fahrenheit { "F" } else { "C" },
+        if opts.fahrenheit { "°F" } else { "°C" },
         temp_trend
     );
 
@@ -390,11 +399,15 @@ fn format_watch_line_with_trend(
             timestamp, co2_display, temp_display, humidity_display, battery_display
         )
     } else if let Some(radon) = reading.radon {
-        // AranetRn+
-        let radon_display = style::format_radon_colored(radon, opts.no_color);
+        // AranetRn+ - format radon with proper unit conversion and coloring
+        let radon_display = if opts.bq {
+            style::format_radon_colored(radon, opts.no_color)
+        } else {
+            style::format_radon_pci_colored(radon, bq_to_pci(radon), opts.no_color)
+        };
         format!(
-            "[{}] {} Bq/m3 | {} | {} | {}\n",
-            timestamp, radon_display, temp_display, humidity_display, battery_display
+            "[{}] {} {} | {} | {} | {}\n",
+            timestamp, radon_display, opts.radon_display_unit(), temp_display, humidity_display, battery_display
         )
     } else if let Some(rate) = reading.radiation_rate {
         // Aranet Radiation

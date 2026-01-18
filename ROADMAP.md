@@ -9,16 +9,16 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 ---
 
-## Current Progress (Updated Jan 17, 2026)
+## Current Progress (Updated Jan 18, 2026)
 
 | Phase | Component | Status | Progress |
 |-------|-----------|--------|----------|
-| 0 | Foundation | ✅ DONE | README, LICENSE, CI, CHANGELOG, aranet-types |
-| 1 | Core Library | ✅ DONE | Full BLE: scan, connect, read, history, settings - tested with real hardware |
-| 2 | CLI Tool | ✅ DONE | All core commands: scan, read, status, info, history, set, watch, config |
-| 3 | TUI Dashboard | 🔶 WIP | App shell + quit key; sensor integration pending |
-| 4 | GUI Application | 🔶 WIP | egui shell works; sensor integration pending |
-| 5 | WASM Module | 🔶 WIP | Basic init/log; Web Bluetooth pending |
+| 0 | Foundation | Done | README, LICENSE, CI, CHANGELOG, aranet-types |
+| 1 | Core Library | Done | Full BLE: scan, connect, read, history, settings - tested with real hardware |
+| 2 | CLI Tool | Done | All core commands: scan, read, status, info, history, set, watch, config |
+| 3 | TUI Dashboard | WIP | App shell + quit key; sensor integration pending |
+| 4 | GUI Application | WIP | egui shell works; sensor integration pending |
+| 5 | WASM Module | WIP | Basic init/log; Web Bluetooth pending |
 
 **Legend**: [ ] Not started - [~] In progress/partial - [x] Complete
 
@@ -35,6 +35,12 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 ### Recent Improvements (Jan 2026)
 
+- **Code coverage with cargo-llvm-cov**: CI now reports test coverage via Codecov
+- **Property-based testing with proptest**: Fuzz testing for all byte parsers to catch edge cases
+- **310+ tests**: Expanded from 268 to 310+ tests across the workspace
+- **Bug fix**: Fixed Aranet Radiation advertisement parser panic on malformed data (found by proptest)
+- **GUI/TUI tests**: Added component tests for aranet-gui and aranet-tui (previously 0 tests each)
+- **Enhanced MockDevice tests**: Comprehensive coverage for history, settings, calibration operations
 - **CLI Phase 2 complete**: All commands fully implemented
 - `set` command for device settings (interval, range, smart_home)
 - `watch` command for continuous monitoring with auto-reconnect
@@ -42,7 +48,7 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 - Config file support with device, format, no_color, fahrenheit, inhg options
 - Added `--json` global flag, `ARANET_DEVICE` env var, `--no-color` flag
 - Added `status` command for quick one-line output
-- Colored CO₂ status indicators (green/amber/red)
+- Colored CO2 status indicators (green/amber/red)
 - JSON and CSV output for all commands
 - `doctor` command for BLE diagnostics and troubleshooting
 - `alias` command for friendly device names
@@ -52,7 +58,7 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 - History `--since`/`--until` date filters
 - Progress bars for history download
 - `--inhg`/`--hpa` pressure unit options
-- All workspace tests passing
+- All workspace tests passing (100% pass rate)
 
 ### Next Priority
 
@@ -527,9 +533,18 @@ aranet/
 
 ### Unit Tests
 
-- **aranet-types**: Test data parsing, serialization, type conversions
-- **aranet-core**: Test with mock BLE adapter where possible
+- **aranet-types**: Test data parsing, serialization, type conversions, proptest fuzz testing
+- **aranet-core**: Test with mock BLE adapter, proptest for parsers
+- **aranet-gui**: Component tests for AppState
+- **aranet-tui**: Component tests for App key handling
 - Run with: `cargo test --workspace`
+
+### Property-Based Testing (Proptest)
+
+- Fuzz testing for all byte parsers to catch edge cases
+- Tests that parsing never panics on arbitrary input
+- Located in `proptests` modules within each crate
+- Run with: `cargo test --workspace` (included in normal test run)
 
 ### Integration Tests
 
@@ -537,11 +552,18 @@ aranet/
 - Require actual BLE hardware (marked with `#[ignore]`)
 - Run with: `cargo test -- --ignored` (when hardware available)
 
+### Code Coverage
+
+- **cargo-llvm-cov** integrated into CI workflow
+- Coverage reports uploaded to Codecov automatically
+- Run locally with: `cargo llvm-cov --workspace`
+
 ### CI Testing
 
 - GitHub Actions runs on every PR
 - Tests on: Ubuntu, macOS, Windows
 - Linting: `cargo clippy`, `cargo fmt --check`
+- Coverage: cargo-llvm-cov with Codecov upload
 - No hardware tests in CI (no BLE adapter)
 
 ### Hardware Testing Checklist

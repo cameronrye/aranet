@@ -12,8 +12,33 @@ use crate::format::{FormatOptions, format_history_csv, format_history_json, form
 use crate::style;
 use crate::util::{require_device_interactive, write_output};
 
-/// Parse a date/time string in RFC3339 or YYYY-MM-DD format.
+/// Parse a date/time string in various formats:
+/// - RFC3339: "2024-01-15T10:30:00Z"
+/// - YYYY-MM-DD: "2024-01-15"
+/// - Relative: "today", "yesterday", "7d", "24h", "1w"
 fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
+    let s_lower = s.to_lowercase();
+    let now = OffsetDateTime::now_utc();
+
+    // Handle relative date keywords
+    match s_lower.as_str() {
+        "now" => return Ok(now),
+        "today" => {
+            let today = now.date();
+            return Ok(today.with_hms(0, 0, 0).expect("valid time").assume_utc());
+        }
+        "yesterday" => {
+            let yesterday = now.date() - time::Duration::days(1);
+            return Ok(yesterday.with_hms(0, 0, 0).expect("valid time").assume_utc());
+        }
+        _ => {}
+    }
+
+    // Handle relative duration patterns: "7d", "24h", "1w", "30m"
+    if let Some(duration) = parse_relative_duration(&s_lower) {
+        return Ok(now - duration);
+    }
+
     // Try RFC3339 first (e.g., "2024-01-15T10:30:00Z")
     if let Ok(dt) = OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339) {
         return Ok(dt);
@@ -27,9 +52,38 @@ fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
     }
 
     bail!(
-        "Invalid date format '{}'. Use RFC3339 (e.g., 2024-01-15T10:30:00Z) or YYYY-MM-DD",
+        "Invalid date format '{}'. Use RFC3339 (2024-01-15T10:30:00Z), YYYY-MM-DD, \
+         or relative (today, yesterday, 7d, 24h, 1w)",
         s
     )
+}
+
+/// Parse relative duration strings like "7d", "24h", "1w", "30m"
+fn parse_relative_duration(s: &str) -> Option<time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Find where the number ends and the unit begins
+    let (num_str, unit) = s.split_at(
+        s.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count(),
+    );
+
+    let num: i64 = num_str.parse().ok()?;
+    if num <= 0 {
+        return None;
+    }
+
+    match unit.trim() {
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(time::Duration::minutes(num)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(time::Duration::hours(num)),
+        "d" | "day" | "days" => Some(time::Duration::days(num)),
+        "w" | "wk" | "wks" | "week" | "weeks" => Some(time::Duration::weeks(num)),
+        _ => None,
+    }
 }
 
 /// Arguments for the history command.

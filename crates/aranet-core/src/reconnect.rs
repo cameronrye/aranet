@@ -229,8 +229,13 @@ impl ReconnectingDevice {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Reset the cancellation flag (call before starting a new reconnection).
-    fn reset_cancellation(&self) {
+    /// Reset the cancellation flag.
+    ///
+    /// Call this before starting a new reconnection attempt if you want to clear
+    /// a previous cancellation. The `reconnect()` method will check if cancelled
+    /// at the start of each iteration, so this allows re-using a previously
+    /// cancelled `ReconnectingDevice`.
+    pub fn reset_cancellation(&self) {
         self.cancelled.store(false, Ordering::SeqCst);
     }
 
@@ -349,9 +354,17 @@ impl ReconnectingDevice {
     ///
     /// This loop can be cancelled by calling `cancel_reconnect()` from another task.
     /// When cancelled, returns `Error::Cancelled`.
+    ///
+    /// Note: If `cancel_reconnect()` was called before this method, reconnection
+    /// will still proceed. Call `reset_cancellation()` explicitly if you want to
+    /// clear a previous cancellation before starting a new reconnection attempt.
     pub async fn reconnect(&self) -> Result<()> {
-        // Reset cancellation flag at the start
-        self.reset_cancellation();
+        // Only reset if not already cancelled - this prevents a race condition
+        // where cancel_reconnect() is called just before reconnect() starts
+        // and would be immediately cleared.
+        if !self.is_cancelled() {
+            self.reset_cancellation();
+        }
 
         *self.state.write().await = ConnectionState::Reconnecting;
         *self.attempt_count.write().await = 0;

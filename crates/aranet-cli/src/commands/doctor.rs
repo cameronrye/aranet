@@ -57,7 +57,7 @@ pub async fn cmd_doctor(verbose: bool, no_color: bool) -> Result<()> {
     println!();
 
     let mut checks: Vec<Check> = Vec::new();
-    let total_checks = 2;
+    let total_checks = 4;
 
     // Check 1: Bluetooth adapter availability
     print_check_start(1, total_checks, "Bluetooth Adapter", no_color);
@@ -66,13 +66,25 @@ pub async fn cmd_doctor(verbose: bool, no_color: bool) -> Result<()> {
     let adapter_ok = adapter_check.passed;
     checks.push(adapter_check);
 
-    // Check 2: Scan for devices (only if adapter is available)
+    // Check 2: Bluetooth permissions (platform-specific)
+    print_check_start(2, total_checks, "Bluetooth Permissions", no_color);
+    let permission_check = check_permissions().await;
+    print_check_result(&permission_check, no_color);
+    checks.push(permission_check);
+
+    // Check 3: Scan for devices (only if adapter is available)
     if adapter_ok {
-        print_check_start(2, total_checks, "Device Scan", no_color);
+        print_check_start(3, total_checks, "Device Scan", no_color);
         let scan_check = check_scan().await;
         print_check_result(&scan_check, no_color);
         checks.push(scan_check);
     }
+
+    // Check 4: Config file validity
+    print_check_start(4, total_checks, "Configuration", no_color);
+    let config_check = check_config();
+    print_check_result(&config_check, no_color);
+    checks.push(config_check);
 
     println!();
     println!("{}", "─".repeat(50));
@@ -181,6 +193,76 @@ async fn check_scan() -> Check {
         }
         Err(e) => Check::fail("BLE Scanning", format!("Failed ({})", e)),
     }
+}
+
+async fn check_permissions() -> Check {
+    // Platform-specific permission checks
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, we can check if we got an adapter - if we did, permissions are likely OK
+        // There's no direct API to check Bluetooth permissions, but a successful adapter
+        // access implies permissions are granted
+        match scan::get_adapter().await {
+            Ok(_) => Check::pass("Bluetooth Permissions", "Bluetooth access granted"),
+            Err(_) => Check::warn(
+                "Bluetooth Permissions",
+                "May need to grant Bluetooth permission in System Settings",
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, check if user is in bluetooth group
+        if let Ok(output) = std::process::Command::new("groups").output() {
+            let groups = String::from_utf8_lossy(&output.stdout);
+            if groups.contains("bluetooth") {
+                Check::pass("Bluetooth Permissions", "User is in bluetooth group")
+            } else {
+                Check::warn(
+                    "Bluetooth Permissions",
+                    "User not in bluetooth group (may need: sudo usermod -aG bluetooth $USER)",
+                )
+            }
+        } else {
+            Check::warn("Bluetooth Permissions", "Could not check group membership")
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, Bluetooth permissions are typically granted by default
+        Check::pass("Bluetooth Permissions", "Windows grants Bluetooth access by default")
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Check::warn("Bluetooth Permissions", "Unknown platform - cannot check permissions")
+    }
+}
+
+fn check_config() -> Check {
+    use crate::config::Config;
+
+    // Config::load() returns Self directly (defaults if file not found)
+    let config = Config::load();
+    let alias_count = config.aliases.len();
+    let default_device = config.device.is_some();
+    let config_path = Config::path();
+    let config_exists = config_path.exists();
+
+    let msg = if config_exists {
+        format!(
+            "Valid ({} alias{}, default device: {})",
+            alias_count,
+            if alias_count == 1 { "" } else { "es" },
+            if default_device { "set" } else { "not set" }
+        )
+    } else {
+        "No config file (using defaults)".to_string()
+    };
+
+    Check::pass("Configuration", msg)
 }
 
 fn print_troubleshooting_help(verbose: bool, no_color: bool) {

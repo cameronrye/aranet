@@ -250,6 +250,10 @@ pub enum Commands {
         #[command(flatten)]
         device: DeviceArgs,
 
+        /// Skip confirmation prompt
+        #[arg(long, short = 'f')]
+        force: bool,
+
         #[command(subcommand)]
         setting: DeviceSetting,
     },

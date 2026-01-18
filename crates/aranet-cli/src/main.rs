@@ -222,10 +222,10 @@ async fn main() -> Result<()> {
                 .with_compact(compact);
             cmd_info(dev, timeout, format, output, quiet, &opts).await?;
         }
-        Commands::Set { device, setting } => {
+        Commands::Set { device, setting, force } => {
             let dev = resolve_device_with_hint(device.device, &config, quiet);
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
-            cmd_set(dev, timeout, setting, quiet).await?;
+            cmd_set(dev, timeout, setting, quiet, force).await?;
         }
         Commands::Watch {
             device,

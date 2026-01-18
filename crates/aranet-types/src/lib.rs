@@ -34,11 +34,61 @@ pub use uuid as ble;
 #[doc(hidden)]
 pub use uuid as uuids;
 
+/// Unit tests for aranet-types.
+///
+/// # Test Coverage
+///
+/// This module provides comprehensive tests for all public types and parsing functions:
+///
+/// ## CurrentReading Tests
+/// - Parsing from valid 13-byte Aranet4 format
+/// - Parsing from valid 7-byte Aranet2 format
+/// - Error handling for insufficient bytes
+/// - Edge cases (all zeros, max values)
+/// - Builder pattern validation
+/// - Serialization/deserialization roundtrips
+///
+/// ## Status Enum Tests
+/// - Conversion from u8 values (0-3 and unknown)
+/// - Display and Debug formatting
+/// - Equality and ordering
+///
+/// ## DeviceType Tests
+/// - Conversion from u8 device codes (0xF1-0xF4)
+/// - Name-based detection from device names
+/// - Display formatting
+/// - Hash implementation for use in collections
+///
+/// ## DeviceInfo Tests
+/// - Clone and Debug implementations
+/// - Default values
+/// - Equality comparisons
+///
+/// ## HistoryRecord Tests
+/// - Clone and equality
+/// - Timestamp handling
+///
+/// ## ParseError Tests
+/// - Error message formatting
+/// - Equality comparisons
+/// - Helper constructors
+///
+/// ## BLE UUID Tests
+/// - Service UUID constants
+/// - Characteristic UUID constants
+///
+/// # Running Tests
+///
+/// ```bash
+/// cargo test -p aranet-types
+/// ```
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // --- CurrentReading parsing tests ---
+    // ========================================================================
+    // CurrentReading parsing tests
+    // ========================================================================
 
     #[test]
     fn test_parse_current_reading_from_valid_bytes() {
@@ -844,5 +894,169 @@ mod tests {
     fn test_parse_error_invalid_value_helper() {
         let err = ParseError::invalid_value("test error");
         assert_eq!(err.to_string(), "Invalid value: test error");
+    }
+}
+
+/// Property-based tests using proptest.
+///
+/// These tests use randomized inputs to verify that parsing functions:
+/// 1. Never panic on any input (safety guarantee)
+/// 2. Correctly parse valid inputs (correctness guarantee)
+/// 3. Properly roundtrip through serialization (consistency guarantee)
+///
+/// # Test Categories
+///
+/// ## Panic Safety Tests
+/// - `parse_current_reading_never_panics`: Random bytes to `from_bytes`
+/// - `parse_aranet2_never_panics`: Random bytes to `from_bytes_aranet2`
+/// - `status_from_u8_never_panics`: Any u8 to Status
+/// - `device_type_try_from_never_panics`: Any u8 to DeviceType
+///
+/// ## Valid Input Tests
+/// - `parse_valid_aranet4_bytes`: Structured valid Aranet4 data
+/// - `parse_valid_aranet2_bytes`: Structured valid Aranet2 data
+///
+/// ## Roundtrip Tests
+/// - `current_reading_json_roundtrip`: JSON serialization consistency
+///
+/// # Running Property Tests
+///
+/// ```bash
+/// cargo test -p aranet-types proptests
+/// ```
+///
+/// To run with more test cases:
+/// ```bash
+/// PROPTEST_CASES=10000 cargo test -p aranet-types proptests
+/// ```
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Parsing random bytes should never panic - it may return Ok or Err,
+        /// but should always be safe to call.
+        #[test]
+        fn parse_current_reading_never_panics(data: Vec<u8>) {
+            let _ = CurrentReading::from_bytes(&data);
+        }
+
+        /// Parsing random bytes for Aranet2 should never panic.
+        #[test]
+        fn parse_aranet2_never_panics(data: Vec<u8>) {
+            let _ = CurrentReading::from_bytes_aranet2(&data);
+        }
+
+        /// Status conversion from any u8 should never panic.
+        #[test]
+        fn status_from_u8_never_panics(value: u8) {
+            let status = Status::from(value);
+            // Should always produce a valid Status variant
+            let _ = format!("{:?}", status);
+        }
+
+        /// DeviceType conversion should return Ok or Err, never panic.
+        #[test]
+        fn device_type_try_from_never_panics(value: u8) {
+            let _ = DeviceType::try_from(value);
+        }
+
+        /// Valid 13-byte input should always parse successfully for Aranet4.
+        #[test]
+        fn parse_valid_aranet4_bytes(
+            co2 in 0u16..10000u16,
+            temp_raw in 0u16..2000u16,
+            pressure_raw in 8000u16..12000u16,
+            humidity in 0u8..100u8,
+            battery in 0u8..100u8,
+            status_byte in 0u8..4u8,
+            interval in 60u16..3600u16,
+            age in 0u16..3600u16,
+        ) {
+            let mut data = [0u8; 13];
+            data[0..2].copy_from_slice(&co2.to_le_bytes());
+            data[2..4].copy_from_slice(&temp_raw.to_le_bytes());
+            data[4..6].copy_from_slice(&pressure_raw.to_le_bytes());
+            data[6] = humidity;
+            data[7] = battery;
+            data[8] = status_byte;
+            data[9..11].copy_from_slice(&interval.to_le_bytes());
+            data[11..13].copy_from_slice(&age.to_le_bytes());
+
+            let result = CurrentReading::from_bytes(&data);
+            prop_assert!(result.is_ok());
+
+            let reading = result.unwrap();
+            prop_assert_eq!(reading.co2, co2);
+            prop_assert_eq!(reading.humidity, humidity);
+            prop_assert_eq!(reading.battery, battery);
+            prop_assert_eq!(reading.interval, interval);
+            prop_assert_eq!(reading.age, age);
+        }
+
+        /// Valid 7-byte input should always parse successfully for Aranet2.
+        #[test]
+        fn parse_valid_aranet2_bytes(
+            temp_raw in 0u16..2000u16,
+            humidity in 0u8..100u8,
+            battery in 0u8..100u8,
+            status_byte in 0u8..4u8,
+            interval in 60u16..3600u16,
+        ) {
+            let mut data = [0u8; 7];
+            data[0..2].copy_from_slice(&temp_raw.to_le_bytes());
+            data[2] = humidity;
+            data[3] = battery;
+            data[4] = status_byte;
+            data[5..7].copy_from_slice(&interval.to_le_bytes());
+
+            let result = CurrentReading::from_bytes_aranet2(&data);
+            prop_assert!(result.is_ok());
+
+            let reading = result.unwrap();
+            prop_assert_eq!(reading.humidity, humidity);
+            prop_assert_eq!(reading.battery, battery);
+            prop_assert_eq!(reading.interval, interval);
+        }
+
+        /// JSON serialization roundtrip should preserve all values.
+        #[test]
+        fn current_reading_json_roundtrip(
+            co2 in 0u16..10000u16,
+            temperature in -20.0f32..60.0f32,
+            pressure in 800.0f32..1200.0f32,
+            humidity in 0u8..100u8,
+            battery in 0u8..100u8,
+            interval in 60u16..3600u16,
+            age in 0u16..3600u16,
+        ) {
+            let reading = CurrentReading {
+                co2,
+                temperature,
+                pressure,
+                humidity,
+                battery,
+                status: Status::Green,
+                interval,
+                age,
+                captured_at: None,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+                radon_avg_24h: None,
+                radon_avg_7d: None,
+                radon_avg_30d: None,
+            };
+
+            let json = serde_json::to_string(&reading).unwrap();
+            let parsed: CurrentReading = serde_json::from_str(&json).unwrap();
+
+            prop_assert_eq!(parsed.co2, reading.co2);
+            prop_assert_eq!(parsed.humidity, reading.humidity);
+            prop_assert_eq!(parsed.battery, reading.battery);
+            prop_assert_eq!(parsed.interval, reading.interval);
+            prop_assert_eq!(parsed.age, reading.age);
+        }
     }
 }

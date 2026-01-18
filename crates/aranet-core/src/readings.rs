@@ -843,3 +843,131 @@ mod tests {
         assert_eq!(result.reading.status, Status::Yellow);
     }
 }
+
+/// Property-based tests for BLE reading parsers.
+///
+/// These tests verify that all parsing functions are safe to call with any input,
+/// ensuring they never panic regardless of the byte sequence provided.
+///
+/// # Test Categories
+///
+/// ## Panic Safety Tests
+/// Each device type parser is tested with random byte sequences:
+/// - `parse_aranet4_never_panics`: Aranet4 CO2 sensor format
+/// - `parse_aranet2_never_panics`: Aranet2 temperature/humidity format
+/// - `parse_aranet_radon_never_panics`: Aranet Radon sensor format
+/// - `parse_aranet_radon_gatt_never_panics`: Aranet Radon GATT format
+/// - `parse_aranet_radiation_gatt_never_panics`: Aranet Radiation format
+/// - `parse_reading_for_device_never_panics`: Generic dispatcher
+///
+/// ## Valid Input Tests
+/// - `aranet4_valid_bytes_parse_correctly`: Structured Aranet4 data
+/// - `aranet2_valid_bytes_parse_correctly`: Structured Aranet2 data
+///
+/// # Running Tests
+///
+/// ```bash
+/// cargo test -p aranet-core proptests
+/// ```
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Parsing random bytes should never panic for any device type.
+        #[test]
+        fn parse_aranet4_never_panics(data: Vec<u8>) {
+            let _ = parse_aranet4_reading(&data);
+        }
+
+        #[test]
+        fn parse_aranet2_never_panics(data: Vec<u8>) {
+            let _ = parse_aranet2_reading(&data);
+        }
+
+        #[test]
+        fn parse_aranet_radon_never_panics(data: Vec<u8>) {
+            let _ = parse_aranet_radon_reading(&data);
+        }
+
+        #[test]
+        fn parse_aranet_radon_gatt_never_panics(data: Vec<u8>) {
+            let _ = parse_aranet_radon_gatt(&data);
+        }
+
+        #[test]
+        fn parse_aranet_radiation_gatt_never_panics(data: Vec<u8>) {
+            let _ = parse_aranet_radiation_gatt(&data);
+        }
+
+        /// parse_reading_for_device should never panic regardless of input.
+        #[test]
+        fn parse_reading_for_device_never_panics(
+            data: Vec<u8>,
+            device_type_byte in 0xF1u8..=0xF4u8,
+        ) {
+            if let Ok(device_type) = DeviceType::try_from(device_type_byte) {
+                let _ = parse_reading_for_device(&data, device_type);
+            }
+        }
+
+        /// Valid Aranet4 readings should round-trip correctly.
+        #[test]
+        fn aranet4_valid_bytes_parse_correctly(
+            co2 in 0u16..10000u16,
+            temp_raw in 0u16..2000u16,
+            pressure_raw in 8000u16..12000u16,
+            humidity in 0u8..100u8,
+            battery in 0u8..100u8,
+            status_byte in 0u8..4u8,
+            interval in 60u16..3600u16,
+            age in 0u16..3600u16,
+        ) {
+            let mut data = [0u8; 13];
+            data[0..2].copy_from_slice(&co2.to_le_bytes());
+            data[2..4].copy_from_slice(&temp_raw.to_le_bytes());
+            data[4..6].copy_from_slice(&pressure_raw.to_le_bytes());
+            data[6] = humidity;
+            data[7] = battery;
+            data[8] = status_byte;
+            data[9..11].copy_from_slice(&interval.to_le_bytes());
+            data[11..13].copy_from_slice(&age.to_le_bytes());
+
+            let result = parse_aranet4_reading(&data);
+            prop_assert!(result.is_ok());
+
+            let reading = result.unwrap();
+            prop_assert_eq!(reading.co2, co2);
+            prop_assert_eq!(reading.humidity, humidity);
+            prop_assert_eq!(reading.battery, battery);
+            prop_assert_eq!(reading.interval, interval);
+            prop_assert_eq!(reading.age, age);
+        }
+
+        /// Valid Aranet2 readings should parse correctly.
+        #[test]
+        fn aranet2_valid_bytes_parse_correctly(
+            temp_raw in 0u16..2000u16,
+            humidity in 0u8..100u8,
+            battery in 0u8..100u8,
+            status_byte in 0u8..4u8,
+            interval in 60u16..3600u16,
+        ) {
+            let mut data = [0u8; 7];
+            data[0..2].copy_from_slice(&temp_raw.to_le_bytes());
+            data[2] = humidity;
+            data[3] = battery;
+            data[4] = status_byte;
+            data[5..7].copy_from_slice(&interval.to_le_bytes());
+
+            let result = parse_aranet2_reading(&data);
+            prop_assert!(result.is_ok());
+
+            let reading = result.unwrap();
+            prop_assert_eq!(reading.co2, 0); // Aranet2 has no CO2
+            prop_assert_eq!(reading.humidity, humidity);
+            prop_assert_eq!(reading.battery, battery);
+        }
+    }
+}

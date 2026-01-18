@@ -80,8 +80,8 @@ fn format_status_text(
         let radon_display = style::format_radon_colored(radon, opts.no_color);
         let humidity_display = style::format_humidity_colored(reading.humidity, opts.no_color);
         format!(
-            "{}: {} Bq/m3 {} {} {} {:.1}hPa\n",
-            name_display, radon_display, status_str, temp, humidity_display, reading.pressure
+            "{}: {} {} {} {} {} {:.1}hPa\n",
+            name_display, radon_display, opts.radon_display_unit(), status_str, temp, humidity_display, reading.pressure
         )
     } else if let Some(rate) = reading.radiation_rate {
         // Aranet Radiation
@@ -103,7 +103,7 @@ fn format_status_brief(reading: &aranet_types::CurrentReading, opts: &FormatOpti
         if opts.bq {
             format!("{}\n", radon)
         } else {
-            format!("{:.2}\n", radon as f32 / 37.0)
+            format!("{:.2}\n", bq_to_pci(radon))
         }
     } else if let Some(rate) = reading.radiation_rate {
         // Aranet Radiation: just rate
