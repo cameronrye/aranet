@@ -24,13 +24,13 @@ impl Store {
         let path = path.as_ref();
 
         // Create parent directories if needed
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| Error::CreateDirectory {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| Error::CreateDirectory {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
 
         info!("Opening database at {}", path.display());
