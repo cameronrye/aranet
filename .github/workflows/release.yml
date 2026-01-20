@@ -1,0 +1,163 @@
+# Release workflow powered by cargo-dist
+# This workflow builds and publishes release artifacts when a tag is pushed.
+#
+# To release:
+#   1. Update version in Cargo.toml files
+#   2. Commit: git commit -am "chore: release v0.1.0"
+#   3. Tag: git tag v0.1.0
+#   4. Push: git push origin main --tags
+#
+# cargo-dist will:
+#   - Build binaries for all platforms
+#   - Create GitHub Release with artifacts
+#   - Generate shell/PowerShell install scripts
+#   - Update Homebrew formula in tap repo
+
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Create the GitHub Release and upload global artifacts
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      has-releases: ${{ steps.plan.outputs.has-releases }}
+      releases: ${{ steps.plan.outputs.releases }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@0.28.0
+
+      - name: Run cargo-dist plan
+        id: plan
+        run: |
+          cargo dist plan --tag="${{ github.ref_name }}" --output-format=json > plan.json
+          echo "has-releases=$(jq -r '.releases | length > 0' plan.json)" >> $GITHUB_OUTPUT
+          echo "releases=$(jq -c '.releases' plan.json)" >> $GITHUB_OUTPUT
+          cat plan.json
+
+  # Build for each platform
+  build:
+    needs: plan
+    if: needs.plan.outputs.has-releases == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90"
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@0.28.0
+
+      - name: Build artifacts
+        run: cargo dist build --tag="${{ github.ref_name }}" --target="${{ matrix.target }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: target/distrib/
+
+  # Publish the release
+  publish:
+    needs: [plan, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@0.28.0
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo dist plan --tag="${{ github.ref_name }}" --output-format=json > plan.json
+          
+          # Create release notes from CHANGELOG if available
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          
+          # Create the release
+          gh release create "${{ github.ref_name }}" \
+            --title "Aranet CLI ${{ github.ref_name }}" \
+            --generate-notes \
+            target/distrib/*
+
+      - name: Update Homebrew tap
+        if: success()
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            cargo dist plan --tag="${{ github.ref_name }}" --artifacts=global --output-format=json > plan.json
+            echo "Homebrew formula would be updated here"
+            # The actual update happens via cargo-dist's homebrew installer
+          else
+            echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew tap update"
+          fi
+

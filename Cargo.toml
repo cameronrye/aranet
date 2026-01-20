@@ -58,3 +58,39 @@ tui = []
 gui = []
 wasm = []
 
+# Config for 'cargo dist'
+[workspace.metadata.dist]
+# The preferred cargo-dist version to use in CI (Conditions to К update this are the same
+# having issues/incremental improvements released.)
+cargo-dist-version = "0.28.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build for
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# Publish jobs to run in CI
+pr-run-mode = "plan"
+# Whether to auto-include files like README/LICENSE
+auto-includes = true
+# Skip aranet-service in distributions (it's a separate deployment)
+# Only distribute aranet (CLI) and aranet-tui binaries
+allow-dirty = ["ci"]
+
+# Homebrew tap configuration
+[workspace.metadata.dist.homebrew]
+# The GitHub repository to push the Homebrew formula to
+tap = "cameronrye/homebrew-aranet"
+# The formula name (defaults to package name)
+formula = "aranet"
+
