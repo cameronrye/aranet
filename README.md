@@ -197,3 +197,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 Made with ❤️ by [Cameron Rye](https://rye.dev/)
+
+<sub>This project is not affiliated with, endorsed by, or sponsored by Aranet or SAF Tehnika JSC. Aranet is a trademark of SAF Tehnika JSC.</sub>
