@@ -9,17 +9,17 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 ---
 
-## Current Progress (Updated Jan 18, 2026)
+## Current Progress (Updated Jan 19, 2026)
 
 | Phase | Component | Status | Progress |
 |-------|-----------|--------|----------|
 | 0 | Foundation | Done | README, LICENSE, CI, CHANGELOG, aranet-types |
 | 1 | Core Library | Done | Full BLE: scan, connect, read, history, settings - tested with real hardware |
 | 2 | CLI Tool | Done | All core commands: scan, read, status, info, history, set, watch, config |
-| 3 | TUI Dashboard | WIP | App shell + quit key; sensor integration pending |
+| 3 | TUI Dashboard | Done | Full dashboard with tabs, sparklines, help overlay, multi-device support |
 | 4 | GUI Application | WIP | egui shell works; sensor integration pending |
 | 5 | WASM Module | WIP | Basic init/log; Web Bluetooth pending |
-| 6 | Data Persistence & API | WIP | aranet-store complete; aranet-service pending |
+| 6 | Data Persistence & API | Done | aranet-store complete; aranet-service complete |
 
 **Legend**: [ ] Not started - [~] In progress/partial - [x] Complete
 
@@ -63,11 +63,12 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 ### Next Priority
 
-1. Add sensor data display to TUI shell
-2. Add sensor data display to GUI shell
-3. Implement Web Bluetooth in WASM module
-4. ~~**Data persistence layer (aranet-store)**~~ - Complete (v0.1.7)
-5. **Background service (aranet-service)** - Data collector + REST API
+1. ~~Add sensor data display to TUI shell~~ - Complete (v0.3.0)
+2. ~~**TUI Polish**: Auto-refresh, trend indicators, scrollable history, settings editing~~ - Complete (v0.1.8)
+3. Add sensor data display to GUI shell
+4. Implement Web Bluetooth in WASM module
+5. ~~**Data persistence layer (aranet-store)**~~ - Complete (v0.1.7)
+6. ~~**Background service (aranet-service)**~~ - Complete (v0.1.8)
 
 ## Vision
 
@@ -285,14 +286,98 @@ Manufacturer ID: 0x0702 (SAF Tehnika)
 
 | Feature | Priority | Status |
 |---------|----------|--------|
-| Basic TUI framework | P0 | [x] App shell complete |
-| Live sensor readings display | P0 | [ ] |
-| Multi-device dashboard | P0 | [ ] |
-| Historical chart (sparklines) | P1 | [ ] |
-| CO2 status color coding (green/amber/red) | P1 | [ ] |
-| Keyboard navigation | P1 | [~] Quit key works |
-| Alert thresholds | P2 | [ ] |
-| Data logging to file | P2 | [ ] |
+| Basic TUI framework | P0 | [x] App shell, event loop, terminal setup |
+| Live sensor readings display | P0 | [x] Dashboard panel with color-coded readings |
+| Multi-device dashboard | P0 | [x] Device list sidebar with connection status |
+| Historical chart (sparklines) | P1 | [x] Sparklines in dashboard and history tab |
+| CO2 status color coding (green/amber/red) | P1 | [x] Full color coding for CO2, radon, battery |
+| Keyboard navigation | P1 | [x] Full keybindings: q/s/r/c/d/y/↑↓/Tab/? |
+| Tab system (Dashboard/History/Settings) | P1 | [x] Three tabs with dedicated content |
+| Help overlay | P1 | [x] Press ? for keyboard shortcuts |
+| Background worker | P0 | [x] Async BLE operations with channels |
+| RefreshAll command | P1 | [x] Refresh readings from all devices |
+| Disconnect command | P1 | [x] Disconnect from device |
+| Alert thresholds | P2 | [x] CO2 threshold alerts with visual banner |
+| Data logging to file | P2 | [x] CSV logging with L key toggle, REC indicator |
+
+### TUI Enhancement Roadmap
+
+The current TUI is functional but basic. Below are planned enhancements organized by priority:
+
+#### Visual & Layout Improvements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Header bar with app title | P2 | [x] | Show "Aranet Monitor v0.3.0" with connected device count |
+| Wider device list option | P2 | [x] | Toggle width with ']' key (28/40 chars) |
+| Trend indicators | P1 | [x] | Show ↑↓→ arrows next to readings based on recent history |
+| Reading cards with borders | P2 | [x] | Grid of bordered cards for CO2/Temp/Humidity/etc |
+| Better sparkline labels | P2 | [x] | Min/max on Y-axis, timestamps on X-axis |
+| Responsive layout | P2 | [x] | Auto-hide sidebar on narrow (<80 cols), toggle with '[' |
+| Theme support | P3 | [x] | Light/dark theme with 't' key (☀/☽ indicator) |
+
+#### Data Display Enhancements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Min/Max/Avg stats | P1 | [x] | Show session statistics (min, max, avg CO2) in readings panel |
+| Radon 1-day/7-day averages | P1 | [x] | Display 24h and 7d radon averages for radon devices |
+| RSSI signal strength | P2 | [x] | Show BLE signal strength bars for connected devices |
+| Device uptime | P3 | [x] | Show uptime in device list and settings |
+| Last sync timestamp | P2 | [x] | Show when history was last synced in History tab |
+| Reading age warning | P1 | [x] | Highlight if reading is stale (> 2x interval) |
+
+#### History Tab Improvements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Scrollable history list | P1 | [x] | Scroll through all history records with PgUp/PgDn |
+| Time range filter | P1 | [x] | Filter by 0=all, 1=today, 2=24h, 3=7d, 4=30d |
+| Export from TUI | P2 | [x] | Export visible history to CSV with 'e' key |
+| Larger chart view | P2 | [x] | Full-screen sparkline with 'g' key |
+| Multiple metrics chart | P2 | [x] | Stacked temp/humidity with T/H keys |
+
+#### Settings Tab Improvements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Edit measurement interval | P1 | [x] | Change device interval with Enter key (1, 2, 5, 10 min) |
+| Edit Bluetooth range | P2 | [x] | Toggle standard/extended with 'B' key |
+| Device alias/rename | P2 | [x] | Set friendly name with 'n' key |
+| Alert threshold config | P1 | [x] | Customize CO2/radon alert thresholds with +/- keys |
+| Toggle Smart Home mode | P3 | [x] | Toggle with 'I' key, 🏠 indicator in header |
+
+#### UX Improvements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Auto-refresh readings | P0 | [x] | Automatically poll connected devices on interval |
+| Loading spinners | P1 | [x] | Show spinners during connect/sync operations |
+| Status message queue | P2 | [x] | Queue multiple messages, auto-dismiss after 5s timeout |
+| Confirmation dialogs | P2 | [x] | Confirm before disconnect with Y/N prompt |
+| Mouse support | P2 | [x] | Click to select device, tabs, buttons |
+| Shift+Tab for prev tab | P1 | [x] | Backward tab navigation (currently only forward) |
+| Battery low warning | P1 | [x] | Alert when battery drops below 20% |
+| Error details popup | P2 | [x] | Full error with 'E' key, ❌ indicator in status bar |
+
+#### Multi-Device Features
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Device filter by type | P2 | [x] | Filter by Aranet4/Radon/Radiation/Connected with 'f' key |
+| Device filter by status | P2 | [x] | Included in device filter (Connected filter option) |
+| Comparison view | P2 | [x] | Side-by-side readings with 'v' key, '</>' to cycle |
+| Connect all | P2 | [x] | Connect to all known devices with 'C' (Shift+c) |
+| Broadcast refresh | P1 | [x] | Refresh all connected devices (implemented) |
+
+#### Notifications & Alerts
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Terminal bell on alert | P2 | [x] | Beep when CO2/radon exceeds threshold ('b' to toggle) |
+| Alert history log | P2 | [x] | View past alerts with timestamps using 'a' key |
+| Sticky alerts | P2 | [x] | Toggle with 'A' key, shows [STICKY] in header |
+| Alert severity levels | P2 | [x] | Info (blue ℹ), Warning (yellow ⚠), Critical (red 🚨) |
 
 ### TUI Dependencies (use latest versions)
 
@@ -429,14 +514,14 @@ This phase adds two new crates for data persistence, caching, and external integ
 
 | Feature | Priority | Status |
 |---------|----------|--------|
-| REST API endpoints | P0 | [ ] |
-| Background device polling | P0 | [ ] |
-| Configurable poll intervals per device | P0 | [ ] |
-| WebSocket real-time updates | P1 | [ ] |
-| Health check endpoint | P1 | [ ] |
-| Foreground server mode | P0 | [ ] |
-| Daemon mode (background service) | P1 | [ ] |
-| systemd/launchd service files | P2 | [ ] |
+| REST API endpoints | P0 | [x] |
+| Background device polling | P0 | [x] |
+| Configurable poll intervals per device | P0 | [x] |
+| WebSocket real-time updates | P1 | [x] |
+| Health check endpoint | P1 | [x] |
+| Foreground server mode | P0 | [x] |
+| Daemon mode (background service) | P1 | [x] |
+| systemd/launchd service files | P2 | [x] |
 
 ### REST API Endpoints
 
@@ -744,7 +829,8 @@ aranet/
 | 0 | Foundation | Done | README, LICENSE, CI, examples |
 | 1 | Core Library | Done | btleplug, tokio, thiserror |
 | 2 | CLI Tool | Done | Phase 1 + clap, serde |
-| 3 | TUI Dashboard | 1-2 weeks | Phase 1 + ratatui, crossterm |
+| 3 | TUI Dashboard (basic) | Done | Phase 1 + ratatui, crossterm |
+| 3+ | TUI Polish & Features | 1-2 weeks | Auto-refresh, settings, history scrolling |
 | 4 | GUI App | 2-3 weeks | Phase 1 + egui/iced |
 | 5 | WASM Web | 2-3 weeks | aranet-types + wasm-bindgen |
 | 6 | Data Persistence & API | 1-2 weeks | Phase 1 + rusqlite, axum |
@@ -887,3 +973,7 @@ rust-version = "1.90"  # Updated Jan 2026
 ## License
 
 MIT (matching Aranet4-Python)
+
+---
+
+Made with ❤️ by [Cameron Rye](https://rye.dev/)

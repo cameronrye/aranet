@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced unmaintained `atty` crate with `std::io::IsTerminal` (resolves RUSTSEC-2024-0375)
+- Updated `rusqlite` from 0.33 to 0.35
+- Updated multiple dependencies to latest versions
+- Marked `aranet-gui` and `aranet-wasm` as `publish = false` (not ready for release)
+
+### Added
+
+- CONTRIBUTING.md with contribution guidelines
+- SECURITY.md with vulnerability reporting process
+- GitHub issue templates for bug reports and feature requests
+- Pull request template
+
+## [0.1.8] - 2026-01-19
+
+### Added
+
+- **TUI Dashboard Enhancements** - Complete overhaul with 44 new features
+  - **Navigation**: Tab/Shift+Tab for tabs, j/k/arrows for devices, vim-style keybindings
+  - **Auto-refresh**: Readings update automatically based on device interval
+  - **Trend indicators**: Up/down/stable arrows next to readings
+  - **Statistics**: Min/Max/Avg CO2 stats, radon 1-day/7-day averages
+  - **Alerts**: CO2/radon threshold alerts with Info/Warning/Critical severity levels
+  - **Alert history**: View past alerts with 'a' key, sticky alerts with 'A'
+  - **Terminal bell**: Audio alert on threshold breach (toggle with 'b')
+  - **Sparkline charts**: CO2/radon history with min/max labels and time axis
+  - **Full-screen chart**: Press 'g' for expanded chart view
+  - **Multiple metrics**: Stack temperature/humidity on chart with T/H keys
+  - **Time range filter**: 0=all, 1=today, 2=24h, 3=7d, 4=30d
+  - **Scrollable history**: PgUp/PgDn to scroll through records
+  - **Export history**: Press 'e' to export visible history to CSV
+  - **Device filter**: Cycle filter with 'f' (All/Aranet4/Radon/Radiation/Connected)
+  - **Comparison view**: Side-by-side device readings with 'v', cycle with '<'/'>'
+  - **Connect all**: Connect to all known devices with 'C'
+  - **Device alias**: Set friendly names with 'n' key
+  - **Settings editing**: Change interval with Enter, BLE range with 'B', Smart Home with 'I'
+  - **Threshold config**: Adjust CO2/radon thresholds with +/- keys
+  - **Theme support**: Toggle light/dark theme with 't' key
+  - **Responsive layout**: Auto-hide sidebar on narrow terminals, toggle with '['
+  - **Wider sidebar**: Toggle sidebar width with ']' key
+  - **Mouse support**: Click to select devices, tabs, and buttons
+  - **RSSI signal strength**: Visual signal bars for connected devices
+  - **Device uptime**: Shows how long device has been connected
+  - **Battery warning**: Alert when battery drops below 20%
+  - **Reading age warning**: Highlight stale readings (> 2x interval)
+  - **Loading spinners**: Visual feedback during connect/sync operations
+  - **Status messages**: Queue of messages with auto-dismiss timeout
+  - **Confirmation dialogs**: Y/N prompts before destructive actions
+  - **Error details**: View full error with 'E' key
+  - **Help overlay**: Press '?' for organized keyboard shortcuts cheatsheet
+  - **Header bar**: Shows connected count, avg CO2, alert count, indicators
+  - **ASCII-only output**: All indicators use pure ASCII characters for compatibility
+
 ## [0.1.7] - 2026-01-18
 
 ### Added

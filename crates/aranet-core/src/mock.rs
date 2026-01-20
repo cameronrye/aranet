@@ -353,6 +353,26 @@ impl MockDevice {
         self.current_reading.write().await.battery = level;
     }
 
+    /// Set radon concentration in Bq/m³ (AranetRn+ devices).
+    pub async fn set_radon(&self, radon: u32) {
+        self.current_reading.write().await.radon = Some(radon);
+    }
+
+    /// Set radon averages (AranetRn+ devices).
+    pub async fn set_radon_averages(&self, avg_24h: u32, avg_7d: u32, avg_30d: u32) {
+        let mut reading = self.current_reading.write().await;
+        reading.radon_avg_24h = Some(avg_24h);
+        reading.radon_avg_7d = Some(avg_7d);
+        reading.radon_avg_30d = Some(avg_30d);
+    }
+
+    /// Set radiation values (Aranet Radiation devices).
+    pub async fn set_radiation(&self, rate: f32, total: f64) {
+        let mut reading = self.current_reading.write().await;
+        reading.radiation_rate = Some(rate);
+        reading.radiation_total = Some(total);
+    }
+
     /// Set RSSI (signal strength) for testing.
     pub fn set_rssi(&self, rssi: i16) {
         self.rssi.store(rssi, Ordering::Relaxed);
@@ -522,6 +542,12 @@ pub struct MockDeviceBuilder {
     battery: u8,
     status: Status,
     auto_connect: bool,
+    radon: Option<u32>,
+    radon_avg_24h: Option<u32>,
+    radon_avg_7d: Option<u32>,
+    radon_avg_30d: Option<u32>,
+    radiation_rate: Option<f32>,
+    radiation_total: Option<f64>,
 }
 
 impl Default for MockDeviceBuilder {
@@ -536,6 +562,12 @@ impl Default for MockDeviceBuilder {
             battery: 85,
             status: Status::Green,
             auto_connect: true,
+            radon: None,
+            radon_avg_24h: None,
+            radon_avg_7d: None,
+            radon_avg_30d: None,
+            radiation_rate: None,
+            radiation_total: None,
         }
     }
 }
@@ -610,6 +642,48 @@ impl MockDeviceBuilder {
         self
     }
 
+    /// Set radon concentration in Bq/m³ (AranetRn+ devices).
+    #[must_use]
+    pub fn radon(mut self, radon: u32) -> Self {
+        self.radon = Some(radon);
+        self
+    }
+
+    /// Set 24-hour average radon concentration in Bq/m³ (AranetRn+ devices).
+    #[must_use]
+    pub fn radon_avg_24h(mut self, avg: u32) -> Self {
+        self.radon_avg_24h = Some(avg);
+        self
+    }
+
+    /// Set 7-day average radon concentration in Bq/m³ (AranetRn+ devices).
+    #[must_use]
+    pub fn radon_avg_7d(mut self, avg: u32) -> Self {
+        self.radon_avg_7d = Some(avg);
+        self
+    }
+
+    /// Set 30-day average radon concentration in Bq/m³ (AranetRn+ devices).
+    #[must_use]
+    pub fn radon_avg_30d(mut self, avg: u32) -> Self {
+        self.radon_avg_30d = Some(avg);
+        self
+    }
+
+    /// Set radiation dose rate in µSv/h (Aranet Radiation devices).
+    #[must_use]
+    pub fn radiation_rate(mut self, rate: f32) -> Self {
+        self.radiation_rate = Some(rate);
+        self
+    }
+
+    /// Set total radiation dose in mSv (Aranet Radiation devices).
+    #[must_use]
+    pub fn radiation_total(mut self, total: f64) -> Self {
+        self.radiation_total = Some(total);
+        self
+    }
+
     /// Build the mock device.
     ///
     /// Note: This is a sync method that sets initial state directly.
@@ -626,12 +700,12 @@ impl MockDeviceBuilder {
             interval: 300,
             age: 60,
             captured_at: None,
-            radon: None,
-            radiation_rate: None,
-            radiation_total: None,
-            radon_avg_24h: None,
-            radon_avg_7d: None,
-            radon_avg_30d: None,
+            radon: self.radon,
+            radiation_rate: self.radiation_rate,
+            radiation_total: self.radiation_total,
+            radon_avg_24h: self.radon_avg_24h,
+            radon_avg_7d: self.radon_avg_7d,
+            radon_avg_30d: self.radon_avg_30d,
         };
 
         MockDevice {

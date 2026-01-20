@@ -39,6 +39,9 @@ pub const HISTORY_V1: Uuid = uuid!("f0cd2003-95da-4f4b-9ac8-aa55d312af0c");
 /// History data characteristic (version 2) - read-based.
 pub const HISTORY_V2: Uuid = uuid!("f0cd2005-95da-4f4b-9ac8-aa55d312af0c");
 
+/// Sensor state characteristic for reading device settings.
+pub const SENSOR_STATE: Uuid = uuid!("f0cd1401-95da-4f4b-9ac8-aa55d312af0c");
+
 /// Command characteristic for device control.
 pub const COMMAND: Uuid = uuid!("f0cd1402-95da-4f4b-9ac8-aa55d312af0c");
 
@@ -158,6 +161,12 @@ mod tests {
     fn test_history_v2_uuid() {
         let expected = "f0cd2005-95da-4f4b-9ac8-aa55d312af0c";
         assert_eq!(HISTORY_V2.to_string(), expected);
+    }
+
+    #[test]
+    fn test_sensor_state_uuid() {
+        let expected = "f0cd1401-95da-4f4b-9ac8-aa55d312af0c";
+        assert_eq!(SENSOR_STATE.to_string(), expected);
     }
 
     #[test]
@@ -287,6 +296,7 @@ mod tests {
             READ_INTERVAL,
             HISTORY_V1,
             HISTORY_V2,
+            SENSOR_STATE,
             COMMAND,
             SECONDS_SINCE_UPDATE,
             CALIBRATION,

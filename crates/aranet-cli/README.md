@@ -245,6 +245,16 @@ aranet completions zsh > ~/.zfunc/_aranet
 aranet completions fish > ~/.config/fish/completions/aranet.fish
 ```
 
+## TUI Dashboard
+
+Launch the interactive terminal dashboard:
+
+```bash
+aranet tui
+```
+
+The TUI provides real-time monitoring with sparkline charts, threshold alerts, multi-device support, and more. See [aranet-tui](../aranet-tui/) for the complete feature list and keybindings.
+
 ## Related Crates
 
 This CLI is part of the [aranet](https://github.com/cameronrye/aranet) workspace:
@@ -255,7 +265,9 @@ This CLI is part of the [aranet](https://github.com/cameronrye/aranet) workspace
 | [aranet-types](../aranet-types/) | [![crates.io](https://img.shields.io/crates/v/aranet-types.svg)](https://crates.io/crates/aranet-types) | Shared types for sensor data |
 | [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local data persistence |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
-| [aranet-gui](../aranet-gui/) | [![crates.io](https://img.shields.io/crates/v/aranet-gui.svg)](https://crates.io/crates/aranet-gui) | Desktop application (egui) |
+| [aranet-service](../aranet-service/) | - | Background collector and REST API |
+| [aranet-gui](../aranet-gui/) | - | Desktop application (planned) |
+| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module (planned) |
 
 ## License
 
@@ -263,4 +275,4 @@ MIT
 
 ---
 
-Made with love by [Cameron Rye](https://rye.dev/)
+Made with ❤️ by [Cameron Rye](https://rye.dev/)

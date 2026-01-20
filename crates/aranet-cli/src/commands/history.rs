@@ -177,6 +177,10 @@ pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
         })
         .collect();
 
+    // Reverse to show newest first (device sends oldest first)
+    let mut history = history;
+    history.reverse();
+
     // Apply count limit if specified (0 means all)
     let history: Vec<_> = if count > 0 {
         history.into_iter().take(count as usize).collect()

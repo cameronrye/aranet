@@ -126,8 +126,8 @@ fn query_history(
     let history: Vec<_> = records.iter().map(|r| r.to_history()).collect();
 
     let fahrenheit = output.resolve_fahrenheit(config.fahrenheit);
-    let bq = output.resolve_bq(false);
-    let inhg = output.resolve_inhg(false);
+    let bq = output.resolve_bq(config.bq);
+    let inhg = output.resolve_inhg(config.inhg);
 
     let opts = FormatOptions::new(false, fahrenheit, crate::cli::StyleMode::Rich)
         .with_no_header(output.no_header)

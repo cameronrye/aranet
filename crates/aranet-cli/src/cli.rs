@@ -464,6 +464,10 @@ pub enum ConfigKey {
     NoColor,
     /// Use Fahrenheit for temperature
     Fahrenheit,
+    /// Use inHg for pressure (instead of hPa)
+    Inhg,
+    /// Use Bq/m³ for radon (instead of pCi/L)
+    Bq,
 }
 
 /// Configuration subcommands

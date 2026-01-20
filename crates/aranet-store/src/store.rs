@@ -79,6 +79,31 @@ impl Store {
             .ok_or_else(|| Error::DeviceNotFound(device_id.to_string()))
     }
 
+    /// Update device metadata (name and type).
+    ///
+    /// This is a simpler version of `update_device_info` for when you only have
+    /// basic device information (e.g., from BLE advertisement or connection).
+    pub fn update_device_metadata(
+        &self,
+        device_id: &str,
+        name: Option<&str>,
+        device_type: Option<DeviceType>,
+    ) -> Result<()> {
+        let device_type_str = device_type.map(|dt| format!("{:?}", dt));
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        self.conn.execute(
+            "UPDATE devices SET
+                name = COALESCE(?2, name),
+                device_type = COALESCE(?3, device_type),
+                last_seen = ?4
+             WHERE id = ?1",
+            rusqlite::params![device_id, name, device_type_str, now],
+        )?;
+
+        Ok(())
+    }
+
     /// Update device info from DeviceInfo.
     pub fn update_device_info(&self, device_id: &str, info: &DeviceInfo) -> Result<()> {
         // Infer device type from model name if possible

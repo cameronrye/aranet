@@ -1,4 +1,132 @@
 //! Error types for aranet-core.
+//!
+//! This module defines all error types that can occur when communicating with
+//! Aranet devices via Bluetooth Low Energy.
+//!
+//! # Error Recovery Strategies
+//!
+//! Different errors require different recovery approaches. This guide helps you
+//! choose the right strategy for each error type.
+//!
+//! ## Retry vs Reconnect
+//!
+//! | Error Type | Strategy | Rationale |
+//! |------------|----------|-----------|
+//! | [`Error::Timeout`] | Retry (2-3 times) | Transient BLE congestion |
+//! | [`Error::Bluetooth`] | Retry, then reconnect | May be transient or connection lost |
+//! | [`Error::NotConnected`] | Reconnect | Connection was lost |
+//! | [`Error::ConnectionFailed`] | Retry with backoff | Device may be temporarily busy |
+//! | [`Error::WriteFailed`] | Retry (1-2 times) | BLE write can fail transiently |
+//! | [`Error::InvalidData`] | Do not retry | Data corruption, report to user |
+//! | [`Error::DeviceNotFound`] | Do not retry | Device not in range or wrong name |
+//! | [`Error::CharacteristicNotFound`] | Do not retry | Firmware incompatibility |
+//! | [`Error::InvalidConfig`] | Do not retry | Fix configuration and restart |
+//!
+//! ## Recommended Timeouts
+//!
+//! | Operation | Recommended Timeout | Notes |
+//! |-----------|---------------------|-------|
+//! | Device scan | 10-30 seconds | Aranet4 advertises every ~4s |
+//! | Connection | 10-15 seconds | May take longer if device is busy |
+//! | Read current | 5 seconds | Usually completes in <1s |
+//! | Read device info | 5 seconds | Multiple characteristic reads |
+//! | History download | 2-5 minutes | Depends on record count |
+//! | Write settings | 5 seconds | Includes verification read |
+//!
+//! ## Using RetryConfig
+//!
+//! For transient failures, use [`crate::RetryConfig`] with [`crate::with_retry`]:
+//!
+//! ```ignore
+//! use aranet_core::{RetryConfig, with_retry};
+//!
+//! // Default: 3 retries with exponential backoff (100ms -> 200ms -> 400ms)
+//! let config = RetryConfig::default();
+//!
+//! // For unreliable connections: 5 retries, more aggressive
+//! let aggressive = RetryConfig::aggressive();
+//!
+//! // Wrap your operation
+//! let reading = with_retry(&config, "read_current", || async {
+//!     device.read_current().await
+//! }).await?;
+//! ```
+//!
+//! ## Using ReconnectingDevice
+//!
+//! For long-running applications, use [`crate::ReconnectingDevice`] which
+//! automatically handles reconnection:
+//!
+//! ```ignore
+//! use aranet_core::{ReconnectingDevice, ReconnectOptions};
+//!
+//! // Default: 5 attempts with exponential backoff (1s -> 2s -> 4s -> 8s -> 16s)
+//! let options = ReconnectOptions::default();
+//!
+//! // For always-on services: unlimited retries
+//! let unlimited = ReconnectOptions::unlimited();
+//!
+//! // Connect with auto-reconnect
+//! let device = ReconnectingDevice::connect("Aranet4 12345", options).await?;
+//!
+//! // Operations automatically reconnect if connection is lost
+//! let reading = device.read_current().await?;
+//! ```
+//!
+//! ## Error Classification
+//!
+//! The retry module internally classifies errors as retryable or not.
+//! The following errors are considered retryable:
+//!
+//! - [`Error::Timeout`] - BLE operations can time out due to interference
+//! - [`Error::Bluetooth`] - Generic BLE errors are often transient
+//! - [`Error::NotConnected`] - Connection may have been lost, reconnect and retry
+//! - [`Error::WriteFailed`] - Write operations can fail transiently
+//! - [`Error::ConnectionFailed`] with `OutOfRange`, `Timeout`, or `BleError` reasons
+//! - [`Error::Io`] - I/O errors may be transient
+//!
+//! The following errors should NOT be retried:
+//!
+//! - [`Error::InvalidData`] - Data is corrupted, retrying won't help
+//! - [`Error::InvalidHistoryData`] - History data format error
+//! - [`Error::InvalidReadingFormat`] - Reading format error
+//! - [`Error::DeviceNotFound`] - Device is not available
+//! - [`Error::CharacteristicNotFound`] - Device doesn't support this feature
+//! - [`Error::Cancelled`] - Operation was intentionally cancelled
+//! - [`Error::InvalidConfig`] - Configuration error, fix and restart
+//!
+//! ## Example: Robust Reading Loop
+//!
+//! ```ignore
+//! use aranet_core::{Device, Error, RetryConfig, with_retry};
+//! use std::time::Duration;
+//!
+//! async fn read_with_recovery(device: &Device) -> Result<CurrentReading, Error> {
+//!     let config = RetryConfig::new(3);
+//!
+//!     with_retry(&config, "read_current", || async {
+//!         device.read_current().await
+//!     }).await
+//! }
+//!
+//! // For long-running monitoring
+//! async fn monitoring_loop(identifier: &str) {
+//!     let options = ReconnectOptions::default()
+//!         .max_attempts(10)
+//!         .initial_delay(Duration::from_secs(2));
+//!
+//!     let device = ReconnectingDevice::connect(identifier, options).await?;
+//!
+//!     loop {
+//!         match device.read_current().await {
+//!             Ok(reading) => println!("CO2: {} ppm", reading.co2),
+//!             Err(Error::Cancelled) => break, // Graceful shutdown
+//!             Err(e) => eprintln!("Error (will retry): {}", e),
+//!         }
+//!         tokio::time::sleep(Duration::from_secs(60)).await;
+//!     }
+//! }
+//! ```
 
 use std::time::Duration;
 

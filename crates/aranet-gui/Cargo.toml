@@ -1,18 +1,19 @@
 [package]
 name = "aranet-gui"
-version = "0.1.0"
+version = "0.1.8"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Native desktop GUI for Aranet environmental sensors"
+publish = false
 
 [[bin]]
 name = "aranet-gui"
 path = "src/main.rs"
 
 [dependencies]
-aranet-core = { version = "0.1", path = "../aranet-core" }
+aranet-core = { version = "0.1.8", path = "../aranet-core" }
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

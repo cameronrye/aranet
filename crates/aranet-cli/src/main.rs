@@ -114,10 +114,10 @@ async fn main() -> Result<()> {
     let style = cli.style;
     // Base fahrenheit from config (can be overridden per-command)
     let config_fahrenheit = config.fahrenheit;
-    // Base bq from config (currently always false, but future-proofed)
-    let config_bq = false;
-    // Base inhg from config (currently always false, but future-proofed)
-    let config_inhg = false;
+    // Base bq from config (can be overridden per-command)
+    let config_bq = config.bq;
+    // Base inhg from config (can be overridden per-command)
+    let config_inhg = config.inhg;
     // Parse config format (used as fallback when command format is default)
     let config_format = config.format.as_deref().and_then(parse_format);
 
@@ -337,6 +337,8 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
                 ConfigKey::Timeout => config.timeout.map(|t| t.to_string()).unwrap_or_default(),
                 ConfigKey::NoColor => config.no_color.to_string(),
                 ConfigKey::Fahrenheit => config.fahrenheit.to_string(),
+                ConfigKey::Inhg => config.inhg.to_string(),
+                ConfigKey::Bq => config.bq.to_string(),
             };
             println!("{}", value);
         }
@@ -376,6 +378,16 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
                         )
                     })?;
                 }
+                ConfigKey::Inhg => {
+                    config.inhg = parse_bool(value).map_err(|_| {
+                        anyhow::anyhow!("Invalid inhg value: {}. Use 'true' or 'false'.", value)
+                    })?;
+                }
+                ConfigKey::Bq => {
+                    config.bq = parse_bool(value).map_err(|_| {
+                        anyhow::anyhow!("Invalid bq value: {}. Use 'true' or 'false'.", value)
+                    })?;
+                }
             }
             config.save()?;
             println!("Set {:?} = {}", key, value);
@@ -388,6 +400,8 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
                 ConfigKey::Timeout => config.timeout = None,
                 ConfigKey::NoColor => config.no_color = false,
                 ConfigKey::Fahrenheit => config.fahrenheit = false,
+                ConfigKey::Inhg => config.inhg = false,
+                ConfigKey::Bq => config.bq = false,
             }
             config.save()?;
             println!("Unset {:?}", key);

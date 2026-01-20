@@ -1,0 +1,37 @@
+[Unit]
+Description=Aranet Sensor Collector Service
+Documentation=https://github.com/cameronrye/aranet
+After=network-online.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=aranet
+Group=aranet
+ExecStart=/usr/local/bin/aranet-service
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Environment file (optional)
+EnvironmentFile=-/etc/default/aranet
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Allow read/write to data directory
+ReadWritePaths=/var/lib/aranet
+
+# Allow Bluetooth access
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
+

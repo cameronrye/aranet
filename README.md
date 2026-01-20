@@ -12,6 +12,7 @@
 Connect to your Aranet devices via Bluetooth LE to read measurements, download history, and monitor air quality.
 
 [![CI](https://github.com/cameronrye/aranet/workflows/CI/badge.svg)](https://github.com/cameronrye/aranet/actions)
+[![codecov](https://codecov.io/gh/cameronrye/aranet/graph/badge.svg)](https://codecov.io/gh/cameronrye/aranet)
 [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli)
 [![docs.rs](https://docs.rs/aranet-core/badge.svg)](https://docs.rs/aranet-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -37,6 +38,12 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - Query cached data without device connection
   - Automatic deduplication of history records
 - **aranet-tui** — Terminal UI dashboard for real-time monitoring
+  - Multi-device monitoring with auto-refresh
+  - Sparkline charts with min/max labels
+  - CO2/radon threshold alerts with audio bell
+  - Light/dark theme, mouse support, vim keybindings
+  - Export history to CSV, comparison view
+  - Device filter, alias management, settings editing
 - **aranet-gui** — Desktop application built with egui
 - **aranet-wasm** — WebAssembly module for browser integration *(planned)*
 
@@ -166,4 +173,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-Made with love by [Cameron Rye](https://rye.dev/)
+Made with ❤️ by [Cameron Rye](https://rye.dev/)

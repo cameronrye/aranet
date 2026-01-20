@@ -1,6 +1,6 @@
 //! Set command implementation.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,7 +17,7 @@ fn confirm_change(message: &str, force: bool) -> Result<bool> {
     }
 
     // Check if stdin is a terminal (interactive mode)
-    if !atty::is(atty::Stream::Stdin) {
+    if !io::stdin().is_terminal() {
         // Non-interactive mode - require --force flag
         eprintln!("Error: Cannot prompt for confirmation in non-interactive mode.");
         eprintln!("Use --force to skip confirmation.");

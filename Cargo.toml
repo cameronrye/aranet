@@ -3,6 +3,7 @@ members = [
     "crates/aranet-types",
     "crates/aranet-core",
     "crates/aranet-store",
+    "crates/aranet-service",
     "crates/aranet-cli",
     "crates/aranet-tui",
     "crates/aranet-gui",
@@ -15,6 +16,7 @@ default-members = [
     "crates/aranet-types",
     "crates/aranet-core",
     "crates/aranet-store",
+    "crates/aranet-service",
     "crates/aranet-cli",
     "crates/aranet-tui",
 ]
@@ -47,6 +49,7 @@ futures = "0.3"
 async-trait = "0.1"
 rand = "0.9"
 tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
 
 [workspace.metadata.features]
 default = ["cli"]

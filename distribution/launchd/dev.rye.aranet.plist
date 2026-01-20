@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.rye.aranet</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/aranet-service</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/aranet</string>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/aranet.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/aranet.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>aranet_service=info</string>
+    </dict>
+</dict>
+</plist>
+

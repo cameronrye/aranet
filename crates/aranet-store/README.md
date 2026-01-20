@@ -103,6 +103,9 @@ This crate is part of the [aranet](https://github.com/cameronrye/aranet) workspa
 | [aranet-types](../aranet-types/) | [![crates.io](https://img.shields.io/crates/v/aranet-types.svg)](https://crates.io/crates/aranet-types) | Shared types for sensor data |
 | [aranet-cli](../aranet-cli/) | [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli) | Command-line interface |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
+| [aranet-service](../aranet-service/) | - | Background collector and REST API |
+| [aranet-gui](../aranet-gui/) | - | Desktop application (planned) |
+| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module (planned) |
 
 ## License
 
@@ -110,5 +113,5 @@ MIT
 
 ---
 
-Made with love by [Cameron Rye](https://rye.dev/)
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
 

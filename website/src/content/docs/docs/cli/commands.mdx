@@ -546,6 +546,59 @@ Database Size: 1.2 MB
 
 ---
 
+## tui
+
+Launch the interactive terminal dashboard for real-time monitoring.
+
+```bash
+aranet tui
+```
+
+### Features
+
+The TUI dashboard provides a full-featured monitoring interface with:
+
+- **Multi-device monitoring** with auto-refresh
+- **Sparkline charts** with min/max labels and time axis
+- **Threshold alerts** with severity levels and terminal bell
+- **Light/dark theme** toggle
+- **Mouse support** for device and tab selection
+- **Export history** to CSV
+- **Comparison view** for side-by-side readings
+
+### Key Bindings
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Next/Previous tab |
+| `j` / `k` / `↑` / `↓` | Navigate devices |
+| `Enter` | Connect/Disconnect or edit setting |
+| `s` | Scan for devices |
+| `r` | Refresh reading |
+| `g` | Full-screen chart |
+| `v` | Comparison view |
+| `e` | Export history to CSV |
+| `t` | Toggle theme |
+| `?` | Show help |
+| `q` | Quit |
+
+### Example
+
+```bash
+$ aranet tui
+
+┌─ Aranet Monitor ─────────────── *2/3 CO2:847 !1 ─┐
+│ ┌─ Devices ───────┐ ┌─ Readings ─────────────────┤
+│ │ * Aranet4 17C3C │ │ CO2         847 ppm  ->    │
+│ │   AranetRn+ 306 │ │ Temperature  22.4 C        │
+│ └─────────────────┘ └────────────────────────────┤
+└──────────────────────────────────────────────────┘
+```
+
+See the [aranet-tui README](https://github.com/cameronrye/aranet/tree/main/crates/aranet-tui) for the complete keyboard reference.
+
+---
+
 ## doctor
 
 Run BLE diagnostics and permission checks to troubleshoot connectivity issues.
@@ -579,5 +632,5 @@ If there are issues, the doctor will provide platform-specific troubleshooting t
 
 ---
 
-Made with love by [Cameron Rye](https://rye.dev/)
+Made with ❤️ by [Cameron Rye](https://rye.dev/)
 

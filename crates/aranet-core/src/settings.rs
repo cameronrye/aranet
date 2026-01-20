@@ -3,11 +3,11 @@
 //! This module provides functionality to read and modify device
 //! settings on Aranet sensors.
 
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::device::Device;
 use crate::error::{Error, Result};
-use crate::uuid::{CALIBRATION, COMMAND, READ_INTERVAL};
+use crate::uuid::{CALIBRATION, COMMAND, READ_INTERVAL, SENSOR_STATE};
 
 /// Measurement interval options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,24 +58,51 @@ impl MeasurementInterval {
 }
 
 /// Bluetooth range options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum BluetoothRange {
     /// Standard range.
+    #[default]
     Standard = 0x00,
     /// Extended range.
     Extended = 0x01,
 }
 
-/// Device settings.
-#[derive(Debug, Clone)]
+/// Temperature display unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TemperatureUnit {
+    /// Celsius (default for most devices).
+    #[default]
+    Celsius,
+    /// Fahrenheit.
+    Fahrenheit,
+}
+
+/// Radon display unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RadonUnit {
+    /// Becquerels per cubic meter (default).
+    #[default]
+    BqM3,
+    /// PicoCuries per liter.
+    PciL,
+}
+
+/// Device settings read from the SENSOR_STATE characteristic.
+#[derive(Debug, Clone, Default)]
 pub struct DeviceSettings {
-    /// Current measurement interval.
-    pub interval: MeasurementInterval,
     /// Smart Home integration enabled.
     pub smart_home_enabled: bool,
     /// Bluetooth range setting.
     pub bluetooth_range: BluetoothRange,
+    /// Temperature display unit.
+    pub temperature_unit: TemperatureUnit,
+    /// Radon display unit (only relevant for Aranet Radon).
+    pub radon_unit: RadonUnit,
+    /// Whether buzzer is enabled.
+    pub buzzer_enabled: bool,
+    /// Whether automatic calibration is enabled (Aranet4 only).
+    pub auto_calibration_enabled: bool,
 }
 
 /// Calibration data from the device.
@@ -160,6 +187,98 @@ impl Device {
         };
 
         Ok(CalibrationData { raw, co2_offset })
+    }
+
+    /// Read device settings from the SENSOR_STATE characteristic.
+    ///
+    /// This reads the device configuration including:
+    /// - Smart Home integration status
+    /// - Bluetooth range setting
+    /// - Temperature display unit
+    /// - Radon display unit (for Aranet Radon devices)
+    /// - Buzzer settings
+    /// - Calibration settings
+    pub async fn get_settings(&self) -> Result<DeviceSettings> {
+        let data = self.read_characteristic(SENSOR_STATE).await?;
+
+        if data.len() < 3 {
+            return Err(Error::InvalidData(
+                "Sensor state data too short".to_string(),
+            ));
+        }
+
+        debug!(
+            "Sensor state raw: {:02x?} (len={})",
+            data,
+            data.len()
+        );
+
+        // Parse the sensor state bytes according to the Aranet protocol:
+        // byte[0] = device type (0xF1=Aranet4, 0xF2=Aranet2, 0xF3=Radon, 0xF4=Radiation)
+        // byte[1] = configuration flags 'c'
+        // byte[2] = options flags 'o'
+        let device_type_byte = data[0];
+        let config_flags = data[1];
+        let option_flags = data[2];
+
+        let is_aranet4 = device_type_byte == 0xF1;
+        let is_aranet_radon = device_type_byte == 0xF3;
+        let is_aranet_radiation = device_type_byte == 0xF4;
+
+        // Parse configuration flags (byte 1):
+        // bit 0: buzzer enabled
+        // bit 5: temperature unit (0=Fahrenheit, 1=Celsius)
+        // bit 7: varies by device (Aranet4=auto calibration, Radon=Bq/pCi)
+        let buzzer_enabled = (config_flags & 0x01) != 0;
+        let temp_bit = (config_flags >> 5) & 0x01;
+        let bit7 = (config_flags >> 7) & 0x01;
+
+        // Temperature unit: bit 5 = 1 means Celsius, 0 means Fahrenheit
+        // Note: Aranet Radiation doesn't have temperature, defaults to Celsius
+        let temperature_unit = if is_aranet_radiation || temp_bit == 1 {
+            TemperatureUnit::Celsius
+        } else {
+            TemperatureUnit::Fahrenheit
+        };
+
+        // Radon unit: for Aranet Radon, bit 7 = 1 means Bq/m³, 0 means pCi/L
+        let radon_unit = if is_aranet_radon {
+            if bit7 == 1 {
+                RadonUnit::BqM3
+            } else {
+                RadonUnit::PciL
+            }
+        } else {
+            RadonUnit::BqM3 // Default for non-radon devices
+        };
+
+        // Auto calibration enabled (Aranet4 only)
+        let auto_calibration_enabled = is_aranet4 && bit7 == 1;
+
+        // Parse option flags (byte 2):
+        // bit 1: bluetooth range (0=normal/standard, 1=extended)
+        // bit 7: smart home integration enabled
+        let bluetooth_range = if (option_flags >> 1) & 0x01 == 1 {
+            BluetoothRange::Extended
+        } else {
+            BluetoothRange::Standard
+        };
+
+        let smart_home_enabled = (option_flags >> 7) & 0x01 == 1;
+
+        debug!(
+            "Parsed settings: smart_home={}, bt_range={:?}, temp_unit={:?}, radon_unit={:?}",
+            smart_home_enabled, bluetooth_range, temperature_unit, radon_unit
+        );
+
+        Ok(DeviceSettings {
+            smart_home_enabled,
+            bluetooth_range,
+            temperature_unit,
+            radon_unit,
+            buzzer_enabled,
+            auto_calibration_enabled,
+        })
     }
 }
 

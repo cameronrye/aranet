@@ -1,0 +1,59 @@
+[package]
+name = "aranet-service"
+version = "0.1.8"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Background collector and HTTP REST API for Aranet sensors"
+keywords = ["aranet", "api", "rest", "service", "sensors"]
+categories = ["web-programming::http-server", "network-programming"]
+
+[[bin]]
+name = "aranet-service"
+path = "src/main.rs"
+
+[dependencies]
+aranet-core = { version = "0.1.8", path = "../aranet-core" }
+aranet-store = { version = "0.1.8", path = "../aranet-store" }
+aranet-types = { version = "0.1.8", path = "../aranet-types" }
+
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Time
+time.workspace = true
+
+# Config paths
+dirs = "6"
+service-manager = "0.10.0"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+hyper = "1.0"
+

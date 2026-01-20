@@ -14,9 +14,10 @@ The Aranet project aims to be the definitive Rust ecosystem for Aranet environme
 | 0 | Foundation | <Badge text="DONE" variant="success" /> | README, LICENSE, CI, CHANGELOG |
 | 1 | Core Library | <Badge text="DONE" variant="success" /> | Full BLE stack tested with hardware |
 | 2 | CLI Tool | <Badge text="DONE" variant="success" /> | All commands implemented and tested |
-| 3 | TUI Dashboard | <Badge text="WIP" variant="caution" /> | App shell complete |
+| 3 | TUI Dashboard | <Badge text="DONE" variant="success" /> | 44 features implemented |
 | 4 | GUI Application | <Badge text="WIP" variant="caution" /> | egui shell works |
 | 5 | WASM Module | <Badge text="WIP" variant="caution" /> | Basic init/log, Web Bluetooth pending |
+| 6 | Data Persistence & API | <Badge text="DONE" variant="success" /> | aranet-store and aranet-service complete |
 
 ## Phase 2: CLI Tool (Complete)
 
@@ -32,24 +33,33 @@ All CLI features implemented:
 - Progress bars for history download
 - Pressure unit conversion (`--inhg` / `--hpa`)
 
-## Phase 3: TUI Dashboard
+## Phase 3: TUI Dashboard (Complete)
 
-Real-time terminal monitoring with ratatui:
+Full-featured terminal monitoring with ratatui (44 features implemented):
 
 <CardGrid>
   <Card title="Live Readings" icon="random">
-    Display current values with auto-refresh
+    Auto-refresh with trend indicators and min/max/avg stats
   </Card>
   <Card title="Multi-Device" icon="list-format">
-    Monitor multiple sensors simultaneously
+    Monitor multiple sensors with filtering and comparison view
   </Card>
   <Card title="Sparklines" icon="bars">
-    Historical chart visualization
+    Historical charts with time axis, multiple metrics (T/H)
   </Card>
   <Card title="Alerts" icon="warning">
-    Visual alerts for CO₂ thresholds
+    Threshold alerts with severity levels and terminal bell
   </Card>
 </CardGrid>
+
+### TUI Features
+
+- **Navigation**: Tab/Shift+Tab, vim-style j/k, mouse support
+- **Views**: Full-screen chart (g), comparison view (v), help overlay (?)
+- **History**: Time range filter (0-4), scrollable records, CSV export (e)
+- **Settings**: Edit interval, BLE range (B), Smart Home (I), thresholds (+/-)
+- **Alerts**: Alert history (a), sticky alerts (A), terminal bell (b)
+- **Display**: Light/dark theme (t), responsive layout, wider sidebar (])
 
 ## Phase 4: GUI Application
 
@@ -76,11 +86,37 @@ Browser-based Aranet monitor:
 
 **Note:** Web Bluetooth only works in Chromium browsers (~50% browser support). iOS Safari does NOT support Web Bluetooth.
 
+## Phase 6: Data Persistence & API (Complete)
+
+Local data storage and HTTP API for integrations:
+
+<CardGrid>
+  <Card title="SQLite Storage" icon="document">
+    Persistent storage for readings and history with schema migrations
+  </Card>
+  <Card title="REST API" icon="rocket">
+    HTTP endpoints for devices, readings, and history queries
+  </Card>
+  <Card title="Background Collector" icon="setting">
+    Automatic device polling with configurable intervals
+  </Card>
+  <Card title="WebSocket" icon="external">
+    Real-time streaming of sensor readings
+  </Card>
+</CardGrid>
+
+### Features
+
+- **aranet-store**: SQLite database with readings, history, and device tracking
+- **aranet-service**: Background collector + HTTP REST API server
+- **CLI integration**: `sync` and `cache` commands for local data management
+- **Service management**: Install as system service (launchd/systemd)
+
 ## Success Metrics
 
-- [ ] All Python library features working in Rust
-- [ ] Single binary CLI with no runtime dependencies
-- [ ] TUI monitoring multiple devices simultaneously
+- [x] All Python library features working in Rust
+- [x] Single binary CLI with no runtime dependencies
+- [x] TUI monitoring multiple devices simultaneously
 - [ ] GUI app installable on all platforms
 - [x] WASM app deployed to GitHub Pages *(this site!)*
 - [ ] Published to crates.io as `aranet`

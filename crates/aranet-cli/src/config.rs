@@ -26,6 +26,14 @@ pub struct Config {
     #[serde(default)]
     pub fahrenheit: bool,
 
+    /// Use inHg for pressure (instead of hPa)
+    #[serde(default)]
+    pub inhg: bool,
+
+    /// Use Bq/m³ for radon (instead of pCi/L)
+    #[serde(default)]
+    pub bq: bool,
+
     /// Connection timeout in seconds
     #[serde(default)]
     pub timeout: Option<u64>,
