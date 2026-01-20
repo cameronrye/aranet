@@ -66,10 +66,8 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-large
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: x86_64-pc-windows-msvc
             os: windows-2022
@@ -97,9 +95,15 @@ jobs:
           toolchain: "1.90"
           targets: ${{ matrix.target }}
 
-      - name: Install cargo-dist
+      - name: Install cargo-dist (Unix)
+        if: runner.os != 'Windows'
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/latest/download/cargo-dist-installer.sh | sh
+
+      - name: Install cargo-dist (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          irm https://github.com/axodotdev/cargo-dist/releases/latest/download/cargo-dist-installer.ps1 | iex
 
       - name: Build artifacts
         run: cargo dist build --tag="${{ github.ref_name }}" --target="${{ matrix.target }}"

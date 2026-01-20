@@ -13,6 +13,10 @@ categories = ["web-programming::http-server", "network-programming"]
 name = "aranet-service"
 path = "src/main.rs"
 
+# Exclude from cargo-dist releases (deployed separately)
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 aranet-core = { version = "0.1.8", path = "../aranet-core" }
 aranet-store = { version = "0.1.8", path = "../aranet-store" }

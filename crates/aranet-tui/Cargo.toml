@@ -11,6 +11,10 @@ description = "Terminal UI dashboard for Aranet environmental sensors (standalon
 name = "aranet-tui"
 path = "src/main.rs"
 
+# Exclude from cargo-dist releases (only aranet-cli is distributed)
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 # Use aranet-cli with only the tui feature (no cli dependencies)
 aranet-cli = { version = "0.1.8", path = "../aranet-cli", default-features = false, features = ["tui"] }
