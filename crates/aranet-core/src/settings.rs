@@ -207,11 +207,7 @@ impl Device {
             ));
         }
 
-        debug!(
-            "Sensor state raw: {:02x?} (len={})",
-            data,
-            data.len()
-        );
+        debug!("Sensor state raw: {:02x?} (len={})", data, data.len());
 
         // Parse the sensor state bytes according to the Aranet protocol:
         // byte[0] = device type (0xF1=Aranet4, 0xF2=Aranet2, 0xF3=Radon, 0xF4=Radiation)

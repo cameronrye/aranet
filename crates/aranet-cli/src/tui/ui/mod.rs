@@ -143,7 +143,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(
             " Aranet Monitor ",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("v0.3.0 ", Style::default().fg(theme.text_muted)),
     ];
@@ -151,7 +153,11 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     // Connected count
     let connected = app.connected_count();
     let total = app.devices.len();
-    let conn_color = if connected == 0 { theme.danger } else { theme.success };
+    let conn_color = if connected == 0 {
+        theme.danger
+    } else {
+        theme.success
+    };
     spans.push(Span::styled(
         format!(" *{}/{} ", connected, total),
         Style::default().fg(conn_color),
@@ -171,7 +177,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     if alert_count > 0 {
         spans.push(Span::styled(
             format!(" !{} ", alert_count),
-            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -202,8 +210,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(" HOME ", Style::default().fg(theme.success)));
     }
 
-    let header = Paragraph::new(Line::from(spans))
-        .style(theme.header_style());
+    let header = Paragraph::new(Line::from(spans)).style(theme.header_style());
 
     frame.render_widget(header, area);
 }
@@ -222,7 +229,11 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             } else {
                 hints.push(("j/k", "select"));
                 if app.selected_device().is_some() {
-                    if app.selected_device().map(|d| matches!(d.status, super::app::ConnectionStatus::Connected)).unwrap_or(false) {
+                    if app
+                        .selected_device()
+                        .map(|d| matches!(d.status, super::app::ConnectionStatus::Connected))
+                        .unwrap_or(false)
+                    {
                         hints.push(("r", "refresh"));
                         hints.push(("d", "disconnect"));
                         hints.push(("S", "sync"));
@@ -257,21 +268,33 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     // Build left content with context-sensitive hints
     let left_spans = if app.scanning {
         vec![
-            Span::styled(format!("{} ", app.spinner_char()), Style::default().fg(theme.primary)),
+            Span::styled(
+                format!("{} ", app.spinner_char()),
+                Style::default().fg(theme.primary),
+            ),
             Span::styled("Scanning...", Style::default().fg(theme.text_secondary)),
         ]
     } else if app.is_any_connecting() {
         vec![
-            Span::styled(format!("{} ", app.spinner_char()), Style::default().fg(theme.primary)),
+            Span::styled(
+                format!("{} ", app.spinner_char()),
+                Style::default().fg(theme.primary),
+            ),
             Span::styled("Connecting...", Style::default().fg(theme.text_secondary)),
         ]
     } else if app.is_syncing() {
         vec![
-            Span::styled(format!("{} ", app.spinner_char()), Style::default().fg(theme.primary)),
+            Span::styled(
+                format!("{} ", app.spinner_char()),
+                Style::default().fg(theme.primary),
+            ),
             Span::styled("Syncing...", Style::default().fg(theme.text_secondary)),
         ]
     } else if let Some(msg) = app.current_status_message() {
-        vec![Span::styled(format!(" {}", msg), Style::default().fg(theme.text_secondary))]
+        vec![Span::styled(
+            format!(" {}", msg),
+            Style::default().fg(theme.text_secondary),
+        )]
     } else {
         // Context-sensitive hints with styled keys
         let hints = context_hints(app);
@@ -280,8 +303,16 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             if i > 0 {
                 spans.push(Span::styled(" | ", Style::default().fg(theme.text_muted)));
             }
-            spans.push(Span::styled(*key, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled(format!(" {}", desc), Style::default().fg(theme.text_muted)));
+            spans.push(Span::styled(
+                *key,
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {}", desc),
+                Style::default().fg(theme.text_muted),
+            ));
         }
         spans
     };
@@ -302,8 +333,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     // Logging indicator
     if app.logging_enabled {
-        let log_indicator = Paragraph::new(" REC")
-            .style(Style::default().fg(theme.danger).add_modifier(Modifier::BOLD));
+        let log_indicator = Paragraph::new(" REC").style(
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
+        );
         frame.render_widget(log_indicator, status_layout[1]);
     }
 
@@ -313,7 +347,6 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(right, status_layout[2]);
 }
-
 
 /// Draw the tab bar with modern styling.
 fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
@@ -339,7 +372,10 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
             };
             // Add underline to active tab for visual emphasis
             let styled_name = if is_active {
-                Span::styled(format!(" {} ", name), style.add_modifier(Modifier::UNDERLINED))
+                Span::styled(
+                    format!(" {} ", name),
+                    style.add_modifier(Modifier::UNDERLINED),
+                )
             } else {
                 Span::styled(format!(" {} ", name), style)
             };

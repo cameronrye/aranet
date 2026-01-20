@@ -78,7 +78,10 @@ async fn collect_device(state: Arc<AppState>, config: DeviceConfig) {
             Err(e) => {
                 consecutive_failures += 1;
                 if consecutive_failures <= 3 {
-                    warn!("Failed to poll {}: {} (attempt {})", device_id, e, consecutive_failures);
+                    warn!(
+                        "Failed to poll {}: {} (attempt {})",
+                        device_id, e, consecutive_failures
+                    );
                 } else if consecutive_failures == 4 {
                     error!(
                         "Failed to poll {} after {} attempts, will continue trying silently",
@@ -126,4 +129,3 @@ pub enum CollectorError {
     #[error("Failed to store: {0}")]
     Store(aranet_store::Error),
 }
-

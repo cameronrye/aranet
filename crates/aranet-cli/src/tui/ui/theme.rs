@@ -55,12 +55,12 @@ impl AppTheme {
             info: Color::Rgb(96, 165, 250),    // blue-400
 
             // Text
-            text_primary: Color::Rgb(248, 250, 252),   // slate-50
+            text_primary: Color::Rgb(248, 250, 252), // slate-50
             text_secondary: Color::Rgb(148, 163, 184), // slate-400
-            text_muted: Color::Rgb(100, 116, 139),     // slate-500
+            text_muted: Color::Rgb(100, 116, 139),   // slate-500
 
             // Borders
-            border_active: Color::Rgb(34, 211, 238),  // cyan-400
+            border_active: Color::Rgb(34, 211, 238), // cyan-400
             border_inactive: Color::Rgb(71, 85, 105), // slate-600
 
             // Backgrounds
@@ -83,12 +83,12 @@ impl AppTheme {
             info: Color::Rgb(37, 99, 235),    // blue-600
 
             // Text (dark for light backgrounds)
-            text_primary: Color::Rgb(15, 23, 42),      // slate-900
-            text_secondary: Color::Rgb(71, 85, 105),   // slate-600
-            text_muted: Color::Rgb(148, 163, 184),     // slate-400
+            text_primary: Color::Rgb(15, 23, 42),    // slate-900
+            text_secondary: Color::Rgb(71, 85, 105), // slate-600
+            text_muted: Color::Rgb(148, 163, 184),   // slate-400
 
             // Borders
-            border_active: Color::Rgb(6, 182, 212),     // cyan-500
+            border_active: Color::Rgb(6, 182, 212), // cyan-500
             border_inactive: Color::Rgb(203, 213, 225), // slate-300
 
             // Backgrounds

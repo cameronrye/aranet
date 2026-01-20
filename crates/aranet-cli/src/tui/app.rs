@@ -394,7 +394,10 @@ pub fn calculate_radon_averages(history: &[HistoryRecord]) -> (Option<u32>, Opti
 #[derive(Debug, Clone)]
 pub enum PendingAction {
     /// Disconnect from device.
-    Disconnect { device_id: String, device_name: String },
+    Disconnect {
+        device_id: String,
+        device_name: String,
+    },
 }
 
 /// Main application state for the TUI.
@@ -490,10 +493,7 @@ pub struct App {
 
 impl App {
     /// Create a new application with the given command and event channels.
-    pub fn new(
-        command_tx: mpsc::Sender<Command>,
-        event_rx: mpsc::Receiver<SensorEvent>,
-    ) -> Self {
+    pub fn new(command_tx: mpsc::Sender<Command>, event_rx: mpsc::Receiver<SensorEvent>) -> Self {
         Self {
             should_quit: false,
             active_tab: Tab::default(),
@@ -588,7 +588,11 @@ impl App {
     /// Toggle Smart Home mode.
     pub fn toggle_smart_home(&mut self) {
         self.smart_home_enabled = !self.smart_home_enabled;
-        let status = if self.smart_home_enabled { "enabled" } else { "disabled" };
+        let status = if self.smart_home_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
         self.push_status_message(format!("Smart Home mode {}", status));
     }
 
@@ -688,7 +692,9 @@ impl App {
                 }
             }
             SensorEvent::ConnectionError { device_id, error } => {
-                let device_name = self.devices.iter()
+                let device_name = self
+                    .devices
+                    .iter()
                     .find(|d| d.id == device_id)
                     .map(|d| d.display_name().to_string())
                     .unwrap_or_else(|| device_id.clone());
@@ -722,7 +728,9 @@ impl App {
                 }
             }
             SensorEvent::ReadingError { device_id, error } => {
-                let device_name = self.devices.iter()
+                let device_name = self
+                    .devices
+                    .iter()
                     .find(|d| d.id == device_id)
                     .map(|d| d.display_name().to_string())
                     .unwrap_or_else(|| device_id.clone());
@@ -756,7 +764,9 @@ impl App {
             }
             SensorEvent::HistorySyncError { device_id, error } => {
                 self.syncing = false;
-                let device_name = self.devices.iter()
+                let device_name = self
+                    .devices
+                    .iter()
                     .find(|d| d.id == device_id)
                     .map(|d| d.display_name().to_string())
                     .unwrap_or_else(|| device_id.clone());
@@ -770,7 +780,10 @@ impl App {
                     device.error = Some(error);
                 }
             }
-            SensorEvent::IntervalChanged { device_id, interval_secs } => {
+            SensorEvent::IntervalChanged {
+                device_id,
+                interval_secs,
+            } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id)
                     && let Some(reading) = &mut device.reading
                 {
@@ -779,7 +792,9 @@ impl App {
                 self.push_status_message(format!("Interval set to {}m", interval_secs / 60));
             }
             SensorEvent::IntervalError { device_id, error } => {
-                let device_name = self.devices.iter()
+                let device_name = self
+                    .devices
+                    .iter()
                     .find(|d| d.id == device_id)
                     .map(|d| d.display_name().to_string())
                     .unwrap_or_else(|| device_id.clone());
@@ -793,7 +808,10 @@ impl App {
                     device.error = Some(error);
                 }
             }
-            SensorEvent::SettingsLoaded { device_id, settings } => {
+            SensorEvent::SettingsLoaded {
+                device_id,
+                settings,
+            } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.settings = Some(settings);
                     device.last_updated = Some(Instant::now());
@@ -863,8 +881,9 @@ impl App {
 
     /// Get devices matching current filter.
     pub fn filtered_devices(&self) -> Vec<&DeviceState> {
-        self.devices.iter().filter(|d| {
-            match self.device_filter {
+        self.devices
+            .iter()
+            .filter(|d| match self.device_filter {
                 DeviceFilter::All => true,
                 DeviceFilter::Aranet4Only => {
                     matches!(d.device_type, Some(DeviceType::Aranet4))
@@ -878,8 +897,8 @@ impl App {
                 DeviceFilter::ConnectedOnly => {
                     matches!(d.status, ConnectionStatus::Connected)
                 }
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Cycle device filter to next option.
@@ -922,7 +941,9 @@ impl App {
     pub fn cycle_interval(&mut self) -> Option<(String, u16)> {
         let device = self.selected_device()?;
         let reading = device.reading.as_ref()?;
-        let current_idx = self.interval_options.iter()
+        let current_idx = self
+            .interval_options
+            .iter()
             .position(|&i| i == reading.interval)
             .unwrap_or(0);
         let next_idx = (current_idx + 1) % self.interval_options.len();
@@ -1151,7 +1172,8 @@ impl App {
                 }
             } else if !self.sticky_alerts {
                 // Clear radon alert if level improved (unless sticky)
-                self.alerts.retain(|a| !(a.device_id == device_id && a.message.contains("Radon")));
+                self.alerts
+                    .retain(|a| !(a.device_id == device_id && a.message.contains("Radon")));
             }
         }
     }
@@ -1171,7 +1193,11 @@ impl App {
         self.sticky_alerts = !self.sticky_alerts;
         self.push_status_message(format!(
             "Sticky alerts {}",
-            if self.sticky_alerts { "enabled" } else { "disabled" }
+            if self.sticky_alerts {
+                "enabled"
+            } else {
+                "disabled"
+            }
         ));
     }
 
@@ -1235,7 +1261,10 @@ impl App {
 
         let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
         let radon = reading.radon.map(|r| r.to_string()).unwrap_or_default();
-        let radiation = reading.radiation_rate.map(|r| format!("{:.3}", r)).unwrap_or_default();
+        let radiation = reading
+            .radiation_rate
+            .map(|r| format!("{:.3}", r))
+            .unwrap_or_default();
 
         let _ = writeln!(
             writer,
@@ -1263,7 +1292,9 @@ impl App {
         }
 
         // Filter history based on current filter
-        let filtered: Vec<_> = device.history.iter()
+        let filtered: Vec<_> = device
+            .history
+            .iter()
             .filter(|r| self.filter_matches_record(r))
             .collect();
 
@@ -1279,12 +1310,20 @@ impl App {
         std::fs::create_dir_all(&export_dir).ok()?;
 
         // Generate filename with timestamp
-        let now = time::OffsetDateTime::now_local()
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         let filename = format!(
             "history_{}_{}.csv",
-            device.name.as_deref().unwrap_or(&device.id).replace(" ", "_"),
-            now.format(&time::format_description::parse("[year][month][day]_[hour][minute][second]").unwrap()).unwrap_or_default()
+            device
+                .name
+                .as_deref()
+                .unwrap_or(&device.id)
+                .replace(" ", "_"),
+            now.format(
+                &time::format_description::parse("[year][month][day]_[hour][minute][second]")
+                    .unwrap()
+            )
+            .unwrap_or_default()
         );
         let path = export_dir.join(&filename);
 
@@ -1292,21 +1331,32 @@ impl App {
         let mut file = std::fs::File::create(&path).ok()?;
 
         // Header
-        writeln!(file, "timestamp,co2,temperature,humidity,pressure,radon,radiation_rate").ok()?;
+        writeln!(
+            file,
+            "timestamp,co2,temperature,humidity,pressure,radon,radiation_rate"
+        )
+        .ok()?;
 
         // Records
         for record in filtered {
             writeln!(
                 file,
                 "{},{},{:.1},{},{:.1},{},{}",
-                record.timestamp.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                record
+                    .timestamp
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
                 record.co2,
                 record.temperature,
                 record.humidity,
                 record.pressure,
                 record.radon.map(|v| v.to_string()).unwrap_or_default(),
-                record.radiation_rate.map(|v| format!("{:.3}", v)).unwrap_or_default(),
-            ).ok()?;
+                record
+                    .radiation_rate
+                    .map(|v| format!("{:.3}", v))
+                    .unwrap_or_default(),
+            )
+            .ok()?;
         }
 
         Some(path.to_string_lossy().to_string())
@@ -1343,7 +1393,9 @@ impl App {
 
         // Determine refresh interval based on first connected device's reading interval
         // or use default of 60 seconds
-        let interval = self.devices.iter()
+        let interval = self
+            .devices
+            .iter()
             .find(|d| d.status == ConnectionStatus::Connected)
             .and_then(|d| d.reading.as_ref())
             .map(|r| Duration::from_secs(r.interval as u64))
@@ -1360,7 +1412,8 @@ impl App {
         if should_refresh {
             self.last_auto_refresh = Some(now);
             // Return IDs of all connected devices
-            self.devices.iter()
+            self.devices
+                .iter()
                 .filter(|d| d.status == ConnectionStatus::Connected)
                 .map(|d| d.id.clone())
                 .collect()
@@ -1405,7 +1458,9 @@ impl App {
     /// Start editing alias for selected device.
     pub fn start_alias_edit(&mut self) {
         if let Some(device) = self.selected_device() {
-            self.alias_input = device.alias.clone()
+            self.alias_input = device
+                .alias
+                .clone()
                 .or_else(|| device.name.clone())
                 .unwrap_or_default();
             self.editing_alias = true;
@@ -1465,7 +1520,9 @@ impl App {
 
     /// Get average CO2 across all connected devices with readings.
     pub fn average_co2(&self) -> Option<u16> {
-        let values: Vec<u16> = self.devices.iter()
+        let values: Vec<u16> = self
+            .devices
+            .iter()
             .filter(|d| matches!(d.status, ConnectionStatus::Connected))
             .filter_map(|d| d.reading.as_ref())
             .filter_map(|r| if r.co2 > 0 { Some(r.co2) } else { None })
@@ -1480,14 +1537,16 @@ impl App {
 
     /// Get count of connected devices.
     pub fn connected_count(&self) -> usize {
-        self.devices.iter()
+        self.devices
+            .iter()
             .filter(|d| matches!(d.status, ConnectionStatus::Connected))
             .count()
     }
 
     /// Check if any device is currently connecting.
     pub fn is_any_connecting(&self) -> bool {
-        self.devices.iter()
+        self.devices
+            .iter()
             .any(|d| matches!(d.status, ConnectionStatus::Connecting))
     }
 
@@ -1509,7 +1568,9 @@ impl App {
             // Pick the next device as comparison target
             let next = (self.selected_device + 1) % self.devices.len();
             self.comparison_device_index = Some(next);
-            self.push_status_message("Comparison view: use </> to change second device".to_string());
+            self.push_status_message(
+                "Comparison view: use </> to change second device".to_string(),
+            );
         } else {
             self.comparison_device_index = None;
         }
@@ -1542,7 +1603,7 @@ impl App {
 
     /// Get the comparison device.
     pub fn comparison_device(&self) -> Option<&DeviceState> {
-        self.comparison_device_index.and_then(|i| self.devices.get(i))
+        self.comparison_device_index
+            .and_then(|i| self.devices.get(i))
     }
 }
-

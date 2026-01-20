@@ -43,8 +43,7 @@ pub enum Level {
 
 /// Get the native service manager for this platform.
 fn get_manager(level: Level) -> Result<Box<dyn ServiceManager>, ServiceError> {
-    let mut manager = <dyn ServiceManager>::native()
-        .map_err(|_| ServiceError::NoServiceManager)?;
+    let mut manager = <dyn ServiceManager>::native().map_err(|_| ServiceError::NoServiceManager)?;
 
     let service_level = match level {
         Level::System => ServiceLevel::System,
@@ -84,7 +83,9 @@ pub fn install(level: Level) -> Result<(), ServiceError> {
             working_directory: None,
             environment: None,
             autostart: true,
-            restart_policy: RestartPolicy::OnFailure { delay_secs: Some(5) },
+            restart_policy: RestartPolicy::OnFailure {
+                delay_secs: Some(5),
+            },
         })
         .map_err(|e| ServiceError::Manager(e.to_string()))?;
 
@@ -134,7 +135,9 @@ pub fn status(level: Level) -> Result<ServiceStatus, ServiceError> {
 
     // Try to query status - service-manager doesn't have a direct status method,
     // so we check if we can interact with the service
-    match manager.stop(ServiceStopCtx { label: label.clone() }) {
+    match manager.stop(ServiceStopCtx {
+        label: label.clone(),
+    }) {
         Ok(_) => {
             // Was running, start it back up
             let _ = manager.start(ServiceStartCtx { label });
@@ -150,4 +153,3 @@ pub enum ServiceStatus {
     Running,
     Stopped,
 }
-

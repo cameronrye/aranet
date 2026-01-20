@@ -14,11 +14,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Sparkline};
 
 use aranet_types::DeviceType;
 
-use crate::tui::app::{App, DeviceState, PendingAction};
-use crate::tui::errors::format_error_with_guidance;
 use super::colors::{battery_color, co2_color, radon_color};
 use super::theme::{AppTheme, BORDER_TYPE};
 use super::widgets::{resample_sparkline_data, sparkline_data};
+use crate::tui::app::{App, DeviceState, PendingAction};
+use crate::tui::errors::format_error_with_guidance;
 
 /// Draw help overlay with keyboard shortcuts.
 pub(super) fn draw_help_overlay(frame: &mut Frame) {
@@ -26,8 +26,12 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
 
     let area = frame.area();
     // Use a moderate portion of the screen (70% width, 70% height)
-    let width = (area.width * 70 / 100).max(60).min(area.width.saturating_sub(2));
-    let height = (area.height * 70 / 100).max(20).min(area.height.saturating_sub(2));
+    let width = (area.width * 70 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let height = (area.height * 70 / 100)
+        .max(20)
+        .min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
 
@@ -45,7 +49,9 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
     let left_lines = vec![
         Line::from(Span::styled(
             "--- Navigation ---",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         shortcut_line("Tab/Shift+Tab", "Next/Prev tab", &theme),
@@ -56,7 +62,9 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "--- Views ---",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         shortcut_line("?", "Toggle help", &theme),
@@ -68,7 +76,9 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "--- Devices ---",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         shortcut_line("s", "Scan for devices", &theme),
@@ -83,7 +93,9 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
     let right_lines = vec![
         Line::from(Span::styled(
             "--- Charts ---",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         shortcut_line("T", "Toggle temp on chart", &theme),
@@ -92,7 +104,9 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "--- Alerts ---",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         shortcut_line("Esc", "Dismiss alert", &theme),
@@ -102,7 +116,9 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "--- Settings ---",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         shortcut_line("t", "Toggle theme", &theme),
@@ -112,7 +128,9 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "--- Other ---",
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         shortcut_line("e", "Export history", &theme),
@@ -144,10 +162,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
 /// Create a shortcut line with key and description.
 fn shortcut_line<'a>(key: &str, desc: &str, theme: &AppTheme) -> Line<'a> {
     Line::from(vec![
-        Span::styled(
-            format!("{:>12} ", key),
-            Style::default().fg(theme.warning),
-        ),
+        Span::styled(format!("{:>12} ", key), Style::default().fg(theme.warning)),
         Span::styled(desc.to_string(), Style::default().fg(theme.text_secondary)),
     ])
 }
@@ -173,7 +188,12 @@ pub(super) fn draw_alert_history(frame: &mut Frame, app: &App) {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(" Press ", Style::default().fg(theme.text_muted)),
-            Span::styled("a", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" to close ", Style::default().fg(theme.text_muted)),
         ]),
         Line::from(""),
@@ -187,8 +207,7 @@ pub(super) fn draw_alert_history(frame: &mut Frame, app: &App) {
     } else {
         // Show most recent alerts first
         for record in app.alert_history.iter().rev().take(15) {
-            let format =
-                time::format_description::parse("[month]-[day] [hour]:[minute]").unwrap();
+            let format = time::format_description::parse("[month]-[day] [hour]:[minute]").unwrap();
             let time_str = record.timestamp.format(&format).unwrap_or_default();
 
             lines.push(Line::from(vec![
@@ -196,10 +215,16 @@ pub(super) fn draw_alert_history(frame: &mut Frame, app: &App) {
                     format!("{} ", record.severity.icon()),
                     Style::default().fg(record.severity.color()),
                 ),
-                Span::styled(format!("{} ", time_str), Style::default().fg(theme.text_muted)),
+                Span::styled(
+                    format!("{} ", time_str),
+                    Style::default().fg(theme.text_muted),
+                ),
                 Span::styled(&record.device_name, Style::default().fg(theme.primary)),
                 Span::raw(": "),
-                Span::styled(&record.message, Style::default().fg(record.severity.color())),
+                Span::styled(
+                    &record.message,
+                    Style::default().fg(record.severity.color()),
+                ),
             ]));
         }
 
@@ -219,7 +244,9 @@ pub(super) fn draw_alert_history(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(theme.warning))
             .title(Span::styled(
                 " Alert History ",
-                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
             )),
     );
 
@@ -259,14 +286,13 @@ pub(super) fn draw_alias_editor(frame: &mut Frame, app: &App) {
         ]),
     ];
 
-    let dialog = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BORDER_TYPE)
-                .border_style(theme.border_active_style())
-                .title(Span::styled(" Set Device Alias ", theme.title_style())),
-        );
+    let dialog = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BORDER_TYPE)
+            .border_style(theme.border_active_style())
+            .title(Span::styled(" Set Device Alias ", theme.title_style())),
+    );
 
     frame.render_widget(dialog, dialog_area);
 }
@@ -300,7 +326,9 @@ pub(super) fn draw_error_popup(frame: &mut Frame, app: &App) {
         // Main error message (user-friendly)
         Line::from(Span::styled(
             &short_message,
-            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ];
@@ -330,7 +358,12 @@ pub(super) fn draw_error_popup(frame: &mut Frame, app: &App) {
     // Dismiss instruction
     lines.push(Line::from(vec![
         Span::styled("Press ", Style::default().fg(theme.text_muted)),
-        Span::styled("E", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "E",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" to dismiss", Style::default().fg(theme.text_muted)),
     ]));
 
@@ -341,7 +374,9 @@ pub(super) fn draw_error_popup(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(theme.danger))
             .title(Span::styled(
                 " Error ",
-                Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.danger)
+                    .add_modifier(Modifier::BOLD),
             )),
     );
 
@@ -372,12 +407,25 @@ pub(super) fn draw_confirmation_dialog(frame: &mut Frame, app: &App) {
 
         let lines = vec![
             Line::from(""),
-            Line::from(Span::styled(message, Style::default().fg(theme.text_primary))),
+            Line::from(Span::styled(
+                message,
+                Style::default().fg(theme.text_primary),
+            )),
             Line::from(""),
             Line::from(vec![
-                Span::styled(" [Y]es ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [Y]es ",
+                    Style::default()
+                        .fg(theme.success)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
-                Span::styled(" [N]o ", Style::default().fg(theme.danger).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [N]o ",
+                    Style::default()
+                        .fg(theme.danger)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
         ];
 
@@ -390,7 +438,9 @@ pub(super) fn draw_confirmation_dialog(frame: &mut Frame, app: &App) {
                     .border_style(Style::default().fg(theme.warning))
                     .title(Span::styled(
                         " Confirm ",
-                        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.warning)
+                            .add_modifier(Modifier::BOLD),
                     )),
             );
 
@@ -452,7 +502,11 @@ pub(super) fn draw_fullscreen_chart(frame: &mut Frame, app: &App) {
     let title_para = Paragraph::new(title_text)
         .alignment(ratatui::layout::Alignment::Center)
         .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme.border_inactive)));
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme.border_inactive)),
+        );
     frame.render_widget(title_para, layout[0]);
 
     // Chart - resample data to fill the entire width (minus borders)
@@ -471,14 +525,25 @@ pub(super) fn draw_fullscreen_chart(frame: &mut Frame, app: &App) {
 
     // Legend
     let legend = Line::from(vec![
-        Span::styled(format!(" Min: {} ", min_val), Style::default().fg(theme.success)),
-        Span::styled(format!(" Max: {} ", max_val), Style::default().fg(theme.danger)),
+        Span::styled(
+            format!(" Min: {} ", min_val),
+            Style::default().fg(theme.success),
+        ),
+        Span::styled(
+            format!(" Max: {} ", max_val),
+            Style::default().fg(theme.danger),
+        ),
         Span::styled(
             format!(" Points: {} ", data.len()),
             Style::default().fg(theme.text_muted),
         ),
         Span::styled(" | Press ", Style::default().fg(theme.text_muted)),
-        Span::styled("g", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "g",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" to close ", Style::default().fg(theme.text_muted)),
     ]);
     let legend_para = Paragraph::new(legend).alignment(ratatui::layout::Alignment::Center);
@@ -506,15 +571,19 @@ pub(super) fn draw_comparison_view(frame: &mut Frame, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // Header
-            Constraint::Min(10),    // Content
-            Constraint::Length(2),  // Footer
+            Constraint::Length(2), // Header
+            Constraint::Min(10),   // Content
+            Constraint::Length(2), // Footer
         ])
         .split(area);
 
     // Header
     let header = Paragraph::new(" Comparison View ")
-        .style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(header, layout[0]);
 
@@ -531,17 +600,33 @@ pub(super) fn draw_comparison_view(frame: &mut Frame, app: &App) {
     // Footer
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled("v", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "v",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("=close  ", Style::default().fg(theme.text_muted)),
-        Span::styled("</>", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "</>",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("=change device ", Style::default().fg(theme.text_muted)),
     ]))
-        .alignment(ratatui::layout::Alignment::Center);
+    .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(footer, layout[2]);
 }
 
 /// Draw a single device in comparison view.
-fn draw_comparison_device(frame: &mut Frame, area: Rect, device: &DeviceState, label: &str, theme: &AppTheme) {
+fn draw_comparison_device(
+    frame: &mut Frame,
+    area: Rect,
+    device: &DeviceState,
+    label: &str,
+    theme: &AppTheme,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BORDER_TYPE)
@@ -571,7 +656,10 @@ fn draw_comparison_device(frame: &mut Frame, area: Rect, device: &DeviceState, l
                 let color = radon_color(radon);
                 lines.push(Line::from(vec![
                     Span::styled("Radon: ", Style::default().fg(theme.text_secondary)),
-                    Span::styled(format!("{} Bq/m3", radon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{} Bq/m3", radon),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
                 ]));
             }
         }
@@ -580,7 +668,10 @@ fn draw_comparison_device(frame: &mut Frame, area: Rect, device: &DeviceState, l
                 let color = co2_color(reading.co2);
                 lines.push(Line::from(vec![
                     Span::styled("CO2: ", Style::default().fg(theme.text_secondary)),
-                    Span::styled(format!("{} ppm", reading.co2), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{} ppm", reading.co2),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
                 ]));
             }
         }
@@ -589,13 +680,19 @@ fn draw_comparison_device(frame: &mut Frame, area: Rect, device: &DeviceState, l
     // Temperature
     lines.push(Line::from(vec![
         Span::styled("Temp: ", Style::default().fg(theme.text_secondary)),
-        Span::styled(format!("{:.1}C", reading.temperature), Style::default().fg(theme.text_primary)),
+        Span::styled(
+            format!("{:.1}C", reading.temperature),
+            Style::default().fg(theme.text_primary),
+        ),
     ]));
 
     // Humidity
     lines.push(Line::from(vec![
         Span::styled("Humidity: ", Style::default().fg(theme.text_secondary)),
-        Span::styled(format!("{}%", reading.humidity), Style::default().fg(theme.text_primary)),
+        Span::styled(
+            format!("{}%", reading.humidity),
+            Style::default().fg(theme.text_primary),
+        ),
     ]));
 
     // Battery

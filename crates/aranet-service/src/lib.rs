@@ -43,4 +43,3 @@ pub mod ws;
 pub use collector::Collector;
 pub use config::{Config, ConfigError, DeviceConfig, ServerConfig, StorageConfig};
 pub use state::{AppState, ReadingEvent};
-

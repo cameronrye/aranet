@@ -534,15 +534,34 @@ async fn test_multi_device_concurrent_reads() {
 async fn test_polymorphic_device_collection() {
     // Create a collection of devices with different types (auto_connect=true by default in builder)
     let devices: Vec<Box<dyn AranetDevice + Send + Sync>> = vec![
-        Box::new(MockDeviceBuilder::new().name("Aranet4 Test").device_type(DeviceType::Aranet4).build()),
-        Box::new(MockDeviceBuilder::new().name("Radon Test").device_type(DeviceType::AranetRadon).build()),
-        Box::new(MockDeviceBuilder::new().name("Aranet2 Test").device_type(DeviceType::Aranet2).build()),
+        Box::new(
+            MockDeviceBuilder::new()
+                .name("Aranet4 Test")
+                .device_type(DeviceType::Aranet4)
+                .build(),
+        ),
+        Box::new(
+            MockDeviceBuilder::new()
+                .name("Radon Test")
+                .device_type(DeviceType::AranetRadon)
+                .build(),
+        ),
+        Box::new(
+            MockDeviceBuilder::new()
+                .name("Aranet2 Test")
+                .device_type(DeviceType::Aranet2)
+                .build(),
+        ),
     ];
 
     // Read from all devices through trait interface
     for device in &devices {
         let reading = device.read_current().await;
-        assert!(reading.is_ok(), "Failed to read from {}", device.name().unwrap_or("unknown"));
+        assert!(
+            reading.is_ok(),
+            "Failed to read from {}",
+            device.name().unwrap_or("unknown")
+        );
     }
 
     // Verify device types
@@ -569,9 +588,7 @@ async fn test_validation_with_device_reading() {
     let reading = device.read_current().await.unwrap();
 
     // Validate with Aranet4-specific config
-    let validator = ReadingValidator::new(
-        aranet_core::validation::ValidatorConfig::for_aranet4()
-    );
+    let validator = ReadingValidator::new(aranet_core::validation::ValidatorConfig::for_aranet4());
     let result = validator.validate(&reading);
 
     // Should be valid (within Aranet4 range of 10000 max)
@@ -588,9 +605,7 @@ async fn test_validation_catches_invalid_readings() {
 
     let reading = device.read_current().await.unwrap();
 
-    let validator = ReadingValidator::new(
-        aranet_core::validation::ValidatorConfig::for_aranet4()
-    );
+    let validator = ReadingValidator::new(aranet_core::validation::ValidatorConfig::for_aranet4());
     let result = validator.validate(&reading);
 
     // Should be invalid
@@ -643,7 +658,7 @@ async fn test_radon_device_lifecycle() {
 /// Test radon validation thresholds
 #[tokio::test]
 async fn test_radon_validation() {
-    use aranet_core::validation::{ValidatorConfig, ValidationWarning};
+    use aranet_core::validation::{ValidationWarning, ValidatorConfig};
 
     let config = ValidatorConfig::for_aranet_radon();
     let validator = ReadingValidator::new(config);
@@ -669,7 +684,12 @@ async fn test_radon_validation() {
 
     let result = validator.validate(&reading);
     assert!(!result.is_valid, "High radon should fail validation");
-    assert!(result.warnings.iter().any(|w| matches!(w, ValidationWarning::RadonTooHigh { .. })));
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::RadonTooHigh { .. }))
+    );
 }
 
 /// Test AranetRn+ device with MockDeviceBuilder

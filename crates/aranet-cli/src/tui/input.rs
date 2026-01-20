@@ -254,18 +254,20 @@ pub fn apply_action(
             duration: Duration::from_secs(5),
         }),
         Action::Refresh => Some(Command::RefreshAll),
-        Action::Connect => {
-            app.selected_device().map(|device| Command::Connect {
-                device_id: device.id.clone(),
-            })
-        }
+        Action::Connect => app.selected_device().map(|device| Command::Connect {
+            device_id: device.id.clone(),
+        }),
         Action::ConnectAll => {
             // Connect to all disconnected devices one by one
             // Find first disconnected device and connect
-            let first_disconnected = app.devices.iter()
+            let first_disconnected = app
+                .devices
+                .iter()
                 .find(|d| matches!(d.status, ConnectionStatus::Disconnected))
                 .map(|d| d.id.clone());
-            let count = app.devices.iter()
+            let count = app
+                .devices
+                .iter()
                 .filter(|d| matches!(d.status, ConnectionStatus::Disconnected))
                 .count();
 
@@ -289,11 +291,9 @@ pub fn apply_action(
             }
             None
         }
-        Action::SyncHistory => {
-            app.selected_device().map(|device| Command::SyncHistory {
-                device_id: device.id.clone(),
-            })
-        }
+        Action::SyncHistory => app.selected_device().map(|device| Command::SyncHistory {
+            device_id: device.id.clone(),
+        }),
         Action::SelectNext => {
             if app.active_tab == Tab::Settings {
                 app.select_next_setting();
@@ -338,7 +338,11 @@ pub fn apply_action(
             app.bell_enabled = !app.bell_enabled;
             app.push_status_message(format!(
                 "Bell notifications {}",
-                if app.bell_enabled { "enabled" } else { "disabled" }
+                if app.bell_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             ));
             None
         }
@@ -402,12 +406,13 @@ pub fn apply_action(
             None
         }
         Action::ChangeSetting => {
-            if app.active_tab == Tab::Settings
-                && app.selected_setting == 0
-            {
+            if app.active_tab == Tab::Settings && app.selected_setting == 0 {
                 // Interval setting
                 if let Some((device_id, new_interval)) = app.cycle_interval() {
-                    return Some(Command::SetInterval { device_id, interval_secs: new_interval });
+                    return Some(Command::SetInterval {
+                        device_id,
+                        interval_secs: new_interval,
+                    });
                 }
             }
             None
@@ -434,7 +439,14 @@ pub fn apply_action(
         }
         Action::ToggleSidebar => {
             app.toggle_sidebar();
-            app.push_status_message(if app.show_sidebar { "Sidebar shown" } else { "Sidebar hidden" }.to_string());
+            app.push_status_message(
+                if app.show_sidebar {
+                    "Sidebar shown"
+                } else {
+                    "Sidebar hidden"
+                }
+                .to_string(),
+            );
             None
         }
         Action::ToggleSidebarWidth => {
@@ -534,13 +546,21 @@ pub fn apply_action(
         }
         Action::ToggleChartTemp => {
             app.toggle_chart_metric(App::METRIC_TEMP);
-            let status = if app.chart_shows(App::METRIC_TEMP) { "shown" } else { "hidden" };
+            let status = if app.chart_shows(App::METRIC_TEMP) {
+                "shown"
+            } else {
+                "hidden"
+            };
             app.push_status_message(format!("Temperature on chart: {}", status));
             None
         }
         Action::ToggleChartHumidity => {
             app.toggle_chart_metric(App::METRIC_HUMIDITY);
-            let status = if app.chart_shows(App::METRIC_HUMIDITY) { "shown" } else { "hidden" };
+            let status = if app.chart_shows(App::METRIC_HUMIDITY) {
+                "shown"
+            } else {
+                "hidden"
+            };
             app.push_status_message(format!("Humidity on chart: {}", status));
             None
         }

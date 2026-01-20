@@ -5,9 +5,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 
 use aranet_types::{DeviceType, HistoryRecord};
 
-use crate::tui::app::{App, HistoryFilter};
 use super::theme::BORDER_TYPE;
-use super::widgets::{format_radon_for_device, format_temp_for_device, resample_sparkline_data, sparkline_data};
+use super::widgets::{
+    format_radon_for_device, format_temp_for_device, resample_sparkline_data, sparkline_data,
+};
+use crate::tui::app::{App, HistoryFilter};
 
 /// Get data for a specific chart metric from history.
 /// Returns (data vector, color, label) tuple.
@@ -101,8 +103,16 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(""),
             Line::from(vec![
                 Span::styled("Press ", Style::default().fg(theme.text_muted)),
-                Span::styled("S", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-                Span::styled(" to sync history from device", Style::default().fg(theme.text_muted)),
+                Span::styled(
+                    "S",
+                    Style::default()
+                        .fg(theme.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " to sync history from device",
+                    Style::default().fg(theme.text_muted),
+                ),
             ]),
         ];
         let msg = Paragraph::new(lines)
@@ -157,7 +167,10 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
         info_lines.push(Line::from(vec![
             Span::styled("  Last sync: ", Style::default().fg(theme.text_muted)),
             Span::styled(sync_str, Style::default().fg(theme.text_primary)),
-            Span::styled(format!(" ({})", age_str), Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!(" ({})", age_str),
+                Style::default().fg(theme.text_muted),
+            ),
         ]));
     } else {
         info_lines.push(Line::from(vec![
@@ -174,10 +187,17 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
         // Build title with legend
         let mut title_spans = vec![Span::styled(" Trend ", theme.title_style())];
         for &metric in &metrics_to_show {
-            let (_, color, label) = get_chart_metric_data(&device.history, metric, device.device_type);
-            title_spans.push(Span::styled(format!("[{}] ", label), Style::default().fg(color)));
+            let (_, color, label) =
+                get_chart_metric_data(&device.history, metric, device.device_type);
+            title_spans.push(Span::styled(
+                format!("[{}] ", label),
+                Style::default().fg(color),
+            ));
         }
-        title_spans.push(Span::styled("(T/H toggle) ", Style::default().fg(theme.text_muted)));
+        title_spans.push(Span::styled(
+            "(T/H toggle) ",
+            Style::default().fg(theme.text_muted),
+        ));
 
         let sparkline_block = Block::default()
             .title(Line::from(title_spans))
@@ -210,7 +230,8 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
         // Draw each metric's sparkline, resampled to fit the available width
         let chart_width = chart_rows.first().map(|r| r.width as usize).unwrap_or(0);
         for (i, &metric) in metrics_to_show.iter().enumerate() {
-            let (data, color, _label) = get_chart_metric_data(&device.history, metric, device.device_type);
+            let (data, color, _label) =
+                get_chart_metric_data(&device.history, metric, device.device_type);
             if !data.is_empty() {
                 // Resample data to fill the entire width
                 let resampled = resample_sparkline_data(&data, chart_width);
@@ -223,7 +244,13 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
 
         // Draw X-axis time labels
         if let (Some(oldest), Some(newest)) = (device.history.first(), device.history.last()) {
-            draw_sparkline_x_axis(frame, sparkline_vertical[1], oldest.timestamp, newest.timestamp, theme.text_muted);
+            draw_sparkline_x_axis(
+                frame,
+                sparkline_vertical[1],
+                oldest.timestamp,
+                newest.timestamp,
+                theme.text_muted,
+            );
         }
     }
 
@@ -256,7 +283,9 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
     // Calculate visible records with scroll
     let visible_count = (layout[2].height as usize).saturating_sub(2); // Account for borders
     let total_records = filtered_history.len();
-    let scroll_offset = app.history_scroll.min(total_records.saturating_sub(visible_count));
+    let scroll_offset = app
+        .history_scroll
+        .min(total_records.saturating_sub(visible_count));
 
     // Get device settings for unit formatting
     let settings = device.settings.as_ref();
@@ -280,10 +309,16 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
             } else if record.co2 > 0 {
                 format!("CO2: {} ppm", record.co2)
             } else {
-                format!("Temp: {}", format_temp_for_device(record.temperature, settings))
+                format!(
+                    "Temp: {}",
+                    format_temp_for_device(record.temperature, settings)
+                )
             };
             Line::from(vec![
-                Span::styled(format!("  {}  ", time), Style::default().fg(theme.text_muted)),
+                Span::styled(
+                    format!("  {}  ", time),
+                    Style::default().fg(theme.text_muted),
+                ),
                 Span::styled(value, Style::default().fg(theme.text_secondary)),
             ])
         })

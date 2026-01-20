@@ -8,7 +8,6 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline};
 
 use aranet_types::DeviceType;
 
-use crate::tui::app::{calculate_radon_averages, App, ConnectionStatus, DeviceFilter};
 use super::colors::{battery_color, co2_color, radon_color};
 use super::rssi_display;
 use super::theme::{AppTheme, BORDER_TYPE};
@@ -16,6 +15,7 @@ use super::widgets::{
     co2_trend, convert_radon_for_device, format_radon_for_device, format_temp_for_device,
     radon_unit_for_device, resample_sparkline_data, sparkline_data,
 };
+use crate::tui::app::{App, ConnectionStatus, DeviceFilter, calculate_radon_averages};
 
 /// Create a bordered reading card with status-aware border color.
 fn reading_card(
@@ -68,11 +68,7 @@ pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, device)| {
-            let name = device
-                .display_name()
-                .chars()
-                .take(18)
-                .collect::<String>();
+            let name = device.display_name().chars().take(18).collect::<String>();
 
             let (status_icon, icon_color) = match &device.status {
                 ConnectionStatus::Connected => ("*", theme.success),
@@ -85,7 +81,9 @@ pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
             let prefix = if is_selected { "> " } else { "  " };
 
             let name_style = if is_selected {
-                Style::default().fg(theme.text_primary).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text_secondary)
             };
@@ -101,7 +99,10 @@ pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
             if matches!(device.status, ConnectionStatus::Connected) {
                 if let Some(rssi) = device.rssi {
                     let (bars, color) = rssi_display(rssi);
-                    spans.push(Span::styled(format!(" {}", bars), Style::default().fg(color)));
+                    spans.push(Span::styled(
+                        format!(" {}", bars),
+                        Style::default().fg(color),
+                    ));
                 }
                 // Add uptime for connected devices
                 if let Some(uptime) = device.uptime() {
@@ -142,7 +143,12 @@ pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Press ", Style::default().fg(theme.text_muted)),
-                Span::styled("s", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "s",
+                    Style::default()
+                        .fg(theme.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" to scan", Style::default().fg(theme.text_muted)),
             ]),
         ];
@@ -190,8 +196,16 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(""),
             Line::from(vec![
                 Span::styled("Press ", Style::default().fg(theme.text_muted)),
-                Span::styled("s", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-                Span::styled(" to scan for devices", Style::default().fg(theme.text_muted)),
+                Span::styled(
+                    "s",
+                    Style::default()
+                        .fg(theme.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " to scan for devices",
+                    Style::default().fg(theme.text_muted),
+                ),
             ]),
         ];
         let msg = Paragraph::new(lines)
@@ -227,10 +241,7 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(theme.text_muted),
             )),
             Line::from(""),
-            Line::from(Span::styled(
-                status_msg,
-                Style::default().fg(theme.warning),
-            )),
+            Line::from(Span::styled(status_msg, Style::default().fg(theme.warning))),
         ];
         let msg = Paragraph::new(lines)
             .alignment(Alignment::Center)
@@ -268,9 +279,7 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
         .split(inner);
 
     // Draw alert banner if active
-    if has_alert
-        && let Some(alert) = app.alerts.iter().find(|a| a.device_id == device.id)
-    {
+    if has_alert && let Some(alert) = app.alerts.iter().find(|a| a.device_id == device.id) {
         let alert_style = Style::default()
             .fg(theme.text_primary)
             .bg(alert.severity.color())
@@ -344,7 +353,13 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(card, row1_cols[1]);
     } else {
         // For Aranet2, show humidity in the second slot of row 1
-        let card = reading_card("Humidity", &format!("{}%", reading.humidity), theme.info, None, &theme);
+        let card = reading_card(
+            "Humidity",
+            &format!("{}%", reading.humidity),
+            theme.info,
+            None,
+            &theme,
+        );
         frame.render_widget(card, row1_cols[1]);
     }
 
@@ -356,12 +371,24 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     // Humidity card (skip if Aranet2 since it's already shown)
     if reading.co2 > 0 || reading.radon.is_some() || reading.radiation_rate.is_some() {
-        let card = reading_card("Humidity", &format!("{}%", reading.humidity), theme.info, None, &theme);
+        let card = reading_card(
+            "Humidity",
+            &format!("{}%", reading.humidity),
+            theme.info,
+            None,
+            &theme,
+        );
         frame.render_widget(card, row2_cols[0]);
     } else {
         // For Aranet2, show battery in row 2 left slot
         let color = battery_color(reading.battery);
-        let card = reading_card("Battery", &format!("{}%", reading.battery), color, None, &theme);
+        let card = reading_card(
+            "Battery",
+            &format!("{}%", reading.battery),
+            color,
+            None,
+            &theme,
+        );
         frame.render_widget(card, row2_cols[0]);
     }
 
@@ -385,7 +412,11 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
             format!("{}h ago", reading.age / 3600)
         };
         let is_stale = reading.age > reading.interval * 2;
-        let age_color = if is_stale { theme.danger } else { theme.text_muted };
+        let age_color = if is_stale {
+            theme.danger
+        } else {
+            theme.text_muted
+        };
         let card = reading_card("Age", &age_str, age_color, None, &theme);
         frame.render_widget(card, row2_cols[1]);
     }
@@ -399,7 +430,13 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
     // Battery card (skip if Aranet2 since it's already shown)
     if reading.co2 > 0 || reading.radon.is_some() || reading.radiation_rate.is_some() {
         let color = battery_color(reading.battery);
-        let card = reading_card("Battery", &format!("{}%", reading.battery), color, None, &theme);
+        let card = reading_card(
+            "Battery",
+            &format!("{}%", reading.battery),
+            color,
+            None,
+            &theme,
+        );
         frame.render_widget(card, row3_cols[0]);
 
         // Age card
@@ -411,7 +448,11 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
             format!("{}h ago", reading.age / 3600)
         };
         let is_stale = reading.age > reading.interval * 2;
-        let age_color = if is_stale { theme.danger } else { theme.text_muted };
+        let age_color = if is_stale {
+            theme.danger
+        } else {
+            theme.text_muted
+        };
         let card = reading_card("Age", &age_str, age_color, None, &theme);
         frame.render_widget(card, row3_cols[1]);
     }
@@ -457,8 +498,10 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
         let (day_avg, week_avg) = calculate_radon_averages(&device.history);
         let radon_unit = radon_unit_for_device(settings);
 
-        let mut avg_spans =
-            vec![Span::styled("  Averages  ", Style::default().fg(theme.text_muted))];
+        let mut avg_spans = vec![Span::styled(
+            "  Averages  ",
+            Style::default().fg(theme.text_muted),
+        )];
 
         if let Some(avg) = day_avg {
             let avg_display = convert_radon_for_device(avg, settings);

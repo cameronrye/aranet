@@ -4,10 +4,10 @@ use aranet_core::settings::{BluetoothRange, RadonUnit, TemperatureUnit};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::tui::app::App;
 use super::colors::battery_color;
 use super::rssi_display;
 use super::theme::BORDER_TYPE;
+use crate::tui::app::App;
 
 /// Renders the settings panel with device info and configuration options.
 pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
@@ -57,7 +57,10 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
         info_lines.push(Line::from(vec![
             Span::styled("  Signal:       ", Style::default().fg(theme.text_muted)),
             Span::styled(bars, Style::default().fg(color)),
-            Span::styled(format!(" ({}dBm)", rssi), Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!(" ({}dBm)", rssi),
+                Style::default().fg(theme.text_muted),
+            ),
         ]));
     }
 
@@ -110,7 +113,10 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
     };
     info_lines.push(Line::from(vec![
         Span::styled("  CO2 Alert:    ", Style::default().fg(theme.text_muted)),
-        Span::styled(format!("[{} ppm]", app.co2_alert_threshold), co2_threshold_style),
+        Span::styled(
+            format!("[{} ppm]", app.co2_alert_threshold),
+            co2_threshold_style,
+        ),
         Span::styled(" (+/- to adjust)", Style::default().fg(theme.text_muted)),
     ]));
 
@@ -122,7 +128,10 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
     };
     info_lines.push(Line::from(vec![
         Span::styled("  Radon Alert:  ", Style::default().fg(theme.text_muted)),
-        Span::styled(format!("[{} Bq/m3]", app.radon_alert_threshold), radon_threshold_style),
+        Span::styled(
+            format!("[{} Bq/m3]", app.radon_alert_threshold),
+            radon_threshold_style,
+        ),
         Span::styled(" (+/- to adjust)", Style::default().fg(theme.text_muted)),
     ]));
 
@@ -158,8 +167,16 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         // Smart Home setting
-        let smart_home_text = if settings.smart_home_enabled { "Enabled" } else { "Disabled" };
-        let smart_home_color = if settings.smart_home_enabled { theme.success } else { theme.text_muted };
+        let smart_home_text = if settings.smart_home_enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        };
+        let smart_home_color = if settings.smart_home_enabled {
+            theme.success
+        } else {
+            theme.text_muted
+        };
         info_lines.push(Line::from(vec![
             Span::styled("  Smart Home:   ", Style::default().fg(theme.text_muted)),
             Span::styled(smart_home_text, Style::default().fg(smart_home_color)),
@@ -176,8 +193,16 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
         ]));
 
         // Buzzer setting
-        let buzzer_text = if settings.buzzer_enabled { "Enabled" } else { "Disabled" };
-        let buzzer_color = if settings.buzzer_enabled { theme.success } else { theme.text_muted };
+        let buzzer_text = if settings.buzzer_enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        };
+        let buzzer_color = if settings.buzzer_enabled {
+            theme.success
+        } else {
+            theme.text_muted
+        };
         info_lines.push(Line::from(vec![
             Span::styled("  Buzzer:       ", Style::default().fg(theme.text_muted)),
             Span::styled(buzzer_text, Style::default().fg(buzzer_color)),
@@ -185,8 +210,16 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
 
         // Auto calibration (Aranet4 only)
         if device.device_type == Some(aranet_types::DeviceType::Aranet4) {
-            let auto_cal_text = if settings.auto_calibration_enabled { "Enabled" } else { "Disabled" };
-            let auto_cal_color = if settings.auto_calibration_enabled { theme.success } else { theme.text_muted };
+            let auto_cal_text = if settings.auto_calibration_enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            };
+            let auto_cal_color = if settings.auto_calibration_enabled {
+                theme.success
+            } else {
+                theme.text_muted
+            };
             info_lines.push(Line::from(vec![
                 Span::styled("  Auto Calib:   ", Style::default().fg(theme.text_muted)),
                 Span::styled(auto_cal_text, Style::default().fg(auto_cal_color)),
@@ -195,7 +228,10 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         info_lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled("(Connect to view device settings)", Style::default().fg(theme.text_muted).italic()),
+            Span::styled(
+                "(Connect to view device settings)",
+                Style::default().fg(theme.text_muted).italic(),
+            ),
         ]));
     }
 
@@ -203,7 +239,10 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
     info_lines.push(Line::from(vec![
         Span::styled("  Use ", Style::default().fg(theme.text_muted).italic()),
         Span::styled("j/k", Style::default().fg(theme.primary)),
-        Span::styled(" to select, ", Style::default().fg(theme.text_muted).italic()),
+        Span::styled(
+            " to select, ",
+            Style::default().fg(theme.text_muted).italic(),
+        ),
         Span::styled("+/-", Style::default().fg(theme.primary)),
         Span::styled(" to adjust", Style::default().fg(theme.text_muted).italic()),
     ]));
@@ -211,4 +250,3 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
     let settings_para = Paragraph::new(info_lines).block(block);
     frame.render_widget(settings_para, area);
 }
-

@@ -73,7 +73,9 @@ impl From<aranet_store::StoredDevice> for DeviceResponse {
 }
 
 /// List all devices.
-async fn list_devices(State(state): State<Arc<AppState>>) -> Result<Json<Vec<DeviceResponse>>, AppError> {
+async fn list_devices(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<DeviceResponse>>, AppError> {
     let store = state.store.lock().await;
     let devices = store.list_devices()?;
     Ok(Json(devices.into_iter().map(Into::into).collect()))
@@ -99,7 +101,10 @@ async fn get_current_reading(
     let store = state.store.lock().await;
     let reading = store
         .get_latest_reading(&id)?
-        .ok_or(AppError::NotFound(format!("No readings for device: {}", id)))?;
+        .ok_or(AppError::NotFound(format!(
+            "No readings for device: {}",
+            id
+        )))?;
     Ok(Json(reading))
 }
 
@@ -258,7 +263,12 @@ mod tests {
         let app = router().with_state(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -278,7 +288,12 @@ mod tests {
         let app = router().with_state(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/api/devices").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -360,7 +375,12 @@ mod tests {
         let app = router().with_state(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/api/readings").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/readings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -480,4 +500,3 @@ mod tests {
         assert!(debug.contains("test"));
     }
 }
-

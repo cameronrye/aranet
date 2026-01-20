@@ -237,4 +237,3 @@ mod tests {
         assert_eq!(radon_color(1000), Color::Red);
     }
 }
-

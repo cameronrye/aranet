@@ -21,7 +21,10 @@ pub fn format_error_with_guidance(error: &str) -> (String, Option<String>) {
     if error_lower.contains("not found") || error_lower.contains("no devices") {
         return (
             "Device not found".to_string(),
-            Some("Make sure the device is powered on, in range, and not connected to another app.".to_string()),
+            Some(
+                "Make sure the device is powered on, in range, and not connected to another app."
+                    .to_string(),
+            ),
         );
     }
 
@@ -53,7 +56,9 @@ pub fn format_error_with_guidance(error: &str) -> (String, Option<String>) {
     if error_lower.contains("permission") || error_lower.contains("access denied") {
         return (
             "Bluetooth permission denied".to_string(),
-            Some("Grant Bluetooth permissions in System Settings > Privacy & Security.".to_string()),
+            Some(
+                "Grant Bluetooth permissions in System Settings > Privacy & Security.".to_string(),
+            ),
         );
     }
 
@@ -69,7 +74,10 @@ pub fn format_error_with_guidance(error: &str) -> (String, Option<String>) {
     if error_lower.contains("out of range") {
         return (
             "Device out of range".to_string(),
-            Some("Move closer to the device (within 10 meters with clear line of sight).".to_string()),
+            Some(
+                "Move closer to the device (within 10 meters with clear line of sight)."
+                    .to_string(),
+            ),
         );
     }
 
@@ -77,7 +85,9 @@ pub fn format_error_with_guidance(error: &str) -> (String, Option<String>) {
     if error_lower.contains("invalid reading") || error_lower.contains("invalid data") {
         return (
             "Invalid sensor data".to_string(),
-            Some("The device returned unexpected data. Try refreshing or reconnecting.".to_string()),
+            Some(
+                "The device returned unexpected data. Try refreshing or reconnecting.".to_string(),
+            ),
         );
     }
 
@@ -85,10 +95,12 @@ pub fn format_error_with_guidance(error: &str) -> (String, Option<String>) {
     if error_lower.contains("bluetooth error") || error_lower.contains("ble error") {
         return (
             "Bluetooth error".to_string(),
-            Some("Try disabling and re-enabling Bluetooth, or restart the application.".to_string()),
+            Some(
+                "Try disabling and re-enabling Bluetooth, or restart the application.".to_string(),
+            ),
         );
     }
-    
+
     // Default - show original error, no suggestion
     (error.to_string(), None)
 }
@@ -245,4 +257,3 @@ mod tests {
         assert_eq!(msg, "Device out of range");
     }
 }
-

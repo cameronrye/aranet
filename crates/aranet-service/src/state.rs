@@ -41,8 +41,8 @@ pub struct ReadingEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aranet_types::Status;
     use crate::config::Config;
+    use aranet_types::Status;
 
     fn create_test_reading(device_id: &str, co2: u16) -> aranet_store::StoredReading {
         aranet_store::StoredReading {
@@ -133,4 +133,3 @@ mod tests {
         assert!(debug.contains("test"));
     }
 }
-

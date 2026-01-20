@@ -125,7 +125,11 @@ async fn run_event_loop(
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        let action = input::handle_key(key.code, app.editing_alias, app.pending_confirmation.is_some());
+                        let action = input::handle_key(
+                            key.code,
+                            app.editing_alias,
+                            app.pending_confirmation.is_some(),
+                        );
                         if let Some(cmd) = input::apply_action(app, action, command_tx) {
                             let _ = command_tx.try_send(cmd);
                         }
@@ -220,4 +224,3 @@ mod tests {
         assert_eq!(action, input::Action::None);
     }
 }
-

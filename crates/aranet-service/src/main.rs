@@ -216,4 +216,3 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
 
     Ok(())
 }
-

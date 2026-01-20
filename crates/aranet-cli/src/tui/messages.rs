@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use aranet_core::settings::DeviceSettings;
 use aranet_core::DiscoveredDevice;
+use aranet_core::settings::DeviceSettings;
 use aranet_types::{CurrentReading, DeviceType, HistoryRecord};
 
 /// Commands sent from the UI thread to the background worker.
@@ -210,4 +210,3 @@ pub enum SensorEvent {
         settings: DeviceSettings,
     },
 }
-

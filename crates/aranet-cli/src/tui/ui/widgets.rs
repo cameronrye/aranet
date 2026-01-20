@@ -59,11 +59,7 @@ pub fn radon_unit_for_device(settings: Option<&DeviceSettings>) -> &'static str 
         .map(|s| s.radon_unit == RadonUnit::PciL)
         .unwrap_or(false);
 
-    if use_pci {
-        "pCi/L"
-    } else {
-        "Bq/m³"
-    }
+    if use_pci { "pCi/L" } else { "Bq/m³" }
 }
 
 /// Convert radon value for display based on device settings.
@@ -75,11 +71,7 @@ pub fn convert_radon_for_device(bq: u32, settings: Option<&DeviceSettings>) -> f
         .map(|s| s.radon_unit == RadonUnit::PciL)
         .unwrap_or(false);
 
-    if use_pci {
-        bq_to_pci(bq)
-    } else {
-        bq as f32
-    }
+    if use_pci { bq_to_pci(bq) } else { bq as f32 }
 }
 
 /// Extracts primary sensor values from history records for use in a sparkline widget.

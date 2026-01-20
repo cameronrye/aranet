@@ -167,7 +167,10 @@ impl ServerConfig {
                     Err(_) => {
                         errors.push(ValidationError {
                             field: "server.bind".to_string(),
-                            message: format!("invalid port '{}': must be a number 1-65535", port_str),
+                            message: format!(
+                                "invalid port '{}': must be a number 1-65535",
+                                port_str
+                            ),
                         });
                     }
                     Ok(_) => {} // Valid port
@@ -398,13 +401,11 @@ mod tests {
             storage: StorageConfig {
                 path: PathBuf::from("/tmp/test.db"),
             },
-            devices: vec![
-                DeviceConfig {
-                    address: "AA:BB:CC:DD:EE:FF".to_string(),
-                    alias: Some("Test Device".to_string()),
-                    poll_interval: 30,
-                },
-            ],
+            devices: vec![DeviceConfig {
+                address: "AA:BB:CC:DD:EE:FF".to_string(),
+                alias: Some("Test Device".to_string()),
+                poll_interval: 30,
+            }],
         };
 
         config.save(&config_path).unwrap();
@@ -491,35 +492,49 @@ mod tests {
     #[test]
     fn test_server_bind_validation() {
         // Valid bind addresses
-        let valid = ServerConfig { bind: "127.0.0.1:8080".to_string() };
+        let valid = ServerConfig {
+            bind: "127.0.0.1:8080".to_string(),
+        };
         assert!(valid.validate().is_empty());
 
-        let valid_ipv6 = ServerConfig { bind: "[::1]:8080".to_string() };
+        let valid_ipv6 = ServerConfig {
+            bind: "[::1]:8080".to_string(),
+        };
         assert!(valid_ipv6.validate().is_empty());
 
-        let valid_hostname = ServerConfig { bind: "localhost:8080".to_string() };
+        let valid_hostname = ServerConfig {
+            bind: "localhost:8080".to_string(),
+        };
         assert!(valid_hostname.validate().is_empty());
 
         // Invalid: empty
-        let empty = ServerConfig { bind: "".to_string() };
+        let empty = ServerConfig {
+            bind: "".to_string(),
+        };
         let errors = empty.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("cannot be empty"));
 
         // Invalid: no port
-        let no_port = ServerConfig { bind: "127.0.0.1".to_string() };
+        let no_port = ServerConfig {
+            bind: "127.0.0.1".to_string(),
+        };
         let errors = no_port.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("host:port"));
 
         // Invalid: port 0
-        let port_zero = ServerConfig { bind: "127.0.0.1:0".to_string() };
+        let port_zero = ServerConfig {
+            bind: "127.0.0.1:0".to_string(),
+        };
         let errors = port_zero.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("cannot be 0"));
 
         // Invalid: non-numeric port
-        let bad_port = ServerConfig { bind: "127.0.0.1:abc".to_string() };
+        let bad_port = ServerConfig {
+            bind: "127.0.0.1:abc".to_string(),
+        };
         let errors = bad_port.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("must be a number"));
@@ -528,11 +543,15 @@ mod tests {
     #[test]
     fn test_storage_path_validation() {
         // Valid path
-        let valid = StorageConfig { path: PathBuf::from("/data/aranet.db") };
+        let valid = StorageConfig {
+            path: PathBuf::from("/data/aranet.db"),
+        };
         assert!(valid.validate().is_empty());
 
         // Invalid: empty path
-        let empty = StorageConfig { path: PathBuf::new() };
+        let empty = StorageConfig {
+            path: PathBuf::new(),
+        };
         let errors = empty.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("cannot be empty"));
@@ -675,4 +694,3 @@ mod tests {
         assert!(display.contains("devices[0].address"));
     }
 }
-

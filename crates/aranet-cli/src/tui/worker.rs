@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aranet_core::settings::{DeviceSettings, MeasurementInterval};
-use aranet_core::{scan::scan_with_options, Device, ScanOptions};
+use aranet_core::{Device, ScanOptions, scan::scan_with_options};
 use aranet_store::Store;
 use aranet_types::{CurrentReading, DeviceType};
 use tokio::sync::mpsc;
@@ -146,7 +146,10 @@ impl SensorWorker {
             Command::SyncHistory { device_id } => {
                 self.handle_sync_history(&device_id).await;
             }
-            Command::SetInterval { device_id, interval_secs } => {
+            Command::SetInterval {
+                device_id,
+                interval_secs,
+            } => {
                 self.handle_set_interval(&device_id, interval_secs).await;
             }
             Command::Shutdown => {
@@ -587,7 +590,10 @@ impl SensorWorker {
             warn!(device_id, error = %e, "Failed to disconnect after setting interval");
         }
 
-        info!(device_id, interval_secs, "Measurement interval set successfully");
+        info!(
+            device_id,
+            interval_secs, "Measurement interval set successfully"
+        );
 
         // Send success event
         if let Err(e) = self
@@ -726,9 +732,7 @@ impl SensorWorker {
         // Query all history for the device (no limit)
         // The UI will filter by time range and resample for sparkline display
         use aranet_store::HistoryQuery;
-        let query = HistoryQuery::new()
-            .device(device_id)
-            .oldest_first(); // Chronological order for sparkline (oldest to newest)
+        let query = HistoryQuery::new().device(device_id).oldest_first(); // Chronological order for sparkline (oldest to newest)
 
         match store.query_history(&query) {
             Ok(stored_records) => {
@@ -747,7 +751,11 @@ impl SensorWorker {
                     })
                     .collect();
 
-                info!(device_id, count = records.len(), "Loaded history from store");
+                info!(
+                    device_id,
+                    count = records.len(),
+                    "Loaded history from store"
+                );
 
                 if let Err(e) = self
                     .event_tx
@@ -891,7 +899,11 @@ impl SensorWorker {
         };
 
         let record_count = records.len();
-        info!(device_id, count = record_count, "Downloaded history from device");
+        info!(
+            device_id,
+            count = record_count,
+            "Downloaded history from device"
+        );
 
         // Disconnect from device
         let _ = device.disconnect().await;
