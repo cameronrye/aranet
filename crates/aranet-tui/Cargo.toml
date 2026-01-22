@@ -1,6 +1,6 @@
 [package]
 name = "aranet-tui"
-version = "0.1.8"
+version = "0.1.9"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,6 +17,6 @@ dist = false
 
 [dependencies]
 # Use aranet-cli with only the tui feature (no cli dependencies)
-aranet-cli = { version = "0.1.8", path = "../aranet-cli", default-features = false, features = ["tui"] }
+aranet-cli = { version = "0.1.9", path = "../aranet-cli", default-features = false, features = ["tui"] }
 anyhow.workspace = true
 tokio.workspace = true

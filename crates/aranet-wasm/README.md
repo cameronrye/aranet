@@ -64,7 +64,7 @@ This crate is part of the [aranet](https://github.com/cameronrye/aranet) workspa
 | [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local data persistence |
 | [aranet-cli](../aranet-cli/) | [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli) | Command-line interface |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
-| [aranet-gui](../aranet-gui/) | - | Desktop application (planned) |
+| [aranet-gui](../aranet-gui/) | - | Desktop GUI application |
 | [aranet-service](../aranet-service/) | - | Background collector and REST API |
 
 ## License

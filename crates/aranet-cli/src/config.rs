@@ -49,7 +49,50 @@ pub struct Config {
     /// Name of the last connected device (for display)
     #[serde(default)]
     pub last_device_name: Option<String>,
+
+    /// Behavior settings for unified data architecture
+    #[serde(default)]
+    pub behavior: BehaviorConfig,
 }
+
+/// Behavior configuration for unified data architecture.
+///
+/// Controls automatic connection, sync, and device memory across all tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviorConfig {
+    /// Auto-connect to known devices on startup (TUI/GUI)
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
+
+    /// Auto-sync history on connection
+    #[serde(default = "default_true")]
+    pub auto_sync: bool,
+
+    /// Remember devices in database after connection
+    #[serde(default = "default_true")]
+    pub remember_devices: bool,
+
+    /// Load cached data (devices, readings) on startup
+    #[serde(default = "default_true")]
+    pub load_cache: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for BehaviorConfig {
+    fn default() -> Self {
+        Self {
+            auto_connect: true,
+            auto_sync: true,
+            remember_devices: true,
+            load_cache: true,
+        }
+    }
+}
+
+
 
 impl Config {
     /// Get the config file path
@@ -137,6 +180,7 @@ pub fn update_last_device(identifier: &str, name: Option<&str>) -> Result<()> {
 /// - None if device was explicitly provided
 /// - Some("default") if using default device
 /// - Some("last") if using last connected device
+/// - Some("store") if using known device from database
 pub fn get_device_source(
     device: Option<&str>,
     config: &Config,
@@ -147,9 +191,27 @@ pub fn get_device_source(
         (Some(d.clone()), Some("default"))
     } else if let Some(d) = &config.last_device {
         (Some(d.clone()), Some("last"))
+    } else if config.behavior.load_cache {
+        // Try to get a known device from the store
+        if let Some(d) = get_first_known_device() {
+            (Some(d), Some("store"))
+        } else {
+            (None, None)
+        }
     } else {
         (None, None)
     }
+}
+
+/// Get the first known device from the store database.
+///
+/// Returns the device ID of the most recently connected device in the store,
+/// or None if the store is empty or cannot be opened.
+fn get_first_known_device() -> Option<String> {
+    let store_path = aranet_store::default_db_path();
+    let store = aranet_store::Store::open(&store_path).ok()?;
+    let devices = store.list_devices().ok()?;
+    devices.first().map(|d| d.id.clone())
 }
 
 /// Resolve timeout: use provided value, fall back to config, then default
@@ -222,5 +284,43 @@ mod tests {
         // Value equals default and no config, so use default
         let result = resolve_timeout(30, &config, 30);
         assert_eq!(result, 30);
+    }
+
+    #[test]
+    fn test_behavior_config_defaults_to_true() {
+        let behavior = BehaviorConfig::default();
+        assert!(behavior.auto_connect);
+        assert!(behavior.auto_sync);
+        assert!(behavior.remember_devices);
+        assert!(behavior.load_cache);
+    }
+
+    #[test]
+    fn test_config_has_default_behavior() {
+        let config = Config::default();
+        assert!(config.behavior.auto_connect);
+        assert!(config.behavior.auto_sync);
+        assert!(config.behavior.remember_devices);
+        assert!(config.behavior.load_cache);
+    }
+
+    #[test]
+    fn test_behavior_config_serialization() {
+        let behavior = BehaviorConfig {
+            auto_connect: false,
+            auto_sync: true,
+            remember_devices: false,
+            load_cache: true,
+        };
+        let toml_str = toml::to_string(&behavior).unwrap();
+        assert!(toml_str.contains("auto_connect = false"));
+        assert!(toml_str.contains("auto_sync = true"));
+
+        // Deserialize back
+        let parsed: BehaviorConfig = toml::from_str(&toml_str).unwrap();
+        assert!(!parsed.auto_connect);
+        assert!(parsed.auto_sync);
+        assert!(!parsed.remember_devices);
+        assert!(parsed.load_cache);
     }
 }

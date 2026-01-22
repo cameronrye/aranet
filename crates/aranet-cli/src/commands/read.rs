@@ -68,6 +68,7 @@ async fn cmd_read_single(
     let show_progress = !quiet && matches!(format, OutputFormat::Text);
     let device =
         crate::util::connect_device_with_progress(identifier, timeout, show_progress).await?;
+    let device_id = device.address().to_string();
     let device_name = device.name().map(|s| s.to_string());
     let reading = device
         .read_current()
@@ -75,6 +76,9 @@ async fn cmd_read_single(
         .context("Failed to read current values")?;
 
     device.disconnect().await.ok();
+
+    // Save reading to store (unified data architecture)
+    crate::util::save_reading_to_store(&device_id, &reading);
 
     let content = match format {
         OutputFormat::Json => format_reading_json(&reading, opts)?,
@@ -171,6 +175,7 @@ async fn read_device(
         .await
         .map_err(|e| (identifier.clone(), e))?;
 
+    let device_id = device.address().to_string();
     let reading = device
         .read_current()
         .await
@@ -178,6 +183,9 @@ async fn read_device(
         .map_err(|e| (identifier.clone(), e))?;
 
     device.disconnect().await.ok();
+
+    // Save reading to store (unified data architecture)
+    crate::util::save_reading_to_store(&device_id, &reading);
 
     Ok(DeviceReading {
         identifier,

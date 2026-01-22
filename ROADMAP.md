@@ -9,7 +9,7 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 ---
 
-## Current Progress (Updated Jan 19, 2026)
+## Current Progress (Updated Jan 22, 2026)
 
 | Phase | Component | Status | Progress |
 |-------|-----------|--------|----------|
@@ -17,9 +17,10 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 | 1 | Core Library | Done | Full BLE: scan, connect, read, history, settings - tested with real hardware |
 | 2 | CLI Tool | Done | All core commands: scan, read, status, info, history, set, watch, config |
 | 3 | TUI Dashboard | Done | Full dashboard with tabs, sparklines, help overlay, multi-device support |
-| 4 | GUI Application | WIP | egui shell works; sensor integration pending |
+| 4 | GUI Application | Done | Full MVP: device scan, connect, real-time readings with color coding |
 | 5 | WASM Module | WIP | Basic init/log; Web Bluetooth pending |
 | 6 | Data Persistence & API | Done | aranet-store complete; aranet-service complete |
+| 7 | Unified Data Architecture | Done | Shared database across all tools; auto-connect; auto-sync |
 
 **Legend**: [ ] Not started - [~] In progress/partial - [x] Complete
 
@@ -65,10 +66,11 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 1. ~~Add sensor data display to TUI shell~~ - Complete (v0.3.0)
 2. ~~**TUI Polish**: Auto-refresh, trend indicators, scrollable history, settings editing~~ - Complete (v0.1.8)
-3. Add sensor data display to GUI shell
-4. Implement Web Bluetooth in WASM module
-5. ~~**Data persistence layer (aranet-store)**~~ - Complete (v0.1.7)
-6. ~~**Background service (aranet-service)**~~ - Complete (v0.1.8)
+3. ~~Add sensor data display to GUI shell~~ - Complete (v0.4.0)
+4. **Unified Data Architecture** - All tools share same database, auto-connect, auto-sync (see below)
+5. Implement Web Bluetooth in WASM module
+6. ~~**Data persistence layer (aranet-store)**~~ - Complete (v0.1.7)
+7. ~~**Background service (aranet-service)**~~ - Complete (v0.1.8)
 
 ## Vision
 
@@ -82,6 +84,91 @@ Build the definitive Rust ecosystem for Aranet devices:
 - **aranet-tui** - Real-time terminal UI for monitoring
 - **aranet-gui** - Native desktop app (egui-based)
 - **aranet-wasm** - Web Bluetooth integration for browsers
+
+---
+
+## Unified Data Architecture
+
+All tools (CLI, TUI, GUI, Server) **MUST** share the same database and data source (`aranet-store`).
+This ensures a consistent experience across all interfaces with no data silos.
+
+### Core Principles
+
+| Principle | Description |
+|-----------|-------------|
+| **Shared Database** | All tools read/write to the same SQLite database at platform-specific location |
+| **Device Memory** | All previously connected devices are remembered and loaded on startup |
+| **Auto-Connect** | Connections to known devices are automatic by default (configurable) |
+| **Auto-Sync History** | History is downloaded automatically on first connection and synced on subsequent loads |
+| **Feature Parity** | All tool versions (CLI, TUI, GUI, Server) should implement equivalent functionality |
+
+### Automatic Behavior (Defaults)
+
+| Behavior | On Startup | On Connection | Configurable |
+|----------|------------|---------------|--------------|
+| Load known devices from database | Yes | N/A | Yes |
+| Auto-connect to previously paired devices | Yes | N/A | Yes |
+| Download full history on first connection | N/A | Yes | Yes |
+| Incremental sync on reconnection | N/A | Yes | Yes |
+| Cache current readings to database | N/A | Yes | Yes |
+
+### Implementation Status
+
+| Tool | Uses aranet-store | Loads Devices | Auto-Connect | Auto-Sync | Feature Parity |
+|------|-------------------|---------------|--------------|-----------|----------------|
+| CLI | [x] All commands save to store | [x] Fallback to store | N/A (interactive) | [x] Via sync command | Reference |
+| TUI | [x] | [x] LoadCachedData | [x] | [x] | [x] |
+| GUI | [x] | [x] CachedDataLoaded | [x] | [x] | [x] |
+| Server | [x] | [x] | [x] | [x] | [x] |
+
+### Required Changes for Full Parity
+
+#### CLI (aranet-cli)
+
+- [x] Load known devices from database on startup (fallback when no device specified)
+- [x] Auto-connect to default/saved device if no `--device` specified
+- [x] Save device to database after successful connection
+- [x] Save readings to database after read/status/watch commands
+- [x] Save history to database after history command
+- [x] Full sync via `aranet sync` command with incremental support
+
+#### TUI (aranet-tui)
+
+- [x] Load cached devices on startup (via `LoadCachedData` command)
+- [x] Auto-connect to previously connected devices on startup
+- [x] Auto-sync history on successful connection
+- [x] Store readings to database
+
+#### GUI (aranet-gui)
+
+- [x] Initialize aranet-store on startup
+- [x] Load known devices from database on startup
+- [x] Auto-connect to previously connected devices on startup
+- [x] Auto-sync history on successful connection
+- [x] Store readings to database
+- [x] Show last-known readings even when device is offline
+
+### Database Location
+
+All tools use the same database file determined by `aranet_store::default_db_path()`:
+
+| Platform | Path |
+|----------|------|
+| Linux | `~/.local/share/aranet/data.db` |
+| macOS | `~/Library/Application Support/aranet/data.db` |
+| Windows | `C:\Users\<user>\AppData\Local\aranet\data.db` |
+
+### Configuration (`~/.config/aranet/config.toml`)
+
+```toml
+[behavior]
+auto_connect = true       # Auto-connect to known devices on startup
+auto_sync = true          # Auto-sync history on connection
+remember_devices = true   # Save devices to database after connection
+
+[database]
+path = ""                 # Empty = use default platform path
+```
 
 ---
 
@@ -226,7 +313,7 @@ Manufacturer ID: 0x0702 (SAF Tehnika)
 |---------|----------|--------|
 | `--since` / `--until` date filters | P1 | [x] Implemented |
 | `--format` (text, json, csv) | P1 | [x] Implemented |
-| `--count` limit records | P1 | [~] Defined, not wired |
+| `--count` limit records | P1 | [x] Implemented |
 
 #### Output & Export
 
@@ -394,19 +481,94 @@ The current TUI is functional but basic. Below are planned enhancements organize
 
 ### Milestone: Native Desktop App
 
-| Feature | Priority | Status |
-|---------|----------|--------|
-| Basic GUI framework | P0 | [x] App shell complete |
-| Device discovery UI | P0 | [ ] |
-| Real-time readings dashboard | P0 | [ ] |
-| Historical data charts | P0 | [ ] |
-| Multi-device management | P1 | [ ] |
-| Settings configuration | P1 | [ ] |
-| System tray / menubar icon | P2 | [ ] |
-| Notifications for thresholds | P2 | [ ] |
-| Cross-platform (macOS, Windows, Linux) | P0 | [ ] |
+**MVP Scope**: Device scan + current readings display + history charts + settings view.
 
-### GUI Framework Options (evaluate latest versions)
+| Feature | Priority | Status | Notes |
+|---------|----------|--------|-------|
+| Basic GUI framework | P0 | [x] | egui shell complete |
+| Device discovery UI | P0 | [x] | Device list sidebar + Scan button |
+| Real-time readings dashboard | P0 | [x] | CO2/temp/humidity/pressure with color coding |
+| Cross-platform (macOS, Windows, Linux) | P0 | [~] | egui handles; needs Windows/Linux testing |
+| Multi-device management | P1 | [x] | Device selector sidebar with status |
+| Historical data charts | P1 | [x] | egui_plot charts for CO2, radon, temp, humidity |
+| Settings configuration | P1 | [x] | Full read/write: interval, Smart Home, Bluetooth Range |
+| Auto-refresh | P1 | [x] | Automatic polling at device interval |
+| System tray / menubar icon | P2 | [x] | tray-icon with dynamic CO2 colors, close-to-tray |
+| Notifications for thresholds | P2 | [x] | notify-rust for CO2 threshold alerts |
+
+### Architecture Notes
+
+The GUI must use the same worker/channel pattern as the TUI to keep BLE operations off the UI thread.
+egui's immediate-mode rendering requires non-blocking operations.
+
+```
++------------------+     Command      +------------------+
+|    egui UI       | --------------> |  SensorWorker    |
+|  (main thread)   |                 |  (tokio runtime) |
+|                  | <-------------- |                  |
++------------------+   SensorEvent   +------------------+
+                                              |
+                                              v
+                                     +------------------+
+                                     |   aranet-core    |
+                                     |   (BLE ops)      |
+                                     +------------------+
+```
+
+**Shared Message Types**: The `Command` and `SensorEvent` enums are defined in `aranet-core::messages`
+and re-exported by both TUI (`aranet-cli::tui::messages`) and GUI applications. This ensures
+consistent message definitions for `Scan`, `Connect`, `Disconnect`, `RefreshReading`, `SyncHistory`, etc.
+
+### Implementation Plan
+
+| Week | Focus | Deliverables | Status |
+|------|-------|--------------|--------|
+| 1 | Worker architecture | Tokio runtime integration, channel setup, scan command | [x] Complete |
+| 2 | Readings dashboard | Device list, current readings display, CO2 color coding | [x] Complete |
+| 3 | Polish + testing | Multi-device, loading states, error handling, tests | [x] Complete |
+| 4 | History + Settings | Tab system, egui_plot charts, settings display | [x] Complete |
+
+**P1 Complete**: The GUI supports device scanning, connection, real-time readings with CO2 color coding,
+historical data charts (CO2, radon, radiation, temperature, humidity), and full settings configuration.
+Features include Dashboard/History/Settings tabs, time filtering (All/24h/7d/30d), multi-device support,
+measurement interval editing, Smart Home and Bluetooth Range toggles, and auto-refresh.
+Run with `cargo run --package aranet-gui`.
+
+### AppState Design
+
+```rust
+pub struct AppState {
+    // Device management
+    pub devices: Vec<DeviceState>,
+    pub selected_device: Option<usize>,
+    pub scanning: bool,
+
+    // Worker communication (initialized at startup)
+    pub command_tx: mpsc::Sender<Command>,
+
+    // UI state
+    pub active_view: View, // Dashboard | History | Settings
+    pub error_message: Option<String>,
+    pub status_message: String,
+}
+```
+
+**Key considerations**:
+
+- `command_tx` is stored in AppState; events are polled each frame via `try_recv()`
+- Tokio runtime runs in a separate thread, spawned at app startup
+- Use `Arc<Mutex<>>` sparingly; prefer message passing
+
+### GUI Dependencies
+
+| Dependency | Purpose | Check Latest |
+|------------|---------|--------------|
+| `egui` | Immediate-mode GUI | [crates.io/crates/egui](https://crates.io/crates/egui) |
+| `eframe` | Native window wrapper | [crates.io/crates/eframe](https://crates.io/crates/eframe) |
+| `egui_plot` | Charts (for v0.4.1) | [crates.io/crates/egui_plot](https://crates.io/crates/egui_plot) |
+| `tokio` | Async runtime | [crates.io/crates/tokio](https://crates.io/crates/tokio) |
+
+### GUI Framework Options (for reference)
 
 | Option | Pros | Cons | Check Latest |
 |--------|------|------|--------------|
@@ -415,7 +577,7 @@ The current TUI is functional but basic. Below are planned enhancements organize
 | `tauri` | Web tech UI + Rust backend | Larger binary, WebView dependency | [tauri.app](https://tauri.app) |
 | `dioxus` | React-like, multi-platform | Newer, less mature | [crates.io/crates/dioxus](https://crates.io/crates/dioxus) |
 
-> **Recommendation**: Start with `egui` for rapid prototyping, consider `iced` or `tauri` for production polish.
+> **Decision**: Using `egui` + `eframe` for v0.4.0. Fast iteration, good cross-platform support.
 
 ---
 
@@ -506,9 +668,9 @@ This phase adds two new crates for data persistence, caching, and external integ
 | Cache history records (avoid re-downloading) | P0 | [x] |
 | Track sync state per device | P0 | [x] |
 | Query by device, time range | P0 | [x] |
-| Aggregate queries (min, max, avg) | P1 | [ ] |
-| Export to CSV/JSON | P1 | [ ] |
-| Import from CSV/JSON backup | P2 | [ ] |
+| Aggregate queries (min, max, avg) | P1 | [x] |
+| Export to CSV/JSON | P1 | [x] |
+| Import from CSV/JSON backup | P2 | [x] |
 
 ### aranet-service (Background Collector + HTTP API)
 
@@ -541,12 +703,12 @@ WS   /api/ws                         # Real-time readings stream (WebSocket)
 
 | Feature | Priority | Status |
 |---------|----------|--------|
-| `aranet server` - Start HTTP server | P0 | [ ] |
-| `aranet server --daemon` - Background mode | P1 | [ ] |
+| `aranet server` - Start HTTP server | P0 | [x] |
+| `aranet server --daemon` - Background mode | P1 | [x] |
 | `aranet sync` - One-shot sync to database | P0 | [x] |
-| `aranet sync --all` - Sync all configured devices | P0 | [ ] |
+| `aranet sync --all` - Sync all configured devices | P0 | [x] |
 | `aranet cache` - Query cached data | P0 | [x] |
-| `history --cache` - Read from local cache first | P1 | [ ] |
+| `history --cache` - Read from local cache first | P1 | [x] |
 
 ### Database Schema
 

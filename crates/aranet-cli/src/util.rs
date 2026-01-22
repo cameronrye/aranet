@@ -203,7 +203,54 @@ pub async fn connect_device_with_progress(
     let device_address = device.address().to_string();
     let _ = update_last_device(&device_address, device_name.as_deref());
 
+    // Save device to store database (unified data architecture)
+    save_device_to_store(&device_address, device_name.as_deref());
+
     Ok(device)
+}
+
+/// Save a device connection to the store database.
+///
+/// This is part of the unified data architecture - all tools share the same database.
+fn save_device_to_store(device_id: &str, name: Option<&str>) {
+    let store_path = aranet_store::default_db_path();
+    if let Ok(store) = aranet_store::Store::open(&store_path) {
+        // Insert or update the device in the store
+        if let Err(e) = store.upsert_device(device_id, name) {
+            tracing::warn!("Failed to save device to store: {}", e);
+        }
+    }
+}
+
+/// Save a reading to the store database.
+///
+/// This is part of the unified data architecture - all tools share the same database.
+pub fn save_reading_to_store(device_id: &str, reading: &aranet_types::CurrentReading) {
+    let store_path = aranet_store::default_db_path();
+    if let Ok(store) = aranet_store::Store::open(&store_path)
+        && let Err(e) = store.insert_reading(device_id, reading)
+    {
+        tracing::warn!("Failed to save reading to store: {}", e);
+    }
+}
+
+/// Save history records to the store database.
+///
+/// This is part of the unified data architecture - all tools share the same database.
+/// Returns the number of records inserted.
+pub fn save_history_to_store(device_id: &str, records: &[aranet_types::HistoryRecord]) -> usize {
+    let store_path = aranet_store::default_db_path();
+    if let Ok(store) = aranet_store::Store::open(&store_path) {
+        match store.insert_history(device_id, records) {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!("Failed to save history to store: {}", e);
+                0
+            }
+        }
+    } else {
+        0
+    }
 }
 
 /// Write output to file or stdout

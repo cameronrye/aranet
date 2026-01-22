@@ -193,3 +193,175 @@ pub fn trend_indicator(current: i32, previous: i32, threshold: i32) -> (&'static
 pub fn co2_trend(current: u16, previous: Option<u16>) -> Option<(&'static str, Color)> {
     previous.map(|prev| trend_indicator(current as i32, prev as i32, 20))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // celsius_to_fahrenheit tests
+    // ========================================================================
+
+    #[test]
+    fn test_celsius_to_fahrenheit_freezing() {
+        let result = celsius_to_fahrenheit(0.0);
+        assert!((result - 32.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_celsius_to_fahrenheit_boiling() {
+        let result = celsius_to_fahrenheit(100.0);
+        assert!((result - 212.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_celsius_to_fahrenheit_negative() {
+        // -40 is where C and F are equal
+        let result = celsius_to_fahrenheit(-40.0);
+        assert!((result - (-40.0)).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // bq_to_pci tests
+    // ========================================================================
+
+    #[test]
+    fn test_bq_to_pci_zero() {
+        let result = bq_to_pci(0);
+        assert!((result - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_bq_to_pci_100() {
+        // 100 Bq/m3 = 2.7 pCi/L
+        let result = bq_to_pci(100);
+        assert!((result - 2.7).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // format_temp_for_device tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_temp_no_settings_defaults_celsius() {
+        let result = format_temp_for_device(20.5, None);
+        assert_eq!(result, "20.5°C");
+    }
+
+    #[test]
+    fn test_format_temp_celsius_setting() {
+        let settings = DeviceSettings {
+            temperature_unit: TemperatureUnit::Celsius,
+            ..Default::default()
+        };
+        let result = format_temp_for_device(20.5, Some(&settings));
+        assert_eq!(result, "20.5°C");
+    }
+
+    #[test]
+    fn test_format_temp_fahrenheit_setting() {
+        let settings = DeviceSettings {
+            temperature_unit: TemperatureUnit::Fahrenheit,
+            ..Default::default()
+        };
+        let result = format_temp_for_device(20.0, Some(&settings));
+        // 20C = 68F
+        assert_eq!(result, "68.0°F");
+    }
+
+    // ========================================================================
+    // format_radon_for_device tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_radon_no_settings_defaults_bq() {
+        let result = format_radon_for_device(150, None);
+        assert_eq!(result, "150 Bq/m³");
+    }
+
+    #[test]
+    fn test_format_radon_bq_setting() {
+        let settings = DeviceSettings {
+            radon_unit: RadonUnit::BqM3,
+            ..Default::default()
+        };
+        let result = format_radon_for_device(150, Some(&settings));
+        assert_eq!(result, "150 Bq/m³");
+    }
+
+    #[test]
+    fn test_format_radon_pci_setting() {
+        let settings = DeviceSettings {
+            radon_unit: RadonUnit::PciL,
+            ..Default::default()
+        };
+        let result = format_radon_for_device(100, Some(&settings));
+        // 100 Bq/m3 = 2.70 pCi/L
+        assert_eq!(result, "2.70 pCi/L");
+    }
+
+    // ========================================================================
+    // resample_sparkline_data tests
+    // ========================================================================
+
+    #[test]
+    fn test_resample_empty_data() {
+        let result = resample_sparkline_data(&[], 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resample_zero_width() {
+        let result = resample_sparkline_data(&[1, 2, 3], 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resample_same_size() {
+        let data = vec![1, 2, 3, 4, 5];
+        let result = resample_sparkline_data(&data, 5);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_resample_upsample() {
+        let data = vec![100, 200];
+        let result = resample_sparkline_data(&data, 4);
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn test_resample_downsample() {
+        let data = vec![100, 100, 200, 200];
+        let result = resample_sparkline_data(&data, 2);
+        assert_eq!(result.len(), 2);
+        // Should average buckets
+        assert_eq!(result[0], 100);
+        assert_eq!(result[1], 200);
+    }
+
+    // ========================================================================
+    // trend_indicator tests
+    // ========================================================================
+
+    #[test]
+    fn test_trend_indicator_rising() {
+        let (arrow, color) = trend_indicator(500, 400, 20);
+        assert_eq!(arrow, "↑");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn test_trend_indicator_falling() {
+        let (arrow, color) = trend_indicator(400, 500, 20);
+        assert_eq!(arrow, "↓");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn test_trend_indicator_stable() {
+        let (arrow, color) = trend_indicator(500, 505, 20);
+        assert_eq!(arrow, "→");
+        assert_eq!(color, Color::DarkGray);
+    }
+}

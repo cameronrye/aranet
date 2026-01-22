@@ -628,10 +628,21 @@ impl App {
     }
 
     /// Handle an incoming sensor event and update state accordingly.
-    pub fn handle_sensor_event(&mut self, event: SensorEvent) {
+    ///
+    /// Returns a list of commands to send to the worker (for auto-connect, auto-sync, etc.).
+    pub fn handle_sensor_event(&mut self, event: SensorEvent) -> Vec<Command> {
+        let mut commands = Vec::new();
+
         match event {
             SensorEvent::CachedDataLoaded { devices } => {
+                // Collect device IDs before handling (for auto-connect)
+                let device_ids: Vec<String> = devices.iter().map(|d| d.id.clone()).collect();
                 self.handle_cached_data(devices);
+
+                // Auto-connect to all cached devices
+                for device_id in device_ids {
+                    commands.push(Command::Connect { device_id });
+                }
             }
             SensorEvent::ScanStarted => {
                 self.scanning = true;
@@ -683,6 +694,11 @@ impl App {
                     device.connected_at = Some(Instant::now());
                 }
                 self.push_status_message("Connected".to_string());
+
+                // Auto-sync history after successful connection
+                commands.push(Command::SyncHistory {
+                    device_id: device_id.clone(),
+                });
             }
             SensorEvent::DeviceDisconnected { device_id } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
@@ -817,7 +833,51 @@ impl App {
                     device.last_updated = Some(Instant::now());
                 }
             }
+            SensorEvent::BluetoothRangeChanged {
+                device_id: _,
+                extended,
+            } => {
+                let range = if extended { "Extended" } else { "Standard" };
+                self.push_status_message(format!("Bluetooth range set to {}", range));
+            }
+            SensorEvent::BluetoothRangeError { device_id, error } => {
+                let device_name = self
+                    .devices
+                    .iter()
+                    .find(|d| d.id == device_id)
+                    .and_then(|d| d.name.clone())
+                    .unwrap_or_else(|| device_id.clone());
+                let error_msg = format!("{}: {}", device_name, error);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "Set BT range failed: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+            }
+            SensorEvent::SmartHomeChanged {
+                device_id: _,
+                enabled,
+            } => {
+                let mode = if enabled { "enabled" } else { "disabled" };
+                self.push_status_message(format!("Smart Home {}", mode));
+            }
+            SensorEvent::SmartHomeError { device_id, error } => {
+                let device_name = self
+                    .devices
+                    .iter()
+                    .find(|d| d.id == device_id)
+                    .and_then(|d| d.name.clone())
+                    .unwrap_or_else(|| device_id.clone());
+                let error_msg = format!("{}: {}", device_name, error);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "Set Smart Home failed: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+            }
         }
+
+        commands
     }
 
     /// Get a reference to the currently selected device, if any.

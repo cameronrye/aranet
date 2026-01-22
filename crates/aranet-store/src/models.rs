@@ -21,8 +21,10 @@ pub struct StoredDevice {
     /// Hardware version.
     pub hardware: Option<String>,
     /// First time this device was seen.
+    #[serde(with = "time::serde::rfc3339")]
     pub first_seen: OffsetDateTime,
     /// Last time this device was seen.
+    #[serde(with = "time::serde::rfc3339")]
     pub last_seen: OffsetDateTime,
 }
 
@@ -34,6 +36,7 @@ pub struct StoredReading {
     /// Device identifier.
     pub device_id: String,
     /// When this reading was captured.
+    #[serde(with = "time::serde::rfc3339")]
     pub captured_at: OffsetDateTime,
     /// CO2 concentration in ppm.
     pub co2: u16,
@@ -104,8 +107,10 @@ pub struct StoredHistoryRecord {
     /// Device identifier.
     pub device_id: String,
     /// Timestamp of the reading from the device.
+    #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
     /// When this record was synced to the database.
+    #[serde(with = "time::serde::rfc3339")]
     pub synced_at: OffsetDateTime,
     /// CO2 concentration in ppm.
     pub co2: u16,
@@ -166,5 +171,6 @@ pub struct SyncState {
     /// Total readings on device at last sync.
     pub total_readings: Option<u16>,
     /// When last synced.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_sync_at: Option<OffsetDateTime>,
 }

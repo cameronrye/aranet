@@ -1,45 +1,45 @@
-//! Native desktop GUI for Aranet environmental sensors
+//! Standalone GUI binary for Aranet sensors.
+//!
+//! This is a thin wrapper around aranet-cli's GUI functionality,
+//! providing a separate binary for users who only want the desktop app.
+
+use std::path::PathBuf;
 
 use anyhow::Result;
-use eframe::egui;
+use clap::Parser;
 
-/// Main application state
-struct AranetApp {
-    // Placeholder for future state
-}
+/// Aranet GUI - Desktop application for Aranet environmental sensors
+#[derive(Parser, Debug)]
+#[command(name = "aranet-gui", version, about)]
+struct Args {
+    /// Run in demo mode with mock data (for screenshots and testing)
+    #[arg(long)]
+    demo: bool,
 
-impl AranetApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {}
-    }
-}
+    /// Take a screenshot and save to this path, then exit
+    #[arg(long, value_name = "PATH")]
+    screenshot: Option<PathBuf>,
 
-impl eframe::App for AranetApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(100.0);
-                ui.heading("Aranet GUI");
-                ui.add_space(20.0);
-                ui.label("Coming Soon");
-                ui.add_space(40.0);
-                ui.label("Native desktop interface for Aranet environmental sensors");
-            });
-        });
-    }
+    /// Number of frames to wait before taking screenshot (default: 10)
+    #[arg(long, default_value = "10")]
+    screenshot_delay: u32,
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let args = Args::parse();
 
-    let native_options = eframe::NativeOptions::default();
-
-    eframe::run_native(
-        "Aranet GUI",
-        native_options,
-        Box::new(|cc| Ok(Box::new(AranetApp::new(cc)))),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
-
-    Ok(())
+    if args.demo || args.screenshot.is_some() {
+        let mut options = aranet_cli::gui::GuiOptions {
+            demo: args.demo,
+            screenshot: args.screenshot,
+            screenshot_delay_frames: args.screenshot_delay,
+        };
+        // If taking a screenshot without explicit demo flag, enable demo mode
+        if options.screenshot.is_some() && !options.demo {
+            options.demo = true;
+        }
+        aranet_cli::gui::run_with_options(options)
+    } else {
+        aranet_cli::gui::run()
+    }
 }

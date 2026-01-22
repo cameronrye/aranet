@@ -140,9 +140,12 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
         }
 
         // Read current values
+        let device_id = device.address().to_string();
         match device.read_current().await {
             Ok(reading) => {
                 readings_taken += 1;
+                // Save reading to store (unified data architecture)
+                crate::util::save_reading_to_store(&device_id, &reading);
                 let content = match format {
                     OutputFormat::Json => format_reading_json(&reading, opts)?,
                     OutputFormat::Csv => {

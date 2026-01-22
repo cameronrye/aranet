@@ -5,12 +5,25 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use aranet_core::HistoryOptions;
+use aranet_store::{HistoryQuery, Store};
 use time::OffsetDateTime;
 
 use crate::cli::OutputFormat;
 use crate::format::{FormatOptions, format_history_csv, format_history_json, format_history_text};
 use crate::style;
 use crate::util::{require_device_interactive, write_output};
+
+/// Options for querying history from the cache.
+struct CacheQueryOptions<'a> {
+    device: Option<String>,
+    count: u32,
+    since_dt: Option<OffsetDateTime>,
+    until_dt: Option<OffsetDateTime>,
+    format: OutputFormat,
+    output: Option<&'a PathBuf>,
+    quiet: bool,
+    opts: &'a FormatOptions,
+}
 
 /// Parse a date/time string in various formats:
 /// - RFC3339: "2024-01-15T10:30:00Z"
@@ -96,6 +109,7 @@ pub struct HistoryArgs<'a> {
     pub output: Option<&'a PathBuf>,
     pub quiet: bool,
     pub opts: &'a FormatOptions,
+    pub cache: bool,
 }
 
 pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
@@ -109,12 +123,28 @@ pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
         output,
         quiet,
         opts,
+        cache,
     } = args;
-    let identifier = require_device_interactive(device).await?;
 
     // Parse date filters upfront to fail fast
     let since_dt = since.as_ref().map(|s| parse_datetime(s)).transpose()?;
     let until_dt = until.as_ref().map(|s| parse_datetime(s)).transpose()?;
+
+    // If --cache flag is set, read from local database instead of device
+    if cache {
+        return cmd_history_from_cache(CacheQueryOptions {
+            device,
+            count,
+            since_dt,
+            until_dt,
+            format,
+            output,
+            quiet,
+            opts,
+        });
+    }
+
+    let identifier = require_device_interactive(device).await?;
 
     // Set up progress bar for text output
     let show_progress = !quiet && matches!(format, OutputFormat::Text);
@@ -148,6 +178,7 @@ pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
         HistoryOptions::default()
     };
 
+    let device_id = device.address().to_string();
     let history = device
         .download_history_with_options(history_options)
         .await
@@ -158,6 +189,9 @@ pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
     }
 
     device.disconnect().await.ok();
+
+    // Save history to store (unified data architecture)
+    crate::util::save_history_to_store(&device_id, &history);
 
     // Apply date filters
     let history: Vec<_> = history
@@ -190,6 +224,87 @@ pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
 
     if !quiet && matches!(format, OutputFormat::Text) {
         eprintln!("Downloaded {} records.", history.len());
+    }
+
+    let content = match format {
+        OutputFormat::Json => format_history_json(&history, opts)?,
+        OutputFormat::Text => format_history_text(&history, opts),
+        OutputFormat::Csv => format_history_csv(&history, opts),
+    };
+
+    write_output(output, &content)?;
+    Ok(())
+}
+
+/// Read history from local cache instead of connecting to the device.
+fn cmd_history_from_cache(options: CacheQueryOptions<'_>) -> Result<()> {
+    let CacheQueryOptions {
+        device,
+        count,
+        since_dt,
+        until_dt,
+        format,
+        output,
+        quiet,
+        opts,
+    } = options;
+
+    let store = Store::open_default().context("Failed to open database")?;
+
+    // For cache mode, we need a device identifier
+    let device_id = match device {
+        Some(id) => id,
+        None => {
+            // Try to find a default device or list available devices
+            let devices = store.list_devices()?;
+            if devices.is_empty() {
+                bail!("No devices in cache. Run 'aranet sync' first to cache device data.");
+            }
+            if devices.len() == 1 {
+                devices[0].id.clone()
+            } else {
+                eprintln!("Multiple devices in cache. Please specify one with --device:");
+                for d in &devices {
+                    let name = d.name.as_deref().unwrap_or("(unnamed)");
+                    eprintln!("  {} - {}", d.id, name);
+                }
+                bail!("Device required when multiple devices are cached");
+            }
+        }
+    };
+
+    // Build query
+    let mut query = HistoryQuery::new().device(&device_id);
+
+    if count > 0 {
+        query = query.limit(count);
+    }
+
+    if let Some(since) = since_dt {
+        query = query.since(since);
+    }
+
+    if let Some(until) = until_dt {
+        query = query.until(until);
+    }
+
+    let records = store.query_history(&query)?;
+
+    if records.is_empty() {
+        if !quiet {
+            eprintln!(
+                "No history records found for {}. Run 'aranet sync' to cache device history.",
+                device_id
+            );
+        }
+        return Ok(());
+    }
+
+    // Convert to HistoryRecord for formatting
+    let history: Vec<_> = records.iter().map(|r| r.to_history()).collect();
+
+    if !quiet && matches!(format, OutputFormat::Text) {
+        eprintln!("Retrieved {} records from cache.", history.len());
     }
 
     let content = match format {

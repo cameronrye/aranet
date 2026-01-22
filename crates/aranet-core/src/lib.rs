@@ -73,6 +73,7 @@ pub mod events;
 pub mod guard;
 pub mod history;
 pub mod manager;
+pub mod messages;
 pub mod metrics;
 pub mod mock;
 pub mod readings;
@@ -138,6 +139,7 @@ pub use commands::{
 pub use events::{DeviceEvent, EventReceiver, EventSender};
 pub use guard::{DeviceGuard, SharedDeviceGuard};
 pub use manager::{DeviceManager, ManagedDevice, ManagerConfig};
+pub use messages::{CachedDevice, Command, SensorEvent};
 pub use metrics::{ConnectionMetrics, OperationMetrics};
 pub use mock::{MockDevice, MockDeviceBuilder};
 pub use reconnect::{ReconnectOptions, ReconnectingDevice};

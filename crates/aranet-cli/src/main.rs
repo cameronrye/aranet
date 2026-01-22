@@ -36,8 +36,8 @@ use clap::{CommandFactory, Parser};
 use cli::{AliasSubcommand, Cli, Commands, ConfigAction, ConfigKey, OutputFormat};
 #[cfg(feature = "cli")]
 use commands::{
-    AliasAction, HistoryArgs, SyncArgs, WatchArgs, cmd_alias, cmd_cache, cmd_doctor, cmd_history,
-    cmd_info, cmd_read, cmd_scan, cmd_set, cmd_status, cmd_sync, cmd_watch,
+    AliasAction, HistoryArgs, ServerArgs, SyncArgs, WatchArgs, cmd_alias, cmd_cache, cmd_doctor,
+    cmd_history, cmd_info, cmd_read, cmd_scan, cmd_server, cmd_set, cmd_status, cmd_sync, cmd_watch,
 };
 #[cfg(feature = "cli")]
 use config::{Config, get_device_source, resolve_devices, resolve_timeout};
@@ -88,6 +88,12 @@ async fn main() -> Result<()> {
     #[cfg(feature = "tui")]
     if let Commands::Tui = cli.command {
         return tui::run().await;
+    }
+
+    // Handle GUI command early (when gui feature enabled)
+    #[cfg(feature = "gui")]
+    if let Commands::Gui = cli.command {
+        return aranet_cli::gui::run();
     }
 
     // Load config for device resolution
@@ -185,6 +191,7 @@ async fn main() -> Result<()> {
             count,
             since,
             until,
+            cache,
         } => {
             let format = resolve_format_with_config(cli.json, out.format, config_format);
             let dev = resolve_device_with_hint(device.device, &config, quiet);
@@ -206,6 +213,7 @@ async fn main() -> Result<()> {
                 output,
                 quiet,
                 opts: &opts,
+                cache,
             })
             .await?;
         }
@@ -272,6 +280,7 @@ async fn main() -> Result<()> {
             device,
             format,
             full,
+            all,
         } => {
             let format = resolve_format_with_config(cli.json, format, config_format);
             cmd_sync(
@@ -279,6 +288,7 @@ async fn main() -> Result<()> {
                     device,
                     format,
                     full,
+                    all,
                 },
                 &config,
             )
@@ -287,11 +297,27 @@ async fn main() -> Result<()> {
         Commands::Cache { action } => {
             cmd_cache(action, &config)?;
         }
+        Commands::Server {
+            bind,
+            database,
+            no_collector,
+            daemon,
+        } => {
+            cmd_server(ServerArgs {
+                bind,
+                database,
+                no_collector,
+                daemon,
+            })
+            .await?;
+        }
         Commands::Config { .. } => unreachable!(),
         Commands::Alias { .. } => unreachable!(),
         Commands::Completions { .. } => unreachable!(),
         #[cfg(feature = "tui")]
         Commands::Tui => unreachable!(), // Handled above
+        #[cfg(feature = "gui")]
+        Commands::Gui => unreachable!(), // Handled above
     }
 
     Ok(())
@@ -475,6 +501,9 @@ fn resolve_device_with_hint(
             }
             ("last", None) => {
                 eprintln!("Using last connected device: {}", dev);
+            }
+            ("store", _) => {
+                eprintln!("Using known device from database: {}", dev);
             }
             ("default", _) => {
                 // Don't show message for default device - user explicitly configured it

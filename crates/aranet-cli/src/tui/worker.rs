@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aranet_core::settings::{DeviceSettings, MeasurementInterval};
-use aranet_core::{Device, ScanOptions, scan::scan_with_options};
+use aranet_core::{BluetoothRange, Device, ScanOptions, scan::scan_with_options};
 use aranet_store::Store;
 use aranet_types::{CurrentReading, DeviceType};
 use tokio::sync::mpsc;
@@ -151,6 +151,12 @@ impl SensorWorker {
                 interval_secs,
             } => {
                 self.handle_set_interval(&device_id, interval_secs).await;
+            }
+            Command::SetBluetoothRange { device_id, extended } => {
+                self.handle_set_bluetooth_range(&device_id, extended).await;
+            }
+            Command::SetSmartHome { device_id, enabled } => {
+                self.handle_set_smart_home(&device_id, enabled).await;
             }
             Command::Shutdown => {
                 // Handled in run() loop
@@ -605,6 +611,122 @@ impl SensorWorker {
             .await
         {
             error!("Failed to send IntervalChanged event: {}", e);
+        }
+    }
+
+    /// Handle a set bluetooth range command.
+    async fn handle_set_bluetooth_range(&self, device_id: &str, extended: bool) {
+        let range_name = if extended { "Extended" } else { "Standard" };
+        info!(device_id, range_name, "Setting Bluetooth range");
+
+        // Connect to the device
+        let device = match Device::connect(device_id).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!(device_id, error = %e, "Failed to connect for set Bluetooth range");
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::BluetoothRangeError {
+                        device_id: device_id.to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        // Set the Bluetooth range
+        let range = if extended {
+            BluetoothRange::Extended
+        } else {
+            BluetoothRange::Standard
+        };
+
+        if let Err(e) = device.set_bluetooth_range(range).await {
+            error!(device_id, error = %e, "Failed to set Bluetooth range");
+            let _ = device.disconnect().await;
+            let _ = self
+                .event_tx
+                .send(SensorEvent::BluetoothRangeError {
+                    device_id: device_id.to_string(),
+                    error: e.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        // Disconnect from device
+        if let Err(e) = device.disconnect().await {
+            warn!(device_id, error = %e, "Failed to disconnect after setting Bluetooth range");
+        }
+
+        info!(device_id, range_name, "Bluetooth range set successfully");
+
+        // Send success event
+        if let Err(e) = self
+            .event_tx
+            .send(SensorEvent::BluetoothRangeChanged {
+                device_id: device_id.to_string(),
+                extended,
+            })
+            .await
+        {
+            error!("Failed to send BluetoothRangeChanged event: {}", e);
+        }
+    }
+
+    /// Handle a set smart home command.
+    async fn handle_set_smart_home(&self, device_id: &str, enabled: bool) {
+        let mode = if enabled { "enabled" } else { "disabled" };
+        info!(device_id, mode, "Setting Smart Home");
+
+        // Connect to the device
+        let device = match Device::connect(device_id).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!(device_id, error = %e, "Failed to connect for set Smart Home");
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::SmartHomeError {
+                        device_id: device_id.to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        // Set Smart Home mode
+        if let Err(e) = device.set_smart_home(enabled).await {
+            error!(device_id, error = %e, "Failed to set Smart Home");
+            let _ = device.disconnect().await;
+            let _ = self
+                .event_tx
+                .send(SensorEvent::SmartHomeError {
+                    device_id: device_id.to_string(),
+                    error: e.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        // Disconnect from device
+        if let Err(e) = device.disconnect().await {
+            warn!(device_id, error = %e, "Failed to disconnect after setting Smart Home");
+        }
+
+        info!(device_id, mode, "Smart Home set successfully");
+
+        // Send success event
+        if let Err(e) = self
+            .event_tx
+            .send(SensorEvent::SmartHomeChanged {
+                device_id: device_id.to_string(),
+                enabled,
+            })
+            .await
+        {
+            error!("Failed to send SmartHomeChanged event: {}", e);
         }
     }
 

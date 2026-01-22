@@ -1,10 +1,12 @@
 //! Cache command - query local database.
 
+use std::io::{Read, Write};
+
 use anyhow::{Context, Result};
 use aranet_store::{HistoryQuery, Store};
 use time::OffsetDateTime;
 
-use crate::cli::{CacheAction, OutputArgs};
+use crate::cli::{CacheAction, ExportFormat, OutputArgs, OutputFormat};
 use crate::config::Config;
 use crate::format::{FormatOptions, format_history_csv, format_history_json, format_history_text};
 
@@ -22,7 +24,21 @@ pub fn cmd_cache(action: CacheAction, config: &Config) -> Result<()> {
             until,
             output,
         } => query_history(&store, &device, count, since, until, output, config),
+        CacheAction::Aggregate {
+            device,
+            since,
+            until,
+            format,
+        } => show_aggregate_stats(&store, &device, since, until, format),
+        CacheAction::Export {
+            device,
+            format,
+            output,
+            since,
+            until,
+        } => export_history(&store, &device, format, output, since, until),
         CacheAction::Info => show_info(),
+        CacheAction::Import { format, input } => import_history(&store, format, input),
     }
 }
 
@@ -173,4 +189,187 @@ fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
     }
 
     anyhow::bail!("Invalid date/time format: {}. Use RFC3339 or YYYY-MM-DD", s)
+}
+
+fn show_aggregate_stats(
+    store: &Store,
+    device_id: &str,
+    since: Option<String>,
+    until: Option<String>,
+    format: OutputFormat,
+) -> Result<()> {
+    let mut query = HistoryQuery::new().device(device_id);
+
+    if let Some(since_str) = since {
+        let ts = parse_datetime(&since_str)?;
+        query = query.since(ts);
+    }
+
+    if let Some(until_str) = until {
+        let ts = parse_datetime(&until_str)?;
+        query = query.until(ts);
+    }
+
+    let stats = store.history_stats(&query)?;
+
+    if stats.count == 0 {
+        println!("No history records found for {}", device_id);
+        return Ok(());
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&stats)?;
+            println!("{}", json);
+        }
+        _ => {
+            println!("Aggregate statistics for {}:", device_id);
+            println!("  Records: {}", stats.count);
+
+            if let Some((start, end)) = stats.time_range {
+                let rfc3339 = time::format_description::well_known::Rfc3339;
+                println!(
+                    "  Time range: {} to {}",
+                    start.format(&rfc3339)?,
+                    end.format(&rfc3339)?
+                );
+            }
+
+            println!();
+            println!("  {:12} {:>10} {:>10} {:>10}", "", "Min", "Max", "Avg");
+            println!("  {}", "-".repeat(46));
+
+            if let (Some(min), Some(max), Some(avg)) =
+                (stats.min.co2, stats.max.co2, stats.avg.co2)
+            {
+                println!(
+                    "  {:12} {:>10.0} {:>10.0} {:>10.1} ppm",
+                    "CO2", min, max, avg
+                );
+            }
+
+            if let (Some(min), Some(max), Some(avg)) =
+                (stats.min.temperature, stats.max.temperature, stats.avg.temperature)
+            {
+                println!(
+                    "  {:12} {:>10.1} {:>10.1} {:>10.1} C",
+                    "Temperature", min, max, avg
+                );
+            }
+
+            if let (Some(min), Some(max), Some(avg)) =
+                (stats.min.pressure, stats.max.pressure, stats.avg.pressure)
+            {
+                println!(
+                    "  {:12} {:>10.1} {:>10.1} {:>10.1} hPa",
+                    "Pressure", min, max, avg
+                );
+            }
+
+            if let (Some(min), Some(max), Some(avg)) =
+                (stats.min.humidity, stats.max.humidity, stats.avg.humidity)
+            {
+                println!(
+                    "  {:12} {:>10.0} {:>10.0} {:>10.1} %",
+                    "Humidity", min, max, avg
+                );
+            }
+
+            if let (Some(min), Some(max), Some(avg)) =
+                (stats.min.radon, stats.max.radon, stats.avg.radon)
+            {
+                println!(
+                    "  {:12} {:>10.0} {:>10.0} {:>10.1} Bq/m3",
+                    "Radon", min, max, avg
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn export_history(
+    store: &Store,
+    device_id: &str,
+    format: ExportFormat,
+    output: Option<std::path::PathBuf>,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<()> {
+    let mut query = HistoryQuery::new().device(device_id);
+
+    if let Some(since_str) = since {
+        let ts = parse_datetime(&since_str)?;
+        query = query.since(ts);
+    }
+
+    if let Some(until_str) = until {
+        let ts = parse_datetime(&until_str)?;
+        query = query.until(ts);
+    }
+
+    let content = match format {
+        ExportFormat::Csv => store.export_history_csv(&query)?,
+        ExportFormat::Json => store.export_history_json(&query)?,
+    };
+
+    match output {
+        Some(path) => {
+            let mut file = std::fs::File::create(&path)
+                .with_context(|| format!("Failed to create file: {}", path.display()))?;
+            file.write_all(content.as_bytes())?;
+            println!("Exported to {}", path.display());
+        }
+        None => {
+            print!("{}", content);
+        }
+    }
+
+    Ok(())
+}
+
+fn import_history(
+    store: &Store,
+    format: ExportFormat,
+    input: Option<std::path::PathBuf>,
+) -> Result<()> {
+    // Read input data
+    let data = match input {
+        Some(path) => {
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read file: {}", path.display()))?
+        }
+        None => {
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .context("Failed to read from stdin")?;
+            buffer
+        }
+    };
+
+    // Import based on format
+    let result = match format {
+        ExportFormat::Csv => store.import_history_csv(&data)?,
+        ExportFormat::Json => store.import_history_json(&data)?,
+    };
+
+    // Report results
+    println!("Import complete:");
+    println!("  Total records: {}", result.total);
+    println!("  Imported: {}", result.imported);
+    println!("  Skipped (duplicates): {}", result.skipped);
+
+    if !result.errors.is_empty() {
+        println!("\nErrors ({}):", result.errors.len());
+        for (i, err) in result.errors.iter().enumerate().take(10) {
+            println!("  {}", err);
+            if i == 9 && result.errors.len() > 10 {
+                println!("  ... and {} more errors", result.errors.len() - 10);
+            }
+        }
+    }
+
+    Ok(())
 }

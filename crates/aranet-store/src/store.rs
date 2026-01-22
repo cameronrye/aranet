@@ -531,6 +531,315 @@ impl Store {
     }
 }
 
+/// Aggregate statistics for history data.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryStats {
+    /// Number of records.
+    pub count: u64,
+    /// Minimum values.
+    pub min: HistoryAggregates,
+    /// Maximum values.
+    pub max: HistoryAggregates,
+    /// Average values.
+    pub avg: HistoryAggregates,
+    /// Time range of records.
+    pub time_range: Option<(OffsetDateTime, OffsetDateTime)>,
+}
+
+/// Aggregate values for a single metric set.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryAggregates {
+    /// CO2 in ppm.
+    pub co2: Option<f64>,
+    /// Temperature in Celsius.
+    pub temperature: Option<f64>,
+    /// Pressure in hPa.
+    pub pressure: Option<f64>,
+    /// Humidity percentage.
+    pub humidity: Option<f64>,
+    /// Radon in Bq/m3 (for radon devices).
+    pub radon: Option<f64>,
+}
+
+// Aggregate and export operations
+impl Store {
+    /// Get aggregate statistics for history records.
+    pub fn history_stats(&self, query: &HistoryQuery) -> Result<HistoryStats> {
+        let mut conditions = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(ref device_id) = query.device_id {
+            conditions.push("device_id = ?");
+            params.push(Box::new(device_id.clone()));
+        }
+
+        if let Some(since) = query.since {
+            conditions.push("timestamp >= ?");
+            params.push(Box::new(since.unix_timestamp()));
+        }
+
+        if let Some(until) = query.until {
+            conditions.push("timestamp <= ?");
+            params.push(Box::new(until.unix_timestamp()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT
+                COUNT(*) as count,
+                MIN(co2) as min_co2, MAX(co2) as max_co2, AVG(co2) as avg_co2,
+                MIN(temperature) as min_temp, MAX(temperature) as max_temp, AVG(temperature) as avg_temp,
+                MIN(pressure) as min_press, MAX(pressure) as max_press, AVG(pressure) as avg_press,
+                MIN(humidity) as min_hum, MAX(humidity) as max_hum, AVG(humidity) as avg_hum,
+                MIN(radon) as min_radon, MAX(radon) as max_radon, AVG(radon) as avg_radon,
+                MIN(timestamp) as min_ts, MAX(timestamp) as max_ts
+             FROM history {}",
+            where_clause
+        );
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let stats = self.conn.query_row(&sql, params_refs.as_slice(), |row| {
+            let count: i64 = row.get(0)?;
+            let min_ts: Option<i64> = row.get(16)?;
+            let max_ts: Option<i64> = row.get(17)?;
+
+            let time_range = match (min_ts, max_ts) {
+                (Some(min), Some(max)) => Some((
+                    OffsetDateTime::from_unix_timestamp(min).unwrap(),
+                    OffsetDateTime::from_unix_timestamp(max).unwrap(),
+                )),
+                _ => None,
+            };
+
+            Ok(HistoryStats {
+                count: count as u64,
+                min: HistoryAggregates {
+                    co2: row.get::<_, Option<i64>>(1)?.map(|v| v as f64),
+                    temperature: row.get(4)?,
+                    pressure: row.get(7)?,
+                    humidity: row.get::<_, Option<i64>>(10)?.map(|v| v as f64),
+                    radon: row.get::<_, Option<i64>>(13)?.map(|v| v as f64),
+                },
+                max: HistoryAggregates {
+                    co2: row.get::<_, Option<i64>>(2)?.map(|v| v as f64),
+                    temperature: row.get(5)?,
+                    pressure: row.get(8)?,
+                    humidity: row.get::<_, Option<i64>>(11)?.map(|v| v as f64),
+                    radon: row.get::<_, Option<i64>>(14)?.map(|v| v as f64),
+                },
+                avg: HistoryAggregates {
+                    co2: row.get(3)?,
+                    temperature: row.get(6)?,
+                    pressure: row.get(9)?,
+                    humidity: row.get(12)?,
+                    radon: row.get(15)?,
+                },
+                time_range,
+            })
+        })?;
+
+        Ok(stats)
+    }
+
+    /// Export history records to CSV format.
+    pub fn export_history_csv(&self, query: &HistoryQuery) -> Result<String> {
+        let records = self.query_history(query)?;
+        let mut output = String::new();
+
+        // Header
+        output.push_str("timestamp,device_id,co2,temperature,pressure,humidity,radon\n");
+
+        // Data rows
+        for record in records {
+            let timestamp = record
+                .timestamp
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            let radon = record
+                .radon
+                .map(|r| r.to_string())
+                .unwrap_or_default();
+
+            output.push_str(&format!(
+                "{},{},{},{:.1},{:.2},{},{}\n",
+                timestamp,
+                record.device_id,
+                record.co2,
+                record.temperature,
+                record.pressure,
+                record.humidity,
+                radon
+            ));
+        }
+
+        Ok(output)
+    }
+
+    /// Export history records to JSON format.
+    pub fn export_history_json(&self, query: &HistoryQuery) -> Result<String> {
+        let records = self.query_history(query)?;
+        let json = serde_json::to_string_pretty(&records)
+            .map_err(|e| Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        Ok(json)
+    }
+
+    /// Import history records from CSV format.
+    ///
+    /// Expected CSV format:
+    /// ```csv
+    /// timestamp,device_id,co2,temperature,pressure,humidity,radon
+    /// 2024-01-15T10:30:00Z,Aranet4 17C3C,800,22.5,1013.25,45,
+    /// ```
+    ///
+    /// Returns the number of records imported (deduplicated by device_id + timestamp).
+    pub fn import_history_csv(&self, csv_data: &str) -> Result<ImportResult> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(csv_data.as_bytes());
+
+        let mut total = 0;
+        let mut imported = 0;
+        let mut skipped = 0;
+        let mut errors = Vec::new();
+
+        for (line_num, result) in reader.records().enumerate() {
+            total += 1;
+            let line = line_num + 2; // Account for header and 0-indexing
+
+            let record = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push(format!("Line {}: parse error - {}", line, e));
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Parse fields
+            let timestamp_str = record.get(0).unwrap_or("").trim();
+            let device_id = record.get(1).unwrap_or("").trim();
+            let co2_str = record.get(2).unwrap_or("").trim();
+            let temp_str = record.get(3).unwrap_or("").trim();
+            let pressure_str = record.get(4).unwrap_or("").trim();
+            let humidity_str = record.get(5).unwrap_or("").trim();
+            let radon_str = record.get(6).unwrap_or("").trim();
+
+            // Validate required fields
+            if device_id.is_empty() {
+                errors.push(format!("Line {}: missing device_id", line));
+                skipped += 1;
+                continue;
+            }
+
+            // Parse timestamp
+            let timestamp = match OffsetDateTime::parse(
+                timestamp_str,
+                &time::format_description::well_known::Rfc3339,
+            ) {
+                Ok(ts) => ts,
+                Err(_) => {
+                    errors.push(format!("Line {}: invalid timestamp '{}'", line, timestamp_str));
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Parse numeric fields with defaults
+            let co2: u16 = co2_str.parse().unwrap_or(0);
+            let temperature: f32 = temp_str.parse().unwrap_or(0.0);
+            let pressure: f32 = pressure_str.parse().unwrap_or(0.0);
+            let humidity: u8 = humidity_str.parse().unwrap_or(0);
+            let radon: Option<u32> = if radon_str.is_empty() {
+                None
+            } else {
+                radon_str.parse().ok()
+            };
+
+            // Create history record
+            let history_record = HistoryRecord {
+                timestamp,
+                co2,
+                temperature,
+                pressure,
+                humidity,
+                radon,
+                radiation_rate: None,
+                radiation_total: None,
+            };
+
+            // Ensure device exists and insert record
+            self.upsert_device(device_id, None)?;
+            let count = self.insert_history(device_id, &[history_record])?;
+            imported += count;
+            if count == 0 {
+                skipped += 1; // Duplicate record
+            }
+        }
+
+        Ok(ImportResult {
+            total,
+            imported,
+            skipped,
+            errors,
+        })
+    }
+
+    /// Import history records from JSON format.
+    ///
+    /// Expected JSON format: an array of StoredHistoryRecord objects.
+    ///
+    /// Returns the number of records imported (deduplicated by device_id + timestamp).
+    pub fn import_history_json(&self, json_data: &str) -> Result<ImportResult> {
+        let records: Vec<StoredHistoryRecord> = serde_json::from_str(json_data)
+            .map_err(|e| Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+
+        let total = records.len();
+        let mut imported = 0;
+        let mut skipped = 0;
+
+        for record in records {
+            // Convert to HistoryRecord
+            let history_record = record.to_history();
+
+            // Ensure device exists and insert record
+            self.upsert_device(&record.device_id, None)?;
+            let count = self.insert_history(&record.device_id, &[history_record])?;
+            imported += count;
+            if count == 0 {
+                skipped += 1; // Duplicate record
+            }
+        }
+
+        Ok(ImportResult {
+            total,
+            imported,
+            skipped,
+            errors: Vec::new(),
+        })
+    }
+}
+
+/// Result of an import operation.
+#[derive(Debug, Clone)]
+pub struct ImportResult {
+    /// Total records processed.
+    pub total: usize,
+    /// Records successfully imported.
+    pub imported: usize,
+    /// Records skipped (duplicates or errors).
+    pub skipped: usize,
+    /// Error messages for failed records.
+    pub errors: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +990,121 @@ mod tests {
         // New readings added - should start from 101
         let start = store.calculate_sync_start("test-device", 110).unwrap();
         assert_eq!(start, 101);
+    }
+
+    #[test]
+    fn test_import_history_csv() {
+        let store = Store::open_in_memory().unwrap();
+
+        let csv_data = r#"timestamp,device_id,co2,temperature,pressure,humidity,radon
+2024-01-15T10:30:00Z,Aranet4 17C3C,800,22.5,1013.25,45,
+2024-01-15T11:30:00Z,Aranet4 17C3C,850,23.0,1014.00,48,
+2024-01-15T12:30:00Z,AranetRn+ 306B8,0,21.0,1012.00,50,150
+"#;
+
+        let result = store.import_history_csv(csv_data).unwrap();
+
+        assert_eq!(result.total, 3);
+        assert_eq!(result.imported, 3);
+        assert_eq!(result.skipped, 0);
+        assert!(result.errors.is_empty());
+
+        // Verify data was imported
+        let devices = store.list_devices().unwrap();
+        assert_eq!(devices.len(), 2);
+
+        // Query defaults to newest_first=true (DESC order)
+        let query = HistoryQuery::new().device("Aranet4 17C3C");
+        let records = store.query_history(&query).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].co2, 850); // 11:30 - newest first
+        assert_eq!(records[1].co2, 800); // 10:30 - oldest
+
+        // Verify radon device
+        let query = HistoryQuery::new().device("AranetRn+ 306B8");
+        let records = store.query_history(&query).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].radon, Some(150));
+    }
+
+    #[test]
+    fn test_import_history_csv_deduplication() {
+        let store = Store::open_in_memory().unwrap();
+
+        let csv_data = r#"timestamp,device_id,co2,temperature,pressure,humidity,radon
+2024-01-15T10:30:00Z,test-device,800,22.5,1013.25,45,
+"#;
+
+        // Import once
+        let result = store.import_history_csv(csv_data).unwrap();
+        assert_eq!(result.imported, 1);
+
+        // Import again - should skip duplicate
+        let result = store.import_history_csv(csv_data).unwrap();
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1);
+    }
+
+    #[test]
+    fn test_import_history_csv_with_errors() {
+        let store = Store::open_in_memory().unwrap();
+
+        let csv_data = r#"timestamp,device_id,co2,temperature,pressure,humidity,radon
+invalid-timestamp,test-device,800,22.5,1013.25,45,
+2024-01-15T10:30:00Z,,800,22.5,1013.25,45,
+2024-01-15T11:30:00Z,valid-device,900,23.0,1014.00,50,
+"#;
+
+        let result = store.import_history_csv(csv_data).unwrap();
+
+        assert_eq!(result.total, 3);
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.skipped, 2);
+        assert_eq!(result.errors.len(), 2);
+    }
+
+    #[test]
+    fn test_import_history_json() {
+        let store = Store::open_in_memory().unwrap();
+
+        let json_data = r#"[
+            {
+                "id": 0,
+                "device_id": "Aranet4 17C3C",
+                "timestamp": "2024-01-15T10:30:00Z",
+                "synced_at": "2024-01-15T12:00:00Z",
+                "co2": 800,
+                "temperature": 22.5,
+                "pressure": 1013.25,
+                "humidity": 45,
+                "radon": null,
+                "radiation_rate": null,
+                "radiation_total": null
+            },
+            {
+                "id": 0,
+                "device_id": "Aranet4 17C3C",
+                "timestamp": "2024-01-15T11:30:00Z",
+                "synced_at": "2024-01-15T12:00:00Z",
+                "co2": 850,
+                "temperature": 23.0,
+                "pressure": 1014.0,
+                "humidity": 48,
+                "radon": null,
+                "radiation_rate": null,
+                "radiation_total": null
+            }
+        ]"#;
+
+        let result = store.import_history_json(json_data).unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.skipped, 0);
+
+        // Verify data was imported
+        let query = HistoryQuery::new().device("Aranet4 17C3C");
+        let records = store.query_history(&query).unwrap();
+        assert_eq!(records.len(), 2);
     }
 }

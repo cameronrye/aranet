@@ -9,8 +9,7 @@ members = [
     "crates/aranet-gui",
     "crates/aranet-wasm",
 ]
-# Default members exclude GUI (which is a placeholder) and WASM (which requires special tooling)
-# Build GUI explicitly with: cargo build -p aranet-gui
+# Default members exclude WASM (which requires special tooling)
 # Build WASM explicitly with: cargo build -p aranet-wasm --target wasm32-unknown-unknown
 default-members = [
     "crates/aranet-types",
@@ -19,6 +18,7 @@ default-members = [
     "crates/aranet-service",
     "crates/aranet-cli",
     "crates/aranet-tui",
+    "crates/aranet-gui",
 ]
 resolver = "2"
 

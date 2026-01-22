@@ -229,6 +229,10 @@ pub enum Commands {
         /// Filter records until this date/time (RFC3339 or YYYY-MM-DD)
         #[arg(long)]
         until: Option<String>,
+
+        /// Read from local cache instead of connecting to device
+        #[arg(long)]
+        cache: bool,
     },
 
     /// Display device information
@@ -316,6 +320,10 @@ pub enum Commands {
         /// Force full sync (re-download all history)
         #[arg(long)]
         full: bool,
+
+        /// Sync all known devices from the database
+        #[arg(long, conflicts_with = "device")]
+        all: bool,
     },
 
     /// Query cached data from local database
@@ -324,9 +332,32 @@ pub enum Commands {
         action: CacheAction,
     },
 
+    /// Start the HTTP API server
+    Server {
+        /// Bind address (default: 127.0.0.1:8080)
+        #[arg(short, long, default_value = "127.0.0.1:8080")]
+        bind: String,
+
+        /// Database path (uses default location if not specified)
+        #[arg(long)]
+        database: Option<std::path::PathBuf>,
+
+        /// Disable background collector (API only mode)
+        #[arg(long)]
+        no_collector: bool,
+
+        /// Run as a background daemon (detach from terminal)
+        #[arg(long)]
+        daemon: bool,
+    },
+
     /// Launch interactive terminal dashboard
     #[cfg(feature = "tui")]
     Tui,
+
+    /// Launch native desktop GUI
+    #[cfg(feature = "gui")]
+    Gui,
 }
 
 /// Cache subcommands for querying local database
@@ -364,8 +395,70 @@ pub enum CacheAction {
         output: OutputArgs,
     },
 
+    /// Show aggregate statistics (min/max/avg) for cached history
+    Aggregate {
+        /// Device address (required)
+        #[arg(short, long)]
+        device: String,
+
+        /// Filter records since this date/time
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter records until this date/time
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Output format
+        #[arg(short, long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+
+    /// Export cached history to file
+    Export {
+        /// Device address (required)
+        #[arg(short, long)]
+        device: String,
+
+        /// Output format
+        #[arg(short, long, value_enum, default_value = "csv")]
+        format: ExportFormat,
+
+        /// Output file path (uses stdout if not specified)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Filter records since this date/time
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter records until this date/time
+        #[arg(long)]
+        until: Option<String>,
+    },
+
     /// Show database path and info
     Info,
+
+    /// Import history from a CSV or JSON file
+    Import {
+        /// Input format
+        #[arg(short, long, value_enum, default_value = "csv")]
+        format: ExportFormat,
+
+        /// Input file path (uses stdin if not specified)
+        #[arg(short, long)]
+        input: Option<std::path::PathBuf>,
+    },
+}
+
+/// Export format options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    /// Comma-separated values
+    Csv,
+    /// JavaScript Object Notation
+    Json,
 }
 
 /// Alias subcommands

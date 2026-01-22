@@ -108,6 +108,74 @@ jobs:
       - name: Build artifacts
         run: cargo dist build --tag="${{ github.ref_name }}" --target="${{ matrix.target }}"
 
+      # Build native app bundle for GUI (macOS .app, Windows .exe with resources)
+      - name: Install cargo-bundle (Unix)
+        if: runner.os != 'Windows'
+        run: cargo install cargo-bundle
+
+      - name: Install cargo-bundle (Windows)
+        if: runner.os == 'Windows'
+        run: cargo install cargo-bundle
+
+      - name: Build macOS app bundle
+        if: runner.os == 'macOS'
+        run: |
+          # Build the GUI app bundle
+          cargo bundle --release --package aranet-gui --target ${{ matrix.target }}
+
+          # Find and display the app bundle
+          APP_BUNDLE=$(find target -name "Aranet.app" -type d | head -1)
+          if [ -n "$APP_BUNDLE" ]; then
+            echo "App bundle created at: $APP_BUNDLE"
+            ls -la "$APP_BUNDLE"
+
+            # Add icon to Resources (cargo-bundle doesn't always include it)
+            mkdir -p "$APP_BUNDLE/Contents/Resources"
+            cp assets/aranet-icon.icns "$APP_BUNDLE/Contents/Resources/aranet-gui.icns"
+
+            # Add CFBundleIconFile to Info.plist if not present
+            if ! grep -q "CFBundleIconFile" "$APP_BUNDLE/Contents/Info.plist"; then
+              /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string aranet-gui" "$APP_BUNDLE/Contents/Info.plist"
+            fi
+
+            echo "App bundle contents:"
+            ls -la "$APP_BUNDLE/Contents/Resources/"
+
+            # Create a DMG for distribution
+            DMG_NAME="Aranet-${{ matrix.target }}.dmg"
+
+            # Create a temporary directory for the DMG contents
+            DMG_DIR=$RUNNER_TEMP/dmg
+            mkdir -p "$DMG_DIR"
+            cp -R "$APP_BUNDLE" "$DMG_DIR/"
+
+            # Create Applications symlink for drag-and-drop install
+            ln -s /Applications "$DMG_DIR/Applications"
+
+            # Create the DMG
+            hdiutil create -volname "Aranet" -srcfolder "$DMG_DIR" -ov -format UDZO "target/distrib/$DMG_NAME"
+
+            echo "Created DMG: target/distrib/$DMG_NAME"
+            ls -la target/distrib/
+          else
+            echo "Warning: App bundle not found"
+          fi
+
+      - name: Build Windows app bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Build the GUI app (cargo-bundle creates .exe with embedded resources)
+          cargo bundle --release --package aranet-gui --target ${{ matrix.target }}
+
+          # Find the output
+          $exe = Get-ChildItem -Recurse -Filter "aranet-gui.exe" | Where-Object { $_.DirectoryName -notmatch "deps" } | Select-Object -First 1
+          if ($exe) {
+            Write-Host "Built: $($exe.FullName)"
+            # Copy to distrib folder
+            Copy-Item $exe.FullName -Destination "target/distrib/aranet-gui-${{ matrix.target }}.exe"
+          }
+
       # Apple code signing and notarization for macOS
       - name: Import Apple certificate
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
@@ -139,7 +207,7 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
           echo "Certificate imported successfully"
 
-      - name: Sign macOS binary
+      - name: Sign macOS binaries and app bundle
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -150,54 +218,94 @@ jobs:
             exit 0
           fi
 
+          SIGNING_IDENTITY="Developer ID Application: Cameron Rye ($APPLE_TEAM_ID)"
           echo "Contents of target/distrib:"
           ls -la target/distrib/
 
-          # Find the tarball (cargo-dist uses .tar.xz format)
+          # === Sign CLI binary in tarball ===
           TARBALL=$(find target/distrib -name "aranet-cli-*.tar.xz" | head -1)
           if [ -z "$TARBALL" ]; then
             echo "No aranet-cli tarball found, checking for any tarball..."
             TARBALL=$(find target/distrib -name "*.tar.xz" | head -1)
           fi
 
-          if [ -z "$TARBALL" ]; then
-            echo "No tarball found in target/distrib"
-            exit 1
+          if [ -n "$TARBALL" ]; then
+            echo "Found tarball: $TARBALL"
+
+            # Extract the tarball
+            EXTRACT_DIR=$RUNNER_TEMP/extract
+            mkdir -p "$EXTRACT_DIR"
+            tar -xJf "$TARBALL" -C "$EXTRACT_DIR"
+
+            echo "Extracted contents:"
+            find "$EXTRACT_DIR" -type f
+
+            # Find and sign the CLI binary
+            BINARY_PATH=$(find "$EXTRACT_DIR" -name "aranet" -type f | head -1)
+            if [ -n "$BINARY_PATH" ]; then
+              echo "Signing CLI binary at: $BINARY_PATH"
+              codesign --force --options runtime --sign "$SIGNING_IDENTITY" --timestamp "$BINARY_PATH"
+              codesign -dv --verbose=4 "$BINARY_PATH"
+
+              # Re-package the signed binary
+              TARBALL_NAME=$(basename "$TARBALL")
+              rm "$TARBALL"
+              tar -cJf "target/distrib/$TARBALL_NAME" -C "$EXTRACT_DIR" .
+              echo "Re-packaged signed CLI binary into $TARBALL_NAME"
+            else
+              echo "Warning: CLI binary 'aranet' not found in tarball"
+            fi
+          else
+            echo "No CLI tarball found in target/distrib"
           fi
 
-          echo "Found tarball: $TARBALL"
+          # === Sign the .app bundle and re-create DMG ===
+          DMG_PATH=$(find target/distrib -name "Aranet-*.dmg" | head -1)
+          if [ -n "$DMG_PATH" ]; then
+            echo "Found DMG: $DMG_PATH"
 
-          # Extract the tarball
-          EXTRACT_DIR=$RUNNER_TEMP/extract
-          mkdir -p "$EXTRACT_DIR"
-          tar -xJf "$TARBALL" -C "$EXTRACT_DIR"
+            # Mount the DMG to sign the app inside
+            MOUNT_DIR=$RUNNER_TEMP/dmg_mount
+            mkdir -p "$MOUNT_DIR"
+            hdiutil attach "$DMG_PATH" -mountpoint "$MOUNT_DIR" -nobrowse
 
-          echo "Extracted contents:"
-          find "$EXTRACT_DIR" -type f
+            # Find the app bundle
+            APP_BUNDLE=$(find "$MOUNT_DIR" -name "*.app" -type d | head -1)
+            if [ -n "$APP_BUNDLE" ]; then
+              # Copy app to a writable location for signing
+              SIGN_DIR=$RUNNER_TEMP/sign_app
+              mkdir -p "$SIGN_DIR"
+              cp -R "$APP_BUNDLE" "$SIGN_DIR/"
 
-          # Find the binary
-          BINARY_PATH=$(find "$EXTRACT_DIR" -name "aranet" -type f | head -1)
-          if [ -z "$BINARY_PATH" ]; then
-            echo "Binary 'aranet' not found in extracted tarball"
-            exit 1
+              hdiutil detach "$MOUNT_DIR"
+
+              SIGNED_APP="$SIGN_DIR/$(basename "$APP_BUNDLE")"
+
+              # Sign the app bundle (deep signs all nested code)
+              echo "Signing app bundle: $SIGNED_APP"
+              codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" --timestamp "$SIGNED_APP"
+              codesign -dv --verbose=4 "$SIGNED_APP"
+
+              # Re-create the DMG with signed app
+              DMG_NAME=$(basename "$DMG_PATH")
+              rm "$DMG_PATH"
+
+              DMG_CONTENTS=$RUNNER_TEMP/dmg_contents
+              mkdir -p "$DMG_CONTENTS"
+              cp -R "$SIGNED_APP" "$DMG_CONTENTS/"
+              ln -s /Applications "$DMG_CONTENTS/Applications"
+
+              hdiutil create -volname "Aranet" -srcfolder "$DMG_CONTENTS" -ov -format UDZO "target/distrib/$DMG_NAME"
+              echo "Re-created signed DMG: target/distrib/$DMG_NAME"
+            else
+              hdiutil detach "$MOUNT_DIR" || true
+              echo "Warning: No .app found in DMG"
+            fi
+          else
+            echo "No DMG found to sign"
           fi
 
-          echo "Signing binary at: $BINARY_PATH"
-
-          # Sign with Developer ID Application certificate
-          codesign --force --options runtime --sign "Developer ID Application: Cameron Rye ($APPLE_TEAM_ID)" \
-            --timestamp "$BINARY_PATH"
-
-          # Verify signature
-          codesign -dv --verbose=4 "$BINARY_PATH"
-
-          # Re-package the signed binary
-          TARBALL_NAME=$(basename "$TARBALL")
-          rm "$TARBALL"
-          tar -cJf "target/distrib/$TARBALL_NAME" -C "$EXTRACT_DIR" .
-          echo "Re-packaged signed binary into $TARBALL_NAME"
-
-      - name: Notarize macOS binary
+      - name: Notarize macOS binaries and app bundle
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -210,42 +318,61 @@ jobs:
             exit 0
           fi
 
-          # Find the tarball to notarize (cargo-dist uses .tar.xz)
+          # Write the API key to a file (shared for all submissions)
+          mkdir -p $RUNNER_TEMP/private_keys
+          echo "$APP_STORE_CONNECT_KEY" > $RUNNER_TEMP/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8
+          API_KEY_PATH="$RUNNER_TEMP/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+
+          # === Notarize CLI binary ===
           TARBALL=$(find target/distrib -name "aranet-cli-*.tar.xz" | head -1)
           if [ -z "$TARBALL" ]; then
             TARBALL=$(find target/distrib -name "*.tar.xz" | head -1)
           fi
-          if [ -z "$TARBALL" ]; then
-            echo "No tarball found to notarize"
-            exit 0
+
+          if [ -n "$TARBALL" ]; then
+            echo "Notarizing CLI from tarball: $TARBALL"
+            EXTRACT_DIR=$RUNNER_TEMP/notarize_cli
+            mkdir -p "$EXTRACT_DIR"
+            tar -xJf "$TARBALL" -C "$EXTRACT_DIR"
+            BINARY_PATH=$(find "$EXTRACT_DIR" -name "aranet" -type f | head -1)
+
+            if [ -n "$BINARY_PATH" ]; then
+              ZIP_PATH=$RUNNER_TEMP/aranet-cli-notarize.zip
+              ditto -c -k --keepParent "$BINARY_PATH" "$ZIP_PATH"
+
+              echo "Submitting CLI binary for notarization..."
+              xcrun notarytool submit "$ZIP_PATH" \
+                --key "$API_KEY_PATH" \
+                --key-id "$APP_STORE_CONNECT_KEY_ID" \
+                --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+                --wait
+              echo "CLI binary notarization complete"
+            else
+              echo "Warning: CLI binary not found in tarball"
+            fi
+          else
+            echo "No CLI tarball found to notarize"
           fi
 
-          # Create a zip for notarization (Apple requires zip format)
-          EXTRACT_DIR=$RUNNER_TEMP/notarize
-          mkdir -p "$EXTRACT_DIR"
-          tar -xJf "$TARBALL" -C "$EXTRACT_DIR"
-          BINARY_PATH=$(find "$EXTRACT_DIR" -name "aranet" -type f | head -1)
+          # === Notarize DMG (contains .app bundle) ===
+          DMG_PATH=$(find target/distrib -name "Aranet-*.dmg" | head -1)
+          if [ -n "$DMG_PATH" ]; then
+            echo "Submitting DMG for notarization: $DMG_PATH"
+            xcrun notarytool submit "$DMG_PATH" \
+              --key "$API_KEY_PATH" \
+              --key-id "$APP_STORE_CONNECT_KEY_ID" \
+              --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+              --wait
 
-          if [ -z "$BINARY_PATH" ]; then
-            echo "Binary not found for notarization"
-            exit 1
+            # Staple the notarization ticket to the DMG
+            echo "Stapling notarization ticket to DMG..."
+            xcrun stapler staple "$DMG_PATH"
+            echo "DMG notarization and stapling complete"
+          else
+            echo "No DMG found to notarize"
           fi
 
-          ZIP_PATH=$RUNNER_TEMP/aranet-notarize.zip
-          ditto -c -k --keepParent "$BINARY_PATH" "$ZIP_PATH"
-
-          # Write the API key to a file
-          mkdir -p $RUNNER_TEMP/private_keys
-          echo "$APP_STORE_CONNECT_KEY" > $RUNNER_TEMP/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8
-
-          echo "Submitting for notarization..."
-          xcrun notarytool submit "$ZIP_PATH" \
-            --key "$RUNNER_TEMP/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8" \
-            --key-id "$APP_STORE_CONNECT_KEY_ID" \
-            --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
-            --wait
-
-          echo "Notarization complete"
+          echo "All notarization complete"
 
       - name: Clean up keychain
         if: runner.os == 'macOS' && always()
@@ -305,26 +432,77 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
-            # Download the formula from the release
-            if [ -f "target/distrib/aranet-cli.rb" ]; then
-              echo "Found Homebrew formula in artifacts"
-
-              # Clone the tap repo and update the formula
-              git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/cameronrye/homebrew-aranet.git /tmp/homebrew-aranet
-              cp target/distrib/aranet-cli.rb /tmp/homebrew-aranet/Formula/aranet.rb
-
-              cd /tmp/homebrew-aranet
-              git config user.name "github-actions[bot]"
-              git config user.email "github-actions[bot]@users.noreply.github.com"
-              git add Formula/aranet.rb
-              git commit -m "Update aranet formula to ${{ github.ref_name }}" || echo "No changes to commit"
-              git push origin main
-
-              echo "Homebrew tap updated successfully"
-            else
-              echo "No Homebrew formula found in artifacts, skipping"
-            fi
-          else
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
             echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew tap update"
+            exit 0
           fi
+
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+
+          echo "Generating Homebrew formula and cask for version $VERSION"
+
+          # Calculate SHA256 hashes for all artifacts
+          cd target/distrib
+
+          # CLI binaries (cargo-dist uses aranet-cli-* naming)
+          SHA256_CLI_MACOS_ARM64=$(sha256sum aranet-cli-aarch64-apple-darwin.tar.xz 2>/dev/null | cut -d' ' -f1 || echo "")
+          SHA256_CLI_MACOS_X64=$(sha256sum aranet-cli-x86_64-apple-darwin.tar.xz 2>/dev/null | cut -d' ' -f1 || echo "")
+          SHA256_CLI_LINUX_X64=$(sha256sum aranet-cli-x86_64-unknown-linux-gnu.tar.xz 2>/dev/null | cut -d' ' -f1 || echo "")
+
+          # GUI binaries (cargo-dist uses aranet-gui-* naming)
+          SHA256_GUI_MACOS_ARM64=$(sha256sum aranet-gui-aarch64-apple-darwin.tar.xz 2>/dev/null | cut -d' ' -f1 || echo "")
+          SHA256_GUI_MACOS_X64=$(sha256sum aranet-gui-x86_64-apple-darwin.tar.xz 2>/dev/null | cut -d' ' -f1 || echo "")
+          SHA256_GUI_LINUX_X64=$(sha256sum aranet-gui-x86_64-unknown-linux-gnu.tar.xz 2>/dev/null | cut -d' ' -f1 || echo "")
+
+          # DMG files for Cask
+          SHA256_DMG_ARM64=$(sha256sum Aranet-aarch64-apple-darwin.dmg 2>/dev/null | cut -d' ' -f1 || echo "")
+          SHA256_DMG_X64=$(sha256sum Aranet-x86_64-apple-darwin.dmg 2>/dev/null | cut -d' ' -f1 || echo "")
+
+          cd $GITHUB_WORKSPACE
+
+          echo "SHA256 hashes calculated:"
+          echo "  CLI macOS ARM64: $SHA256_CLI_MACOS_ARM64"
+          echo "  CLI macOS x64: $SHA256_CLI_MACOS_X64"
+          echo "  CLI Linux x64: $SHA256_CLI_LINUX_X64"
+          echo "  GUI macOS ARM64: $SHA256_GUI_MACOS_ARM64"
+          echo "  GUI macOS x64: $SHA256_GUI_MACOS_X64"
+          echo "  GUI Linux x64: $SHA256_GUI_LINUX_X64"
+          echo "  DMG ARM64: $SHA256_DMG_ARM64"
+          echo "  DMG x64: $SHA256_DMG_X64"
+
+          # Clone the tap repo
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/cameronrye/homebrew-aranet.git /tmp/homebrew-aranet
+
+          # Generate Formula from template
+          if [ -f ".github/homebrew/aranet.rb.template" ]; then
+            sed -e "s/{{VERSION}}/$VERSION/g" \
+                -e "s/{{SHA256_CLI_MACOS_ARM64}}/$SHA256_CLI_MACOS_ARM64/g" \
+                -e "s/{{SHA256_CLI_MACOS_X64}}/$SHA256_CLI_MACOS_X64/g" \
+                -e "s/{{SHA256_CLI_LINUX_X64}}/$SHA256_CLI_LINUX_X64/g" \
+                -e "s/{{SHA256_GUI_MACOS_ARM64}}/$SHA256_GUI_MACOS_ARM64/g" \
+                -e "s/{{SHA256_GUI_MACOS_X64}}/$SHA256_GUI_MACOS_X64/g" \
+                -e "s/{{SHA256_GUI_LINUX_X64}}/$SHA256_GUI_LINUX_X64/g" \
+                .github/homebrew/aranet.rb.template > /tmp/homebrew-aranet/Formula/aranet.rb
+            echo "Generated Formula/aranet.rb"
+          fi
+
+          # Generate Cask from template
+          if [ -f ".github/homebrew/aranet-gui.rb.template" ] && [ -n "$SHA256_DMG_ARM64" ]; then
+            mkdir -p /tmp/homebrew-aranet/Casks
+            sed -e "s/{{VERSION}}/$VERSION/g" \
+                -e "s/{{SHA256_DMG_ARM64}}/$SHA256_DMG_ARM64/g" \
+                -e "s/{{SHA256_DMG_X64}}/$SHA256_DMG_X64/g" \
+                .github/homebrew/aranet-gui.rb.template > /tmp/homebrew-aranet/Casks/aranet-gui.rb
+            echo "Generated Casks/aranet-gui.rb"
+          fi
+
+          # Commit and push
+          cd /tmp/homebrew-aranet
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ Casks/ 2>/dev/null || true
+          git commit -m "Update aranet to ${{ github.ref_name }}" || echo "No changes to commit"
+          git push origin main
+
+          echo "Homebrew tap updated successfully"

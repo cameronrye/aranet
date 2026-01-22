@@ -35,7 +35,7 @@ mod store;
 pub use error::{Error, Result};
 pub use models::{StoredDevice, StoredHistoryRecord, StoredReading, SyncState};
 pub use queries::{HistoryQuery, ReadingQuery};
-pub use store::Store;
+pub use store::{HistoryAggregates, HistoryStats, ImportResult, Store};
 
 /// Default database path following platform conventions.
 ///

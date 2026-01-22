@@ -147,7 +147,11 @@ async fn run_event_loop(
 
         // Non-blocking receive of sensor events
         while let Ok(event) = app.event_rx.try_recv() {
-            app.handle_sensor_event(event);
+            // Handle event and send any auto-commands (auto-connect, auto-sync)
+            let auto_commands = app.handle_sensor_event(event);
+            for cmd in auto_commands {
+                let _ = command_tx.try_send(cmd);
+            }
         }
 
         // Check for auto-refresh of connected devices

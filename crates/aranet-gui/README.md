@@ -8,28 +8,42 @@
 
 # aranet-gui
 
-Native desktop GUI for Aranet environmental sensors.
+Native desktop GUI for Aranet environmental sensors built with [egui](https://www.egui.rs/).
 
-> **Note:** This crate is not yet implemented. It serves as a placeholder for a future desktop application built with [egui](https://www.egui.rs/).
+## Features
 
-## Planned Features
+- **Device Discovery** - Scan for nearby Aranet devices via Bluetooth LE
+- **Real-time Monitoring** - Live sensor readings with CO2 color coding (green/yellow/orange/red)
+- **Multi-device Support** - Connect to and monitor multiple devices simultaneously
+- **Historical Charts** - Visualize CO2, radon, radiation, temperature, and humidity trends
+- **Time Filtering** - Filter history by All/24h/7d/30d
+- **Settings Display** - View device configuration (read-only)
+- **Cross-platform** - Works on macOS, Windows, and Linux
 
-- **Native desktop application** - Cross-platform GUI using egui/eframe
-- **Real-time monitoring** - Live sensor readings with visual indicators
-- **Device management** - Scan, connect, and configure Aranet devices
-- **Historical data** - View and export measurement history
-- **Threshold alerts** - Visual notifications for CO2/radon levels
-- **System tray integration** - Background monitoring with notifications
+## Supported Devices
 
-## Status
+- Aranet4 (CO2, temperature, humidity, pressure)
+- Aranet2 (temperature, humidity)
+- AranetRn+ (radon, temperature, pressure, humidity)
+- Aranet Radiation (radiation rate, total dose)
 
-This crate is currently a placeholder. The implementation is planned for a future release.
-
-To build:
+## Usage
 
 ```bash
-cargo build -p aranet-gui
+# Run the GUI application
+cargo run -p aranet-gui
 ```
+
+## Screenshot
+
+![Aranet GUI Dashboard](https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/gui-main.png)
+
+The application features:
+- **Header** - Tabs (Dashboard/History/Settings) and Scan button
+- **Sidebar** - Device list with connection status
+- **Dashboard** - Current readings with color-coded values
+- **History** - Interactive charts for all sensor metrics
+- **Settings** - Device configuration and info display
 
 ## Related Crates
 
@@ -43,7 +57,7 @@ This crate is part of the [aranet](https://github.com/cameronrye/aranet) workspa
 | [aranet-cli](../aranet-cli/) | [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli) | Command-line interface |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
 | [aranet-service](../aranet-service/) | - | Background collector and REST API |
-| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module (planned) |
+| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module |
 
 ## License
 

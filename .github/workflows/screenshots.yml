@@ -1,0 +1,92 @@
+name: Generate Screenshots
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  generate-screenshots:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Install VHS
+        run: |
+          brew install vhs
+          brew install optipng gifsicle
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-screenshots-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-screenshots-
+
+      - name: Build aranet-gui
+        run: cargo build -p aranet-gui --release
+
+      - name: Generate VHS recordings
+        run: |
+          mkdir -p assets/screenshots
+          for tape in scripts/tapes/*.tape; do
+            if [ -f "$tape" ]; then
+              echo "Recording: $tape"
+              vhs "$tape" || echo "Warning: Failed to record $tape"
+            fi
+          done
+
+      - name: Generate GUI screenshot
+        run: |
+          # Run GUI in demo mode and capture screenshot
+          # Note: This requires a display - using virtual framebuffer on Linux
+          ./target/release/aranet-gui --demo --screenshot assets/screenshots/gui-main.png --screenshot-delay 20 || true
+
+      - name: Optimize images
+        run: |
+          # Optimize PNGs
+          for png in assets/screenshots/*.png; do
+            if [ -f "$png" ]; then
+              optipng -quiet "$png" || true
+            fi
+          done
+          # Optimize GIFs
+          for gif in assets/screenshots/*.gif; do
+            if [ -f "$gif" ]; then
+              gifsicle -O3 --colors 256 "$gif" -o "$gif" || true
+            fi
+          done
+
+      - name: List generated screenshots
+        run: ls -la assets/screenshots/
+
+      - name: Commit screenshots
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add assets/screenshots/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "docs: update screenshots for ${{ github.ref_name }}"
+            git push origin HEAD:main
+          fi
+

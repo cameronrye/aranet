@@ -51,6 +51,12 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
 - **aranet-gui** — Desktop application built with egui
 - **aranet-wasm** — WebAssembly module for browser integration *(planned)*
 
+## Screenshots
+
+| CLI | TUI | GUI |
+|-----|-----|-----|
+| ![CLI Demo](assets/screenshots/cli-scan.gif) | ![TUI Demo](assets/screenshots/tui-demo.gif) | ![GUI](assets/screenshots/gui-main.png) |
+
 ## Installation
 
 Install the CLI from [crates.io](https://crates.io/crates/aranet-cli):

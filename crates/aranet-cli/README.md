@@ -26,6 +26,10 @@ cd aranet
 cargo build --release --package aranet-cli
 ```
 
+## Demo
+
+![Aranet CLI Scan Demo](https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/cli-scan.gif)
+
 ## Usage
 
 ### Scan for devices
@@ -266,8 +270,8 @@ This CLI is part of the [aranet](https://github.com/cameronrye/aranet) workspace
 | [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local data persistence |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
 | [aranet-service](../aranet-service/) | - | Background collector and REST API |
-| [aranet-gui](../aranet-gui/) | - | Desktop application (planned) |
-| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module (planned) |
+| [aranet-gui](../aranet-gui/) | - | Desktop GUI application |
+| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module |
 
 ## License
 

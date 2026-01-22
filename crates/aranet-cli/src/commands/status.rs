@@ -25,6 +25,7 @@ pub async fn cmd_status(
     // Use connect_device_with_progress which has its own spinner
     let device = connect_device_with_progress(&identifier, timeout, true).await?;
 
+    let device_id = device.address().to_string();
     let name = device.name().map(|s| s.to_string());
     let reading = device
         .read_current()
@@ -32,6 +33,9 @@ pub async fn cmd_status(
         .context("Failed to read current values")?;
 
     device.disconnect().await.ok();
+
+    // Save reading to store (unified data architecture)
+    crate::util::save_reading_to_store(&device_id, &reading);
 
     let device_name = name.clone().unwrap_or_else(|| identifier.clone());
 

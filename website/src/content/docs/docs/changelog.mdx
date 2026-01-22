@@ -13,7 +13,25 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [0.1.8] - 2026-01-19 <Badge text="Current" variant="success" />
+## [0.1.9] - 2026-01-22 <Badge text="Current" variant="success" />
+
+### Changed
+
+- Replaced unmaintained `atty` crate with `std::io::IsTerminal` (resolves RUSTSEC-2024-0375)
+- Updated `rusqlite` from 0.33 to 0.35
+- Updated multiple dependencies to latest versions
+- Marked `aranet-gui` and `aranet-wasm` as `publish = false` (not ready for release)
+
+### Added
+
+- CONTRIBUTING.md with contribution guidelines
+- SECURITY.md with vulnerability reporting process
+- GitHub issue templates for bug reports and feature requests
+- Pull request template
+
+---
+
+## [0.1.8] - 2026-01-19
 
 ### Added
 

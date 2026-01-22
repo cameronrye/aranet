@@ -1,13 +1,62 @@
 ---
 title: Installation
-description: How to install the Aranet CLI and library from source.
+description: How to install the Aranet CLI on macOS, Linux, and Windows.
 ---
 
-import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Steps, Tabs, TabItem, Aside, Badge, Card, CardGrid } from '@astrojs/starlight/components';
+
+<Badge text="v0.1.9" variant="success" /> Latest Release
+
+## Pre-built Binaries
+
+The fastest way to install Aranet CLI is using pre-built binaries:
+
+<Tabs>
+  <TabItem label="Homebrew (macOS/Linux)">
+```bash
+brew tap cameronrye/aranet
+brew install aranet
+```
+  </TabItem>
+  <TabItem label="Shell (macOS/Linux)">
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.sh | sh
+```
+  </TabItem>
+  <TabItem label="PowerShell (Windows)">
+```powershell
+irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex
+```
+  </TabItem>
+</Tabs>
+
+## Download Direct
+
+Download binaries directly from GitHub Releases:
+
+<CardGrid>
+  <Card title="macOS (Apple Silicon)" icon="apple">
+    [aranet-cli-aarch64-apple-darwin.tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-aarch64-apple-darwin.tar.xz)
+  </Card>
+  <Card title="macOS (Intel)" icon="apple">
+    [aranet-cli-x86_64-apple-darwin.tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-apple-darwin.tar.xz)
+  </Card>
+  <Card title="Linux (x86_64)" icon="linux">
+    [aranet-cli-x86_64-unknown-linux-gnu.tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-unknown-linux-gnu.tar.xz)
+  </Card>
+  <Card title="Windows (x86_64)" icon="seti:windows">
+    [aranet-cli-x86_64-pc-windows-msvc.zip](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-pc-windows-msvc.zip)
+  </Card>
+</CardGrid>
+
+<Aside>
+  All releases include SHA256 checksums. View all versions on the [GitHub Releases](https://github.com/cameronrye/aranet/releases) page.
+</Aside>
 
 ## Install from crates.io
 
-The easiest way to install the Aranet CLI:
+Install using Cargo (requires Rust toolchain):
 
 ```bash
 cargo install aranet-cli

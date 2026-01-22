@@ -138,6 +138,23 @@ aranet alias set living-room AA:BB:CC:DD:EE:FF
   </TabItem>
 </Tabs>
 
+## Screenshots
+
+<div class="not-content" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1rem', margin: '1.5rem 0' }}>
+  <div>
+    <img src="https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/cli-scan.gif" alt="CLI Demo" style={{ width: '100%', borderRadius: '8px' }} />
+    <p style={{ textAlign: 'center', marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>Command-Line Interface</p>
+  </div>
+  <div>
+    <img src="https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/tui-demo.gif" alt="TUI Demo" style={{ width: '100%', borderRadius: '8px' }} />
+    <p style={{ textAlign: 'center', marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>Terminal Dashboard</p>
+  </div>
+  <div>
+    <img src="https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/gui-main.png" alt="GUI Screenshot" style={{ width: '100%', borderRadius: '8px' }} />
+    <p style={{ textAlign: 'center', marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>Desktop Application</p>
+  </div>
+</div>
+
 ## Architecture
 
 import architectureSvg from '../../assets/architecture.svg';
@@ -171,7 +188,7 @@ import architectureSvg from '../../assets/architecture.svg';
     Background daemon with REST API, scheduled syncing, system service integration.
   </Card>
   <Card title="aranet-gui" icon="approve-check">
-    Native desktop application (planned) with system tray and notifications.
+    Native desktop application with real-time monitoring, charts, and multi-device support.
   </Card>
   <Card title="aranet-wasm" icon="seti:wasm">
     WebAssembly module for browser-based sensor access via Web Bluetooth API.

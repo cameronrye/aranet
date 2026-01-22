@@ -104,8 +104,8 @@ This crate is part of the [aranet](https://github.com/cameronrye/aranet) workspa
 | [aranet-cli](../aranet-cli/) | [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli) | Command-line interface |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
 | [aranet-service](../aranet-service/) | - | Background collector and REST API |
-| [aranet-gui](../aranet-gui/) | - | Desktop application (planned) |
-| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module (planned) |
+| [aranet-gui](../aranet-gui/) | - | Desktop GUI application |
+| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module |
 
 ## License
 
