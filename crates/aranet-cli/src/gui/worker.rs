@@ -82,7 +82,10 @@ impl SensorWorker {
             } => {
                 self.handle_set_interval(&device_id, interval_secs).await;
             }
-            Command::SetBluetoothRange { device_id, extended } => {
+            Command::SetBluetoothRange {
+                device_id,
+                extended,
+            } => {
                 self.handle_set_bluetooth_range(&device_id, extended).await;
             }
             Command::SetSmartHome { device_id, enabled } => {
@@ -661,7 +664,10 @@ impl SensorWorker {
 
     async fn handle_set_bluetooth_range(&self, device_id: &str, extended: bool) {
         let range_name = if extended { "Extended" } else { "Standard" };
-        info!("Setting Bluetooth range for {} to {}", device_id, range_name);
+        info!(
+            "Setting Bluetooth range for {} to {}",
+            device_id, range_name
+        );
 
         let device = match Device::connect(device_id).await {
             Ok(d) => d,
@@ -816,4 +822,3 @@ impl SensorWorker {
         }
     }
 }
-

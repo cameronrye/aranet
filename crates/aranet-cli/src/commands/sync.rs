@@ -166,12 +166,7 @@ async fn sync_all_devices(
             .as_ref()
             .unwrap_or(&stored_device.id)
             .clone();
-        println!(
-            "[{}/{}] Syncing {}...",
-            idx + 1,
-            total_devices,
-            device_name
-        );
+        println!("[{}/{}] Syncing {}...", idx + 1, total_devices, device_name);
 
         match sync_single_device(store, &stored_device.id, &device_name, full, timeout).await {
             Ok((downloaded, inserted)) => {
@@ -185,7 +180,10 @@ async fn sync_all_devices(
                     "downloaded": downloaded,
                     "inserted": inserted,
                 }));
-                println!("  [PASS] Downloaded {} records, {} new\n", downloaded, inserted);
+                println!(
+                    "  [PASS] Downloaded {} records, {} new\n",
+                    downloaded, inserted
+                );
             }
             Err(e) => {
                 failed += 1;

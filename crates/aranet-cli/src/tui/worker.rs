@@ -152,7 +152,10 @@ impl SensorWorker {
             } => {
                 self.handle_set_interval(&device_id, interval_secs).await;
             }
-            Command::SetBluetoothRange { device_id, extended } => {
+            Command::SetBluetoothRange {
+                device_id,
+                extended,
+            } => {
                 self.handle_set_bluetooth_range(&device_id, extended).await;
             }
             Command::SetSmartHome { device_id, enabled } => {

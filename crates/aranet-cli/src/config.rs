@@ -92,8 +92,6 @@ impl Default for BehaviorConfig {
     }
 }
 
-
-
 impl Config {
     /// Get the config file path
     pub fn path() -> PathBuf {

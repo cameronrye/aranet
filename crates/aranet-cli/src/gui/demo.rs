@@ -2,8 +2,8 @@
 //!
 //! This module provides deterministic mock data for reproducible screenshots.
 
-use aranet_core::settings::DeviceSettings;
 use aranet_core::BluetoothRange;
+use aranet_core::settings::DeviceSettings;
 use aranet_types::{CurrentReading, DeviceType, HistoryRecord, Status};
 use time::{Duration, OffsetDateTime};
 
@@ -200,4 +200,3 @@ fn generate_radon_history(count: usize) -> Vec<HistoryRecord> {
 
     history
 }
-

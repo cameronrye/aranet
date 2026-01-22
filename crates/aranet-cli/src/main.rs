@@ -37,7 +37,8 @@ use cli::{AliasSubcommand, Cli, Commands, ConfigAction, ConfigKey, OutputFormat}
 #[cfg(feature = "cli")]
 use commands::{
     AliasAction, HistoryArgs, ServerArgs, SyncArgs, WatchArgs, cmd_alias, cmd_cache, cmd_doctor,
-    cmd_history, cmd_info, cmd_read, cmd_scan, cmd_server, cmd_set, cmd_status, cmd_sync, cmd_watch,
+    cmd_history, cmd_info, cmd_read, cmd_scan, cmd_server, cmd_set, cmd_status, cmd_sync,
+    cmd_watch,
 };
 #[cfg(feature = "cli")]
 use config::{Config, get_device_source, resolve_devices, resolve_timeout};

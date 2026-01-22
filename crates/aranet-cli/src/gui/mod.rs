@@ -51,8 +51,8 @@ fn load_icon() -> Option<Arc<IconData>> {
 pub use app::AranetApp;
 pub use theme::{Theme, ThemeMode};
 pub use tray::{
-    check_co2_threshold, hide_dock_icon, show_dock_icon, TrayCommand, TrayError, TrayManager,
-    TrayState,
+    TrayCommand, TrayError, TrayManager, TrayState, check_co2_threshold, hide_dock_icon,
+    show_dock_icon,
 };
 pub use types::{Co2Level, ConnectionState, DeviceState, HistoryFilter, Tab, Trend};
 pub use worker::SensorWorker;
@@ -143,7 +143,10 @@ pub fn run() -> Result<()> {
     let tray_manager = match TrayManager::new(tray_state.clone()) {
         Ok(manager) => Some(manager),
         Err(e) => {
-            warn!("Failed to create system tray: {}. Continuing without tray.", e);
+            warn!(
+                "Failed to create system tray: {}. Continuing without tray.",
+                e
+            );
             None
         }
     };
@@ -250,7 +253,10 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
         match TrayManager::new(tray_state.clone()) {
             Ok(manager) => Some(manager),
             Err(e) => {
-                warn!("Failed to create system tray: {}. Continuing without tray.", e);
+                warn!(
+                    "Failed to create system tray: {}. Continuing without tray.",
+                    e
+                );
                 None
             }
         }

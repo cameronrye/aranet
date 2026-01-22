@@ -239,8 +239,7 @@ fn show_aggregate_stats(
             println!("  {:12} {:>10} {:>10} {:>10}", "", "Min", "Max", "Avg");
             println!("  {}", "-".repeat(46));
 
-            if let (Some(min), Some(max), Some(avg)) =
-                (stats.min.co2, stats.max.co2, stats.avg.co2)
+            if let (Some(min), Some(max), Some(avg)) = (stats.min.co2, stats.max.co2, stats.avg.co2)
             {
                 println!(
                     "  {:12} {:>10.0} {:>10.0} {:>10.1} ppm",
@@ -248,9 +247,11 @@ fn show_aggregate_stats(
                 );
             }
 
-            if let (Some(min), Some(max), Some(avg)) =
-                (stats.min.temperature, stats.max.temperature, stats.avg.temperature)
-            {
+            if let (Some(min), Some(max), Some(avg)) = (
+                stats.min.temperature,
+                stats.max.temperature,
+                stats.avg.temperature,
+            ) {
                 println!(
                     "  {:12} {:>10.1} {:>10.1} {:>10.1} C",
                     "Temperature", min, max, avg
@@ -336,10 +337,8 @@ fn import_history(
 ) -> Result<()> {
     // Read input data
     let data = match input {
-        Some(path) => {
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read file: {}", path.display()))?
-        }
+        Some(path) => std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read file: {}", path.display()))?,
         None => {
             let mut buffer = String::new();
             std::io::stdin()

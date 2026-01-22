@@ -107,7 +107,11 @@ pub fn status_badge(ui: &mut Ui, theme: &Theme, text: &str, color: Color32) {
         .inner_margin(egui::Margin::symmetric(8, 4))
         .corner_radius(egui::CornerRadius::same(theme.rounding.sm as u8))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).color(color).size(theme.typography.caption));
+            ui.label(
+                RichText::new(text)
+                    .color(color)
+                    .size(theme.typography.caption),
+            );
         });
 }
 
@@ -304,10 +308,7 @@ fn format_reading_age(captured_at: time::OffsetDateTime) -> String {
 ///
 /// A reading is stale if it's older than 2x the measurement interval,
 /// or older than 30 minutes if no interval is known.
-pub fn is_reading_stale(
-    captured_at: Option<time::OffsetDateTime>,
-    interval_secs: u16,
-) -> bool {
+pub fn is_reading_stale(captured_at: Option<time::OffsetDateTime>, interval_secs: u16) -> bool {
     let Some(ts) = captured_at else {
         return false; // Can't determine staleness without timestamp
     };
@@ -328,4 +329,3 @@ pub fn is_reading_stale(
 
     age_secs > threshold
 }
-

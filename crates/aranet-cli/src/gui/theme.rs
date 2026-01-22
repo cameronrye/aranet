@@ -160,28 +160,28 @@ impl Theme {
         Self {
             is_dark: true,
             // Zinc-based dark backgrounds
-            bg_primary: Color32::from_rgb(9, 9, 11),      // zinc-950
-            bg_secondary: Color32::from_rgb(24, 24, 27),  // zinc-900
-            bg_card: Color32::from_rgb(39, 39, 42),       // zinc-800
-            bg_elevated: Color32::from_rgb(52, 52, 56),   // zinc-700
+            bg_primary: Color32::from_rgb(9, 9, 11), // zinc-950
+            bg_secondary: Color32::from_rgb(24, 24, 27), // zinc-900
+            bg_card: Color32::from_rgb(39, 39, 42),  // zinc-800
+            bg_elevated: Color32::from_rgb(52, 52, 56), // zinc-700
             // Text
-            text_primary: Color32::from_rgb(250, 250, 250),  // zinc-50
+            text_primary: Color32::from_rgb(250, 250, 250), // zinc-50
             text_secondary: Color32::from_rgb(212, 212, 216), // zinc-300
-            text_muted: Color32::from_rgb(161, 161, 170),    // zinc-400
-            text_on_accent: Color32::WHITE,                   // white text on accent buttons
+            text_muted: Color32::from_rgb(161, 161, 170),   // zinc-400
+            text_on_accent: Color32::WHITE,                 // white text on accent buttons
             // Borders
-            border: Color32::from_rgb(63, 63, 70),        // zinc-700
+            border: Color32::from_rgb(63, 63, 70), // zinc-700
             border_subtle: Color32::from_rgb(39, 39, 42), // zinc-800
-            separator: Color32::from_rgb(52, 52, 56),     // zinc-700
+            separator: Color32::from_rgb(52, 52, 56), // zinc-700
             // Accent (blue)
-            accent: Color32::from_rgb(59, 130, 246),      // blue-500
+            accent: Color32::from_rgb(59, 130, 246), // blue-500
             accent_hover: Color32::from_rgb(96, 165, 250), // blue-400
             // Semantic colors
-            success: Color32::from_rgb(34, 197, 94),      // green-500
-            warning: Color32::from_rgb(250, 204, 21),     // yellow-400
-            caution: Color32::from_rgb(251, 146, 60),     // orange-400
-            danger: Color32::from_rgb(239, 68, 68),       // red-500
-            info: Color32::from_rgb(96, 165, 250),        // blue-400
+            success: Color32::from_rgb(34, 197, 94), // green-500
+            warning: Color32::from_rgb(250, 204, 21), // yellow-400
+            caution: Color32::from_rgb(251, 146, 60), // orange-400
+            danger: Color32::from_rgb(239, 68, 68),  // red-500
+            info: Color32::from_rgb(96, 165, 250),   // blue-400
             // Chart colors
             chart_temperature: Color32::from_rgb(251, 146, 60), // orange-400
             chart_humidity: Color32::from_rgb(96, 165, 250),    // blue-400
@@ -197,28 +197,28 @@ impl Theme {
         Self {
             is_dark: false,
             // Light backgrounds
-            bg_primary: Color32::from_rgb(255, 255, 255),   // white
+            bg_primary: Color32::from_rgb(255, 255, 255), // white
             bg_secondary: Color32::from_rgb(249, 250, 251), // gray-50
-            bg_card: Color32::from_rgb(255, 255, 255),      // white (cards pop on gray bg)
-            bg_elevated: Color32::from_rgb(255, 255, 255),  // white with shadow for elevation
+            bg_card: Color32::from_rgb(255, 255, 255),    // white (cards pop on gray bg)
+            bg_elevated: Color32::from_rgb(255, 255, 255), // white with shadow for elevation
             // Text
-            text_primary: Color32::from_rgb(17, 24, 39),    // gray-900
-            text_secondary: Color32::from_rgb(55, 65, 81),  // gray-700
-            text_muted: Color32::from_rgb(107, 114, 128),   // gray-500
-            text_on_accent: Color32::WHITE,                  // white text on accent buttons
+            text_primary: Color32::from_rgb(17, 24, 39), // gray-900
+            text_secondary: Color32::from_rgb(55, 65, 81), // gray-700
+            text_muted: Color32::from_rgb(107, 114, 128), // gray-500
+            text_on_accent: Color32::WHITE,              // white text on accent buttons
             // Borders
-            border: Color32::from_rgb(209, 213, 219),       // gray-300
+            border: Color32::from_rgb(209, 213, 219), // gray-300
             border_subtle: Color32::from_rgb(229, 231, 235), // gray-200
-            separator: Color32::from_rgb(229, 231, 235),    // gray-200
+            separator: Color32::from_rgb(229, 231, 235), // gray-200
             // Accent (blue)
-            accent: Color32::from_rgb(37, 99, 235),         // blue-600
-            accent_hover: Color32::from_rgb(29, 78, 216),   // blue-700
+            accent: Color32::from_rgb(37, 99, 235), // blue-600
+            accent_hover: Color32::from_rgb(29, 78, 216), // blue-700
             // Semantic colors
-            success: Color32::from_rgb(22, 163, 74),        // green-600
-            warning: Color32::from_rgb(202, 138, 4),        // yellow-600
-            caution: Color32::from_rgb(234, 88, 12),        // orange-600
-            danger: Color32::from_rgb(220, 38, 38),         // red-600
-            info: Color32::from_rgb(37, 99, 235),           // blue-600
+            success: Color32::from_rgb(22, 163, 74), // green-600
+            warning: Color32::from_rgb(202, 138, 4), // yellow-600
+            caution: Color32::from_rgb(234, 88, 12), // orange-600
+            danger: Color32::from_rgb(220, 38, 38),  // red-600
+            info: Color32::from_rgb(37, 99, 235),    // blue-600
             // Chart colors
             chart_temperature: Color32::from_rgb(234, 88, 12), // orange-600
             chart_humidity: Color32::from_rgb(37, 99, 235),    // blue-600
@@ -421,4 +421,3 @@ impl Theme {
         visuals
     }
 }
-

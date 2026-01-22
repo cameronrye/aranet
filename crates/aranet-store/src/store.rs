@@ -661,10 +661,7 @@ impl Store {
                 .timestamp
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default();
-            let radon = record
-                .radon
-                .map(|r| r.to_string())
-                .unwrap_or_default();
+            let radon = record.radon.map(|r| r.to_string()).unwrap_or_default();
 
             output.push_str(&format!(
                 "{},{},{},{:.1},{:.2},{},{}\n",
@@ -746,7 +743,10 @@ impl Store {
             ) {
                 Ok(ts) => ts,
                 Err(_) => {
-                    errors.push(format!("Line {}: invalid timestamp '{}'", line, timestamp_str));
+                    errors.push(format!(
+                        "Line {}: invalid timestamp '{}'",
+                        line, timestamp_str
+                    ));
                     skipped += 1;
                     continue;
                 }

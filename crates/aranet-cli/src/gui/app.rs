@@ -18,7 +18,7 @@ use tracing::{debug, info};
 use super::components;
 use super::theme::{Theme, ThemeMode};
 use super::tray::{
-    check_co2_threshold, hide_dock_icon, show_dock_icon, TrayCommand, TrayManager, TrayState,
+    TrayCommand, TrayManager, TrayState, check_co2_threshold, hide_dock_icon, show_dock_icon,
 };
 use super::types::{
     Co2Level, ConnectionState, DeviceState, HistoryFilter, RadiationLevel, RadonLevel, Tab, Trend,
@@ -154,7 +154,16 @@ impl AranetApp {
         tray_state: Arc<Mutex<TrayState>>,
         tray_manager: Option<TrayManager>,
     ) -> Self {
-        Self::new_with_options(cc, command_tx, event_rx, tray_state, tray_manager, false, None, 3)
+        Self::new_with_options(
+            cc,
+            command_tx,
+            event_rx,
+            tray_state,
+            tray_manager,
+            false,
+            None,
+            3,
+        )
     }
 
     /// Create a new AranetApp instance with demo/screenshot options.
@@ -234,7 +243,8 @@ impl AranetApp {
 
     /// Remove expired toasts.
     fn cleanup_toasts(&mut self) {
-        self.toasts.retain(|t| t.created_at.elapsed() < TOAST_DURATION);
+        self.toasts
+            .retain(|t| t.created_at.elapsed() < TOAST_DURATION);
     }
 
     /// Process system tray events and handle commands.
@@ -260,7 +270,10 @@ impl AranetApp {
                     hide_dock_icon();
                 }
                 TrayCommand::ToggleWindow => {
-                    debug!("Tray command: ToggleWindow, visible={}", self.window_visible);
+                    debug!(
+                        "Tray command: ToggleWindow, visible={}",
+                        self.window_visible
+                    );
                     self.window_visible = !self.window_visible;
                     ctx.send_viewport_cmd(ViewportCommand::Visible(self.window_visible));
                     if self.window_visible {
@@ -413,7 +426,11 @@ impl AranetApp {
             }
             SensorEvent::ReadingUpdated { device_id, reading } => {
                 // Extract CO2 for tray notification before consuming reading
-                let co2_ppm = if reading.co2 > 0 { Some(reading.co2) } else { None };
+                let co2_ppm = if reading.co2 > 0 {
+                    Some(reading.co2)
+                } else {
+                    None
+                };
                 let device_name = self
                     .devices
                     .iter()
@@ -459,7 +476,10 @@ impl AranetApp {
                 }
                 self.add_toast(format!("History sync failed: {}", error), ToastType::Error);
             }
-            SensorEvent::SettingsLoaded { device_id, settings } => {
+            SensorEvent::SettingsLoaded {
+                device_id,
+                settings,
+            } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.settings = Some(settings);
                 }
@@ -476,9 +496,15 @@ impl AranetApp {
                     reading.interval = interval_secs;
                 }
             }
-            SensorEvent::IntervalError { device_id: _, error } => {
+            SensorEvent::IntervalError {
+                device_id: _,
+                error,
+            } => {
                 self.updating_settings = false;
-                self.add_toast(format!("Failed to set interval: {}", error), ToastType::Error);
+                self.add_toast(
+                    format!("Failed to set interval: {}", error),
+                    ToastType::Error,
+                );
             }
             SensorEvent::BluetoothRangeChanged {
                 device_id: _,
@@ -488,9 +514,15 @@ impl AranetApp {
                 let range = if extended { "Extended" } else { "Standard" };
                 self.status = format!("Bluetooth range set to {}", range);
             }
-            SensorEvent::BluetoothRangeError { device_id: _, error } => {
+            SensorEvent::BluetoothRangeError {
+                device_id: _,
+                error,
+            } => {
                 self.updating_settings = false;
-                self.add_toast(format!("Failed to set BT range: {}", error), ToastType::Error);
+                self.add_toast(
+                    format!("Failed to set BT range: {}", error),
+                    ToastType::Error,
+                );
             }
             SensorEvent::SmartHomeChanged {
                 device_id: _,
@@ -500,7 +532,10 @@ impl AranetApp {
                 let mode = if enabled { "enabled" } else { "disabled" };
                 self.add_toast(format!("Smart Home {}", mode), ToastType::Success);
             }
-            SensorEvent::SmartHomeError { device_id: _, error } => {
+            SensorEvent::SmartHomeError {
+                device_id: _,
+                error,
+            } => {
                 self.updating_settings = false;
                 self.add_toast(
                     format!("Failed to set Smart Home: {}", error),
@@ -642,8 +677,7 @@ impl eframe::App for AranetApp {
                                 1.0
                             };
 
-                            let toast_text_color =
-                                self.theme.text_on_accent.gamma_multiply(alpha);
+                            let toast_text_color = self.theme.text_on_accent.gamma_multiply(alpha);
                             egui::Frame::new()
                                 .fill(bg_color.gamma_multiply(0.95 * alpha))
                                 .inner_margin(egui::Margin::symmetric(12, 8))
@@ -657,9 +691,7 @@ impl eframe::App for AranetApp {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new(icon)
-                                                .color(toast_text_color)
-                                                .strong(),
+                                            RichText::new(icon).color(toast_text_color).strong(),
                                         );
                                         ui.label(
                                             RichText::new(&toast.message).color(toast_text_color),
@@ -819,9 +851,11 @@ impl eframe::App for AranetApp {
                     // Status indicator dot
                     let status_color = if self.scanning {
                         self.theme.warning
-                    } else if self.devices.iter().any(|d| {
-                        matches!(d.connection, ConnectionState::Connected)
-                    }) {
+                    } else if self
+                        .devices
+                        .iter()
+                        .any(|d| matches!(d.connection, ConnectionState::Connected))
+                    {
                         self.theme.success
                     } else {
                         self.theme.text_muted
@@ -940,10 +974,7 @@ impl AranetApp {
                             let device = &self.devices[i];
                             let selected = self.selected_device == Some(i);
                             let (frame_fill, border_color) = if selected {
-                                (
-                                    self.theme.tint_bg(self.theme.accent, 20),
-                                    self.theme.accent,
-                                )
+                                (self.theme.tint_bg(self.theme.accent, 20), self.theme.accent)
                             } else {
                                 (Color32::TRANSPARENT, self.theme.border_subtle)
                             };
@@ -1016,20 +1047,28 @@ impl AranetApp {
                                                     // Aranet4: Show CO2
                                                     let color = self.theme.co2_color(reading.co2);
                                                     ui.label(
-                                                        RichText::new(format!("{} ppm", reading.co2))
-                                                            .size(self.theme.typography.caption)
-                                                            .color(color),
+                                                        RichText::new(format!(
+                                                            "{} ppm",
+                                                            reading.co2
+                                                        ))
+                                                        .size(self.theme.typography.caption)
+                                                        .color(color),
                                                     )
                                                     .on_hover_text("CO2 level");
                                                 } else if let Some(radon) = reading.radon {
                                                     // AranetRadon: Show radon
-                                                    let (value, unit) =
-                                                        format_radon(radon, device.settings.as_ref());
+                                                    let (value, unit) = format_radon(
+                                                        radon,
+                                                        device.settings.as_ref(),
+                                                    );
                                                     let color = self.theme.radon_color(radon);
                                                     ui.label(
-                                                        RichText::new(format!("{} {}", value, unit))
-                                                            .size(self.theme.typography.caption)
-                                                            .color(color),
+                                                        RichText::new(format!(
+                                                            "{} {}",
+                                                            value, unit
+                                                        ))
+                                                        .size(self.theme.typography.caption)
+                                                        .color(color),
                                                     )
                                                     .on_hover_text("Radon level");
                                                 } else if let Some(rate) = reading.radiation_rate {
@@ -1068,7 +1107,9 @@ impl AranetApp {
                                                     self.theme.danger
                                                 };
                                                 ui.with_layout(
-                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
                                                     |ui| {
                                                         ui.label(
                                                             RichText::new(format!("{}dB", rssi))
@@ -1134,8 +1175,9 @@ impl AranetApp {
                 });
             });
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                match &device.connection {
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::TOP),
+                |ui| match &device.connection {
                     ConnectionState::Disconnected | ConnectionState::Error(_) => {
                         let btn = egui::Button::new(
                             RichText::new("Connect")
@@ -1178,8 +1220,8 @@ impl AranetApp {
                             });
                         }
                     }
-                }
-            });
+                },
+            );
         });
 
         ui.add_space(self.theme.spacing.lg);
@@ -1224,7 +1266,11 @@ impl AranetApp {
                             .color(self.theme.text_on_accent),
                     )
                     .fill(self.theme.accent);
-                    if ui.add(btn).on_hover_text("Download history from device").clicked() {
+                    if ui
+                        .add(btn)
+                        .on_hover_text("Download history from device")
+                        .clicked()
+                    {
                         self.send_command(Command::SyncHistory {
                             device_id: device.id.clone(),
                         });
@@ -1238,7 +1284,10 @@ impl AranetApp {
         // Filter segmented control
         let filter_options = [
             (HistoryFilter::All, HistoryFilter::All.label()),
-            (HistoryFilter::Last24Hours, HistoryFilter::Last24Hours.label()),
+            (
+                HistoryFilter::Last24Hours,
+                HistoryFilter::Last24Hours.label(),
+            ),
             (HistoryFilter::Last7Days, HistoryFilter::Last7Days.label()),
             (HistoryFilter::Last30Days, HistoryFilter::Last30Days.label()),
         ];
@@ -1333,17 +1382,24 @@ impl AranetApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             if has_co2 {
-                self.render_chart_section(ui, "CO2", "ppm", || {
-                    let co2_points: PlotPoints = filtered
-                        .iter()
-                        .map(|r| [-to_hours_ago(r.timestamp), r.co2 as f64])
-                        .collect();
-                    (co2_points, self.theme.info)
-                }, plot_height, Some(vec![
-                    (800.0, "Good", self.theme.success),
-                    (1000.0, "Moderate", self.theme.warning),
-                    (1500.0, "Poor", self.theme.danger),
-                ]));
+                self.render_chart_section(
+                    ui,
+                    "CO2",
+                    "ppm",
+                    || {
+                        let co2_points: PlotPoints = filtered
+                            .iter()
+                            .map(|r| [-to_hours_ago(r.timestamp), r.co2 as f64])
+                            .collect();
+                        (co2_points, self.theme.info)
+                    },
+                    plot_height,
+                    Some(vec![
+                        (800.0, "Good", self.theme.success),
+                        (1000.0, "Moderate", self.theme.warning),
+                        (1500.0, "Poor", self.theme.danger),
+                    ]),
+                );
             }
 
             if has_radon {
@@ -1366,28 +1422,49 @@ impl AranetApp {
                         (300.0, "High", self.theme.danger),
                     ]
                 };
-                self.render_chart_section(ui, "Radon", radon_unit_label, || {
-                    let radon_points: PlotPoints = filtered
-                        .iter()
-                        .filter_map(|r| {
-                            r.radon.map(|v| {
-                                let value = if use_pci { bq_to_pci(v) as f64 } else { v as f64 };
-                                [-to_hours_ago(r.timestamp), value]
+                self.render_chart_section(
+                    ui,
+                    "Radon",
+                    radon_unit_label,
+                    || {
+                        let radon_points: PlotPoints = filtered
+                            .iter()
+                            .filter_map(|r| {
+                                r.radon.map(|v| {
+                                    let value = if use_pci {
+                                        bq_to_pci(v) as f64
+                                    } else {
+                                        v as f64
+                                    };
+                                    [-to_hours_ago(r.timestamp), value]
+                                })
                             })
-                        })
-                        .collect();
-                    (radon_points, self.theme.warning)
-                }, plot_height, Some(thresholds));
+                            .collect();
+                        (radon_points, self.theme.warning)
+                    },
+                    plot_height,
+                    Some(thresholds),
+                );
             }
 
             if has_radiation {
-                self.render_chart_section(ui, "Radiation Rate", "uSv/h", || {
-                    let radiation_points: PlotPoints = filtered
-                        .iter()
-                        .filter_map(|r| r.radiation_rate.map(|v| [-to_hours_ago(r.timestamp), v as f64]))
-                        .collect();
-                    (radiation_points, self.theme.danger)
-                }, plot_height, None);
+                self.render_chart_section(
+                    ui,
+                    "Radiation Rate",
+                    "uSv/h",
+                    || {
+                        let radiation_points: PlotPoints = filtered
+                            .iter()
+                            .filter_map(|r| {
+                                r.radiation_rate
+                                    .map(|v| [-to_hours_ago(r.timestamp), v as f64])
+                            })
+                            .collect();
+                        (radiation_points, self.theme.danger)
+                    },
+                    plot_height,
+                    None,
+                );
             }
 
             // Use device settings for temperature unit
@@ -1397,28 +1474,42 @@ impl AranetApp {
                 .map(|s| s.temperature_unit == TemperatureUnit::Fahrenheit)
                 .unwrap_or(false);
             let temp_unit_label = if use_fahrenheit { "F" } else { "C" };
-            self.render_chart_section(ui, "Temperature", temp_unit_label, || {
-                let temp_points: PlotPoints = filtered
-                    .iter()
-                    .map(|r| {
-                        let value = if use_fahrenheit {
-                            celsius_to_fahrenheit(r.temperature) as f64
-                        } else {
-                            r.temperature as f64
-                        };
-                        [-to_hours_ago(r.timestamp), value]
-                    })
-                    .collect();
-                (temp_points, self.theme.chart_temperature)
-            }, plot_height, None);
+            self.render_chart_section(
+                ui,
+                "Temperature",
+                temp_unit_label,
+                || {
+                    let temp_points: PlotPoints = filtered
+                        .iter()
+                        .map(|r| {
+                            let value = if use_fahrenheit {
+                                celsius_to_fahrenheit(r.temperature) as f64
+                            } else {
+                                r.temperature as f64
+                            };
+                            [-to_hours_ago(r.timestamp), value]
+                        })
+                        .collect();
+                    (temp_points, self.theme.chart_temperature)
+                },
+                plot_height,
+                None,
+            );
 
-            self.render_chart_section(ui, "Humidity", "%", || {
-                let humidity_points: PlotPoints = filtered
-                    .iter()
-                    .map(|r| [-to_hours_ago(r.timestamp), r.humidity as f64])
-                    .collect();
-                (humidity_points, self.theme.chart_humidity)
-            }, plot_height, None);
+            self.render_chart_section(
+                ui,
+                "Humidity",
+                "%",
+                || {
+                    let humidity_points: PlotPoints = filtered
+                        .iter()
+                        .map(|r| [-to_hours_ago(r.timestamp), r.humidity as f64])
+                        .collect();
+                    (humidity_points, self.theme.chart_humidity)
+                },
+                plot_height,
+                None,
+            );
         });
     }
 
@@ -1526,9 +1617,9 @@ impl AranetApp {
                                             .color(text_color),
                                     )
                                     .fill(bg)
-                                    .corner_radius(egui::CornerRadius::same(
-                                        self.theme.rounding.sm as u8,
-                                    ));
+                                    .corner_radius(
+                                        egui::CornerRadius::same(self.theme.rounding.sm as u8),
+                                    );
 
                                     if ui.add(btn).clicked() && !is_selected {
                                         self.updating_settings = true;
@@ -1748,7 +1839,12 @@ impl AranetApp {
                         .num_columns(2)
                         .spacing([self.theme.spacing.xl, self.theme.spacing.sm])
                         .show(ui, |ui| {
-                            Self::render_settings_row_static(ui, &self.theme, "Device ID", &device.id);
+                            Self::render_settings_row_static(
+                                ui,
+                                &self.theme,
+                                "Device ID",
+                                &device.id,
+                            );
 
                             if let Some(name) = &device.name {
                                 Self::render_settings_row_static(ui, &self.theme, "Name", name);

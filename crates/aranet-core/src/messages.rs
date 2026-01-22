@@ -19,8 +19,8 @@
 
 use std::time::Duration;
 
-use crate::settings::DeviceSettings;
 use crate::DiscoveredDevice;
+use crate::settings::DeviceSettings;
 use aranet_types::{CurrentReading, DeviceType, HistoryRecord};
 
 /// Commands sent from the UI thread to the background worker.
@@ -316,4 +316,3 @@ mod tests {
         assert!(device.name.is_none());
     }
 }
-

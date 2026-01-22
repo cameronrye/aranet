@@ -75,11 +75,7 @@ pub async fn cmd_server(args: ServerArgs) -> Result<()> {
         .with_state(state);
 
     // Parse bind address
-    let addr: std::net::SocketAddr = config
-        .server
-        .bind
-        .parse()
-        .context("Invalid bind address")?;
+    let addr: std::net::SocketAddr = config.server.bind.parse().context("Invalid bind address")?;
 
     println!("Starting Aranet API server on http://{}", addr);
     println!("API endpoints:");
@@ -131,10 +127,7 @@ fn run_daemon(config: &aranet_service::Config) -> Result<()> {
             .spawn()
             .context("Failed to spawn daemon process")?;
 
-        println!(
-            "Aranet server started in background (PID: {})",
-            child.id()
-        );
+        println!("Aranet server started in background (PID: {})", child.id());
         println!("Listening on http://{}", config.server.bind);
     }
 
@@ -153,13 +146,9 @@ fn run_daemon(config: &aranet_service::Config) -> Result<()> {
             .spawn()
             .context("Failed to spawn daemon process")?;
 
-        println!(
-            "Aranet server started in background (PID: {})",
-            child.id()
-        );
+        println!("Aranet server started in background (PID: {})", child.id());
         println!("Listening on http://{}", config.server.bind);
     }
 
     Ok(())
 }
-

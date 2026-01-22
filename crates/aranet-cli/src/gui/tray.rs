@@ -7,9 +7,9 @@
 //! - Background monitoring support
 
 use std::sync::{Arc, Mutex};
+use tracing::{debug, info, warn};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tracing::{debug, info, warn};
 
 use super::types::Co2Level;
 
@@ -80,11 +80,11 @@ impl TrayState {
     /// Format tooltip text based on current state.
     pub fn tooltip(&self) -> String {
         let mut parts = vec!["Aranet".to_string()];
-        
+
         if let Some(name) = &self.device_name {
             parts.push(format!("Device: {}", name));
         }
-        
+
         if let Some(co2) = self.co2_ppm {
             let level_text = match Co2Level::from_ppm(co2) {
                 Co2Level::Good => "Good",
@@ -94,7 +94,7 @@ impl TrayState {
             };
             parts.push(format!("CO2: {} ppm ({})", co2, level_text));
         }
-        
+
         parts.join("\n")
     }
 }
@@ -151,7 +151,7 @@ impl TrayManager {
             state,
         })
     }
-    
+
     /// Process pending tray events and return any commands.
     pub fn process_events(&self) -> Vec<TrayCommand> {
         let mut commands = Vec::new();
@@ -268,8 +268,7 @@ fn load_tray_icon_with_color(level: Option<&Co2Level>) -> Result<Icon, TrayError
     }
 
     let (width, height) = img.dimensions();
-    Icon::from_rgba(img.into_raw(), width, height)
-        .map_err(|e| TrayError::IconLoad(e.to_string()))
+    Icon::from_rgba(img.into_raw(), width, height).map_err(|e| TrayError::IconLoad(e.to_string()))
 }
 
 /// Send a desktop notification for a threshold alert.
