@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hardened Runtime entitlements for Aranet GUI -->
+    
+    <!-- Allow Bluetooth access for connecting to Aranet sensors -->
+    <key>com.apple.security.device.bluetooth</key>
+    <true/>
+    
+    <!-- Allow outgoing network connections (for future features) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    
+    <!-- Allow JIT compilation (required by some Rust async runtimes) -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    
+    <!-- Allow unsigned executable memory (may be needed by btleplug/tokio) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
+

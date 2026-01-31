@@ -8,7 +8,12 @@
 
 # aranet-gui
 
+[![crates.io](https://img.shields.io/crates/v/aranet-gui.svg)](https://crates.io/crates/aranet-gui)
+[![docs.rs](https://docs.rs/aranet-gui/badge.svg)](https://docs.rs/aranet-gui)
+
 Native desktop GUI for Aranet environmental sensors built with [egui](https://www.egui.rs/).
+
+**[Full Documentation](https://cameronrye.github.io/aranet/)**
 
 ## Features
 
@@ -17,7 +22,8 @@ Native desktop GUI for Aranet environmental sensors built with [egui](https://ww
 - **Multi-device Support** - Connect to and monitor multiple devices simultaneously
 - **Historical Charts** - Visualize CO2, radon, radiation, temperature, and humidity trends
 - **Time Filtering** - Filter history by All/24h/7d/30d
-- **Settings Display** - View device configuration (read-only)
+- **Device Settings** - Configure measurement interval, Bluetooth range, and Smart Home mode
+- **System Tray** - Minimize to system tray with status indicator
 - **Cross-platform** - Works on macOS, Windows, and Linux
 
 ## Supported Devices
@@ -56,8 +62,7 @@ This crate is part of the [aranet](https://github.com/cameronrye/aranet) workspa
 | [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local data persistence |
 | [aranet-cli](../aranet-cli/) | [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli) | Command-line interface |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
-| [aranet-service](../aranet-service/) | - | Background collector and REST API |
-| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module |
+| [aranet-service](../aranet-service/) | [![crates.io](https://img.shields.io/crates/v/aranet-service.svg)](https://crates.io/crates/aranet-service) | Background collector and REST API |
 
 ## License
 

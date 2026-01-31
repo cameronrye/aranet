@@ -5,12 +5,12 @@
   --sl-color-accent-low: #166534;
   --sl-color-accent: #22c55e;
   --sl-color-accent-high: #86efac;
-  
+
   /* Status colors */
   --aranet-green: #22c55e;
   --aranet-amber: #eab308;
   --aranet-red: #ef4444;
-  
+
   /* Sensor type colors */
   --aranet-co2: #3b82f6;
   --aranet-temp: #f97316;
@@ -38,17 +38,44 @@
   }
 }
 
-/* Landing page cards */
+/* ============================================
+   CARD STYLES - Gradient borders on hover
+   ============================================ */
+
 .sl-card {
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.sl-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, var(--aranet-green), var(--aranet-co2), var(--aranet-pressure));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
 }
 
 .sl-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
+  transform: translateY(-3px);
+  box-shadow: 0 12px 40px rgba(34, 197, 94, 0.15);
 }
 
-/* Sensor status badge styles */
+.sl-card:hover::before {
+  opacity: 1;
+}
+
+/* ============================================
+   STATUS BADGES
+   ============================================ */
+
 .status-badge {
   display: inline-flex;
   align-items: center;
@@ -73,112 +100,34 @@
   color: var(--aranet-red);
 }
 
-/* Code block enhancements */
+/* ============================================
+   CODE BLOCKS - Copy button enhancement
+   ============================================ */
+
 .expressive-code pre {
   border-radius: 0.5rem;
 }
 
-/* Device cards on landing page */
-.device-grid.not-content {
-  display: grid !important;
-  grid-template-columns: repeat(2, 1fr) !important;
-  gap: 0.75rem !important;
-  margin-block: 1.5rem !important;
+/* Style the copy button */
+.expressive-code .copy button {
+  background: var(--sl-color-accent) !important;
+  border-radius: 6px !important;
+  transition: transform 0.15s ease, background 0.15s ease !important;
 }
 
-@media (min-width: 30rem) {
-  .device-grid.not-content {
-    gap: 1rem !important;
-  }
+.expressive-code .copy button:hover {
+  transform: scale(1.1);
+  background: var(--sl-color-accent-high) !important;
 }
 
-@media (min-width: 50rem) {
-  .device-grid.not-content {
-    grid-template-columns: repeat(4, 1fr) !important;
-    gap: 1.5rem !important;
-    margin-block: 2rem !important;
-  }
+.expressive-code .copy button:active {
+  transform: scale(0.95);
 }
 
-.device-grid .device-card {
-  display: flex !important;
-  flex-direction: column !important;
-  align-items: center !important;
-  justify-content: flex-start !important;
-  background: var(--sl-color-bg-nav) !important;
-  border: 1px solid var(--sl-color-hairline) !important;
-  border-radius: 0.75rem !important;
-  padding: 1.25rem 1rem !important;
-  text-align: center !important;
-  transition: border-color 0.2s ease !important;
-  height: 140px !important;
-  box-sizing: border-box !important;
-}
+/* ============================================
+   STATS ROW - Hero position
+   ============================================ */
 
-@media (min-width: 50rem) {
-  .device-grid .device-card {
-    padding: 1.5rem !important;
-    height: 160px !important;
-  }
-}
-
-.device-grid .device-card:hover {
-  border-color: var(--sl-color-accent) !important;
-}
-
-.device-grid .device-icon {
-  font-size: 2rem !important;
-  line-height: 1 !important;
-  flex-shrink: 0 !important;
-  display: block !important;
-}
-
-@media (min-width: 50rem) {
-  .device-grid .device-icon {
-    font-size: 2.5rem !important;
-  }
-}
-
-.device-grid .device-name {
-  display: block !important;
-  margin-top: 0.5rem !important;
-  margin-bottom: 0.25rem !important;
-  font-size: 1rem !important;
-  font-weight: 600 !important;
-  color: var(--sl-color-white) !important;
-  flex-shrink: 0 !important;
-}
-
-@media (min-width: 50rem) {
-  .device-grid .device-name {
-    font-size: 1.125rem !important;
-  }
-}
-
-.device-grid .device-desc {
-  display: block !important;
-  font-size: 0.75rem !important;
-  color: var(--sl-color-gray-3) !important;
-  margin: 0 !important;
-  line-height: 1.4 !important;
-  flex-grow: 1 !important;
-}
-
-@media (min-width: 50rem) {
-  .device-grid .device-desc {
-    font-size: 0.875rem !important;
-  }
-}
-
-/* Feature grid */
-.feature-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 1.5rem;
-  margin-block: 2rem;
-}
-
-/* Stats section */
 .stats-row.not-content {
   display: grid !important;
   grid-template-columns: repeat(2, 1fr) !important;
@@ -187,6 +136,12 @@
   padding: 1.25rem !important;
   background: var(--sl-color-bg-nav) !important;
   border-radius: 0.75rem !important;
+}
+
+.stats-row.stats-hero {
+  margin-top: 0 !important;
+  margin-bottom: 2rem !important;
+  border: 1px solid var(--sl-color-hairline) !important;
 }
 
 @media (min-width: 50rem) {
@@ -198,6 +153,10 @@
     gap: 3rem !important;
     margin-block: 2rem !important;
     padding: 1.5rem !important;
+  }
+
+  .stats-row.stats-hero {
+    margin-bottom: 3rem !important;
   }
 }
 
@@ -245,7 +204,272 @@
   }
 }
 
-/* Terminal/CLI preview styling */
+/* ============================================
+   DEVICE GRID - With icons
+   ============================================ */
+
+.device-grid.not-content {
+  display: grid !important;
+  grid-template-columns: repeat(2, 1fr) !important;
+  gap: 0.75rem !important;
+  margin-block: 1.5rem !important;
+}
+
+@media (min-width: 30rem) {
+  .device-grid.not-content {
+    gap: 1rem !important;
+  }
+}
+
+@media (min-width: 50rem) {
+  .device-grid.not-content {
+    grid-template-columns: repeat(4, 1fr) !important;
+    gap: 1.5rem !important;
+    margin-block: 2rem !important;
+  }
+}
+
+.device-grid .device-card {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  background: var(--sl-color-bg-nav) !important;
+  border: 1px solid var(--sl-color-hairline) !important;
+  border-radius: 0.75rem !important;
+  padding: 1rem 0.75rem !important;
+  text-align: center !important;
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease !important;
+  min-height: 160px !important;
+  box-sizing: border-box !important;
+  position: relative !important;
+}
+
+@media (min-width: 50rem) {
+  .device-grid .device-card {
+    padding: 1.25rem 1rem !important;
+    min-height: 180px !important;
+  }
+}
+
+.device-grid .device-card:hover {
+  border-color: var(--sl-color-accent) !important;
+  transform: translateY(-2px) !important;
+  box-shadow: 0 8px 24px rgba(34, 197, 94, 0.1) !important;
+}
+
+/* Device-specific accent colors on hover */
+.device-grid .device-card[data-device="aranet4"]:hover {
+  border-color: var(--aranet-green) !important;
+  box-shadow: 0 8px 24px rgba(34, 197, 94, 0.15) !important;
+}
+
+.device-grid .device-card[data-device="aranet2"]:hover {
+  border-color: var(--aranet-co2) !important;
+  box-shadow: 0 8px 24px rgba(59, 130, 246, 0.15) !important;
+}
+
+.device-grid .device-card[data-device="aranetrn"]:hover {
+  border-color: var(--aranet-radon) !important;
+  box-shadow: 0 8px 24px rgba(168, 85, 247, 0.15) !important;
+}
+
+.device-grid .device-card[data-device="radiation"]:hover {
+  border-color: var(--aranet-radiation) !important;
+  box-shadow: 0 8px 24px rgba(236, 72, 153, 0.15) !important;
+}
+
+/* Device icons */
+.device-grid .device-icon {
+  width: 48px !important;
+  height: 48px !important;
+  margin-bottom: 0.5rem !important;
+  color: var(--sl-color-accent) !important;
+  flex-shrink: 0 !important;
+}
+
+.device-grid .device-icon svg {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Device-specific icon colors */
+.device-card[data-device="aranet4"] .device-icon { color: var(--aranet-green) !important; }
+.device-card[data-device="aranet2"] .device-icon { color: var(--aranet-co2) !important; }
+.device-card[data-device="aranetrn"] .device-icon { color: var(--aranet-radon) !important; }
+.device-card[data-device="radiation"] .device-icon { color: var(--aranet-radiation) !important; }
+
+@media (min-width: 50rem) {
+  .device-grid .device-icon {
+    width: 56px !important;
+    height: 56px !important;
+  }
+}
+
+.device-grid .device-name {
+  display: block !important;
+  margin-bottom: 0.25rem !important;
+  font-size: 0.95rem !important;
+  font-weight: 600 !important;
+  color: var(--sl-color-white) !important;
+  flex-shrink: 0 !important;
+}
+
+@media (min-width: 50rem) {
+  .device-grid .device-name {
+    font-size: 1.05rem !important;
+  }
+}
+
+/* Device badge (e.g., "Most Popular") */
+.device-grid .device-badge {
+  display: inline-block !important;
+  font-size: 0.65rem !important;
+  font-weight: 600 !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.5px !important;
+  padding: 0.15rem 0.5rem !important;
+  border-radius: 9999px !important;
+  background: linear-gradient(135deg, var(--aranet-green), var(--aranet-amber)) !important;
+  color: #000 !important;
+  margin-bottom: 0.35rem !important;
+}
+
+.device-grid .device-desc {
+  display: block !important;
+  font-size: 0.7rem !important;
+  color: var(--sl-color-gray-3) !important;
+  margin: 0 !important;
+  line-height: 1.4 !important;
+  flex-grow: 1 !important;
+}
+
+@media (min-width: 50rem) {
+  .device-grid .device-desc {
+    font-size: 0.8rem !important;
+  }
+}
+
+/* ============================================
+   SHOWCASE SECTION - Tabbed screenshots
+   ============================================ */
+
+.showcase-section {
+  margin: 2rem 0 !important;
+}
+
+.showcase-tabs {
+  position: relative;
+}
+
+.showcase-tabs input[type="radio"] {
+  display: none;
+}
+
+.showcase-tab-labels {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.showcase-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  background: var(--sl-color-bg-nav);
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.5rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--sl-color-gray-2);
+  transition: all 0.2s ease;
+}
+
+.showcase-tab-label svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.showcase-tab-label:hover {
+  border-color: var(--sl-color-accent);
+  color: var(--sl-color-white);
+}
+
+/* Active tab states */
+#showcase-cli:checked ~ .showcase-tab-labels label[for="showcase-cli"],
+#showcase-tui:checked ~ .showcase-tab-labels label[for="showcase-tui"],
+#showcase-gui:checked ~ .showcase-tab-labels label[for="showcase-gui"] {
+  background: var(--sl-color-accent);
+  border-color: var(--sl-color-accent);
+  color: #000;
+}
+
+/* Showcase content panels */
+.showcase-content {
+  position: relative;
+  background: var(--sl-color-bg-nav);
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.75rem;
+  overflow: hidden;
+}
+
+.showcase-panel {
+  display: none;
+  flex-direction: column;
+}
+
+.showcase-panel img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.showcase-caption {
+  padding: 1rem 1.25rem;
+  border-top: 1px solid var(--sl-color-hairline);
+}
+
+.showcase-caption h4 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+
+.showcase-caption p {
+  margin: 0;
+  font-size: 0.875rem;
+  color: var(--sl-color-gray-3);
+  line-height: 1.5;
+}
+
+/* Show active panel */
+#showcase-cli:checked ~ .showcase-content #panel-cli,
+#showcase-tui:checked ~ .showcase-content #panel-tui,
+#showcase-gui:checked ~ .showcase-content #panel-gui {
+  display: flex;
+}
+
+/* ============================================
+   FEATURE GRID
+   ============================================ */
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1.5rem;
+  margin-block: 2rem;
+}
+
+/* ============================================
+   TERMINAL/CLI PREVIEW
+   ============================================ */
+
 .cli-preview {
   background: #1a1a2e;
   border-radius: 0.75rem;
@@ -266,3 +490,194 @@
   color: #94a3b8;
 }
 
+/* ============================================
+   FOOTER SECTION
+   ============================================ */
+
+.footer-section {
+  text-align: center !important;
+  padding: 1rem 0 !important;
+}
+
+.footer-section p {
+  margin: 0.5rem 0 !important;
+  color: var(--sl-color-gray-3) !important;
+}
+
+.footer-section a {
+  color: var(--sl-color-accent) !important;
+}
+
+.footer-section .disclaimer {
+  font-size: 0.75rem !important;
+  opacity: 0.7 !important;
+}
+
+/* ============================================
+   BACK TO TOP BUTTON
+   ============================================ */
+
+.back-to-top {
+  position: fixed;
+  bottom: 2rem;
+  right: 2rem;
+  width: 44px;
+  height: 44px;
+  background: var(--sl-color-accent);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(20px);
+  transition: all 0.3s ease;
+  z-index: 100;
+  box-shadow: 0 4px 12px rgba(34, 197, 94, 0.3);
+}
+
+.back-to-top:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(34, 197, 94, 0.4);
+}
+
+.back-to-top.visible {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+
+.back-to-top svg {
+  width: 24px;
+  height: 24px;
+  color: #000;
+}
+
+/* ============================================
+   MOBILE IMPROVEMENTS
+   ============================================ */
+
+@media (max-width: 30rem) {
+  /* Ensure code blocks are readable */
+  .expressive-code {
+    font-size: 0.8rem !important;
+  }
+
+  /* Add scroll hint for code blocks */
+  .expressive-code pre {
+    position: relative;
+  }
+
+  .expressive-code pre::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 30px;
+    background: linear-gradient(to right, transparent, var(--sl-color-bg-nav));
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+
+  .expressive-code pre:hover::after {
+    opacity: 1;
+  }
+
+  /* Hero gradient text fix for mobile Safari */
+  .hero h1 span {
+    -webkit-background-clip: text !important;
+    background-clip: text !important;
+  }
+
+  /* Compact stats on very small screens */
+  .stats-row.not-content {
+    gap: 1rem !important;
+    padding: 1rem !important;
+  }
+
+  .stats-row .stat-value {
+    font-size: 1.25rem !important;
+  }
+
+  /* Showcase section mobile */
+  .showcase-tab-labels {
+    gap: 0.35rem;
+  }
+
+  .showcase-tab-label {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+  }
+
+  .showcase-tab-label svg {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+/* ============================================
+   TROUBLESHOOTING/FAQ PAGE STYLES
+   ============================================ */
+
+.faq-section {
+  margin: 1.5rem 0;
+}
+
+.faq-item {
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.5rem;
+  margin-bottom: 0.75rem;
+  overflow: hidden;
+}
+
+.faq-item summary {
+  padding: 1rem 1.25rem;
+  cursor: pointer;
+  font-weight: 500;
+  background: var(--sl-color-bg-nav);
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  list-style: none;
+}
+
+.faq-item summary::-webkit-details-marker {
+  display: none;
+}
+
+.faq-item summary::before {
+  content: "+";
+  font-size: 1.25rem;
+  font-weight: 300;
+  color: var(--sl-color-accent);
+  transition: transform 0.2s;
+}
+
+.faq-item[open] summary::before {
+  content: "-";
+}
+
+.faq-item .faq-content {
+  padding: 1rem 1.25rem;
+  border-top: 1px solid var(--sl-color-hairline);
+}
+
+/* ============================================
+   PRINT STYLES
+   ============================================ */
+
+@media print {
+  .back-to-top,
+  .showcase-tab-labels {
+    display: none !important;
+  }
+
+  .showcase-panel {
+    display: block !important;
+    page-break-inside: avoid;
+  }
+}

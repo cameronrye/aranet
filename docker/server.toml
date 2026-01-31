@@ -1,0 +1,56 @@
+# Aranet Service Configuration for Docker
+#
+# This is the default configuration for running aranet-service in Docker.
+# Mount this file to /app/server.toml in the container.
+
+[server]
+# Bind to all interfaces for Docker networking
+bind = "0.0.0.0:8080"
+# Buffer size for WebSocket broadcast channel
+broadcast_buffer = 100
+
+[storage]
+# Database path (mounted volume in Docker)
+path = "/data/aranet.db"
+
+[prometheus]
+# Enable Prometheus metrics endpoint at /metrics
+enabled = true
+
+# Optional: Push gateway for environments where scraping isn't possible
+# push_gateway = "http://prometheus-pushgateway:9091"
+# push_interval = 60
+
+[mqtt]
+# Enable MQTT publishing
+enabled = false
+# MQTT broker URL (use service name if running in same Docker network)
+broker = "mqtt://mosquitto:1883"
+# Topic prefix for published messages
+topic_prefix = "aranet"
+# Client ID for MQTT connection
+client_id = "aranet-service"
+# QoS level (0, 1, or 2)
+qos = 1
+# Retain messages on broker
+retain = true
+# Optional authentication
+# username = "aranet"
+# password = "secret"
+
+# Devices to monitor
+# Note: Bluetooth is not available in Docker by default.
+# For BLE access, you need to:
+# 1. Run container with --privileged
+# 2. Mount /var/run/dbus from host
+# 3. Use Linux host with Bluetooth adapter
+
+# [[devices]]
+# address = "Aranet4 XXXXX"
+# alias = "office"
+# poll_interval = 60
+
+# [[devices]]
+# address = "Aranet4 YYYYY"
+# alias = "bedroom"
+# poll_interval = 120

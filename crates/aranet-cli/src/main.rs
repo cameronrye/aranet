@@ -16,13 +16,15 @@ mod cli;
 #[cfg(feature = "cli")]
 mod commands;
 #[cfg(feature = "cli")]
-mod config;
-#[cfg(feature = "cli")]
 mod format;
 #[cfg(feature = "cli")]
 mod style;
 #[cfg(feature = "cli")]
 mod util;
+
+// Config is defined in lib.rs but re-exported for main.rs use
+#[cfg(feature = "cli")]
+use aranet_cli::config;
 
 // TUI module (conditionally compiled)
 #[cfg(feature = "tui")]
@@ -41,7 +43,7 @@ use commands::{
     cmd_watch,
 };
 #[cfg(feature = "cli")]
-use config::{Config, get_device_source, resolve_devices, resolve_timeout};
+use config::{Config, get_device_source, resolve_alias_with_info, resolve_timeout};
 #[cfg(feature = "cli")]
 use format::FormatOptions;
 #[cfg(feature = "cli")]
@@ -159,7 +161,7 @@ async fn main() -> Result<()> {
                     vec![]
                 }
             } else {
-                resolve_devices(device.device, &config)
+                resolve_devices_with_feedback(device.device, &config, quiet)
             };
             let timeout = Duration::from_secs(resolve_timeout(device.timeout, &config, 30));
             let opts =
@@ -475,6 +477,29 @@ fn resolve_format_with_config(
         // Use config format if available, otherwise default to text
         config_format.unwrap_or(OutputFormat::Text)
     }
+}
+
+/// Resolve multiple devices with alias feedback.
+/// Shows a message when aliases are resolved to device addresses.
+#[cfg(feature = "cli")]
+fn resolve_devices_with_feedback(
+    devices: Vec<String>,
+    config: &Config,
+    quiet: bool,
+) -> Vec<String> {
+    devices
+        .into_iter()
+        .map(|d| {
+            let (resolved, was_alias, alias_name) = resolve_alias_with_info(&d, config);
+            if !quiet
+                && was_alias
+                && let Some(alias) = alias_name
+            {
+                eprintln!("Using alias '{}' -> {}", alias, resolved);
+            }
+            resolved
+        })
+        .collect()
 }
 
 /// Show a message about which device source is being used.

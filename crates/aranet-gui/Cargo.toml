@@ -1,6 +1,6 @@
 [package]
 name = "aranet-gui"
-version = "0.1.10"
+version = "0.1.11"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,7 +14,7 @@ path = "src/main.rs"
 # This is a thin wrapper around aranet-cli's GUI functionality.
 # The actual GUI implementation lives in aranet-cli under the "gui" feature.
 [dependencies]
-aranet-cli = { version = "0.1.10", path = "../aranet-cli", default-features = false, features = ["gui"] }
+aranet-cli = { version = "0.1.11", path = "../aranet-cli", default-features = false, features = ["gui"] }
 anyhow.workspace = true
 clap.workspace = true
 
@@ -31,7 +31,7 @@ identifier = "dev.rye.aranet"
 # Path to the icon file (relative to Cargo.toml)
 icon = ["../../assets/aranet-icon.png", "../../assets/aranet-icon.icns"]
 # Application version (uses package version)
-version = "0.1.10"
+version = "0.1.11"
 # Short description
 short_description = "Monitor Aranet environmental sensors"
 # Long description
@@ -60,10 +60,12 @@ resources = ["../../assets/aranet-icon.png"]
 minimum_system_version = "11.0"
 # Code signing identity (set via environment variable in CI)
 # signing_identity = "Developer ID Application: ..."
-# Entitlements file for sandbox/hardened runtime
-# entitlements = "entitlements.plist"
+# Entitlements file for hardened runtime (Bluetooth access, etc.)
+entitlements = "entitlements.plist"
 # High resolution capable
 high_resolution = true
+# Info.plist values for privacy permissions
+info_plist = { NSBluetoothAlwaysUsageDescription = "Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors.", NSBluetoothPeripheralUsageDescription = "Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors." }
 
 # Windows-specific settings
 [package.metadata.bundle.windows]

@@ -1772,4 +1772,354 @@ mod tests {
         assert!((opts.convert_temp(0.0) - 32.0).abs() < 0.01);
         assert!((opts.convert_temp(100.0) - 212.0).abs() < 0.01);
     }
+
+    // ========================================================================
+    // bq_to_pci conversion tests
+    // ========================================================================
+
+    #[test]
+    fn test_bq_to_pci_zero() {
+        assert_eq!(bq_to_pci(0), 0.0);
+    }
+
+    #[test]
+    fn test_bq_to_pci_100() {
+        // 100 Bq/m³ = 2.7 pCi/L
+        assert!((bq_to_pci(100) - 2.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_bq_to_pci_epa_action_level() {
+        // EPA action level is 4 pCi/L ≈ 148 Bq/m³
+        assert!((bq_to_pci(148) - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_bq_to_pci_large_value() {
+        // 1000 Bq/m³ = 27 pCi/L
+        assert!((bq_to_pci(1000) - 27.0).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // hpa_to_inhg conversion tests
+    // ========================================================================
+
+    #[test]
+    fn test_hpa_to_inhg_zero() {
+        assert_eq!(hpa_to_inhg(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_hpa_to_inhg_standard_pressure() {
+        // Standard atmospheric pressure: 1013.25 hPa = 29.92 inHg
+        assert!((hpa_to_inhg(1013.25) - 29.92).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_hpa_to_inhg_high_pressure() {
+        // High pressure: 1030 hPa ≈ 30.42 inHg
+        assert!((hpa_to_inhg(1030.0) - 30.42).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_hpa_to_inhg_low_pressure() {
+        // Low pressure: 980 hPa ≈ 28.94 inHg
+        assert!((hpa_to_inhg(980.0) - 28.94).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // csv_escape tests
+    // ========================================================================
+
+    #[test]
+    fn test_csv_escape_simple() {
+        assert_eq!(csv_escape("hello"), "hello");
+        assert_eq!(csv_escape("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_csv_escape_empty() {
+        assert_eq!(csv_escape(""), "");
+    }
+
+    #[test]
+    fn test_csv_escape_comma() {
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape("one,two,three"), "\"one,two,three\"");
+    }
+
+    #[test]
+    fn test_csv_escape_quote() {
+        assert_eq!(csv_escape("say \"hello\""), "\"say \"\"hello\"\"\"");
+        assert_eq!(csv_escape("\""), "\"\"\"\"");
+    }
+
+    #[test]
+    fn test_csv_escape_newline() {
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+        assert_eq!(csv_escape("line1\rline2"), "\"line1\rline2\"");
+    }
+
+    #[test]
+    fn test_csv_escape_combined() {
+        // Multiple special characters
+        assert_eq!(csv_escape("a,\"b\"\nc"), "\"a,\"\"b\"\"\nc\"");
+    }
+
+    // ========================================================================
+    // FormatOptions builder tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_options_default() {
+        let opts = FormatOptions::default();
+        assert!(!opts.no_color);
+        assert!(!opts.fahrenheit);
+        assert!(!opts.no_header);
+        assert!(!opts.compact);
+        assert!(!opts.bq);
+        assert!(!opts.inhg);
+        assert_eq!(opts.style, StyleMode::Rich);
+    }
+
+    #[test]
+    fn test_format_options_with_no_header() {
+        let opts = FormatOptions::default().with_no_header(true);
+        assert!(opts.no_header);
+    }
+
+    #[test]
+    fn test_format_options_with_compact() {
+        let opts = FormatOptions::default().with_compact(true);
+        assert!(opts.compact);
+    }
+
+    #[test]
+    fn test_format_options_with_bq() {
+        let opts = FormatOptions::default().with_bq(true);
+        assert!(opts.bq);
+    }
+
+    #[test]
+    fn test_format_options_with_inhg() {
+        let opts = FormatOptions::default().with_inhg(true);
+        assert!(opts.inhg);
+    }
+
+    #[test]
+    fn test_format_options_chained() {
+        let opts = FormatOptions::default()
+            .with_no_header(true)
+            .with_compact(true)
+            .with_bq(true)
+            .with_inhg(true);
+        assert!(opts.no_header);
+        assert!(opts.compact);
+        assert!(opts.bq);
+        assert!(opts.inhg);
+    }
+
+    #[test]
+    fn test_format_options_is_rich() {
+        let opts = FormatOptions::default();
+        assert!(opts.is_rich());
+
+        let opts = FormatOptions::new(false, false, StyleMode::Plain);
+        assert!(!opts.is_rich());
+    }
+
+    #[test]
+    fn test_format_options_is_plain() {
+        let opts = FormatOptions::new(false, false, StyleMode::Plain);
+        assert!(opts.is_plain());
+
+        let opts = FormatOptions::default();
+        assert!(!opts.is_plain());
+    }
+
+    // ========================================================================
+    // format_radon tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_radon_pci_mode() {
+        let opts = test_opts(); // bq = false by default
+        let result = opts.format_radon(100);
+        assert!(result.contains("2.70 pCi/L"));
+    }
+
+    #[test]
+    fn test_format_radon_bq_mode() {
+        let opts = FormatOptions {
+            bq: true,
+            ..test_opts()
+        };
+        let result = opts.format_radon(100);
+        assert!(result.contains("100 Bq/m"));
+    }
+
+    #[test]
+    fn test_format_radon_plain_mode_ascii() {
+        let opts = FormatOptions {
+            bq: true,
+            style: StyleMode::Plain,
+            ..test_opts()
+        };
+        let result = opts.format_radon(100);
+        // Plain mode should use ASCII "Bq/m3" not "Bq/m³"
+        assert_eq!(result, "100 Bq/m3");
+    }
+
+    #[test]
+    fn test_convert_radon_pci() {
+        let opts = test_opts();
+        assert!((opts.convert_radon(100) - 2.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_convert_radon_bq() {
+        let opts = FormatOptions {
+            bq: true,
+            ..test_opts()
+        };
+        assert_eq!(opts.convert_radon(100), 100.0);
+    }
+
+    // ========================================================================
+    // format_pressure tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_pressure_hpa() {
+        let opts = test_opts(); // inhg = false by default
+        let result = opts.format_pressure(1013.25);
+        assert_eq!(result, "1013.2 hPa");
+    }
+
+    #[test]
+    fn test_format_pressure_inhg() {
+        let opts = FormatOptions {
+            inhg: true,
+            ..test_opts()
+        };
+        let result = opts.format_pressure(1013.25);
+        assert!(result.contains("29.92 inHg"));
+    }
+
+    #[test]
+    fn test_convert_pressure_hpa() {
+        let opts = test_opts();
+        assert_eq!(opts.convert_pressure(1013.25), 1013.25);
+    }
+
+    #[test]
+    fn test_convert_pressure_inhg() {
+        let opts = FormatOptions {
+            inhg: true,
+            ..test_opts()
+        };
+        assert!((opts.convert_pressure(1013.25) - 29.92).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // FormatOptions::new tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_options_new_plain_mode_disables_color() {
+        let opts = FormatOptions::new(false, false, StyleMode::Plain);
+        // Plain mode should automatically set no_color to true
+        assert!(opts.no_color);
+    }
+
+    #[test]
+    fn test_format_options_new_with_fahrenheit() {
+        let opts = FormatOptions::new(false, true, StyleMode::Rich);
+        assert!(opts.fahrenheit);
+        assert!(!opts.no_color);
+    }
+
+    // ========================================================================
+    // format_temp plain mode tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_temp_plain_mode_no_degree_symbol() {
+        let opts = FormatOptions::new(false, false, StyleMode::Plain);
+        let result = opts.format_temp(22.5);
+        // Plain mode should use "C" not "°C"
+        assert_eq!(result, "22.5C");
+    }
+
+    #[test]
+    fn test_format_temp_plain_fahrenheit() {
+        let opts = FormatOptions::new(false, true, StyleMode::Plain);
+        let result = opts.format_temp(0.0);
+        assert_eq!(result, "32.0F");
+    }
+
+    // ========================================================================
+    // radon_unit and radon_csv_header tests
+    // ========================================================================
+
+    #[test]
+    fn test_radon_csv_header() {
+        let opts = test_opts();
+        assert_eq!(opts.radon_csv_header(), "radon_pci");
+
+        let opts = FormatOptions {
+            bq: true,
+            ..test_opts()
+        };
+        assert_eq!(opts.radon_csv_header(), "radon_bq");
+    }
+
+    #[test]
+    fn test_radon_unit() {
+        let opts = test_opts();
+        assert_eq!(opts.radon_unit(), "pCi/L");
+
+        let opts = FormatOptions {
+            bq: true,
+            ..test_opts()
+        };
+        assert_eq!(opts.radon_unit(), "Bq/m3");
+    }
+
+    #[test]
+    fn test_radon_display_unit() {
+        let opts = test_opts();
+        assert_eq!(opts.radon_display_unit(), "pCi/L");
+
+        // Rich mode with bq should use superscript
+        let opts = FormatOptions {
+            bq: true,
+            ..FormatOptions::default()
+        };
+        assert_eq!(opts.radon_display_unit(), "Bq/m³");
+
+        // Plain mode should use ASCII
+        let opts = FormatOptions {
+            bq: true,
+            style: StyleMode::Plain,
+            ..test_opts()
+        };
+        assert_eq!(opts.radon_display_unit(), "Bq/m3");
+    }
+
+    // ========================================================================
+    // pressure_csv_header tests
+    // ========================================================================
+
+    #[test]
+    fn test_pressure_csv_header() {
+        let opts = test_opts();
+        assert_eq!(opts.pressure_csv_header(), "pressure_hpa");
+
+        let opts = FormatOptions {
+            inhg: true,
+            ..test_opts()
+        };
+        assert_eq!(opts.pressure_csv_header(), "pressure_inhg");
+    }
 }

@@ -45,7 +45,6 @@ body:
         - aranet-core
         - aranet-store
         - aranet-service
-        - aranet-wasm
         - Documentation
         - Other
     validations:
@@ -65,7 +64,7 @@ body:
     attributes:
       label: Roadmap Check
       options:
-        - label: I have checked the ROADMAP.md and this feature is not already planned
+        - label: I have checked the existing issues and docs/ARCHITECTURE.md
           required: true
 
   - type: textarea

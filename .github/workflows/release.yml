@@ -148,6 +148,16 @@ jobs:
               /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string aranet-gui" "$APP_BUNDLE/Contents/Info.plist"
             fi
 
+            # Add Bluetooth usage descriptions (required by macOS TCC)
+            # NSBluetoothAlwaysUsageDescription - required for macOS 11.0+
+            if ! grep -q "NSBluetoothAlwaysUsageDescription" "$APP_BUNDLE/Contents/Info.plist"; then
+              /usr/libexec/PlistBuddy -c "Add :NSBluetoothAlwaysUsageDescription string 'Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors.'" "$APP_BUNDLE/Contents/Info.plist"
+            fi
+            # NSBluetoothPeripheralUsageDescription - for backward compatibility with older macOS
+            if ! grep -q "NSBluetoothPeripheralUsageDescription" "$APP_BUNDLE/Contents/Info.plist"; then
+              /usr/libexec/PlistBuddy -c "Add :NSBluetoothPeripheralUsageDescription string 'Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors.'" "$APP_BUNDLE/Contents/Info.plist"
+            fi
+
             echo "App bundle contents:"
             ls -la "$APP_BUNDLE/Contents/Resources/"
 
@@ -303,9 +313,13 @@ jobs:
 
               SIGNED_APP="$SIGN_DIR/$(basename "$APP_BUNDLE")"
 
-              # Sign the app bundle (deep signs all nested code)
+              # Copy entitlements file to the signing location
+              ENTITLEMENTS_PATH="crates/aranet-gui/entitlements.plist"
+
+              # Sign the app bundle with entitlements (deep signs all nested code)
               echo "Signing app bundle: $SIGNED_APP"
-              codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" --timestamp "$SIGNED_APP"
+              echo "Using entitlements: $ENTITLEMENTS_PATH"
+              codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS_PATH" --sign "$SIGNING_IDENTITY" --timestamp "$SIGNED_APP"
               codesign -dv --verbose=4 "$SIGNED_APP"
 
               # Re-create the DMG with signed app

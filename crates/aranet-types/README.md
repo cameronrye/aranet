@@ -8,9 +8,14 @@
 
 # aranet-types
 
+[![crates.io](https://img.shields.io/crates/v/aranet-types.svg)](https://crates.io/crates/aranet-types)
+[![docs.rs](https://docs.rs/aranet-types/badge.svg)](https://docs.rs/aranet-types)
+
 Platform-agnostic types for Aranet environmental sensors.
 
-This crate provides shared types that can be used by both native and WebAssembly implementations for interacting with Aranet devices (Aranet4, Aranet2, Aranet Radon, Aranet Radiation).
+**[Full Documentation](https://cameronrye.github.io/aranet/)**
+
+This crate provides shared types for interacting with Aranet devices (Aranet4, Aranet2, Aranet Radon, Aranet Radiation).
 
 ## Features
 
@@ -83,9 +88,8 @@ This crate is part of the [aranet](https://github.com/cameronrye/aranet) workspa
 | [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local data persistence |
 | [aranet-cli](../aranet-cli/) | [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli) | Command-line interface |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
-| [aranet-service](../aranet-service/) | - | Background collector and REST API |
-| [aranet-gui](../aranet-gui/) | - | Desktop GUI application |
-| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module |
+| [aranet-service](../aranet-service/) | [![crates.io](https://img.shields.io/crates/v/aranet-service.svg)](https://crates.io/crates/aranet-service) | Background collector and REST API |
+| [aranet-gui](../aranet-gui/) | [![crates.io](https://img.shields.io/crates/v/aranet-gui.svg)](https://crates.io/crates/aranet-gui) | Desktop GUI application |
 
 ## License
 

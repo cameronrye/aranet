@@ -54,7 +54,7 @@ Use the bug report issue template when creating a new issue.
 
 Feature requests are welcome! Please:
 
-1. Check the [ROADMAP.md](ROADMAP.md) for planned features
+1. Check the [Architecture docs](docs/ARCHITECTURE.md) for technical details
 2. Search existing issues for similar suggestions
 3. Use the feature request issue template
 4. Provide clear use cases and examples
@@ -119,8 +119,7 @@ aranet/
 │   ├── aranet-service/  # Background collector and REST API
 │   ├── aranet-cli/      # CLI tool
 │   ├── aranet-tui/      # Terminal dashboard
-│   ├── aranet-gui/      # Desktop GUI (planned)
-│   └── aranet-wasm/     # WebAssembly module (planned)
+│   └── aranet-gui/      # Desktop GUI
 ├── docs/                # Protocol documentation
 ├── distribution/        # Service configuration files
 └── website/             # Documentation website

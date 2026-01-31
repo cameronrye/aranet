@@ -87,6 +87,9 @@ pub mod traits;
 pub mod util;
 pub mod validation;
 
+#[cfg(feature = "service-client")]
+pub mod service_client;
+
 // Re-export types and uuid modules from aranet-types for backwards compatibility
 pub use aranet_types::types;
 pub use aranet_types::uuid;
@@ -110,22 +113,82 @@ pub use traits::AranetDevice;
 /// connection ownership ambiguity), wrapping it in `Arc` is the standard
 /// pattern for concurrent access.
 ///
-/// # Example
+/// # Choosing the Right Device Type
+///
+/// This crate provides several device types for different use cases:
+///
+/// | Type | Use Case | Auto-Reconnect | Thread-Safe |
+/// |------|----------|----------------|-------------|
+/// | [`Device`] | Single command, short-lived | No | Yes (via Arc) |
+/// | [`ReconnectingDevice`] | Long-running apps | Yes | Yes |
+/// | [`SharedDevice`] | Sharing Device across tasks | No | Yes |
+/// | [`DeviceManager`] | Managing multiple devices | Yes | Yes |
+///
+/// ## Decision Guide
+///
+/// ### Use [`Device`] when:
+/// - Running a single command (read, history download)
+/// - Connection lifetime is short and well-defined
+/// - You'll handle reconnection yourself
 ///
 /// ```no_run
+/// # async fn example() -> aranet_core::Result<()> {
+/// use aranet_core::Device;
+/// let device = Device::connect("Aranet4 12345").await?;
+/// let reading = device.read_current().await?;
+/// device.disconnect().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ### Use [`ReconnectingDevice`] when:
+/// - Building a long-running application (daemon, service)
+/// - You want automatic reconnection on connection loss
+/// - Continuous monitoring over extended periods
+///
+/// ```no_run
+/// # async fn example() -> aranet_core::Result<()> {
+/// use aranet_core::{AranetDevice, ReconnectingDevice, ReconnectOptions};
+/// let options = ReconnectOptions::default();
+/// let device = ReconnectingDevice::connect("Aranet4 12345", options).await?;
+/// // Will auto-reconnect on connection loss
+/// let reading = device.read_current().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ### Use [`SharedDevice`] when:
+/// - Sharing a single [`Device`] across multiple async tasks
+/// - You need concurrent reads but want one connection
+///
+/// ```no_run
+/// # async fn example() -> aranet_core::Result<()> {
 /// use aranet_core::{Device, SharedDevice};
 /// use std::sync::Arc;
 ///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = Device::connect("Aranet4 12345").await?;
 /// let shared: SharedDevice = Arc::new(device);
 ///
-/// // Clone the Arc to share across tasks
 /// let shared_clone = Arc::clone(&shared);
 /// tokio::spawn(async move {
 ///     let reading = shared_clone.read_current().await;
-///     // ...
 /// });
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ### Use [`DeviceManager`] when:
+/// - Managing multiple devices simultaneously
+/// - Need centralized connection/disconnection handling
+/// - Building a multi-device monitoring application
+///
+/// ```no_run
+/// # async fn example() -> aranet_core::Result<()> {
+/// use aranet_core::DeviceManager;
+/// let manager = DeviceManager::new();
+/// manager.add_device("AA:BB:CC:DD:EE:FF").await?;
+/// manager.add_device("11:22:33:44:55:66").await?;
+/// // Manager handles connections for all devices
 /// # Ok(())
 /// # }
 /// ```

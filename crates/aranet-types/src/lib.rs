@@ -1,7 +1,7 @@
 //! Platform-agnostic types for Aranet environmental sensors.
 //!
-//! This crate provides shared types that can be used by both native
-//! (aranet-core) and WebAssembly (aranet-wasm) implementations.
+//! This crate provides shared types used across all aranet crates
+//! including aranet-core, aranet-cli, aranet-tui, and aranet-gui.
 //!
 //! # Features
 //!

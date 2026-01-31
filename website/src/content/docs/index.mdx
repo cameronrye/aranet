@@ -4,46 +4,101 @@ description: A complete Rust implementation for Aranet environmental sensors - C
 template: splash
 hero:
   title: |
-    Monitor Your Air Quality
-    <span style="background: linear-gradient(90deg, #22c55e, #eab308, #ef4444); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">with Rust</span>
-  tagline: The definitive Rust ecosystem for Aranet environmental sensors. Fast, safe, cross-platform.
+    Know Your Air Quality
+    <span style="background: linear-gradient(90deg, #22c55e, #eab308, #ef4444); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">In Seconds</span>
+  tagline: The complete Rust toolkit for Aranet sensors. Scan, read, and analyze CO₂, temperature, humidity, radon, and radiation data with blazing-fast performance.
   image:
     alt: Aranet sensor visualization
     file: ../../assets/hero-sensors.svg
   actions:
-    - text: Get Started
-      link: /aranet/docs/getting-started/
+    - text: Get Aranet CLI
+      link: /aranet/docs/installation/
       icon: right-arrow
       variant: primary
-    - text: Download
+    - text: Download Desktop App
       link: /aranet/docs/downloads/
       icon: down-caret
       variant: secondary
-    - text: View on GitHub
+    - text: GitHub
       link: https://github.com/cameronrye/aranet
-      icon: external
+      icon: github
       variant: minimal
 ---
 
-import { Card, CardGrid, Badge, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+{/* Stats Row - Social Proof */}
+<div class="not-content stats-row stats-hero">
+  <div class="stat-item">
+    <span class="stat-value">7</span>
+    <span class="stat-label">Rust Crates</span>
+  </div>
+  <div class="stat-item">
+    <span class="stat-value">4</span>
+    <span class="stat-label">Device Types</span>
+  </div>
+  <div class="stat-item">
+    <span class="stat-value">3</span>
+    <span class="stat-label">Platforms</span>
+  </div>
+  <div class="stat-item">
+    <span class="stat-value">MIT</span>
+    <span class="stat-label">License</span>
+  </div>
+</div>
 
 ## Supported Devices
 
 <div class="not-content device-grid">
-  <div class="device-card">
+  <div class="device-card" data-device="aranet4">
+    <div class="device-icon">
+      <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="8" y="4" width="32" height="40" rx="4" stroke="currentColor" stroke-width="2"/>
+        <rect x="12" y="10" width="24" height="16" rx="2" fill="currentColor" opacity="0.2"/>
+        <text x="24" y="22" text-anchor="middle" font-size="8" font-weight="bold" fill="currentColor">CO₂</text>
+        <circle cx="16" cy="34" r="2" fill="currentColor"/>
+        <circle cx="24" cy="34" r="2" fill="currentColor" opacity="0.5"/>
+        <circle cx="32" cy="34" r="2" fill="currentColor" opacity="0.3"/>
+      </svg>
+    </div>
     <span class="device-name">Aranet4</span>
+    <span class="device-badge">Most Popular</span>
     <span class="device-desc">CO₂, Temperature, Humidity, Pressure</span>
   </div>
-  <div class="device-card">
+  <div class="device-card" data-device="aranet2">
+    <div class="device-icon">
+      <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="10" y="6" width="28" height="36" rx="4" stroke="currentColor" stroke-width="2"/>
+        <path d="M24 14 L24 28 M18 22 L24 28 L30 22" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="24" cy="36" r="2" fill="currentColor"/>
+      </svg>
+    </div>
     <span class="device-name">Aranet2</span>
     <span class="device-desc">Temperature, Humidity</span>
   </div>
-  <div class="device-card">
+  <div class="device-card" data-device="aranetrn">
+    <div class="device-icon">
+      <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="8" y="4" width="32" height="40" rx="4" stroke="currentColor" stroke-width="2"/>
+        <circle cx="24" cy="20" r="8" stroke="currentColor" stroke-width="2"/>
+        <text x="24" y="24" text-anchor="middle" font-size="7" font-weight="bold" fill="currentColor">Rn</text>
+        <rect x="14" y="32" width="20" height="4" rx="1" fill="currentColor" opacity="0.3"/>
+        <rect x="14" y="32" width="12" height="4" rx="1" fill="currentColor" opacity="0.6"/>
+      </svg>
+    </div>
     <span class="device-name">AranetRn+</span>
     <span class="device-desc">Radon, Temperature, Pressure, Humidity</span>
   </div>
-  <div class="device-card">
-    <span class="device-name">Aranet Radiation</span>
+  <div class="device-card" data-device="radiation">
+    <div class="device-icon">
+      <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="24" cy="24" r="18" stroke="currentColor" stroke-width="2"/>
+        <circle cx="24" cy="24" r="4" fill="currentColor"/>
+        <path d="M24 6 L24 14 M24 34 L24 42 M6 24 L14 24 M34 24 L42 24" stroke="currentColor" stroke-width="2" opacity="0.6"/>
+        <path d="M12 12 L17 17 M31 31 L36 36 M12 36 L17 31 M31 17 L36 12" stroke="currentColor" stroke-width="2" opacity="0.4"/>
+      </svg>
+    </div>
+    <span class="device-name">Radiation</span>
     <span class="device-desc">Dose Rate (µSv/h), Total Dose (mSv)</span>
   </div>
 </div>
@@ -61,37 +116,49 @@ import { Card, CardGrid, Badge, Tabs, TabItem } from '@astrojs/starlight/compone
     Subscribe to live sensor updates with auto-reconnection and configurable backoff strategies.
   </Card>
   <Card title="Comprehensive Tooling" icon="setting">
-    CLI for quick readings, TUI dashboard for monitoring, GUI app for desktop, and WASM for browsers.
+    CLI for quick readings, TUI dashboard for monitoring, GUI app for desktop, and background service with REST API.
   </Card>
 </CardGrid>
 
 ## Quick Start
 
 <Tabs>
-  <TabItem label="Homebrew">
+  <TabItem label="Homebrew (Recommended)">
 ```bash
-# macOS and Linux
+# macOS and Linux - Recommended
 brew tap cameronrye/aranet
 brew install aranet
+
+# Verify installation
+aranet --version
 ```
   </TabItem>
-  <TabItem label="Shell">
+  <TabItem label="Shell Script">
 ```bash
 # macOS and Linux
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.sh | sh
+
+# Verify installation
+aranet --version
 ```
   </TabItem>
   <TabItem label="PowerShell">
 ```powershell
 # Windows
 irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex
+
+# Verify installation
+aranet --version
 ```
   </TabItem>
   <TabItem label="Cargo">
 ```bash
-# From crates.io
+# From crates.io (requires Rust toolchain)
 cargo install aranet-cli
+
+# Verify installation
+aranet --version
 ```
   </TabItem>
   <TabItem label="Source">
@@ -99,21 +166,33 @@ cargo install aranet-cli
 # Build from source
 git clone https://github.com/cameronrye/aranet.git
 cd aranet && cargo build --release
+
+# Binary will be at ./target/release/aranet
+./target/release/aranet --version
 ```
   </TabItem>
 </Tabs>
+
+<Aside type="tip" title="Quick Tip">
+After installation, run `aranet doctor` to check your Bluetooth setup and permissions.
+</Aside>
 
 <Tabs>
   <TabItem label="Scan">
 ```bash
 # Find nearby Aranet devices
 aranet scan
+
+# Output:
+# Found 2 devices:
+#   Aranet4 1234A  AA:BB:CC:DD:EE:FF  -45 dBm
+#   Aranet2 5678B  11:22:33:44:55:66  -52 dBm
 ```
   </TabItem>
   <TabItem label="Read">
 ```bash
 # Read current sensor values
-aranet read <DEVICE_ADDRESS>
+aranet read AA:BB:CC:DD:EE:FF
 
 # Output:
 # CO₂: 847 ppm (Green)
@@ -125,37 +204,74 @@ aranet read <DEVICE_ADDRESS>
   <TabItem label="History">
 ```bash
 # Download measurement history
-aranet history <DEVICE_ADDRESS> --output history.csv
+aranet history AA:BB:CC:DD:EE:FF --output history.csv
 
 # Filter by date range
-aranet history <DEVICE_ADDRESS> --since 2026-01-15
+aranet history AA:BB:CC:DD:EE:FF --since 2026-01-15
+
+# Export as JSON
+aranet history AA:BB:CC:DD:EE:FF --format json
 ```
   </TabItem>
   <TabItem label="Multi-Device">
 ```bash
+# Setup device aliases for easy access
+aranet alias set living-room AA:BB:CC:DD:EE:FF
+aranet alias set bedroom 11:22:33:44:55:66
+
 # Read from multiple devices
 aranet read -d living-room -d bedroom
 
-# Setup device aliases
-aranet alias set living-room AA:BB:CC:DD:EE:FF
+# Watch all aliased devices
+aranet watch --all
 ```
   </TabItem>
 </Tabs>
 
-## Screenshots
+## See It In Action
 
-<div class="not-content" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1rem', margin: '1.5rem 0' }}>
-  <div>
-    <img src="https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/cli-scan.gif" alt="CLI Demo" style={{ width: '100%', borderRadius: '8px' }} />
-    <p style={{ textAlign: 'center', marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>Command-Line Interface</p>
-  </div>
-  <div>
-    <img src="https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/tui-demo.gif" alt="TUI Demo" style={{ width: '100%', borderRadius: '8px' }} />
-    <p style={{ textAlign: 'center', marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>Terminal Dashboard</p>
-  </div>
-  <div>
-    <img src="https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/gui-main.png" alt="GUI Screenshot" style={{ width: '100%', borderRadius: '8px' }} />
-    <p style={{ textAlign: 'center', marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>Desktop Application</p>
+<div class="not-content showcase-section">
+  <div class="showcase-tabs">
+    <input type="radio" name="showcase" id="showcase-cli" checked />
+    <input type="radio" name="showcase" id="showcase-tui" />
+    <input type="radio" name="showcase" id="showcase-gui" />
+    <div class="showcase-tab-labels">
+      <label for="showcase-cli" class="showcase-tab-label">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-6-6-6M12 19h8"/></svg>
+        Command Line
+      </label>
+      <label for="showcase-tui" class="showcase-tab-label">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        Terminal Dashboard
+      </label>
+      <label for="showcase-gui" class="showcase-tab-label">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><circle cx="12" cy="10" r="3"/></svg>
+        Desktop App
+      </label>
+    </div>
+    <div class="showcase-content">
+      <div class="showcase-panel" id="panel-cli">
+        <img src="/aranet/screenshots/cli-scan.gif" alt="CLI Demo - Scanning for devices and reading sensor data" loading="lazy" />
+        <div class="showcase-caption">
+          <h4>Powerful Command Line</h4>
+          <p>Scan for devices, read current values, download history, and export to CSV - all from your terminal. Supports aliases for quick access to frequently-used devices.</p>
+        </div>
+      </div>
+      <div class="showcase-panel" id="panel-tui">
+        <img src="/aranet/screenshots/tui-demo.gif" alt="TUI Demo - Real-time monitoring dashboard" loading="lazy" />
+        <div class="showcase-caption">
+          <h4>Real-Time Terminal Dashboard</h4>
+          <p>Monitor multiple devices simultaneously with sparkline charts, color-coded alerts, and vim-style keyboard navigation. Perfect for headless servers and SSH sessions.</p>
+        </div>
+      </div>
+      <div class="showcase-panel" id="panel-gui">
+        <img src="/aranet/screenshots/gui-main.png" alt="GUI Screenshot - Native desktop application" loading="lazy" />
+        <div class="showcase-caption">
+          <h4>Native Desktop Application</h4>
+          <p>Full-featured GUI with real-time charts, historical data visualization, and system tray integration. Available for macOS, Windows, and Linux.</p>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -188,39 +304,18 @@ import architectureSvg from '../../assets/architecture.svg';
   <Card title="aranet-tui" icon="laptop">
     Terminal dashboard with sparklines, alerts, vim keys, multi-device monitoring.
   </Card>
-  <Card title="aranet-service" icon="server">
-    Background daemon with REST API, scheduled syncing, system service integration.
+  <Card title="aranet-service" icon="setting">
+    Background daemon with REST API, Prometheus metrics, MQTT publishing, WebSocket streaming.
   </Card>
   <Card title="aranet-gui" icon="approve-check">
     Native desktop application with real-time monitoring, charts, and multi-device support.
   </Card>
-  <Card title="aranet-wasm" icon="seti:wasm">
-    WebAssembly module for browser-based sensor access via Web Bluetooth API.
-  </Card>
 </CardGrid>
-
-<div class="not-content stats-row">
-  <div class="stat-item">
-    <span class="stat-value">8</span>
-    <span class="stat-label">Crates</span>
-  </div>
-  <div class="stat-item">
-    <span class="stat-value">4</span>
-    <span class="stat-label">Device Types</span>
-  </div>
-  <div class="stat-item">
-    <span class="stat-value">3</span>
-    <span class="stat-label">Platforms</span>
-  </div>
-  <div class="stat-item">
-    <span class="stat-value">MIT</span>
-    <span class="stat-label">License</span>
-  </div>
-</div>
 
 ---
 
-Made with ❤️ by [Cameron Rye](https://rye.dev/)
-
-<small style={{ opacity: 0.6 }}>This project is not affiliated with, endorsed by, or sponsored by Aranet or SAF Tehnika JSC. Aranet is a trademark of SAF Tehnika JSC.</small>
+<div class="not-content footer-section">
+  <p>Made with ❤️ by <a href="https://rye.dev/">Cameron Rye</a></p>
+  <p class="disclaimer">This project is not affiliated with, endorsed by, or sponsored by Aranet or SAF Tehnika JSC. Aranet is a trademark of SAF Tehnika JSC.</p>
+</div>
 

@@ -1,0 +1,257 @@
+---
+title: API Security
+description: Configure authentication and rate limiting for aranet-service.
+---
+
+import { Aside, Steps, Tabs, TabItem, Badge } from '@astrojs/starlight/components';
+
+The aranet-service REST API includes optional security features for production deployments.
+
+## Security Features
+
+| Feature | Purpose | Default |
+|---------|---------|---------|
+| API Key Authentication | Require `X-API-Key` header | Disabled |
+| Rate Limiting | Limit requests per IP | Disabled |
+| Input Sanitization | Prevent XSS in device names | Always enabled |
+
+<Aside type="tip">
+  Both API key authentication and rate limiting are **disabled by default**. Enable them when exposing the API to untrusted networks.
+</Aside>
+
+## Configuration
+
+Add a `[security]` section to your `server.toml`:
+
+```toml
+[security]
+# API key authentication
+api_key_enabled = true
+api_key = "your-secure-random-key-at-least-16-chars"
+
+# Rate limiting
+rate_limit_enabled = true
+rate_limit_requests = 100   # max requests per window
+rate_limit_window_secs = 60 # window duration in seconds
+```
+
+## API Key Authentication
+
+When enabled, all API requests (except `/api/health`) must include a valid API key.
+
+### Configuration
+
+```toml
+[security]
+api_key_enabled = true
+api_key = "your-secure-api-key-here"
+```
+
+**Requirements:**
+- API key must be at least 16 characters
+- Use a cryptographically random string (e.g., `openssl rand -base64 32`)
+
+### Usage
+
+Include the key in the `X-API-Key` header:
+
+```bash
+# With authentication
+curl -H "X-API-Key: your-secure-api-key-here" http://localhost:8080/api/devices
+
+# Health endpoint works without authentication (for monitoring)
+curl http://localhost:8080/api/health
+```
+
+### Error Response
+
+If the key is missing or invalid:
+
+```json
+{
+  "error": "Invalid or missing API key",
+  "hint": "Provide a valid API key in the X-API-Key header"
+}
+```
+
+**HTTP Status:** `401 Unauthorized`
+
+## Rate Limiting
+
+Limits the number of requests per IP address within a time window.
+
+### Configuration
+
+```toml
+[security]
+rate_limit_enabled = true
+rate_limit_requests = 100   # requests allowed per window
+rate_limit_window_secs = 60 # window size in seconds
+```
+
+This allows 100 requests per minute per IP address.
+
+### Response Headers
+
+When rate limiting is enabled, responses include:
+
+| Header | Description |
+|--------|-------------|
+| `X-RateLimit-Limit` | Maximum requests per window |
+| `X-RateLimit-Remaining` | Requests remaining in current window |
+| `Retry-After` | Seconds until window resets (when limited) |
+
+### Error Response
+
+When rate limit is exceeded:
+
+```json
+{
+  "error": "Too many requests",
+  "retry_after": 45
+}
+```
+
+**HTTP Status:** `429 Too Many Requests`
+
+### Tuning
+
+| Use Case | Recommended Settings |
+|----------|---------------------|
+| Single client | `rate_limit_requests = 1000` |
+| Public API | `rate_limit_requests = 60` |
+| Dashboard polling | `rate_limit_requests = 120` |
+
+<Aside type="caution">
+  If running behind a reverse proxy (nginx, Caddy, etc.), the rate limiter sees the proxy's IP, not the client's. Configure your proxy to forward the real client IP, or implement rate limiting at the proxy level instead.
+</Aside>
+
+## Input Sanitization
+
+Device names are automatically sanitized to prevent XSS attacks in web interfaces.
+
+**Allowed characters:**
+- Alphanumeric (a-z, A-Z, 0-9)
+- Spaces, dashes, underscores
+- Colons (for MAC addresses)
+
+**Limits:**
+- Maximum 64 characters
+- Minimum 3 characters for device IDs
+
+This sanitization is always enabled and cannot be disabled.
+
+## Production Checklist
+
+<Steps>
+1. **Generate a strong API key**
+   ```bash
+   openssl rand -base64 32
+   ```
+
+2. **Enable authentication**
+   ```toml
+   [security]
+   api_key_enabled = true
+   api_key = "your-generated-key"
+   ```
+
+3. **Enable rate limiting**
+   ```toml
+   rate_limit_enabled = true
+   rate_limit_requests = 100
+   rate_limit_window_secs = 60
+   ```
+
+4. **Use HTTPS** (via reverse proxy)
+   ```nginx
+   server {
+       listen 443 ssl;
+       server_name aranet.example.com;
+
+       location / {
+           proxy_pass http://127.0.0.1:8080;
+           proxy_set_header X-Real-IP $remote_addr;
+       }
+   }
+   ```
+
+5. **Bind to localhost only**
+   ```toml
+   [server]
+   bind = "127.0.0.1:8080"
+   ```
+</Steps>
+
+## Example: Full Security Configuration
+
+```toml
+[server]
+bind = "127.0.0.1:8080"
+
+[security]
+# Require API key for all requests
+api_key_enabled = true
+api_key = "aHR0cHM6Ly95b3V0dWJlLmNvbS93YXRjaD92PWRRdzR3OVdnWGNR"
+
+# Rate limit: 100 requests per minute per IP
+rate_limit_enabled = true
+rate_limit_requests = 100
+rate_limit_window_secs = 60
+
+[storage]
+path = "~/.local/share/aranet/data.db"
+
+[[devices]]
+address = "Aranet4 XXXXX"
+alias = "office"
+poll_interval = 60
+```
+
+## Client Examples
+
+### curl
+
+```bash
+export ARANET_API_KEY="your-api-key"
+curl -H "X-API-Key: $ARANET_API_KEY" http://localhost:8080/api/devices
+```
+
+### Python
+
+```python
+import requests
+
+API_KEY = "your-api-key"
+BASE_URL = "http://localhost:8080"
+
+headers = {"X-API-Key": API_KEY}
+
+response = requests.get(f"{BASE_URL}/api/devices", headers=headers)
+devices = response.json()
+```
+
+### JavaScript
+
+```javascript
+const API_KEY = 'your-api-key';
+const BASE_URL = 'http://localhost:8080';
+
+const response = await fetch(`${BASE_URL}/api/devices`, {
+  headers: { 'X-API-Key': API_KEY }
+});
+const devices = await response.json();
+```
+
+### Rust
+
+```rust
+use reqwest::Client;
+
+let client = Client::new();
+let response = client
+    .get("http://localhost:8080/api/devices")
+    .header("X-API-Key", "your-api-key")
+    .send()
+    .await?;
+```

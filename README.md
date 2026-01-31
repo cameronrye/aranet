@@ -49,7 +49,15 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - Export history to CSV, comparison view
   - Device filter, alias management, settings editing
 - **aranet-gui** — Desktop application built with egui
-- **aranet-wasm** — WebAssembly module for browser integration *(planned)*
+  - Multi-panel interface with device list, detail, history, comparison views
+  - Alert system with threshold management
+  - Export to CSV/JSON, system tray, light/dark themes
+- **aranet-service** — Background daemon with REST API and integrations
+  - HTTP API for devices, readings, history queries
+  - WebSocket real-time streaming
+  - Prometheus metrics endpoint (`/metrics`)
+  - MQTT publisher for IoT integration
+  - Service management (install/start/stop)
 
 ## Screenshots
 
@@ -137,10 +145,10 @@ aranet/
 │   ├── aranet-types/    # Platform-agnostic types (shared)
 │   ├── aranet-core/     # Core BLE library
 │   ├── aranet-store/    # Local SQLite data persistence
+│   ├── aranet-service/  # Background service + REST API
 │   ├── aranet-cli/      # CLI tool
 │   ├── aranet-tui/      # Terminal dashboard
-│   ├── aranet-gui/      # Desktop GUI (egui)
-│   └── aranet-wasm/     # WebAssembly module
+│   └── aranet-gui/      # Desktop GUI (egui)
 └── docs/                # Protocol documentation
 ```
 
@@ -181,13 +189,10 @@ Here are some features and improvements that would be great additions to the pro
 | Aranet2 history download | Implement history data retrieval for Aranet2 devices | Medium |
 | Aranet Radiation history | Complete history download support for Aranet Radiation sensors | Medium |
 | Home Assistant integration | Create a Home Assistant custom component using aranet-core | Medium |
-| Prometheus exporter | Add metrics endpoint for Prometheus/Grafana monitoring | Easy |
-| MQTT publisher | Publish readings to MQTT broker for IoT integration | Easy |
 | InfluxDB export | Direct export to InfluxDB time-series database | Easy |
-| Web dashboard | Complete the aranet-wasm module for browser-based monitoring | Hard |
 | Calibration support | Add device calibration commands for CO2 sensors | Medium |
-| Notification system | Desktop notifications when thresholds are exceeded | Easy |
 | Data visualization | Enhanced charting and trend analysis in TUI/GUI | Medium |
+| Grafana dashboard | Pre-built dashboard templates for Prometheus metrics | Easy |
 
 If you're interested in tackling any of these, please open an issue to discuss your approach before starting work. We're happy to provide guidance and answer questions!
 

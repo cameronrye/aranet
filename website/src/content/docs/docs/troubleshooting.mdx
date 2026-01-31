@@ -1,0 +1,579 @@
+---
+title: Troubleshooting & FAQ
+description: Common issues and frequently asked questions when using the Aranet Rust ecosystem.
+---
+
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+This guide covers common issues you might encounter when using the Aranet CLI, TUI, GUI, or library, along with solutions and workarounds.
+
+## Quick Diagnostics
+
+Run the built-in diagnostic tool to check your system:
+
+```bash
+aranet doctor
+```
+
+This will check:
+- Bluetooth adapter status
+- Required permissions
+- Known device connectivity
+- Configuration validity
+
+---
+
+## Bluetooth Issues
+
+<div class="not-content faq-section">
+
+<details class="faq-item">
+<summary>Device not found during scan</summary>
+<div class="faq-content">
+
+**Symptoms:** `aranet scan` returns no devices or times out.
+
+**Solutions:**
+
+1. **Ensure the device is in range** - Aranet devices have a Bluetooth range of approximately 10 meters (33 feet).
+
+2. **Check if the device is paired with another app** - Some devices only allow one active connection. Close the official Aranet Home app or disconnect from other Bluetooth managers.
+
+3. **Restart Bluetooth on your system:**
+
+<Tabs>
+  <TabItem label="macOS">
+```bash
+# Turn Bluetooth off and on
+blueutil --power 0 && sleep 2 && blueutil --power 1
+```
+  </TabItem>
+  <TabItem label="Linux">
+```bash
+# Restart Bluetooth service
+sudo systemctl restart bluetooth
+```
+  </TabItem>
+  <TabItem label="Windows">
+```powershell
+# Restart Bluetooth service
+Restart-Service bthserv
+```
+  </TabItem>
+</Tabs>
+
+4. **Increase scan duration:**
+```bash
+aranet scan --timeout 30
+```
+
+5. **Try passive scanning** (doesn't require active Bluetooth queries):
+```bash
+aranet scan --passive
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Connection drops or times out</summary>
+<div class="faq-content">
+
+**Symptoms:** Commands fail with "connection timeout" or "device disconnected" errors.
+
+**Solutions:**
+
+1. **Move closer to the device** - Bluetooth Low Energy signal strength varies.
+
+2. **Check for interference** - WiFi routers, microwaves, and other 2.4GHz devices can interfere.
+
+3. **Retry with longer timeout:**
+```bash
+aranet read <ADDRESS> --timeout 60
+```
+
+4. **Check device battery** - Low battery can affect Bluetooth transmission power. Use:
+```bash
+aranet info <ADDRESS>
+```
+
+5. **Reset the device connection:**
+```bash
+# Disconnect and reconnect to the device
+aranet read <ADDRESS>
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>"Permission denied" or "Access denied" errors</summary>
+<div class="faq-content">
+
+**Symptoms:** Bluetooth operations fail with permission errors.
+
+<Tabs>
+  <TabItem label="macOS">
+
+macOS requires Bluetooth permission for terminal applications.
+
+<Steps>
+1. Open **System Settings** → **Privacy & Security** → **Bluetooth**
+2. Ensure your terminal app (Terminal, iTerm2, etc.) is listed and enabled
+3. If not listed, run `aranet scan` once - macOS should prompt for permission
+4. Restart your terminal after granting permission
+</Steps>
+
+  </TabItem>
+  <TabItem label="Linux">
+
+Linux requires either root access or proper group membership.
+
+**Option 1: Add user to bluetooth group**
+```bash
+sudo usermod -aG bluetooth $USER
+# Log out and back in for changes to take effect
+```
+
+**Option 2: Grant capabilities to the binary**
+```bash
+sudo setcap 'cap_net_raw,cap_net_admin+eip' $(which aranet)
+```
+
+**Option 3: Configure D-Bus policy**
+Create `/etc/dbus-1/system.d/aranet.conf`:
+```xml
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Policy//EN"
+  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="YOUR_USERNAME">
+    <allow own="org.bluez"/>
+    <allow send_destination="org.bluez"/>
+    <allow send_interface="org.bluez.GattCharacteristic1"/>
+    <allow send_interface="org.bluez.GattDescriptor1"/>
+    <allow send_interface="org.freedesktop.DBus.ObjectManager"/>
+    <allow send_interface="org.freedesktop.DBus.Properties"/>
+  </policy>
+</busconfig>
+```
+
+  </TabItem>
+  <TabItem label="Windows">
+
+Windows typically doesn't require special permissions for Bluetooth, but:
+
+1. **Run as Administrator** if you encounter issues
+2. **Check Windows Bluetooth settings** - ensure Bluetooth is enabled
+3. **Update Bluetooth drivers** via Device Manager
+
+  </TabItem>
+</Tabs>
+
+</div>
+</details>
+
+</div>
+
+---
+
+## Installation Issues
+
+<div class="not-content faq-section">
+
+<details class="faq-item">
+<summary>Homebrew installation fails</summary>
+<div class="faq-content">
+
+**Try these solutions in order:**
+
+1. **Update Homebrew:**
+```bash
+brew update
+brew upgrade
+```
+
+2. **Re-tap the repository:**
+```bash
+brew untap cameronrye/aranet
+brew tap cameronrye/aranet
+brew install aranet
+```
+
+3. **Install from source instead:**
+```bash
+brew install --build-from-source aranet
+```
+
+4. **Check for conflicts:**
+```bash
+brew doctor
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Cargo build fails with btleplug errors</summary>
+<div class="faq-content">
+
+**Common causes and solutions:**
+
+**On Linux - missing D-Bus development files:**
+```bash
+# Debian/Ubuntu
+sudo apt install libdbus-1-dev pkg-config
+
+# Fedora/RHEL
+sudo dnf install dbus-devel pkgconfig
+
+# Arch
+sudo pacman -S dbus pkgconf
+```
+
+**On macOS - missing Xcode tools:**
+```bash
+xcode-select --install
+```
+
+**Outdated Rust toolchain:**
+```bash
+rustup update stable
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Shell completions not working</summary>
+<div class="faq-content">
+
+**Generate and install completions for your shell:**
+
+<Tabs>
+  <TabItem label="Bash">
+```bash
+aranet completions bash > ~/.local/share/bash-completion/completions/aranet
+# Or for system-wide:
+sudo aranet completions bash > /etc/bash_completion.d/aranet
+```
+  </TabItem>
+  <TabItem label="Zsh">
+```bash
+aranet completions zsh > ~/.zsh/completions/_aranet
+# Add to ~/.zshrc if not present:
+# fpath=(~/.zsh/completions $fpath)
+# autoload -Uz compinit && compinit
+```
+  </TabItem>
+  <TabItem label="Fish">
+```bash
+aranet completions fish > ~/.config/fish/completions/aranet.fish
+```
+  </TabItem>
+  <TabItem label="PowerShell">
+```powershell
+aranet completions powershell >> $PROFILE
+```
+  </TabItem>
+</Tabs>
+
+**Restart your shell after installing completions.**
+
+</div>
+</details>
+
+</div>
+
+---
+
+## Data & Export Issues
+
+<div class="not-content faq-section">
+
+<details class="faq-item">
+<summary>History download is slow or incomplete</summary>
+<div class="faq-content">
+
+Aranet devices can store weeks of data. Large downloads take time due to BLE bandwidth limitations.
+
+**Tips for faster downloads:**
+
+1. **Use incremental sync** - only download new data:
+```bash
+aranet sync <ADDRESS>
+```
+
+2. **Filter by date range:**
+```bash
+aranet history <ADDRESS> --since 2026-01-01 --until 2026-01-15
+```
+
+3. **Limit the number of records:**
+```bash
+aranet history <ADDRESS> --limit 1000
+```
+
+4. **Download to local database for future queries:**
+```bash
+# Sync downloads history to the local SQLite database
+aranet sync <ADDRESS>
+
+# Query cached data without connecting to device
+aranet cache history <ADDRESS>
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>CSV export has wrong encoding or format</summary>
+<div class="faq-content">
+
+**Specify the output format explicitly:**
+
+```bash
+# Standard CSV with headers
+aranet history <ADDRESS> --format csv > data.csv
+
+# JSON for programmatic use
+aranet history <ADDRESS> --format json > data.json
+
+# Plain text (default)
+aranet history <ADDRESS> --format text
+```
+
+**For Excel compatibility:** Open the CSV file in Excel. If characters display incorrectly, use Excel's "Get Data from Text/CSV" import feature and select UTF-8 encoding.
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Timestamps appear wrong</summary>
+<div class="faq-content">
+
+**Aranet devices store timestamps in UTC.** The CLI converts to your local timezone by default.
+
+**If timestamps appear incorrect:**
+
+1. **Verify your system timezone** is set correctly
+2. **Check device interval** - history timestamps are calculated from the device's current time minus intervals
+3. **Use JSON output** for precise timestamp inspection:
+```bash
+aranet history <ADDRESS> --format json
+```
+
+**If device time is significantly wrong,** you may need to reconfigure the device using the official Aranet Home app.
+
+</div>
+</details>
+
+</div>
+
+---
+
+## TUI & GUI Issues
+
+<div class="not-content faq-section">
+
+<details class="faq-item">
+<summary>TUI display is garbled or colors are wrong</summary>
+<div class="faq-content">
+
+**Check your terminal compatibility:**
+
+1. **Use a modern terminal** - The TUI requires 256-color or truecolor support. Recommended: iTerm2, Alacritty, Windows Terminal, Kitty.
+
+2. **Set TERM environment variable:**
+```bash
+export TERM=xterm-256color
+aranet tui
+```
+
+3. **Force basic mode:**
+```bash
+aranet tui --style basic
+```
+
+4. **Disable Unicode if symbols don't render:**
+```bash
+aranet tui --ascii
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>GUI won't start or crashes on launch</summary>
+<div class="faq-content">
+
+**Common solutions:**
+
+1. **Check system requirements:**
+   - macOS 11.0+ (Big Sur or later)
+   - Windows 10 version 1903+
+   - Linux with GTK 3.24+
+
+2. **On macOS - verify app permissions:**
+   - Open System Settings → Privacy & Security
+   - Check Bluetooth and Accessibility permissions
+
+3. **Try launching from terminal** to see error messages:
+```bash
+# macOS
+/Applications/Aranet.app/Contents/MacOS/aranet-gui
+
+# Linux
+aranet-gui --debug
+```
+
+4. **Reset GUI settings:**
+```bash
+rm -rf ~/.config/aranet-gui
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>System tray icon not appearing</summary>
+<div class="faq-content">
+
+**Linux users:** System tray support varies by desktop environment.
+
+- **GNOME:** Install the AppIndicator extension
+- **KDE:** Should work out of the box
+- **i3/Sway:** Use a status bar with tray support (e.g., Waybar, i3bar with i3blocks)
+
+**macOS users:** The menu bar icon should appear automatically. If not, check System Settings → Control Center → Menu Bar Only.
+
+</div>
+</details>
+
+</div>
+
+---
+
+## Frequently Asked Questions
+
+<div class="not-content faq-section">
+
+<details class="faq-item">
+<summary>Which devices are supported?</summary>
+<div class="faq-content">
+
+Currently supported devices:
+
+| Device | Sensors | Status |
+|--------|---------|--------|
+| Aranet4 | CO2, Temperature, Humidity, Pressure | Full support |
+| Aranet2 | Temperature, Humidity | Full support |
+| AranetRn+ | Radon, Temperature, Pressure, Humidity | Full support |
+| Aranet Radiation | Dose Rate, Total Dose | Full support |
+
+**Not yet supported:** Aranet PRO base station, Aranet Cloud integration.
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Can I use multiple devices simultaneously?</summary>
+<div class="faq-content">
+
+Yes! The CLI, TUI, and GUI all support multiple devices.
+
+**CLI - Read from multiple devices:**
+```bash
+aranet read -d living-room -d bedroom -d office
+```
+
+**TUI - Monitor multiple devices:**
+```bash
+aranet tui --devices living-room,bedroom,office
+# Or monitor all aliased devices:
+aranet tui --all
+```
+
+**Set up aliases for easy access:**
+```bash
+aranet alias set living-room AA:BB:CC:DD:EE:FF
+aranet alias set bedroom 11:22:33:44:55:66
+aranet alias list
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>How do I integrate with Home Assistant?</summary>
+<div class="faq-content">
+
+Use the `aranet-service` daemon to expose a REST API:
+
+```bash
+# Start the service
+aranet-service --port 8080
+
+# The API is now available at http://localhost:8080
+# GET /devices - List all devices
+# GET /devices/:id/current - Get current readings
+# GET /devices/:id/history - Get historical data
+```
+
+Then configure Home Assistant to poll the REST API using the [RESTful sensor integration](https://www.home-assistant.io/integrations/rest/).
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>What are the CO2 color thresholds?</summary>
+<div class="faq-content">
+
+The Aranet4 uses the following thresholds (configurable on the device):
+
+| Level | CO2 Range | Color | Meaning |
+|-------|-----------|-------|---------|
+| Good | < 1000 ppm | Green | Air quality is good |
+| Warning | 1000-1400 ppm | Amber | Consider ventilating |
+| Poor | > 1400 ppm | Red | Ventilation needed |
+
+These thresholds can be customized:
+```bash
+aranet set <ADDRESS> --co2-warning 800 --co2-alarm 1200
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Is this project affiliated with Aranet/SAF Tehnika?</summary>
+<div class="faq-content">
+
+**No.** This is an independent, community-driven open-source project. It is not affiliated with, endorsed by, or sponsored by Aranet or SAF Tehnika JSC.
+
+Aranet is a trademark of SAF Tehnika JSC. This project communicates with Aranet devices using their documented Bluetooth Low Energy protocol.
+
+</div>
+</details>
+
+</div>
+
+---
+
+## Still Having Issues?
+
+If you've tried the solutions above and still have problems:
+
+1. **Check existing issues** on [GitHub Issues](https://github.com/cameronrye/aranet/issues)
+2. **Open a new issue** with:
+   - Your OS and version
+   - Output of `aranet doctor`
+   - Steps to reproduce the problem
+   - Full error message
+3. **Join the discussion** on GitHub Discussions for general questions
+
+<Aside type="tip">
+Include the `--debug` flag when running commands to get more detailed output for bug reports:
+```bash
+aranet --debug scan
+```
+</Aside>

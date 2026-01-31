@@ -253,7 +253,15 @@ pub fn apply_action(
         Action::Scan => Some(Command::Scan {
             duration: Duration::from_secs(5),
         }),
-        Action::Refresh => Some(Command::RefreshAll),
+        Action::Refresh => {
+            if app.active_tab == Tab::Service {
+                // In Service tab, refresh service status
+                Some(Command::RefreshServiceStatus)
+            } else {
+                // In other tabs, refresh sensor readings
+                Some(Command::RefreshAll)
+            }
+        }
         Action::Connect => app.selected_device().map(|device| Command::Connect {
             device_id: device.id.clone(),
         }),
@@ -314,15 +322,17 @@ pub fn apply_action(
             app.active_tab = match app.active_tab {
                 Tab::Dashboard => Tab::History,
                 Tab::History => Tab::Settings,
-                Tab::Settings => Tab::Dashboard,
+                Tab::Settings => Tab::Service,
+                Tab::Service => Tab::Dashboard,
             };
             None
         }
         Action::PreviousTab => {
             app.active_tab = match app.active_tab {
-                Tab::Dashboard => Tab::Settings,
+                Tab::Dashboard => Tab::Service,
                 Tab::History => Tab::Dashboard,
                 Tab::Settings => Tab::History,
+                Tab::Service => Tab::Settings,
             };
             None
         }
@@ -406,7 +416,25 @@ pub fn apply_action(
             None
         }
         Action::ChangeSetting => {
-            if app.active_tab == Tab::Settings && app.selected_setting == 0 {
+            if app.active_tab == Tab::Service {
+                // In Service tab, Enter toggles collector start/stop
+                if let Some(ref status) = app.service_status {
+                    if status.reachable {
+                        if status.collector_running {
+                            return Some(Command::StopServiceCollector);
+                        } else {
+                            return Some(Command::StartServiceCollector);
+                        }
+                    } else {
+                        app.push_status_message("Service not reachable".to_string());
+                    }
+                } else {
+                    app.push_status_message(
+                        "Service status unknown - press 'r' to refresh".to_string(),
+                    );
+                }
+                None
+            } else if app.active_tab == Tab::Settings && app.selected_setting == 0 {
                 // Interval setting
                 if let Some((device_id, new_interval)) = app.cycle_interval() {
                     return Some(Command::SetInterval {
@@ -414,8 +442,10 @@ pub fn apply_action(
                         interval_secs: new_interval,
                     });
                 }
+                None
+            } else {
+                None
             }
-            None
         }
         Action::ExportHistory => {
             if let Some(path) = app.export_history() {
@@ -464,6 +494,8 @@ pub fn apply_action(
                     app.active_tab = Tab::History;
                 } else if x < 45 {
                     app.active_tab = Tab::Settings;
+                } else if x < 60 {
+                    app.active_tab = Tab::Service;
                 }
             }
             // Device list is in the left sidebar (x < ~25, y > 4)

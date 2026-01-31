@@ -1,6 +1,6 @@
 [package]
 name = "aranet-store"
-version = "0.1.9"
+version = "0.1.11"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +11,7 @@ keywords = ["aranet", "storage", "sqlite", "sensors", "database"]
 categories = ["database", "caching"]
 
 [dependencies]
-aranet-types = { version = "0.1.9", path = "../aranet-types" }
+aranet-types = { version = "0.1.11", path = "../aranet-types" }
 rusqlite = { version = "0.35", features = ["bundled", "time"] }
 thiserror.workspace = true
 time.workspace = true

@@ -1,0 +1,328 @@
+---
+title: WebSocket API
+description: Real-time sensor updates via WebSocket connection.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+aranet-service provides a WebSocket endpoint for receiving real-time sensor readings as they're collected.
+
+## Connection
+
+Connect to the WebSocket endpoint:
+
+```
+ws://localhost:8080/api/ws
+```
+
+Or with TLS (if configured):
+
+```
+wss://your-server:8080/api/ws
+```
+
+## Authentication
+
+If API key authentication is enabled in your configuration, include the key in the connection URL or headers.
+
+<Aside type="note">
+  WebSocket connections are subject to the same authentication requirements as REST endpoints. See [API Security](/docs/service/security/) for configuration details.
+</Aside>
+
+### Using Query Parameter
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080/api/ws?api_key=your-key');
+```
+
+### Using Headers (where supported)
+
+Some WebSocket libraries support custom headers:
+
+```javascript
+// Node.js with ws library
+const WebSocket = require('ws');
+const ws = new WebSocket('ws://localhost:8080/api/ws', {
+  headers: { 'X-API-Key': 'your-api-key' }
+});
+```
+
+```python
+# Python with websockets
+import websockets
+
+async with websockets.connect(
+    "ws://localhost:8080/api/ws",
+    extra_headers={"X-API-Key": "your-api-key"}
+) as ws:
+    ...
+```
+
+## Message Format
+
+When a new reading is collected, the server broadcasts a JSON message:
+
+```json
+{
+  "device_id": "Aranet4 17C3C",
+  "reading": {
+    "device_id": "Aranet4 17C3C",
+    "co2": 750,
+    "temperature": 23.5,
+    "humidity": 48,
+    "pressure": 1013.25,
+    "battery": 85,
+    "status": "Green",
+    "interval": 60,
+    "age": 5,
+    "captured_at": "2024-01-15T10:30:00Z",
+    "radon": null,
+    "radiation_rate": null,
+    "radiation_total": null
+  }
+}
+```
+
+### Field Descriptions
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `device_id` | string | Device Bluetooth address or name |
+| `co2` | number | CO₂ concentration in ppm |
+| `temperature` | number | Temperature in °C |
+| `humidity` | number | Relative humidity in % |
+| `pressure` | number | Atmospheric pressure in hPa |
+| `battery` | number | Battery level in % (0-100) |
+| `status` | string | Air quality: "Green", "Yellow", "Red", "Error" |
+| `interval` | number | Device measurement interval in seconds |
+| `age` | number | Reading age in seconds when captured |
+| `captured_at` | string | ISO 8601 timestamp (UTC) |
+| `radon` | number \| null | Radon level in Bq/m³ (Aranet Rn+ only) |
+| `radiation_rate` | number \| null | Radiation rate in µSv/h (Aranet Radiation only) |
+| `radiation_total` | number \| null | Total radiation dose in mSv |
+
+## Client Examples
+
+### JavaScript / Browser
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080/api/ws');
+
+ws.onopen = () => {
+  console.log('Connected to Aranet WebSocket');
+};
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(`Device: ${data.device_id}`);
+  console.log(`CO2: ${data.reading.co2} ppm`);
+  console.log(`Temperature: ${data.reading.temperature}°C`);
+};
+
+ws.onerror = (error) => {
+  console.error('WebSocket error:', error);
+};
+
+ws.onclose = () => {
+  console.log('Disconnected from Aranet WebSocket');
+  // Implement reconnection logic here
+};
+```
+
+### Python
+
+```python
+import asyncio
+import json
+import websockets
+
+async def listen_to_aranet():
+    uri = "ws://localhost:8080/api/ws"
+
+    async with websockets.connect(uri) as websocket:
+        print("Connected to Aranet WebSocket")
+
+        async for message in websocket:
+            data = json.loads(message)
+            reading = data["reading"]
+
+            print(f"Device: {data['device_id']}")
+            print(f"  CO2: {reading['co2']} ppm")
+            print(f"  Temperature: {reading['temperature']}°C")
+            print(f"  Humidity: {reading['humidity']}%")
+            print()
+
+if __name__ == "__main__":
+    asyncio.run(listen_to_aranet())
+```
+
+### Rust
+
+```rust
+use futures_util::StreamExt;
+use serde::Deserialize;
+use tokio_tungstenite::connect_async;
+
+#[derive(Debug, Deserialize)]
+struct ReadingEvent {
+    device_id: String,
+    reading: Reading,
+}
+
+#[derive(Debug, Deserialize)]
+struct Reading {
+    co2: u16,
+    temperature: f32,
+    humidity: u8,
+    pressure: f32,
+    battery: u8,
+    status: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = "ws://localhost:8080/api/ws";
+    let (ws_stream, _) = connect_async(url).await?;
+
+    println!("Connected to Aranet WebSocket");
+
+    let (_, mut read) = ws_stream.split();
+
+    while let Some(msg) = read.next().await {
+        if let Ok(msg) = msg {
+            if let Ok(text) = msg.into_text() {
+                let event: ReadingEvent = serde_json::from_str(&text)?;
+                println!("Device: {}", event.device_id);
+                println!("  CO2: {} ppm", event.reading.co2);
+                println!("  Temp: {}°C", event.reading.temperature);
+            }
+        }
+    }
+
+    Ok(())
+}
+```
+
+### curl / websocat
+
+```bash
+# Using websocat (install via cargo install websocat)
+websocat ws://localhost:8080/api/ws
+
+# With pretty printing
+websocat ws://localhost:8080/api/ws | jq .
+```
+
+## Keep-Alive
+
+The WebSocket connection uses ping/pong frames for keep-alive. The server responds automatically to ping frames. Clients should:
+
+1. Send periodic ping frames (recommended: every 30 seconds)
+2. Implement reconnection logic for dropped connections
+
+<Aside type="tip">
+  Most WebSocket libraries handle ping/pong automatically. If your connection drops frequently, check network firewalls or load balancer timeout settings.
+</Aside>
+
+## Reconnection Strategy
+
+Implement exponential backoff for reconnection:
+
+```javascript
+class AranetWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.reconnectDelay = 1000;
+    this.maxDelay = 30000;
+    this.connect();
+  }
+
+  connect() {
+    this.ws = new WebSocket(this.url);
+
+    this.ws.onopen = () => {
+      console.log('Connected');
+      this.reconnectDelay = 1000; // Reset delay on success
+    };
+
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      this.onReading(data);
+    };
+
+    this.ws.onclose = () => {
+      console.log(`Reconnecting in ${this.reconnectDelay}ms...`);
+      setTimeout(() => this.connect(), this.reconnectDelay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxDelay);
+    };
+  }
+
+  onReading(data) {
+    // Override this method to handle readings
+    console.log(data);
+  }
+}
+
+const client = new AranetWebSocket('ws://localhost:8080/api/ws');
+```
+
+## Configuration
+
+### Broadcast Buffer
+
+Configure the broadcast buffer size in `server.toml`:
+
+```toml
+[server]
+bind = "127.0.0.1:8080"
+broadcast_buffer = 100  # Number of messages buffered
+```
+
+If clients are slow to process messages, they may miss readings when the buffer is full. Increase this value for slower clients.
+
+## Integration Examples
+
+### Home Automation Dashboard
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Aranet Monitor</title>
+  <style>
+    .reading { font-size: 2em; margin: 20px; }
+    .good { color: green; }
+    .moderate { color: orange; }
+    .poor { color: red; }
+  </style>
+</head>
+<body>
+  <div id="co2" class="reading">-- ppm</div>
+  <div id="temp" class="reading">--°C</div>
+
+  <script>
+    const ws = new WebSocket('ws://localhost:8080/api/ws');
+
+    ws.onmessage = (event) => {
+      const { reading } = JSON.parse(event.data);
+
+      const co2El = document.getElementById('co2');
+      co2El.textContent = `${reading.co2} ppm`;
+      co2El.className = 'reading ' +
+        (reading.co2 < 800 ? 'good' :
+         reading.co2 < 1000 ? 'moderate' : 'poor');
+
+      document.getElementById('temp').textContent =
+        `${reading.temperature.toFixed(1)}°C`;
+    };
+  </script>
+</body>
+</html>
+```
+
+### Node-RED Integration
+
+1. Add **websocket in** node
+2. Set URL to `ws://localhost:8080/api/ws`
+3. Connect to **json** node to parse
+4. Route to your automation flows

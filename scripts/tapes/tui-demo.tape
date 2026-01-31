@@ -6,11 +6,11 @@
 Output assets/screenshots/tui-demo.gif
 
 Set Shell bash
-Set FontSize 14
-Set Width 1000
-Set Height 700
+Set FontSize 16
+Set Width 1200
+Set Height 800
 Set Theme "Catppuccin Mocha"
-Set Padding 10
+Set Padding 24
 Set TypingSpeed 50ms
 
 # Launch TUI

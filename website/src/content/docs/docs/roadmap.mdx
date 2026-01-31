@@ -16,8 +16,8 @@ The Aranet project aims to be the definitive Rust ecosystem for Aranet environme
 | 2 | CLI Tool | <Badge text="DONE" variant="success" /> | All commands implemented and tested |
 | 3 | TUI Dashboard | <Badge text="DONE" variant="success" /> | 44 features implemented |
 | 4 | GUI Application | <Badge text="DONE" variant="success" /> | Full MVP with charts and multi-device |
-| 5 | WASM Module | <Badge text="WIP" variant="caution" /> | Basic init/log, Web Bluetooth pending |
-| 6 | Data Persistence & API | <Badge text="DONE" variant="success" /> | aranet-store and aranet-service complete |
+| 5 | Data Persistence & API | <Badge text="DONE" variant="success" /> | aranet-store and aranet-service complete |
+| 6 | Integrations | <Badge text="DONE" variant="success" /> | Prometheus metrics, MQTT publisher |
 
 ## Phase 2: CLI Tool (Complete)
 
@@ -73,20 +73,7 @@ Native desktop app with egui:
 - Multi-device support - Connect and monitor multiple devices
 - Cross-platform - Works on macOS, Windows, and Linux
 
-## Phase 5: WASM Web App
-
-Browser-based Aranet monitor:
-
-- Web Bluetooth device discovery (Chrome/Edge)
-- Real-time dashboard UI
-- Historical data download
-- PWA support (installable, offline)
-- CSV export
-- Chart visualizations
-
-**Note:** Web Bluetooth only works in Chromium browsers (~50% browser support). iOS Safari does NOT support Web Bluetooth.
-
-## Phase 6: Data Persistence & API (Complete)
+## Phase 5: Data Persistence & API (Complete)
 
 Local data storage and HTTP API for integrations:
 
@@ -112,14 +99,39 @@ Local data storage and HTTP API for integrations:
 - **CLI integration**: `sync` and `cache` commands for local data management
 - **Service management**: Install as system service (launchd/systemd)
 
+## Phase 6: Integrations (Complete)
+
+External system integrations for monitoring and IoT:
+
+<CardGrid>
+  <Card title="Prometheus Metrics" icon="bars">
+    `/metrics` endpoint with full sensor data for Grafana dashboards
+  </Card>
+  <Card title="MQTT Publisher" icon="external">
+    Broadcast readings to MQTT brokers for Home Assistant and IoT
+  </Card>
+  <Card title="Service Control" icon="setting">
+    CLI commands for service install/start/stop management
+  </Card>
+  <Card title="Configuration API" icon="document">
+    Runtime configuration management via REST API
+  </Card>
+</CardGrid>
+
+### Features
+
+- **Prometheus**: Sensor metrics, collector statistics, push gateway support
+- **MQTT**: Topic-based publishing, TLS support, configurable QoS
+- **Service management**: `aranet-service service install/start/stop`
+- **Dynamic config**: Add/remove devices without restart
+
 ## Success Metrics
 
 - [x] All Python library features working in Rust
 - [x] Single binary CLI with no runtime dependencies
 - [x] TUI monitoring multiple devices simultaneously
-- [ ] GUI app installable on all platforms
-- [x] WASM app deployed to GitHub Pages *(this site!)*
-- [ ] Published to crates.io as `aranet`
+- [x] GUI app installable on all platforms
+- [x] Published to crates.io as `aranet-cli`
 - [x] All dependencies on latest stable versions
 - [x] Zero `cargo audit` warnings
 
@@ -130,7 +142,8 @@ We welcome contributions! Areas where help is especially appreciated:
 1. **Testing with hardware** — Help test with Aranet2, Radiation sensors
 2. **GUI/TUI polish** — UI/UX improvements
 3. **Documentation** — Examples, tutorials, translations
-4. **Web Bluetooth** — WASM integration expertise
+4. **Integrations** — Home Assistant, InfluxDB, Grafana dashboards
+5. **Device support** — Aranet2 history, Radiation history download
 
 ---
 

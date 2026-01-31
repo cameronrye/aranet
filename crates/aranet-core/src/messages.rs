@@ -89,6 +89,29 @@ pub enum Command {
         enabled: bool,
     },
 
+    /// Refresh the aranet-service status.
+    RefreshServiceStatus,
+
+    /// Start the aranet-service collector.
+    StartServiceCollector,
+
+    /// Stop the aranet-service collector.
+    StopServiceCollector,
+
+    /// Set a friendly alias/name for a device.
+    SetAlias {
+        /// The device identifier.
+        device_id: String,
+        /// The new alias (or None to clear).
+        alias: Option<String>,
+    },
+
+    /// Forget (remove) a device from the known devices list and store.
+    ForgetDevice {
+        /// The device identifier.
+        device_id: String,
+    },
+
     /// Shut down the worker thread.
     Shutdown,
 }
@@ -268,6 +291,87 @@ pub enum SensorEvent {
         /// Description of the error.
         error: String,
     },
+
+    /// Service status refreshed successfully.
+    ServiceStatusRefreshed {
+        /// Whether the service is reachable.
+        reachable: bool,
+        /// Whether the collector is running.
+        collector_running: bool,
+        /// Service uptime in seconds.
+        uptime_seconds: Option<u64>,
+        /// Monitored devices with their collection stats.
+        devices: Vec<ServiceDeviceStats>,
+    },
+
+    /// Service status refresh failed.
+    ServiceStatusError {
+        /// Description of the error.
+        error: String,
+    },
+
+    /// Service collector started successfully.
+    ServiceCollectorStarted,
+
+    /// Service collector stopped successfully.
+    ServiceCollectorStopped,
+
+    /// Service collector action failed.
+    ServiceCollectorError {
+        /// Description of the error.
+        error: String,
+    },
+
+    /// Device alias changed successfully.
+    AliasChanged {
+        /// The device identifier.
+        device_id: String,
+        /// The new alias (or None if cleared).
+        alias: Option<String>,
+    },
+
+    /// Failed to set device alias.
+    AliasError {
+        /// The device identifier.
+        device_id: String,
+        /// Description of the error.
+        error: String,
+    },
+
+    /// Device was forgotten (removed from known devices).
+    DeviceForgotten {
+        /// The device identifier.
+        device_id: String,
+    },
+
+    /// Failed to forget device.
+    ForgetDeviceError {
+        /// The device identifier.
+        device_id: String,
+        /// Description of the error.
+        error: String,
+    },
+}
+
+/// Statistics for a device being monitored by the service.
+#[derive(Debug, Clone)]
+pub struct ServiceDeviceStats {
+    /// Device identifier.
+    pub device_id: String,
+    /// Device alias/name.
+    pub alias: Option<String>,
+    /// Poll interval in seconds.
+    pub poll_interval: u64,
+    /// Whether the device is currently being polled.
+    pub polling: bool,
+    /// Number of successful polls.
+    pub success_count: u64,
+    /// Number of failed polls.
+    pub failure_count: u64,
+    /// Last poll time.
+    pub last_poll_at: Option<time::OffsetDateTime>,
+    /// Last error message.
+    pub last_error: Option<String>,
 }
 
 #[cfg(test)]

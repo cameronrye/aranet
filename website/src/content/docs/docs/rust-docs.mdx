@@ -32,14 +32,13 @@ The Aranet project provides comprehensive Rust API documentation generated from 
 
 | Crate | Description |
 |-------|-------------|
-| `aranet-types` | Platform-agnostic types shared between native and WASM |
+| `aranet-types` | Platform-agnostic types shared across all crates |
 | `aranet-core` | Core BLE library with device discovery, readings, and settings |
 | `aranet-store` | SQLite-based data persistence for readings and history |
 | `aranet-service` | Background collector and HTTP REST API server |
 | `aranet-cli` | Command-line interface for quick readings and data export |
 | `aranet-tui` | Terminal UI dashboard for real-time monitoring |
 | `aranet-gui` | Desktop GUI application |
-| `aranet-wasm` | WebAssembly module for browser-based sensor access |
 
 ## Documentation Conventions
 
@@ -54,22 +53,24 @@ All public APIs are documented with:
 ## Example: Reading from a Device
 
 ```rust
-use aranet_core::{scan_for_devices, connect, read_current};
+use aranet_core::{Device, scan};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Scan for nearby Aranet devices
-    let devices = scan_for_devices(Duration::from_secs(5)).await?;
-    
+    let devices = scan::scan_for_devices().await?;
+    println!("Found {} devices", devices.len());
+
     // Connect to the first device found
-    if let Some(device) = devices.first() {
-        let connection = connect(device).await?;
-        
+    if let Some(info) = devices.first() {
+        let device = Device::connect(&info.name).await?;
+
         // Read current sensor values
-        let reading = read_current(&connection).await?;
+        let reading = device.read_current().await?;
         println!("CO₂: {} ppm", reading.co2);
+        println!("Temperature: {:.1}°C", reading.temperature);
     }
-    
+
     Ok(())
 }
 ```

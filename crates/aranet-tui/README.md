@@ -8,7 +8,12 @@
 
 # aranet-tui
 
+[![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui)
+[![docs.rs](https://docs.rs/aranet-tui/badge.svg)](https://docs.rs/aranet-tui)
+
 Terminal UI dashboard for Aranet environmental sensors.
+
+**[Full Documentation](https://cameronrye.github.io/aranet/)**
 
 A feature-rich terminal dashboard built with [ratatui](https://ratatui.rs/) for real-time monitoring of Aranet sensor data.
 
@@ -154,9 +159,8 @@ This crate is part of the [aranet](https://github.com/cameronrye/aranet) workspa
 | [aranet-types](../aranet-types/) | [![crates.io](https://img.shields.io/crates/v/aranet-types.svg)](https://crates.io/crates/aranet-types) | Shared types |
 | [aranet-cli](../aranet-cli/) | [![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli) | CLI tool |
 | [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local persistence |
-| [aranet-service](../aranet-service/) | - | Background collector and REST API |
-| [aranet-gui](../aranet-gui/) | - | Desktop GUI application |
-| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module |
+| [aranet-service](../aranet-service/) | [![crates.io](https://img.shields.io/crates/v/aranet-service.svg)](https://crates.io/crates/aranet-service) | Background collector and REST API |
+| [aranet-gui](../aranet-gui/) | [![crates.io](https://img.shields.io/crates/v/aranet-gui.svg)](https://crates.io/crates/aranet-gui) | Desktop GUI application |
 
 ## License
 

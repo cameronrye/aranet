@@ -372,3 +372,75 @@ fn import_history(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // parse_datetime tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_datetime_rfc3339() {
+        let result = parse_datetime("2024-01-15T10:30:00Z").unwrap();
+
+        assert_eq!(result.year(), 2024);
+        assert_eq!(result.month(), time::Month::January);
+        assert_eq!(result.day(), 15);
+        assert_eq!(result.hour(), 10);
+        assert_eq!(result.minute(), 30);
+        assert_eq!(result.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_rfc3339_with_offset() {
+        let result = parse_datetime("2024-01-15T10:30:00+05:00").unwrap();
+
+        assert_eq!(result.year(), 2024);
+        assert_eq!(result.month(), time::Month::January);
+        assert_eq!(result.day(), 15);
+    }
+
+    #[test]
+    fn test_parse_datetime_date_only() {
+        let result = parse_datetime("2024-01-15").unwrap();
+
+        assert_eq!(result.year(), 2024);
+        assert_eq!(result.month(), time::Month::January);
+        assert_eq!(result.day(), 15);
+        // Date-only should be start of day in UTC
+        assert_eq!(result.hour(), 0);
+        assert_eq!(result.minute(), 0);
+        assert_eq!(result.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_invalid() {
+        assert!(parse_datetime("invalid").is_err());
+        assert!(parse_datetime("2024/01/15").is_err()); // Wrong separator
+        assert!(parse_datetime("").is_err());
+        assert!(parse_datetime("not-a-date").is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_error_message() {
+        let result = parse_datetime("bad-date");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Invalid date/time format"));
+    }
+
+    #[test]
+    fn test_parse_datetime_edge_dates() {
+        // First day of year
+        let result = parse_datetime("2024-01-01").unwrap();
+        assert_eq!(result.month(), time::Month::January);
+        assert_eq!(result.day(), 1);
+
+        // Last day of year
+        let result = parse_datetime("2024-12-31").unwrap();
+        assert_eq!(result.month(), time::Month::December);
+        assert_eq!(result.day(), 31);
+    }
+}

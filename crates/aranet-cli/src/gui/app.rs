@@ -8,142 +8,137 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aranet_core::messages::{Command, SensorEvent};
-use aranet_core::settings::{DeviceSettings, RadonUnit, TemperatureUnit};
-use aranet_core::{BluetoothRange, DeviceType};
-use eframe::egui::{self, Color32, RichText, UserData, ViewportCommand};
-use egui_plot::{HLine, Line, Plot, PlotPoints};
+use aranet_core::service_client::DeviceCollectionStats;
+use eframe::egui::{self, RichText, UserData, ViewportCommand};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+use crate::config::{Config, GuiConfig};
+
 use super::components;
+use super::export;
+use super::helpers::{SCAN_DURATION, TOAST_DURATION, Toast, ToastType};
 use super::theme::{Theme, ThemeMode};
 use super::tray::{
     TrayCommand, TrayManager, TrayState, check_co2_threshold, hide_dock_icon, show_dock_icon,
 };
 use super::types::{
-    Co2Level, ConnectionState, DeviceState, HistoryFilter, RadiationLevel, RadonLevel, Tab, Trend,
+    ConnectionFilter, ConnectionState, DeviceState, DeviceTypeFilter, HistoryFilter, Tab,
 };
 
-/// Default scan duration.
-const SCAN_DURATION: Duration = Duration::from_secs(5);
-
-/// How long toast notifications are displayed.
-const TOAST_DURATION: Duration = Duration::from_secs(4);
-
-/// Toast notification type.
+/// State of the aranet-service.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Info may be used later
-enum ToastType {
-    Success,
-    Error,
-    Info,
-}
-
-/// A toast notification.
-#[derive(Debug, Clone)]
-struct Toast {
-    message: String,
-    toast_type: ToastType,
-    created_at: Instant,
-}
-
-/// Available measurement intervals in seconds.
-const INTERVAL_OPTIONS: &[(u16, &str)] = &[
-    (60, "1 min"),
-    (120, "2 min"),
-    (300, "5 min"),
-    (600, "10 min"),
-];
-
-/// Convert Celsius to Fahrenheit.
-#[inline]
-fn celsius_to_fahrenheit(celsius: f32) -> f32 {
-    celsius * 9.0 / 5.0 + 32.0
-}
-
-/// Convert Bq/m³ to pCi/L (1 Bq/m³ = 0.027 pCi/L).
-#[inline]
-fn bq_to_pci(bq: u32) -> f32 {
-    bq as f32 * 0.027
-}
-
-/// Format temperature value and unit based on device settings.
-///
-/// Returns (value_string, unit_string) tuple.
-fn format_temperature(celsius: f32, settings: Option<&DeviceSettings>) -> (String, &'static str) {
-    let use_fahrenheit = settings
-        .map(|s| s.temperature_unit == TemperatureUnit::Fahrenheit)
-        .unwrap_or(false);
-
-    if use_fahrenheit {
-        (format!("{:.1}", celsius_to_fahrenheit(celsius)), "F")
-    } else {
-        (format!("{:.1}", celsius), "C")
-    }
-}
-
-/// Format radon value and unit based on device settings.
-///
-/// Returns (value_string, unit_string) tuple.
-fn format_radon(bq: u32, settings: Option<&DeviceSettings>) -> (String, &'static str) {
-    let use_pci = settings
-        .map(|s| s.radon_unit == RadonUnit::PciL)
-        .unwrap_or(false);
-
-    if use_pci {
-        (format!("{:.2}", bq_to_pci(bq)), "pCi/L")
-    } else {
-        (format!("{}", bq), "Bq/m3")
-    }
+pub struct ServiceState {
+    /// Whether the service is reachable.
+    pub reachable: bool,
+    /// Whether the collector is running.
+    pub collector_running: bool,
+    /// Uptime in seconds.
+    pub uptime_seconds: Option<u64>,
+    /// Per-device collection statistics.
+    pub devices: Vec<DeviceCollectionStats>,
+    /// Last status fetch time (for staleness detection).
+    #[allow(dead_code)]
+    pub fetched_at: Instant,
 }
 
 /// Main application state.
 pub struct AranetApp {
     /// Channel to send commands to the worker.
-    command_tx: mpsc::Sender<Command>,
+    pub(crate) command_tx: mpsc::Sender<Command>,
     /// Channel to receive events from the worker (via std mpsc for non-async).
-    event_rx: std_mpsc::Receiver<SensorEvent>,
+    pub(crate) event_rx: std_mpsc::Receiver<SensorEvent>,
     /// List of discovered/connected devices.
-    devices: Vec<DeviceState>,
+    pub(crate) devices: Vec<DeviceState>,
     /// Currently selected device index.
-    selected_device: Option<usize>,
+    pub(crate) selected_device: Option<usize>,
     /// Whether a scan is in progress.
-    scanning: bool,
+    pub(crate) scanning: bool,
     /// Status message.
-    status: String,
+    pub(crate) status: String,
     /// Active tab/view.
-    active_tab: Tab,
+    pub(crate) active_tab: Tab,
     /// History time filter.
-    history_filter: HistoryFilter,
+    pub(crate) history_filter: HistoryFilter,
+    /// Custom date range start (YYYY-MM-DD string for input).
+    pub(crate) custom_date_start: String,
+    /// Custom date range end (YYYY-MM-DD string for input).
+    pub(crate) custom_date_end: String,
+    /// Device type filter for device list.
+    pub(crate) device_type_filter: DeviceTypeFilter,
+    /// Device connection filter for device list.
+    pub(crate) connection_filter: ConnectionFilter,
     /// Whether a settings update is in progress.
-    updating_settings: bool,
+    pub(crate) updating_settings: bool,
     /// When the last auto-refresh was triggered.
-    last_auto_refresh: Option<Instant>,
+    pub(crate) last_auto_refresh: Option<Instant>,
     /// Whether auto-refresh is enabled.
-    auto_refresh_enabled: bool,
+    pub(crate) auto_refresh_enabled: bool,
     /// Current theme mode (dark/light).
-    theme_mode: ThemeMode,
+    pub(crate) theme_mode: ThemeMode,
     /// Current theme colors.
-    theme: Theme,
+    pub(crate) theme: Theme,
     /// Active toast notifications.
-    toasts: Vec<Toast>,
+    pub(crate) toasts: Vec<Toast>,
     /// Shared tray state for system tray integration.
-    tray_state: Arc<Mutex<TrayState>>,
+    pub(crate) tray_state: Arc<Mutex<TrayState>>,
     /// System tray manager (if tray is available).
-    tray_manager: Option<TrayManager>,
+    pub(crate) tray_manager: Option<TrayManager>,
+    /// Native menu bar manager (if available).
+    pub(crate) menu_manager: Option<super::MenuManager>,
     /// Whether the main window is visible (for close-to-tray behavior).
-    window_visible: bool,
+    pub(crate) window_visible: bool,
     /// Whether to minimize to tray instead of quitting when closing window.
-    close_to_tray: bool,
+    pub(crate) close_to_tray: bool,
     /// Whether running in demo mode with mock data.
     #[allow(dead_code)]
-    demo_mode: bool,
+    pub(crate) demo_mode: bool,
     /// Path to save screenshot (if taking screenshot).
-    screenshot_path: Option<std::path::PathBuf>,
+    pub(crate) screenshot_path: Option<std::path::PathBuf>,
     /// Frame counter for screenshot delay.
-    frame_count: u32,
+    pub(crate) frame_count: u32,
     /// Number of frames to wait before taking screenshot.
-    screenshot_delay_frames: u32,
+    pub(crate) screenshot_delay_frames: u32,
+    // -------------------------------------------------------------------------
+    // Service State
+    // -------------------------------------------------------------------------
+    /// Last known service status.
+    pub(crate) service_status: Option<ServiceState>,
+    /// Whether the service status is being refreshed.
+    pub(crate) service_refreshing: bool,
+    // -------------------------------------------------------------------------
+    // Application Settings
+    // -------------------------------------------------------------------------
+    /// GUI-specific configuration (persisted to config file).
+    pub(crate) gui_config: GuiConfig,
+    // -------------------------------------------------------------------------
+    // UI State
+    // -------------------------------------------------------------------------
+    /// Whether the sidebar is collapsed.
+    pub(crate) sidebar_collapsed: bool,
+    /// Last known window size for saving on exit.
+    pub(crate) last_window_size: Option<egui::Vec2>,
+    /// Last known window position for saving on exit.
+    pub(crate) last_window_pos: Option<egui::Pos2>,
+    /// Alias edit state: (device_id, current_text).
+    pub(crate) alias_edit: Option<(String, String)>,
+    // -------------------------------------------------------------------------
+    // Alert History
+    // -------------------------------------------------------------------------
+    /// History of alerts for the current session.
+    pub(crate) alert_history: Vec<super::types::AlertEntry>,
+    /// Maximum number of alerts to keep in history.
+    pub(crate) alert_history_max: usize,
+    /// Whether the alert history popup is visible.
+    pub(crate) alert_history_visible: bool,
+    /// Do Not Disturb mode - temporarily suppresses all notifications (per-session).
+    pub(crate) do_not_disturb: bool,
+    /// Whether to show combined Temperature & Humidity overlay chart.
+    pub(crate) show_temp_humidity_overlay: bool,
+    /// Whether comparison mode is active (side-by-side device readings).
+    pub(crate) comparison_mode: bool,
+    /// Indices of devices selected for comparison.
+    pub(crate) comparison_devices: Vec<usize>,
 }
 
 impl AranetApp {
@@ -154,6 +149,7 @@ impl AranetApp {
         event_rx: std_mpsc::Receiver<SensorEvent>,
         tray_state: Arc<Mutex<TrayState>>,
         tray_manager: Option<TrayManager>,
+        menu_manager: Option<super::MenuManager>,
     ) -> Self {
         Self::new_with_options(
             cc,
@@ -161,6 +157,7 @@ impl AranetApp {
             event_rx,
             tray_state,
             tray_manager,
+            menu_manager,
             false,
             None,
             3,
@@ -175,17 +172,39 @@ impl AranetApp {
         event_rx: std_mpsc::Receiver<SensorEvent>,
         tray_state: Arc<Mutex<TrayState>>,
         tray_manager: Option<TrayManager>,
+        menu_manager: Option<super::MenuManager>,
         demo_mode: bool,
         screenshot_path: Option<std::path::PathBuf>,
         screenshot_delay_frames: u32,
     ) -> Self {
-        // Initialize theme and apply it
-        let theme_mode = ThemeMode::default();
-        let theme = Theme::for_mode(theme_mode);
+        // Load GUI configuration from config file
+        let config = Config::load();
+        let gui_config = config.gui.clone();
+
+        // Initialize theme based on saved preferences (including compact mode)
+        let theme_mode = match gui_config.theme.as_str() {
+            "light" => ThemeMode::Light,
+            "system" => super::theme::detect_system_theme(),
+            _ => ThemeMode::Dark,
+        };
+        let theme = Theme::for_mode_with_options(theme_mode, gui_config.compact_mode);
         cc.egui_ctx.set_style(theme.to_style());
 
-        // Close-to-tray is enabled only when tray is available
-        let close_to_tray = tray_manager.is_some();
+        // Close-to-tray is enabled only when tray is available and config allows it
+        let close_to_tray = tray_manager.is_some() && gui_config.close_to_tray;
+
+        // Sync tray state with config settings
+        if let Ok(mut state) = tray_state.lock() {
+            state.colored_tray_icon = gui_config.colored_tray_icon;
+            state.notifications_enabled = gui_config.notifications_enabled;
+            state.notification_sound = gui_config.notification_sound;
+        }
+
+        // Sync menu state with initial app state
+        if let Some(ref menu) = menu_manager {
+            menu.set_dark_mode(theme_mode == ThemeMode::Dark);
+            menu.set_auto_refresh(!demo_mode);
+        }
 
         // Load demo devices if in demo mode
         let devices = if demo_mode {
@@ -216,36 +235,139 @@ impl AranetApp {
             status,
             active_tab: Tab::Dashboard,
             history_filter: HistoryFilter::All,
+            custom_date_start: String::new(),
+            custom_date_end: String::new(),
+            device_type_filter: DeviceTypeFilter::All,
+            connection_filter: ConnectionFilter::All,
             updating_settings: false,
             last_auto_refresh: None,
             auto_refresh_enabled: !demo_mode, // Disable auto-refresh in demo mode
             theme_mode,
             theme,
             toasts: Vec::new(),
+            // Read initial window visibility from tray state (for start_minimized support)
+            window_visible: tray_state.lock().map(|s| s.window_visible).unwrap_or(true),
             tray_state,
             tray_manager,
-            window_visible: true,
+            menu_manager,
             close_to_tray,
             demo_mode,
             screenshot_path,
             frame_count: 0,
             screenshot_delay_frames,
+            // Service state
+            service_status: None,
+            service_refreshing: false,
+            // Application settings
+            sidebar_collapsed: gui_config.sidebar_collapsed,
+            last_window_size: None,
+            last_window_pos: None,
+            gui_config,
+            // Alias edit state
+            alias_edit: None,
+            // Alert history
+            alert_history: Vec::new(),
+            alert_history_max: 100, // Keep last 100 alerts
+            alert_history_visible: false,
+            // Do Not Disturb mode (off by default)
+            do_not_disturb: false,
+            // Temperature & Humidity overlay chart (off by default)
+            show_temp_humidity_overlay: false,
+            // Comparison mode (off by default)
+            comparison_mode: false,
+            comparison_devices: Vec::new(),
         }
     }
 
+    /// Set the menu manager after app creation.
+    ///
+    /// This is needed because on macOS, the menu must be created AFTER
+    /// eframe has initialized NSApp inside the run_native callback.
+    pub fn set_menu_manager(&mut self, menu_manager: Option<super::MenuManager>) {
+        // Sync menu state with current app state
+        if let Some(ref menu) = menu_manager {
+            // Theme
+            menu.set_theme(&self.gui_config.theme);
+
+            // Auto-refresh
+            menu.set_auto_refresh(self.auto_refresh_enabled);
+
+            // Notifications
+            menu.set_notifications_enabled(self.gui_config.notifications_enabled);
+
+            // Display options (from config)
+            menu.set_display_options(
+                self.gui_config.show_co2,
+                self.gui_config.show_temperature,
+                self.gui_config.show_humidity,
+                self.gui_config.show_pressure,
+            );
+
+            // Export enabled based on whether we have devices with history
+            let has_history = self.devices.iter().any(|d| !d.history.is_empty());
+            menu.set_export_enabled(has_history);
+        }
+        self.menu_manager = menu_manager;
+    }
+
     /// Add a toast notification.
-    fn add_toast(&mut self, message: impl Into<String>, toast_type: ToastType) {
-        self.toasts.push(Toast {
-            message: message.into(),
-            toast_type,
-            created_at: Instant::now(),
-        });
+    pub(crate) fn add_toast(&mut self, message: impl Into<String>, toast_type: ToastType) {
+        self.toasts.push(Toast::new(message, toast_type));
     }
 
     /// Remove expired toasts.
     fn cleanup_toasts(&mut self) {
-        self.toasts
-            .retain(|t| t.created_at.elapsed() < TOAST_DURATION);
+        self.toasts.retain(|t| !t.is_expired());
+    }
+
+    /// Add an alert to the history log.
+    fn log_alert(&mut self, alert: super::types::AlertEntry) {
+        self.alert_history.insert(0, alert); // Add to front (most recent first)
+        // Trim to max size
+        if self.alert_history.len() > self.alert_history_max {
+            self.alert_history.truncate(self.alert_history_max);
+        }
+    }
+
+    /// Check CO2 level and log alert if threshold exceeded.
+    fn check_and_log_co2_alert(&mut self, device_name: &str, co2_ppm: u16) {
+        use super::types::{AlertEntry, Co2Level};
+
+        let level = Co2Level::from_ppm(co2_ppm);
+
+        // Get the last alert level for this specific check to avoid duplicate alerts
+        let last_co2_alert = self.alert_history.iter().find(|a| {
+            a.device_name == device_name && matches!(a.alert_type, super::types::AlertType::Co2)
+        });
+
+        let should_log = match last_co2_alert {
+            None => matches!(level, Co2Level::Poor | Co2Level::Bad),
+            Some(last) => {
+                // Log when transitioning to a worse level
+                let last_level = if last.message.contains("dangerous") {
+                    Co2Level::Bad
+                } else if last.message.contains("poor") {
+                    Co2Level::Poor
+                } else if last.message.contains("moderate") {
+                    Co2Level::Moderate
+                } else {
+                    Co2Level::Good
+                };
+
+                matches!(
+                    (&last_level, &level),
+                    (Co2Level::Good, Co2Level::Poor | Co2Level::Bad)
+                        | (Co2Level::Moderate, Co2Level::Poor | Co2Level::Bad)
+                        | (Co2Level::Poor, Co2Level::Bad)
+                        | (Co2Level::Bad | Co2Level::Poor, Co2Level::Good)
+                )
+            }
+        };
+
+        if should_log {
+            let alert = AlertEntry::co2(device_name, co2_ppm, level);
+            self.log_alert(alert);
+        }
     }
 
     /// Process system tray events and handle commands.
@@ -260,8 +382,10 @@ impl AranetApp {
                 TrayCommand::ShowWindow => {
                     debug!("Tray command: ShowWindow");
                     self.window_visible = true;
-                    show_dock_icon();
+                    // Order matters: make window visible first, then show dock icon
+                    // (which also activates the app), then focus the window
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    show_dock_icon();
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
                 TrayCommand::HideWindow => {
@@ -276,13 +400,35 @@ impl AranetApp {
                         self.window_visible
                     );
                     self.window_visible = !self.window_visible;
-                    ctx.send_viewport_cmd(ViewportCommand::Visible(self.window_visible));
                     if self.window_visible {
+                        // Order matters: make window visible first, then show dock icon
+                        // (which also activates the app), then focus the window
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                         show_dock_icon();
                         ctx.send_viewport_cmd(ViewportCommand::Focus);
                     } else {
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                         hide_dock_icon();
                     }
+                }
+                TrayCommand::Scan => {
+                    debug!("Tray command: Scan");
+                    if !self.scanning {
+                        self.scanning = true;
+                        self.status = "Scanning...".to_string();
+                        self.send_command(Command::Scan {
+                            duration: SCAN_DURATION,
+                        });
+                    }
+                }
+                TrayCommand::RefreshAll => {
+                    debug!("Tray command: RefreshAll");
+                    self.status = "Refreshing all devices...".to_string();
+                    self.send_command(Command::RefreshAll);
+                }
+                TrayCommand::OpenSettings => {
+                    debug!("Tray command: OpenSettings");
+                    self.active_tab = Tab::Settings;
                 }
                 TrayCommand::Quit => {
                     debug!("Tray command: Quit");
@@ -292,10 +438,246 @@ impl AranetApp {
             }
         }
 
-        // Sync window visibility to tray state
+        // Sync window visibility to tray state and update menu item states
         if let Ok(mut state) = self.tray_state.lock() {
             state.window_visible = self.window_visible;
         }
+
+        // Update tray menu item enabled states based on window visibility
+        if let Some(ref tray_manager) = self.tray_manager {
+            tray_manager.update_tooltip();
+        }
+    }
+
+    /// Process native menu bar events and handle commands.
+    fn process_menu_events(&mut self, ctx: &egui::Context) {
+        // Collect commands first to avoid borrow conflicts
+        let commands: Vec<super::MenuCommand> = self
+            .menu_manager
+            .as_ref()
+            .map(|m| m.process_events())
+            .unwrap_or_default();
+
+        if commands.is_empty() {
+            return;
+        }
+
+        for command in commands {
+            match command {
+                // === File menu ===
+                super::MenuCommand::Scan => {
+                    if !self.scanning {
+                        self.scanning = true;
+                        self.status = "Scanning...".to_string();
+                        let _ = self.command_tx.try_send(Command::Scan {
+                            duration: std::time::Duration::from_secs(5),
+                        });
+                    }
+                }
+                super::MenuCommand::RefreshAll => {
+                    self.status = "Refreshing all devices...".to_string();
+                    let _ = self.command_tx.try_send(Command::RefreshAll);
+                }
+                super::MenuCommand::ExportCsv => {
+                    self.export_selected_device_history("csv");
+                }
+                super::MenuCommand::ExportJson => {
+                    self.export_selected_device_history("json");
+                }
+
+                // === View menu - appearance ===
+                super::MenuCommand::ToggleTheme => {
+                    self.theme_mode.toggle();
+                    self.apply_theme_change(ctx);
+                }
+                super::MenuCommand::ThemeSystem => {
+                    // Detect system preference using platform APIs
+                    self.theme_mode = super::theme::detect_system_theme();
+                    self.gui_config.theme = "system".to_string();
+                    self.apply_theme_change(ctx);
+                    self.save_gui_config();
+                }
+                super::MenuCommand::ThemeLight => {
+                    self.theme_mode = ThemeMode::Light;
+                    self.gui_config.theme = "light".to_string();
+                    self.apply_theme_change(ctx);
+                    self.save_gui_config();
+                }
+                super::MenuCommand::ThemeDark => {
+                    self.theme_mode = ThemeMode::Dark;
+                    self.gui_config.theme = "dark".to_string();
+                    self.apply_theme_change(ctx);
+                    self.save_gui_config();
+                }
+
+                // === View menu - auto refresh ===
+                super::MenuCommand::ToggleAutoRefresh => {
+                    self.auto_refresh_enabled = !self.auto_refresh_enabled;
+                    if let Some(ref menu) = self.menu_manager {
+                        menu.set_auto_refresh(self.auto_refresh_enabled);
+                    }
+                }
+                super::MenuCommand::SetRefreshInterval(seconds) => {
+                    // Store in a field if we want to use a custom interval
+                    // For now just update the menu state
+                    if let Some(ref menu) = self.menu_manager {
+                        menu.set_refresh_interval(seconds);
+                    }
+                    debug!("Refresh interval set to {} seconds", seconds);
+                }
+
+                // === View menu - notifications ===
+                super::MenuCommand::ToggleNotifications => {
+                    self.gui_config.notifications_enabled = !self.gui_config.notifications_enabled;
+                    if let Some(ref menu) = self.menu_manager {
+                        menu.set_notifications_enabled(self.gui_config.notifications_enabled);
+                    }
+                    self.save_gui_config();
+                }
+
+                // === View menu - display toggles ===
+                super::MenuCommand::ToggleCo2Display => {
+                    self.gui_config.show_co2 = !self.gui_config.show_co2;
+                    self.sync_display_toggles_to_menu();
+                    self.save_gui_config();
+                }
+                super::MenuCommand::ToggleTemperatureDisplay => {
+                    self.gui_config.show_temperature = !self.gui_config.show_temperature;
+                    self.sync_display_toggles_to_menu();
+                    self.save_gui_config();
+                }
+                super::MenuCommand::ToggleHumidityDisplay => {
+                    self.gui_config.show_humidity = !self.gui_config.show_humidity;
+                    self.sync_display_toggles_to_menu();
+                    self.save_gui_config();
+                }
+                super::MenuCommand::TogglePressureDisplay => {
+                    self.gui_config.show_pressure = !self.gui_config.show_pressure;
+                    self.sync_display_toggles_to_menu();
+                    self.save_gui_config();
+                }
+
+                // === View menu - tabs ===
+                super::MenuCommand::ShowDashboard => {
+                    self.active_tab = Tab::Dashboard;
+                }
+                super::MenuCommand::ShowHistory => {
+                    self.active_tab = Tab::History;
+                }
+                super::MenuCommand::ShowSettings => {
+                    self.active_tab = Tab::Settings;
+                }
+                super::MenuCommand::ShowService => {
+                    self.active_tab = Tab::Service;
+                }
+
+                // === Device menu ===
+                super::MenuCommand::ConnectDevice(idx) => {
+                    if let Some(device) = self.devices.get(idx) {
+                        let _ = self.command_tx.try_send(Command::Connect {
+                            device_id: device.id.clone(),
+                        });
+                    }
+                }
+                super::MenuCommand::DisconnectDevice(idx) => {
+                    if let Some(device) = self.devices.get(idx) {
+                        let _ = self.command_tx.try_send(Command::Disconnect {
+                            device_id: device.id.clone(),
+                        });
+                    }
+                }
+                super::MenuCommand::ManageAliases => {
+                    // Switch to settings tab where aliases can be managed
+                    self.active_tab = Tab::Settings;
+                    self.add_toast(
+                        "Manage device aliases in Settings".to_string(),
+                        ToastType::Info,
+                    );
+                }
+                super::MenuCommand::ForgetDevice(idx) => {
+                    if let Some(device) = self.devices.get(idx) {
+                        let _ = self.command_tx.try_send(Command::ForgetDevice {
+                            device_id: device.id.clone(),
+                        });
+                    }
+                }
+
+                // === Help menu ===
+                super::MenuCommand::OpenDocumentation => {
+                    if let Err(e) = open::that("https://aranet.dev/docs") {
+                        debug!("Failed to open documentation: {}", e);
+                    }
+                }
+                super::MenuCommand::ReportIssue => {
+                    if let Err(e) = open::that("https://github.com/cameronrye/aranet/issues/new") {
+                        debug!("Failed to open issues page: {}", e);
+                    }
+                }
+                super::MenuCommand::CheckForUpdates => {
+                    // Open releases page for now
+                    if let Err(e) = open::that("https://github.com/cameronrye/aranet/releases") {
+                        debug!("Failed to open releases page: {}", e);
+                    }
+                }
+                super::MenuCommand::ShowAbout => {
+                    // Show about info via toast for now
+                    self.add_toast(
+                        format!("Aranet v{}", env!("CARGO_PKG_VERSION")),
+                        ToastType::Info,
+                    );
+                }
+
+                super::MenuCommand::Quit => {
+                    show_dock_icon(); // Restore dock icon before quitting
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Apply theme changes to the UI and sync with menu.
+    fn apply_theme_change(&mut self, ctx: &egui::Context) {
+        self.theme = Theme::for_mode_with_options(self.theme_mode, self.gui_config.compact_mode);
+        ctx.set_style(self.theme.to_style());
+        if let Some(ref menu) = self.menu_manager {
+            menu.set_dark_mode(self.theme_mode == ThemeMode::Dark);
+        }
+    }
+
+    /// Sync display toggle settings to the menu.
+    fn sync_display_toggles_to_menu(&self) {
+        if let Some(ref menu) = self.menu_manager {
+            menu.set_display_options(
+                self.gui_config.show_co2,
+                self.gui_config.show_temperature,
+                self.gui_config.show_humidity,
+                self.gui_config.show_pressure,
+            );
+        }
+    }
+
+    /// Export history for the currently selected device.
+    fn export_selected_device_history(&mut self, format: &str) {
+        let Some(idx) = self.selected_device else {
+            self.add_toast("No device selected".to_string(), ToastType::Error);
+            return;
+        };
+
+        let Some(device) = self.devices.get(idx) else {
+            return;
+        };
+
+        if device.history.is_empty() {
+            self.add_toast("No history to export".to_string(), ToastType::Error);
+            return;
+        }
+
+        // Clone the data we need to avoid borrow issues
+        let records: Vec<aranet_types::HistoryRecord> = device.history.clone();
+        let device_name = device.display_name().to_string();
+
+        let records_refs: Vec<&aranet_types::HistoryRecord> = records.iter().collect();
+        self.export_history(&records_refs, &device_name, format);
     }
 
     /// Update tray state with current sensor readings.
@@ -321,7 +703,7 @@ impl AranetApp {
     }
 
     /// Send a command to the worker.
-    fn send_command(&self, cmd: Command) {
+    pub(crate) fn send_command(&self, cmd: Command) {
         let _ = self.command_tx.try_send(cmd);
     }
 
@@ -382,6 +764,10 @@ impl AranetApp {
                     if !self.devices.iter().any(|d| d.id == discovered.identifier) {
                         self.devices.push(DeviceState::from_discovered(&discovered));
                     }
+                }
+                // Auto-select first device if none selected
+                if self.selected_device.is_none() && !self.devices.is_empty() {
+                    self.selected_device = Some(0);
                 }
             }
             SensorEvent::ScanError { error } => {
@@ -445,6 +831,12 @@ impl AranetApp {
 
                 // Update tray state with new reading
                 self.update_tray_state(&device_name, co2_ppm);
+
+                // Log alert if CO2 threshold exceeded
+                if let Some(co2) = co2_ppm {
+                    self.check_and_log_co2_alert(&device_name, co2);
+                }
+
                 self.status = "Reading updated".to_string();
             }
             SensorEvent::ReadingError { device_id, error } => {
@@ -468,6 +860,7 @@ impl AranetApp {
             SensorEvent::HistorySynced { device_id, count } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.syncing_history = false;
+                    device.last_sync = Some(time::OffsetDateTime::now_utc());
                 }
                 self.status = format!("Synced {} history records", count);
             }
@@ -543,6 +936,25 @@ impl AranetApp {
                     ToastType::Error,
                 );
             }
+            SensorEvent::AliasChanged { device_id, alias } => {
+                self.updating_settings = false;
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.name = alias.clone();
+                }
+                let msg = if alias.is_some() {
+                    "Device renamed"
+                } else {
+                    "Device name cleared"
+                };
+                self.add_toast(msg.to_string(), ToastType::Success);
+            }
+            SensorEvent::AliasError {
+                device_id: _,
+                error,
+            } => {
+                self.updating_settings = false;
+                self.add_toast(format!("Failed to rename: {}", error), ToastType::Error);
+            }
             SensorEvent::CachedDataLoaded { devices } => {
                 for cached in devices {
                     if !self.devices.iter().any(|d| d.id == cached.id) {
@@ -551,7 +963,97 @@ impl AranetApp {
                 }
                 if !self.devices.is_empty() {
                     self.status = format!("Loaded {} cached device(s)", self.devices.len());
+                    // Auto-select first device if none selected
+                    if self.selected_device.is_none() {
+                        self.selected_device = Some(0);
+                    }
                 }
+            }
+            // Service events
+            SensorEvent::ServiceStatusRefreshed {
+                reachable,
+                collector_running,
+                uptime_seconds,
+                devices,
+            } => {
+                self.service_refreshing = false;
+                self.service_status = Some(ServiceState {
+                    reachable,
+                    collector_running,
+                    uptime_seconds,
+                    devices: devices
+                        .into_iter()
+                        .map(|d| DeviceCollectionStats {
+                            device_id: d.device_id,
+                            alias: d.alias,
+                            poll_interval: d.poll_interval,
+                            last_poll_at: d.last_poll_at,
+                            last_error_at: None,
+                            last_error: d.last_error,
+                            success_count: d.success_count,
+                            failure_count: d.failure_count,
+                            polling: d.polling,
+                        })
+                        .collect(),
+                    fetched_at: Instant::now(),
+                });
+                if reachable {
+                    self.status = if collector_running {
+                        "Service running".to_string()
+                    } else {
+                        "Service stopped".to_string()
+                    };
+                } else {
+                    self.status = "Service not reachable".to_string();
+                }
+            }
+            SensorEvent::ServiceStatusError { error } => {
+                self.service_refreshing = false;
+                self.add_toast(format!("Service error: {}", error), ToastType::Error);
+            }
+            SensorEvent::ServiceCollectorStarted => {
+                self.add_toast("Collector started", ToastType::Success);
+            }
+            SensorEvent::ServiceCollectorStopped => {
+                self.add_toast("Collector stopped", ToastType::Success);
+            }
+            SensorEvent::ServiceCollectorError { error } => {
+                self.add_toast(format!("Collector error: {}", error), ToastType::Error);
+            }
+            SensorEvent::DeviceForgotten { device_id } => {
+                // Remove device from list
+                if let Some(pos) = self.devices.iter().position(|d| d.id == device_id) {
+                    let name = self.devices[pos].display_name().to_string();
+                    self.devices.remove(pos);
+
+                    // Adjust selected device if needed
+                    if let Some(selected) = self.selected_device {
+                        if selected == pos {
+                            // Selected device was removed, clear selection
+                            self.selected_device = None;
+                        } else if selected > pos {
+                            // Adjust index for removed device
+                            self.selected_device = Some(selected - 1);
+                        }
+                    }
+
+                    // Remove from comparison if present
+                    self.comparison_devices.retain(|&i| i != pos);
+                    // Adjust comparison indices for removed device
+                    for idx in &mut self.comparison_devices {
+                        if *idx > pos {
+                            *idx -= 1;
+                        }
+                    }
+
+                    self.add_toast(format!("Forgot device: {}", name), ToastType::Success);
+                }
+            }
+            SensorEvent::ForgetDeviceError { device_id, error } => {
+                self.add_toast(
+                    format!("Failed to forget device {}: {}", device_id, error),
+                    ToastType::Error,
+                );
             }
         }
     }
@@ -559,10 +1061,25 @@ impl AranetApp {
 
 impl eframe::App for AranetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Request repaint at the start to ensure the event loop keeps running
+        // even when the window is hidden (important for tray icon events on macOS)
+        ctx.request_repaint_after(Duration::from_millis(100));
+
+        // Track window size and position for saving on exit
+        ctx.input(|i| {
+            if let Some(rect) = i.viewport().inner_rect {
+                self.last_window_size = Some(rect.size());
+            }
+            if let Some(pos) = i.viewport().outer_rect {
+                self.last_window_pos = Some(pos.min);
+            }
+        });
+
         self.process_events();
         self.check_auto_refresh();
         self.cleanup_toasts();
         self.process_tray_events(ctx);
+        self.process_menu_events(ctx);
 
         // Handle screenshot capture in demo mode
         if self.screenshot_path.is_some() {
@@ -619,12 +1136,19 @@ impl eframe::App for AranetApp {
 
         // Handle keyboard shortcuts
         let mut toggle_theme = false;
+        let mut toggle_sidebar = false;
+        let mut sync_history = false;
+        let mut export_history_csv = false;
+        let mut navigate_device: Option<i32> = None;
+        let mut close_dialogs = false;
         ctx.input(|i| {
+            // F5: Scan for devices
             if i.key_pressed(egui::Key::F5) && !self.scanning {
                 self.send_command(Command::Scan {
                     duration: SCAN_DURATION,
                 });
             }
+            // Cmd+R: Refresh all connected devices
             if i.modifiers.command && i.key_pressed(egui::Key::R) {
                 for device in &self.devices {
                     if matches!(device.connection, ConnectionState::Connected) {
@@ -634,6 +1158,19 @@ impl eframe::App for AranetApp {
                     }
                 }
             }
+            // Cmd+S: Sync history for selected device
+            if i.modifiers.command && i.key_pressed(egui::Key::S) {
+                sync_history = true;
+            }
+            // Cmd+E: Export history to CSV (when on History tab)
+            if i.modifiers.command && i.key_pressed(egui::Key::E) {
+                export_history_csv = true;
+            }
+            // Cmd+,: Open settings tab
+            if i.modifiers.command && i.key_pressed(egui::Key::Comma) {
+                self.active_tab = Tab::Settings;
+            }
+            // 1/2/3/4: Switch tabs
             if i.key_pressed(egui::Key::Num1) {
                 self.active_tab = Tab::Dashboard;
             }
@@ -643,20 +1180,134 @@ impl eframe::App for AranetApp {
             if i.key_pressed(egui::Key::Num3) {
                 self.active_tab = Tab::Settings;
             }
+            if i.key_pressed(egui::Key::Num4) {
+                self.active_tab = Tab::Service;
+            }
+            // T: Toggle theme (when not in text input)
             if i.key_pressed(egui::Key::T) && !i.modifiers.command && !i.modifiers.ctrl {
                 toggle_theme = true;
             }
+            // A: Toggle auto-refresh
             if i.key_pressed(egui::Key::A) && !i.modifiers.command && !i.modifiers.ctrl {
                 self.auto_refresh_enabled = !self.auto_refresh_enabled;
             }
+            // [: Toggle sidebar
+            if i.key_pressed(egui::Key::OpenBracket) && !i.modifiers.command && !i.modifiers.ctrl {
+                toggle_sidebar = true;
+            }
+            // Up/Down: Navigate device list (with Cmd modifier to avoid text conflicts)
+            if i.modifiers.command && i.key_pressed(egui::Key::ArrowUp) {
+                navigate_device = Some(-1);
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::ArrowDown) {
+                navigate_device = Some(1);
+            }
+            // Escape: Close dialogs/popups and cancel editing
+            if i.key_pressed(egui::Key::Escape) {
+                close_dialogs = true;
+            }
         });
+
+        // Apply deferred actions
         if toggle_theme {
             self.theme_mode.toggle();
-            self.theme = Theme::for_mode(self.theme_mode);
+            self.theme =
+                Theme::for_mode_with_options(self.theme_mode, self.gui_config.compact_mode);
             ctx.set_style(self.theme.to_style());
         }
+        if toggle_sidebar {
+            self.sidebar_collapsed = !self.sidebar_collapsed;
+            self.gui_config.sidebar_collapsed = self.sidebar_collapsed;
+            self.save_gui_config();
+        }
+        // Handle Escape: close dialogs/popups and cancel editing
+        if close_dialogs {
+            // Close alert history popup if visible
+            if self.alert_history_visible {
+                self.alert_history_visible = false;
+            }
+            // Cancel alias editing if in progress
+            if self.alias_edit.is_some() {
+                self.alias_edit = None;
+            }
+        }
+        if sync_history
+            && let Some(idx) = self.selected_device
+            && let Some(device) = self.devices.get(idx)
+            && matches!(device.connection, ConnectionState::Connected)
+        {
+            self.send_command(Command::SyncHistory {
+                device_id: device.id.clone(),
+            });
+            self.add_toast(
+                format!("Syncing history for {}", device.display_name()),
+                ToastType::Info,
+            );
+        }
+        // Handle Cmd+E export (only when on History tab with selected device)
+        if export_history_csv
+            && self.active_tab == Tab::History
+            && let Some(idx) = self.selected_device
+        {
+            // Parse custom date range if needed
+            let (custom_start, custom_end) = if self.history_filter == HistoryFilter::Custom {
+                let parse_date = |s: &str| -> Option<time::OffsetDateTime> {
+                    let parts: Vec<&str> = s.trim().split('-').collect();
+                    if parts.len() != 3 {
+                        return None;
+                    }
+                    let year: i32 = parts[0].parse().ok()?;
+                    let month: u8 = parts[1].parse().ok()?;
+                    let day: u8 = parts[2].parse().ok()?;
+                    let month = time::Month::try_from(month).ok()?;
+                    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+                    Some(date.with_hms(0, 0, 0).ok()?.assume_utc())
+                };
+                let start = parse_date(&self.custom_date_start);
+                let end = parse_date(&self.custom_date_end)
+                    .map(|d| d + time::Duration::days(1) - time::Duration::seconds(1));
+                (start, end)
+            } else {
+                (None, None)
+            };
 
-        ctx.request_repaint_after(Duration::from_millis(100));
+            // Clone necessary data to avoid borrow checker issues
+            let export_data = self.devices.get(idx).and_then(|device| {
+                if device.history.is_empty() {
+                    return None;
+                }
+                let now = time::OffsetDateTime::now_utc();
+                let filtered: Vec<_> = device
+                    .history
+                    .iter()
+                    .filter(|r| match self.history_filter {
+                        HistoryFilter::All => true,
+                        HistoryFilter::Last24Hours => {
+                            (now - r.timestamp) < time::Duration::hours(24)
+                        }
+                        HistoryFilter::Last7Days => (now - r.timestamp) < time::Duration::days(7),
+                        HistoryFilter::Last30Days => (now - r.timestamp) < time::Duration::days(30),
+                        HistoryFilter::Custom => {
+                            let after_start = custom_start.is_none_or(|s| r.timestamp >= s);
+                            let before_end = custom_end.is_none_or(|e| r.timestamp <= e);
+                            after_start && before_end
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                Some((filtered, device.display_name().to_string()))
+            });
+            if let Some((filtered, name)) = export_data {
+                self.export_history(&filtered.iter().collect::<Vec<_>>(), &name, "csv");
+            }
+        }
+        if let Some(delta) = navigate_device
+            && !self.devices.is_empty()
+        {
+            let current = self.selected_device.unwrap_or(0) as i32;
+            let new_idx = (current + delta).clamp(0, self.devices.len() as i32 - 1) as usize;
+            self.selected_device = Some(new_idx);
+        }
 
         // Render toast notifications
         if !self.toasts.is_empty() {
@@ -665,10 +1316,15 @@ impl eframe::App for AranetApp {
                 .show(ctx, |ui| {
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                         for toast in &self.toasts {
-                            let (bg_color, icon) = match toast.toast_type {
-                                ToastType::Success => (self.theme.success, "[OK]"),
-                                ToastType::Error => (self.theme.danger, "[!]"),
-                                ToastType::Info => (self.theme.info, "[i]"),
+                            let (is_success, is_error) = match toast.toast_type {
+                                ToastType::Success => (true, false),
+                                ToastType::Error => (false, true),
+                                ToastType::Info => (false, false),
+                            };
+                            let icon = match toast.toast_type {
+                                ToastType::Success => "[OK]",
+                                ToastType::Error => "[!]",
+                                ToastType::Info => "[i]",
                             };
                             let elapsed = toast.created_at.elapsed().as_secs_f32();
                             let fade_start = TOAST_DURATION.as_secs_f32() - 0.5;
@@ -678,28 +1334,31 @@ impl eframe::App for AranetApp {
                                 1.0
                             };
 
-                            let toast_text_color = self.theme.text_on_accent.gamma_multiply(alpha);
+                            let bg_color = self.theme.toast_bg(is_success, is_error);
+                            let text_color = self
+                                .theme
+                                .toast_text(is_success, is_error)
+                                .gamma_multiply(alpha);
+                            let shadow = self.theme.toast_shadow();
+                            let shadow_with_alpha = egui::Shadow {
+                                color: shadow.color.gamma_multiply(alpha),
+                                ..shadow
+                            };
+
                             egui::Frame::new()
-                                .fill(bg_color.gamma_multiply(0.95 * alpha))
+                                .fill(bg_color.gamma_multiply(alpha))
                                 .inner_margin(egui::Margin::symmetric(12, 8))
-                                .corner_radius(egui::CornerRadius::same(6))
-                                .shadow(egui::Shadow {
-                                    offset: [0, 2],
-                                    blur: 8,
-                                    spread: 0,
-                                    color: Color32::from_black_alpha((40.0 * alpha) as u8),
-                                })
+                                .corner_radius(egui::CornerRadius::same(
+                                    self.theme.rounding.md as u8,
+                                ))
+                                .shadow(shadow_with_alpha)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(icon).color(toast_text_color).strong(),
-                                        );
-                                        ui.label(
-                                            RichText::new(&toast.message).color(toast_text_color),
-                                        );
+                                        ui.label(RichText::new(icon).color(text_color).strong());
+                                        ui.label(RichText::new(&toast.message).color(text_color));
                                     });
                                 });
-                            ui.add_space(4.0);
+                            ui.add_space(self.theme.spacing.xs);
                         }
                     });
                 });
@@ -735,6 +1394,7 @@ impl eframe::App for AranetApp {
                         (Tab::Dashboard, "Dashboard", "1"),
                         (Tab::History, "History", "2"),
                         (Tab::Settings, "Settings", "3"),
+                        (Tab::Service, "Service", "4"),
                     ] {
                         let is_selected = self.active_tab == tab;
                         let text_color = if is_selected {
@@ -785,7 +1445,10 @@ impl eframe::App for AranetApp {
                             .clicked()
                         {
                             self.theme_mode.toggle();
-                            self.theme = Theme::for_mode(self.theme_mode);
+                            self.theme = Theme::for_mode_with_options(
+                                self.theme_mode,
+                                self.gui_config.compact_mode,
+                            );
                             ctx.set_style(self.theme.to_style());
                         }
 
@@ -817,12 +1480,13 @@ impl eframe::App for AranetApp {
 
                         // Scan button
                         ui.add_enabled_ui(!self.scanning, |ui| {
+                            let btn_style = self.theme.button_primary();
                             let scan_btn = egui::Button::new(
                                 RichText::new("Scan")
                                     .size(self.theme.typography.body)
-                                    .color(self.theme.text_on_accent),
+                                    .color(btn_style.text),
                             )
-                            .fill(self.theme.accent);
+                            .fill(btn_style.fill);
                             if ui.add(scan_btn).on_hover_text("F5").clicked() {
                                 self.send_command(Command::Scan {
                                     duration: SCAN_DURATION,
@@ -871,6 +1535,94 @@ impl eframe::App for AranetApp {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Alert history button
+                        let alert_count = self.alert_history.len();
+                        let has_recent_alerts = self.alert_history.iter().any(|a| {
+                            a.timestamp.elapsed() < Duration::from_secs(300) // 5 minutes
+                                && matches!(
+                                    a.severity,
+                                    super::types::AlertSeverity::Warning
+                                        | super::types::AlertSeverity::Critical
+                                )
+                        });
+
+                        let alert_color = if has_recent_alerts {
+                            self.theme.warning
+                        } else {
+                            self.theme.text_muted
+                        };
+
+                        let alert_text = if alert_count > 0 {
+                            format!("Alerts ({})", alert_count)
+                        } else {
+                            "Alerts".to_string()
+                        };
+
+                        let ghost_style = self.theme.button_ghost();
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(alert_text)
+                                        .size(self.theme.typography.caption)
+                                        .color(alert_color),
+                                )
+                                .fill(ghost_style.fill),
+                            )
+                            .on_hover_text("View alert history")
+                            .clicked()
+                        {
+                            self.alert_history_visible = !self.alert_history_visible;
+                        }
+
+                        ui.add_space(self.theme.spacing.sm);
+
+                        // Comparison mode button (only show if we have multiple connected devices)
+                        let connected_count = self
+                            .devices
+                            .iter()
+                            .filter(|d| matches!(d.connection, ConnectionState::Connected))
+                            .count();
+
+                        if connected_count >= 2 {
+                            let compare_text = if self.comparison_mode {
+                                format!("Compare ({})", self.comparison_devices.len())
+                            } else {
+                                "Compare".to_string()
+                            };
+                            let btn_style = if self.comparison_mode {
+                                self.theme.button_primary()
+                            } else {
+                                self.theme.button_ghost()
+                            };
+                            let text_color = if self.comparison_mode {
+                                btn_style.text
+                            } else {
+                                self.theme.text_muted
+                            };
+
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(compare_text)
+                                            .size(self.theme.typography.caption)
+                                            .color(text_color),
+                                    )
+                                    .fill(btn_style.fill),
+                                )
+                                .on_hover_text(
+                                    "Compare readings from multiple devices side-by-side",
+                                )
+                                .clicked()
+                            {
+                                self.comparison_mode = !self.comparison_mode;
+                                if !self.comparison_mode {
+                                    self.comparison_devices.clear();
+                                }
+                            }
+                        }
+
+                        ui.add_space(self.theme.spacing.md);
+
                         ui.label(
                             RichText::new("F5: Scan | Cmd+R: Refresh | T: Theme | A: Auto")
                                 .color(self.theme.text_muted)
@@ -879,6 +1631,11 @@ impl eframe::App for AranetApp {
                     });
                 });
             });
+
+        // Alert history popup
+        if self.alert_history_visible {
+            self.render_alert_history_popup(ctx);
+        }
 
         // Left panel with device list
         self.render_device_list(ctx);
@@ -891,6 +1648,29 @@ impl eframe::App for AranetApp {
                     .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8)),
             )
             .show(ctx, |ui| {
+                // Service tab is independent of device selection
+                if self.active_tab == Tab::Service {
+                    self.render_service_panel(ui);
+                    return;
+                }
+
+                // Comparison mode with devices selected
+                if self.comparison_mode && self.comparison_devices.len() >= 2 {
+                    self.render_comparison_panel(ui);
+                    return;
+                }
+
+                // Comparison mode prompt (no devices selected yet)
+                if self.comparison_mode {
+                    components::empty_state(
+                        ui,
+                        &self.theme,
+                        "Select Devices to Compare",
+                        "Click on 2+ devices in the sidebar to compare them side-by-side",
+                    );
+                    return;
+                }
+
                 if let Some(idx) = self.selected_device {
                     let device = self.devices.get(idx).cloned();
                     if let Some(device) = device {
@@ -898,6 +1678,7 @@ impl eframe::App for AranetApp {
                             Tab::Dashboard => self.render_device_panel(ui, &device, idx),
                             Tab::History => self.render_history_panel(ui, &device),
                             Tab::Settings => self.render_settings_panel(ui, &device),
+                            Tab::Service => {} // Handled above
                         }
                     }
                 } else {
@@ -914,1408 +1695,67 @@ impl eframe::App for AranetApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         info!("Sending shutdown command");
         let _ = self.command_tx.try_send(Command::Shutdown);
+
+        // Save window size and position
+        let mut config_changed = false;
+        if let Some(size) = self.last_window_size
+            && size.x > 100.0
+            && size.y > 100.0
+        {
+            self.gui_config.window_width = Some(size.x);
+            self.gui_config.window_height = Some(size.y);
+            config_changed = true;
+        }
+        if let Some(pos) = self.last_window_pos {
+            // Only save reasonable positions (not off-screen)
+            if pos.x >= -1000.0 && pos.y >= -1000.0 && pos.x < 10000.0 && pos.y < 10000.0 {
+                self.gui_config.window_x = Some(pos.x);
+                self.gui_config.window_y = Some(pos.y);
+                config_changed = true;
+            }
+        }
+        if config_changed {
+            debug!(
+                "Saving window geometry: size={:?}, pos={:?}",
+                self.last_window_size, self.last_window_pos
+            );
+            self.save_gui_config();
+        }
     }
 }
 
 impl AranetApp {
-    /// Render the device list side panel.
-    fn render_device_list(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("devices")
-            .min_width(240.0)
-            .max_width(280.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(self.theme.bg_secondary)
-                    .inner_margin(egui::Margin::same(self.theme.spacing.md as i8))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle)),
-            )
-            .show(ctx, |ui| {
-                // Header
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Devices")
-                            .size(self.theme.typography.subheading)
-                            .strong()
-                            .color(self.theme.text_primary),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("{}", self.devices.len()))
-                                .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
-                        );
-                    });
-                });
-                ui.add_space(self.theme.spacing.sm);
-                ui.separator();
-                ui.add_space(self.theme.spacing.sm);
-
-                if self.devices.is_empty() {
-                    components::empty_state(
-                        ui,
-                        &self.theme,
-                        "No Devices",
-                        "Click 'Scan' to discover nearby devices",
-                    );
-                } else {
-                    let mut device_indices: Vec<usize> = (0..self.devices.len()).collect();
-                    device_indices.sort_by(|&a, &b| {
-                        let dev_a = &self.devices[a];
-                        let dev_b = &self.devices[b];
-                        let conn_a = matches!(dev_a.connection, ConnectionState::Connected);
-                        let conn_b = matches!(dev_b.connection, ConnectionState::Connected);
-                        conn_b
-                            .cmp(&conn_a)
-                            .then_with(|| dev_a.display_name().cmp(dev_b.display_name()))
-                    });
-
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let mut new_selection = self.selected_device;
-                        for i in device_indices {
-                            let device = &self.devices[i];
-                            let selected = self.selected_device == Some(i);
-                            let (frame_fill, border_color) = if selected {
-                                (self.theme.tint_bg(self.theme.accent, 20), self.theme.accent)
-                            } else {
-                                (Color32::TRANSPARENT, self.theme.border_subtle)
-                            };
-
-                            let response = egui::Frame::new()
-                                .fill(frame_fill)
-                                .inner_margin(egui::Margin::same(self.theme.spacing.md as i8))
-                                .corner_radius(egui::CornerRadius::same(
-                                    self.theme.rounding.md as u8,
-                                ))
-                                .stroke(egui::Stroke::new(1.0, border_color))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    ui.vertical(|ui| {
-                                        // Device name row
-                                        ui.horizontal(|ui| {
-                                            let (dot_color, status_tip) = match &device.connection {
-                                                ConnectionState::Disconnected => {
-                                                    (self.theme.text_muted, "Disconnected")
-                                                }
-                                                ConnectionState::Connecting => {
-                                                    (self.theme.warning, "Connecting...")
-                                                }
-                                                ConnectionState::Connected => {
-                                                    (self.theme.success, "Connected")
-                                                }
-                                                ConnectionState::Error(_) => {
-                                                    (self.theme.danger, "Connection error")
-                                                }
-                                            };
-                                            components::status_dot(ui, dot_color, status_tip);
-                                            ui.add_space(self.theme.spacing.sm);
-
-                                            let name_color = if selected {
-                                                self.theme.accent
-                                            } else {
-                                                self.theme.text_primary
-                                            };
-                                            ui.label(
-                                                RichText::new(device.display_name())
-                                                    .color(name_color)
-                                                    .size(self.theme.typography.body)
-                                                    .strong(),
-                                            );
-                                        });
-
-                                        // Device info row
-                                        ui.add_space(self.theme.spacing.xs);
-                                        ui.horizontal(|ui| {
-                                            if let Some(device_type) = device.device_type {
-                                                let type_label = match device_type {
-                                                    DeviceType::Aranet4 => "CO2",
-                                                    DeviceType::Aranet2 => "T/H",
-                                                    DeviceType::AranetRadon => "Rn",
-                                                    DeviceType::AranetRadiation => "Rad",
-                                                    _ => "?",
-                                                };
-                                                components::status_badge(
-                                                    ui,
-                                                    &self.theme,
-                                                    type_label,
-                                                    self.theme.info,
-                                                );
-                                                ui.add_space(self.theme.spacing.xs);
-                                            }
-
-                                            // Show primary sensor reading based on device type
-                                            if let Some(ref reading) = device.reading {
-                                                if reading.co2 > 0 {
-                                                    // Aranet4: Show CO2
-                                                    let color = self.theme.co2_color(reading.co2);
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "{} ppm",
-                                                            reading.co2
-                                                        ))
-                                                        .size(self.theme.typography.caption)
-                                                        .color(color),
-                                                    )
-                                                    .on_hover_text("CO2 level");
-                                                } else if let Some(radon) = reading.radon {
-                                                    // AranetRadon: Show radon
-                                                    let (value, unit) = format_radon(
-                                                        radon,
-                                                        device.settings.as_ref(),
-                                                    );
-                                                    let color = self.theme.radon_color(radon);
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "{} {}",
-                                                            value, unit
-                                                        ))
-                                                        .size(self.theme.typography.caption)
-                                                        .color(color),
-                                                    )
-                                                    .on_hover_text("Radon level");
-                                                } else if let Some(rate) = reading.radiation_rate {
-                                                    // AranetRadiation: Show radiation rate
-                                                    let color = self.theme.radiation_color(rate);
-                                                    ui.label(
-                                                        RichText::new(format!("{:.2} uSv/h", rate))
-                                                            .size(self.theme.typography.caption)
-                                                            .color(color),
-                                                    )
-                                                    .on_hover_text("Radiation rate");
-                                                } else {
-                                                    // Aranet2 or unknown: Show temperature
-                                                    let (temp_val, temp_unit) = format_temperature(
-                                                        reading.temperature,
-                                                        device.settings.as_ref(),
-                                                    );
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "{:.1}{}",
-                                                            temp_val, temp_unit
-                                                        ))
-                                                        .size(self.theme.typography.caption)
-                                                        .color(self.theme.text_secondary),
-                                                    )
-                                                    .on_hover_text("Temperature");
-                                                }
-                                            }
-
-                                            if let Some(rssi) = device.rssi {
-                                                let signal_color = if rssi > -60 {
-                                                    self.theme.success
-                                                } else if rssi > -75 {
-                                                    self.theme.warning
-                                                } else {
-                                                    self.theme.danger
-                                                };
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        ui.label(
-                                                            RichText::new(format!("{}dB", rssi))
-                                                                .size(self.theme.typography.caption)
-                                                                .color(signal_color),
-                                                        )
-                                                        .on_hover_text("Signal strength");
-                                                    },
-                                                );
-                                            }
-                                        });
-                                    });
-                                })
-                                .response;
-
-                            if response.interact(egui::Sense::click()).clicked() {
-                                new_selection = Some(i);
-                            }
-
-                            ui.add_space(self.theme.spacing.xs);
-                        }
-                        self.selected_device = new_selection;
-                    });
-                }
-            });
-    }
-
-    /// Render the device detail panel.
-    fn render_device_panel(&self, ui: &mut egui::Ui, device: &DeviceState, idx: usize) {
-        // Device header
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(device.display_name())
-                        .size(self.theme.typography.heading)
-                        .strong()
-                        .color(self.theme.text_primary),
-                );
-                ui.horizontal(|ui| {
-                    if let Some(device_type) = device.device_type {
-                        components::status_badge(
-                            ui,
-                            &self.theme,
-                            &format!("{:?}", device_type),
-                            self.theme.info,
-                        );
-                    }
-                    if let Some(rssi) = device.rssi {
-                        let signal_color = if rssi > -60 {
-                            self.theme.success
-                        } else if rssi > -75 {
-                            self.theme.warning
-                        } else {
-                            self.theme.danger
-                        };
-                        ui.add_space(self.theme.spacing.sm);
-                        ui.label(
-                            RichText::new(format!("{} dBm", rssi))
-                                .size(self.theme.typography.caption)
-                                .color(signal_color),
-                        );
-                    }
-                });
-            });
-
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::TOP),
-                |ui| match &device.connection {
-                    ConnectionState::Disconnected | ConnectionState::Error(_) => {
-                        let btn = egui::Button::new(
-                            RichText::new("Connect")
-                                .size(self.theme.typography.body)
-                                .color(self.theme.text_on_accent),
-                        )
-                        .fill(self.theme.accent);
-                        if ui.add(btn).clicked() {
-                            self.send_command(Command::Connect {
-                                device_id: device.id.clone(),
-                            });
-                        }
-                    }
-                    ConnectionState::Connecting => {
-                        components::loading_indicator(ui, &self.theme, Some("Connecting..."));
-                    }
-                    ConnectionState::Connected => {
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("Refresh").size(self.theme.typography.body),
-                            ))
-                            .on_hover_text("Cmd+R")
-                            .clicked()
-                        {
-                            self.send_command(Command::RefreshReading {
-                                device_id: device.id.clone(),
-                            });
-                        }
-                        ui.add_space(self.theme.spacing.sm);
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("Disconnect")
-                                    .size(self.theme.typography.body)
-                                    .color(self.theme.danger),
-                            ))
-                            .clicked()
-                        {
-                            self.send_command(Command::Disconnect {
-                                device_id: device.id.clone(),
-                            });
-                        }
-                    }
-                },
-            );
-        });
-
-        ui.add_space(self.theme.spacing.lg);
-        ui.separator();
-        ui.add_space(self.theme.spacing.lg);
-
-        // Readings content
-        if device.reading.is_some() {
-            self.render_readings(ui, device);
-        } else if device.connection == ConnectionState::Connected {
-            components::loading_indicator(ui, &self.theme, Some("Waiting for readings..."));
-        } else {
-            components::empty_state(
-                ui,
-                &self.theme,
-                "No Readings",
-                "Connect to the device to view sensor readings",
-            );
-        }
-
-        let _ = idx;
-    }
-
-    /// Render the history panel with charts.
-    fn render_history_panel(&mut self, ui: &mut egui::Ui, device: &DeviceState) {
-        // Header with title and sync button
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{} - History", device.display_name()))
-                    .size(self.theme.typography.heading)
-                    .strong()
-                    .color(self.theme.text_primary),
-            );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if device.syncing_history {
-                    components::loading_indicator(ui, &self.theme, Some("Syncing..."));
-                } else {
-                    let btn = egui::Button::new(
-                        RichText::new("Sync History")
-                            .size(self.theme.typography.body)
-                            .color(self.theme.text_on_accent),
-                    )
-                    .fill(self.theme.accent);
-                    if ui
-                        .add(btn)
-                        .on_hover_text("Download history from device")
-                        .clicked()
-                    {
-                        self.send_command(Command::SyncHistory {
-                            device_id: device.id.clone(),
-                        });
-                    }
-                }
-            });
-        });
-
-        ui.add_space(self.theme.spacing.md);
-
-        // Filter segmented control
-        let filter_options = [
-            (HistoryFilter::All, HistoryFilter::All.label()),
-            (
-                HistoryFilter::Last24Hours,
-                HistoryFilter::Last24Hours.label(),
-            ),
-            (HistoryFilter::Last7Days, HistoryFilter::Last7Days.label()),
-            (HistoryFilter::Last30Days, HistoryFilter::Last30Days.label()),
-        ];
-
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Time Range:")
-                    .size(self.theme.typography.body)
-                    .color(self.theme.text_secondary),
-            );
-            ui.add_space(self.theme.spacing.sm);
-
-            for (filter, label) in filter_options {
-                let is_selected = self.history_filter == filter;
-                let (bg, text_color) = if is_selected {
-                    (self.theme.accent, self.theme.text_on_accent)
-                } else {
-                    (self.theme.bg_card, self.theme.text_secondary)
-                };
-
-                let btn = egui::Button::new(
-                    RichText::new(label)
-                        .size(self.theme.typography.caption)
-                        .color(text_color),
-                )
-                .fill(bg)
-                .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
-
-                if ui.add(btn).clicked() {
-                    self.history_filter = filter;
-                }
-            }
-        });
-
-        ui.add_space(self.theme.spacing.lg);
-        ui.separator();
-        ui.add_space(self.theme.spacing.md);
-
-        if device.history.is_empty() {
-            components::empty_state(
-                ui,
-                &self.theme,
-                "No History Data",
-                "Click 'Sync History' to download data from your device",
-            );
-            return;
-        }
-
-        let now = time::OffsetDateTime::now_utc();
-        let filtered: Vec<_> = device
-            .history
-            .iter()
-            .filter(|r| match self.history_filter {
-                HistoryFilter::All => true,
-                HistoryFilter::Last24Hours => (now - r.timestamp) < time::Duration::hours(24),
-                HistoryFilter::Last7Days => (now - r.timestamp) < time::Duration::days(7),
-                HistoryFilter::Last30Days => (now - r.timestamp) < time::Duration::days(30),
-            })
-            .collect();
-
-        // Record count badge
-        ui.horizontal(|ui| {
-            components::status_badge(
-                ui,
-                &self.theme,
-                &format!("{} records", filtered.len()),
-                self.theme.info,
-            );
-            if filtered.len() != device.history.len() {
-                ui.add_space(self.theme.spacing.sm);
-                ui.label(
-                    RichText::new(format!("of {} total", device.history.len()))
-                        .size(self.theme.typography.caption)
-                        .color(self.theme.text_muted),
-                );
-            }
-        });
-        ui.add_space(self.theme.spacing.md);
-
-        let has_co2 = filtered.iter().any(|r| r.co2 > 0);
-        let has_radon = filtered.iter().any(|r| r.radon.is_some());
-        let has_radiation = filtered.iter().any(|r| r.radiation_rate.is_some());
-
-        let now_secs = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
-        let to_hours_ago = |ts: time::OffsetDateTime| -> f64 {
-            let secs = ts.unix_timestamp() as f64;
-            (now_secs - secs) / 3600.0
-        };
-
-        // Plot styling constants
-        let plot_height = 160.0;
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if has_co2 {
-                self.render_chart_section(
-                    ui,
-                    "CO2",
-                    "ppm",
-                    || {
-                        let co2_points: PlotPoints = filtered
-                            .iter()
-                            .map(|r| [-to_hours_ago(r.timestamp), r.co2 as f64])
-                            .collect();
-                        (co2_points, self.theme.info)
-                    },
-                    plot_height,
-                    Some(vec![
-                        (800.0, "Good", self.theme.success),
-                        (1000.0, "Moderate", self.theme.warning),
-                        (1500.0, "Poor", self.theme.danger),
-                    ]),
-                );
-            }
-
-            if has_radon {
-                // Use device settings for radon unit
-                let use_pci = device
-                    .settings
-                    .as_ref()
-                    .map(|s| s.radon_unit == RadonUnit::PciL)
-                    .unwrap_or(false);
-                let radon_unit_label = if use_pci { "pCi/L" } else { "Bq/m3" };
-                // Threshold lines (convert if using pCi/L)
-                let thresholds = if use_pci {
-                    vec![
-                        (100.0 * 0.027, "Action", self.theme.warning),
-                        (300.0 * 0.027, "High", self.theme.danger),
-                    ]
-                } else {
-                    vec![
-                        (100.0, "Action", self.theme.warning),
-                        (300.0, "High", self.theme.danger),
-                    ]
-                };
-                self.render_chart_section(
-                    ui,
-                    "Radon",
-                    radon_unit_label,
-                    || {
-                        let radon_points: PlotPoints = filtered
-                            .iter()
-                            .filter_map(|r| {
-                                r.radon.map(|v| {
-                                    let value = if use_pci {
-                                        bq_to_pci(v) as f64
-                                    } else {
-                                        v as f64
-                                    };
-                                    [-to_hours_ago(r.timestamp), value]
-                                })
-                            })
-                            .collect();
-                        (radon_points, self.theme.warning)
-                    },
-                    plot_height,
-                    Some(thresholds),
-                );
-            }
-
-            if has_radiation {
-                self.render_chart_section(
-                    ui,
-                    "Radiation Rate",
-                    "uSv/h",
-                    || {
-                        let radiation_points: PlotPoints = filtered
-                            .iter()
-                            .filter_map(|r| {
-                                r.radiation_rate
-                                    .map(|v| [-to_hours_ago(r.timestamp), v as f64])
-                            })
-                            .collect();
-                        (radiation_points, self.theme.danger)
-                    },
-                    plot_height,
-                    None,
-                );
-            }
-
-            // Use device settings for temperature unit
-            let use_fahrenheit = device
-                .settings
-                .as_ref()
-                .map(|s| s.temperature_unit == TemperatureUnit::Fahrenheit)
-                .unwrap_or(false);
-            let temp_unit_label = if use_fahrenheit { "F" } else { "C" };
-            self.render_chart_section(
-                ui,
-                "Temperature",
-                temp_unit_label,
-                || {
-                    let temp_points: PlotPoints = filtered
-                        .iter()
-                        .map(|r| {
-                            let value = if use_fahrenheit {
-                                celsius_to_fahrenheit(r.temperature) as f64
-                            } else {
-                                r.temperature as f64
-                            };
-                            [-to_hours_ago(r.timestamp), value]
-                        })
-                        .collect();
-                    (temp_points, self.theme.chart_temperature)
-                },
-                plot_height,
-                None,
-            );
-
-            self.render_chart_section(
-                ui,
-                "Humidity",
-                "%",
-                || {
-                    let humidity_points: PlotPoints = filtered
-                        .iter()
-                        .map(|r| [-to_hours_ago(r.timestamp), r.humidity as f64])
-                        .collect();
-                    (humidity_points, self.theme.chart_humidity)
-                },
-                plot_height,
-                None,
-            );
-        });
-    }
-
-    /// Render a chart section with consistent styling.
-    fn render_chart_section<F>(
-        &self,
-        ui: &mut egui::Ui,
-        title: &str,
-        unit: &str,
-        data_fn: F,
-        height: f32,
-        thresholds: Option<Vec<(f64, &str, Color32)>>,
-    ) where
-        F: FnOnce() -> (PlotPoints<'static>, Color32),
-    {
-        egui::Frame::new()
-            .fill(self.theme.bg_card)
-            .inner_margin(egui::Margin::same(self.theme.spacing.md as i8))
-            .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-            .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(title)
-                            .size(self.theme.typography.subheading)
-                            .strong()
-                            .color(self.theme.text_primary),
-                    );
-                    ui.label(
-                        RichText::new(format!("({})", unit))
-                            .size(self.theme.typography.caption)
-                            .color(self.theme.text_muted),
-                    );
-                });
-                ui.add_space(self.theme.spacing.sm);
-
-                let (points, line_color) = data_fn();
-
-                Plot::new(format!("{}_plot", title.to_lowercase().replace(' ', "_")))
-                    .height(height)
-                    .show_axes(true)
-                    .show_grid(true)
-                    .allow_drag(true)
-                    .allow_zoom(true)
-                    .allow_boxed_zoom(true)
-                    .allow_scroll(true)
-                    .x_axis_label("Hours ago")
-                    .show(ui, |plot_ui| {
-                        if let Some(ref thresh) = thresholds {
-                            for (value, label, color) in thresh {
-                                plot_ui.hline(
-                                    HLine::new(*label, *value)
-                                        .color(*color)
-                                        .style(egui_plot::LineStyle::dashed_dense()),
-                                );
-                            }
-                        }
-                        plot_ui.line(Line::new(title, points).color(line_color).width(2.0));
-                    });
-            });
-        ui.add_space(self.theme.spacing.md);
-    }
-
-    /// Render the settings panel with editable controls.
-    fn render_settings_panel(&mut self, ui: &mut egui::Ui, device: &DeviceState) {
-        // Header
-        ui.label(
-            RichText::new(format!("{} - Settings", device.display_name()))
-                .size(self.theme.typography.heading)
-                .strong()
-                .color(self.theme.text_primary),
-        );
-        ui.add_space(self.theme.spacing.lg);
-
-        // Collect commands to send after UI rendering
-        let mut commands_to_send: Vec<Command> = Vec::new();
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Measurement Interval Section
-            if device.reading.is_some() {
-                components::section_header(ui, &self.theme, "Measurement Interval");
-
-                egui::Frame::new()
-                    .fill(self.theme.bg_card)
-                    .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
-                    .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
-                    .show(ui, |ui| {
-                        let current_interval =
-                            device.reading.as_ref().map(|r| r.interval).unwrap_or(0);
-
-                        ui.horizontal(|ui| {
-                            for &(secs, label) in INTERVAL_OPTIONS {
-                                let is_selected = current_interval == secs;
-                                let (bg, text_color) = if is_selected {
-                                    (self.theme.accent, self.theme.text_on_accent)
-                                } else {
-                                    (self.theme.bg_secondary, self.theme.text_secondary)
-                                };
-
-                                ui.add_enabled_ui(!self.updating_settings, |ui| {
-                                    let btn = egui::Button::new(
-                                        RichText::new(label)
-                                            .size(self.theme.typography.caption)
-                                            .color(text_color),
-                                    )
-                                    .fill(bg)
-                                    .corner_radius(
-                                        egui::CornerRadius::same(self.theme.rounding.sm as u8),
-                                    );
-
-                                    if ui.add(btn).clicked() && !is_selected {
-                                        self.updating_settings = true;
-                                        self.status = format!("Setting interval to {}...", label);
-                                        commands_to_send.push(Command::SetInterval {
-                                            device_id: device.id.clone(),
-                                            interval_secs: secs,
-                                        });
-                                    }
-                                });
-                            }
-                            if self.updating_settings {
-                                ui.add_space(self.theme.spacing.sm);
-                                components::loading_indicator(ui, &self.theme, None);
-                            }
-                        });
-
-                        ui.add_space(self.theme.spacing.sm);
-                        ui.label(
-                            RichText::new("How often the sensor takes measurements")
-                                .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
-                        );
-                    });
-
-                ui.add_space(self.theme.spacing.lg);
-            }
-
-            // Device Configuration Section
-            if let Some(settings) = &device.settings {
-                components::section_header(ui, &self.theme, "Device Configuration");
-
-                egui::Frame::new()
-                    .fill(self.theme.bg_card)
-                    .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
-                    .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
-                    .show(ui, |ui| {
-                        // Smart Home toggle
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("Smart Home Integration")
-                                        .size(self.theme.typography.body)
-                                        .color(self.theme.text_primary),
-                                );
-                                ui.label(
-                                    RichText::new("Enable broadcasting to smart home systems")
-                                        .size(self.theme.typography.caption)
-                                        .color(self.theme.text_muted),
-                                );
-                            });
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add_enabled_ui(!self.updating_settings, |ui| {
-                                        let current = settings.smart_home_enabled;
-                                        for (val, text) in [(true, "On"), (false, "Off")] {
-                                            let is_selected = current == val;
-                                            let (bg, text_color) = if is_selected {
-                                                (self.theme.accent, self.theme.text_on_accent)
-                                            } else {
-                                                (self.theme.bg_secondary, self.theme.text_secondary)
-                                            };
-
-                                            let btn = egui::Button::new(
-                                                RichText::new(text)
-                                                    .size(self.theme.typography.caption)
-                                                    .color(text_color),
-                                            )
-                                            .fill(bg)
-                                            .corner_radius(egui::CornerRadius::same(
-                                                self.theme.rounding.sm as u8,
-                                            ));
-
-                                            if ui.add(btn).clicked() && !is_selected {
-                                                self.updating_settings = true;
-                                                self.status = if val {
-                                                    "Enabling Smart Home...".to_string()
-                                                } else {
-                                                    "Disabling Smart Home...".to_string()
-                                                };
-                                                commands_to_send.push(Command::SetSmartHome {
-                                                    device_id: device.id.clone(),
-                                                    enabled: val,
-                                                });
-                                            }
-                                        }
-                                    });
-                                },
-                            );
-                        });
-
-                        ui.add_space(self.theme.spacing.md);
-
-                        // Bluetooth Range toggle
-                        let is_extended =
-                            matches!(settings.bluetooth_range, BluetoothRange::Extended);
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("Bluetooth Range")
-                                        .size(self.theme.typography.body)
-                                        .color(self.theme.text_primary),
-                                );
-                                ui.label(
-                                    RichText::new("Extended range uses more battery")
-                                        .size(self.theme.typography.caption)
-                                        .color(self.theme.text_muted),
-                                );
-                            });
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add_enabled_ui(!self.updating_settings, |ui| {
-                                        for (is_ext, label) in
-                                            [(false, "Standard"), (true, "Extended")]
-                                        {
-                                            let is_selected = is_extended == is_ext;
-                                            let (bg, text_color) = if is_selected {
-                                                (self.theme.accent, self.theme.text_on_accent)
-                                            } else {
-                                                (self.theme.bg_secondary, self.theme.text_secondary)
-                                            };
-
-                                            let btn = egui::Button::new(
-                                                RichText::new(label)
-                                                    .size(self.theme.typography.caption)
-                                                    .color(text_color),
-                                            )
-                                            .fill(bg)
-                                            .corner_radius(egui::CornerRadius::same(
-                                                self.theme.rounding.sm as u8,
-                                            ));
-
-                                            if ui.add(btn).clicked() && !is_selected {
-                                                self.updating_settings = true;
-                                                self.status =
-                                                    format!("Setting range to {}...", label);
-                                                commands_to_send.push(Command::SetBluetoothRange {
-                                                    device_id: device.id.clone(),
-                                                    extended: is_ext,
-                                                });
-                                            }
-                                        }
-                                    });
-                                },
-                            );
-                        });
-
-                        ui.add_space(self.theme.spacing.lg);
-                        ui.separator();
-                        ui.add_space(self.theme.spacing.md);
-
-                        // Read-only settings grid
-                        egui::Grid::new("settings_grid")
-                            .num_columns(2)
-                            .spacing([self.theme.spacing.xl, self.theme.spacing.sm])
-                            .show(ui, |ui| {
-                                Self::render_settings_row_static(
-                                    ui,
-                                    &self.theme,
-                                    "Temperature Unit",
-                                    &format!("{:?}", settings.temperature_unit),
-                                );
-                                Self::render_settings_row_static(
-                                    ui,
-                                    &self.theme,
-                                    "Radon Unit",
-                                    &format!("{:?}", settings.radon_unit),
-                                );
-                                Self::render_settings_row_static(
-                                    ui,
-                                    &self.theme,
-                                    "Buzzer",
-                                    if settings.buzzer_enabled {
-                                        "Enabled"
-                                    } else {
-                                        "Disabled"
-                                    },
-                                );
-                                Self::render_settings_row_static(
-                                    ui,
-                                    &self.theme,
-                                    "Auto Calibration",
-                                    if settings.auto_calibration_enabled {
-                                        "Enabled"
-                                    } else {
-                                        "Disabled"
-                                    },
-                                );
-                            });
-                    });
-
-                ui.add_space(self.theme.spacing.lg);
-            } else if device.reading.is_none() {
-                components::empty_state(
-                    ui,
-                    &self.theme,
-                    "No Settings Available",
-                    "Connect to the device to load settings",
-                );
-            }
-
-            // Device Info Section
-            components::section_header(ui, &self.theme, "Device Information");
-
-            egui::Frame::new()
-                .fill(self.theme.bg_card)
-                .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
-                .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-                .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
-                .show(ui, |ui| {
-                    egui::Grid::new("device_info_grid")
-                        .num_columns(2)
-                        .spacing([self.theme.spacing.xl, self.theme.spacing.sm])
-                        .show(ui, |ui| {
-                            Self::render_settings_row_static(
-                                ui,
-                                &self.theme,
-                                "Device ID",
-                                &device.id,
-                            );
-
-                            if let Some(name) = &device.name {
-                                Self::render_settings_row_static(ui, &self.theme, "Name", name);
-                            }
-
-                            if let Some(device_type) = device.device_type {
-                                Self::render_settings_row_static(
-                                    ui,
-                                    &self.theme,
-                                    "Type",
-                                    &format!("{:?}", device_type),
-                                );
-                            }
-
-                            if let Some(rssi) = device.rssi {
-                                Self::render_settings_row_static(
-                                    ui,
-                                    &self.theme,
-                                    "Signal Strength",
-                                    &format!("{} dBm", rssi),
-                                );
-                            }
-
-                            Self::render_settings_row_static(
-                                ui,
-                                &self.theme,
-                                "History Records",
-                                &format!("{}", device.history.len()),
-                            );
-                        });
-                });
-        });
-
-        // Send any queued commands
-        for cmd in commands_to_send {
-            self.send_command(cmd);
+    /// Save GUI configuration to the config file.
+    pub(crate) fn save_gui_config(&self) {
+        let mut config = Config::load();
+        config.gui = self.gui_config.clone();
+        if let Err(e) = config.save() {
+            debug!("Failed to save GUI config: {}", e);
         }
     }
 
-    /// Helper to render a settings grid row (static version to avoid borrow issues).
-    fn render_settings_row_static(ui: &mut egui::Ui, theme: &Theme, label: &str, value: &str) {
-        ui.label(
-            RichText::new(label)
-                .size(theme.typography.body)
-                .color(theme.text_secondary),
-        );
-        ui.label(
-            RichText::new(value)
-                .size(theme.typography.body)
-                .color(theme.text_primary),
-        );
-        ui.end_row();
-    }
-
-    /// Render sensor readings with styled cards.
-    fn render_readings(&self, ui: &mut egui::Ui, device: &DeviceState) {
-        let reading = device.reading.as_ref().unwrap();
-
-        components::section_header(ui, &self.theme, "Current Readings");
-
-        // Show cached data banner if device is offline but we have cached readings
-        if device.is_showing_cached_data() {
-            let is_stale = components::is_reading_stale(reading.captured_at, reading.interval);
-            components::cached_data_banner(ui, &self.theme, reading.captured_at, is_stale);
-            ui.add_space(self.theme.spacing.md);
+    /// Export history records to a file (CSV or JSON).
+    pub(crate) fn export_history(
+        &mut self,
+        records: &[&aranet_types::HistoryRecord],
+        device_name: &str,
+        format: &str,
+    ) {
+        match export::export_history(
+            records,
+            &self.gui_config.export_directory,
+            device_name,
+            format,
+        ) {
+            Ok(filename) => {
+                self.add_toast(
+                    format!("Exported {} records to {}", records.len(), filename),
+                    ToastType::Success,
+                );
+            }
+            Err(e) => {
+                self.add_toast(format!("Export failed: {}", e), ToastType::Error);
+            }
         }
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // CO2 with color-coded card (only for Aranet4)
-            if reading.co2 > 0 {
-                let level = Co2Level::from_ppm(reading.co2);
-                let (status_text, color) = match level {
-                    Co2Level::Good => ("Good", self.theme.success),
-                    Co2Level::Moderate => ("Moderate", self.theme.warning),
-                    Co2Level::Poor => ("Poor", self.theme.caution),
-                    Co2Level::Bad => ("Bad", self.theme.danger),
-                };
-                let bg_color = self.theme.co2_bg_color(reading.co2);
-
-                egui::Frame::new()
-                    .fill(bg_color)
-                    .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
-                    .corner_radius(egui::CornerRadius::same(self.theme.rounding.lg as u8))
-                    .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
-                    .shadow(self.theme.subtle_shadow())
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width().min(320.0));
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new("CO2")
-                                            .color(self.theme.text_muted)
-                                            .size(self.theme.typography.caption),
-                                    );
-                                    ui.add_space(self.theme.spacing.xs);
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(format!("{}", reading.co2))
-                                                .color(color)
-                                                .size(self.theme.typography.metric)
-                                                .strong(),
-                                        );
-                                        ui.add_space(self.theme.spacing.xs);
-                                        ui.label(
-                                            RichText::new("ppm")
-                                                .color(self.theme.text_muted)
-                                                .size(self.theme.typography.body),
-                                        );
-                                        if let Some(trend) = device.co2_trend() {
-                                            let trend_color = match trend {
-                                                Trend::Rising => self.theme.danger,
-                                                Trend::Falling => self.theme.success,
-                                                Trend::Stable => self.theme.text_muted,
-                                            };
-                                            ui.add_space(self.theme.spacing.sm);
-                                            ui.label(
-                                                RichText::new(trend.indicator())
-                                                    .color(trend_color)
-                                                    .size(self.theme.typography.heading),
-                                            );
-                                        }
-                                    });
-                                    ui.add_space(self.theme.spacing.xs);
-                                    components::status_badge(ui, &self.theme, status_text, color);
-                                });
-                            });
-                            ui.add_space(self.theme.spacing.md);
-                            components::co2_gauge(ui, &self.theme, reading.co2);
-                        });
-                    });
-                ui.add_space(self.theme.spacing.lg);
-            }
-
-            // Radon with color-coded card (only for AranetRadon)
-            if let Some(radon) = reading.radon {
-                let level = RadonLevel::from_bq(radon);
-                let color = self.theme.radon_color(radon);
-                let bg_color = self.theme.radon_bg_color(radon);
-                let (radon_value, radon_unit) = format_radon(radon, device.settings.as_ref());
-
-                egui::Frame::new()
-                    .fill(bg_color)
-                    .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
-                    .corner_radius(egui::CornerRadius::same(self.theme.rounding.lg as u8))
-                    .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
-                    .shadow(self.theme.subtle_shadow())
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width().min(320.0));
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new("Radon")
-                                            .color(self.theme.text_muted)
-                                            .size(self.theme.typography.caption),
-                                    );
-                                    ui.add_space(self.theme.spacing.xs);
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(&radon_value)
-                                                .color(color)
-                                                .size(self.theme.typography.metric)
-                                                .strong(),
-                                        );
-                                        ui.add_space(self.theme.spacing.xs);
-                                        ui.label(
-                                            RichText::new(radon_unit)
-                                                .color(self.theme.text_muted)
-                                                .size(self.theme.typography.body),
-                                        );
-                                    });
-                                    ui.add_space(self.theme.spacing.xs);
-                                    components::status_badge(
-                                        ui,
-                                        &self.theme,
-                                        level.status_text(),
-                                        color,
-                                    );
-                                });
-                            });
-                        });
-                    });
-                ui.add_space(self.theme.spacing.lg);
-            }
-
-            // Radiation with color-coded card (only for AranetRadiation)
-            if let Some(rate) = reading.radiation_rate {
-                let level = RadiationLevel::from_usv(rate);
-                let color = self.theme.radiation_color(rate);
-                let bg_color = self.theme.radiation_bg_color(rate);
-
-                egui::Frame::new()
-                    .fill(bg_color)
-                    .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
-                    .corner_radius(egui::CornerRadius::same(self.theme.rounding.lg as u8))
-                    .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
-                    .shadow(self.theme.subtle_shadow())
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width().min(320.0));
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new("Radiation")
-                                            .color(self.theme.text_muted)
-                                            .size(self.theme.typography.caption),
-                                    );
-                                    ui.add_space(self.theme.spacing.xs);
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(format!("{:.3}", rate))
-                                                .color(color)
-                                                .size(self.theme.typography.metric)
-                                                .strong(),
-                                        );
-                                        ui.add_space(self.theme.spacing.xs);
-                                        ui.label(
-                                            RichText::new("uSv/h")
-                                                .color(self.theme.text_muted)
-                                                .size(self.theme.typography.body),
-                                        );
-                                    });
-                                    ui.add_space(self.theme.spacing.xs);
-                                    components::status_badge(
-                                        ui,
-                                        &self.theme,
-                                        level.status_text(),
-                                        color,
-                                    );
-                                });
-                            });
-                            // Show total dose if available
-                            if let Some(total) = reading.radiation_total {
-                                ui.add_space(self.theme.spacing.sm);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("Total Dose:")
-                                            .color(self.theme.text_muted)
-                                            .size(self.theme.typography.caption),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!("{:.2} uSv", total))
-                                            .color(self.theme.text_secondary)
-                                            .size(self.theme.typography.caption),
-                                    );
-                                });
-                            }
-                        });
-                    });
-                ui.add_space(self.theme.spacing.lg);
-            }
-
-            // Metrics grid
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing =
-                    egui::vec2(self.theme.spacing.md, self.theme.spacing.md);
-
-                // Temperature (use device settings for unit)
-                let (temp_value, temp_unit) =
-                    format_temperature(reading.temperature, device.settings.as_ref());
-                components::metric_card(
-                    ui,
-                    &self.theme,
-                    "Temperature",
-                    &temp_value,
-                    temp_unit,
-                    device.temperature_trend(),
-                    self.theme.info,
-                );
-
-                // Humidity
-                components::metric_card(
-                    ui,
-                    &self.theme,
-                    "Humidity",
-                    &format!("{}", reading.humidity),
-                    "%",
-                    device.humidity_trend(),
-                    self.theme.info,
-                );
-
-                // Pressure (if available)
-                if reading.pressure > 0.0 {
-                    components::metric_card(
-                        ui,
-                        &self.theme,
-                        "Pressure",
-                        &format!("{:.1}", reading.pressure),
-                        "hPa",
-                        None,
-                        self.theme.text_secondary,
-                    );
-                }
-
-                // Battery
-                let battery_color = self.theme.battery_color(reading.battery);
-                components::metric_card(
-                    ui,
-                    &self.theme,
-                    "Battery",
-                    &format!("{}", reading.battery),
-                    "%",
-                    None,
-                    battery_color,
-                );
-            });
-        });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ========================================================================
-    // celsius_to_fahrenheit tests
-    // ========================================================================
-
-    #[test]
-    fn test_celsius_to_fahrenheit_freezing() {
-        let result = celsius_to_fahrenheit(0.0);
-        assert!((result - 32.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_celsius_to_fahrenheit_boiling() {
-        let result = celsius_to_fahrenheit(100.0);
-        assert!((result - 212.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_celsius_to_fahrenheit_room_temp() {
-        // 20°C = 68°F
-        let result = celsius_to_fahrenheit(20.0);
-        assert!((result - 68.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_celsius_to_fahrenheit_negative() {
-        // -40°C = -40°F (the point where scales meet)
-        let result = celsius_to_fahrenheit(-40.0);
-        assert!((result - (-40.0)).abs() < 0.01);
-    }
-
-    // ========================================================================
-    // bq_to_pci tests
-    // ========================================================================
-
-    #[test]
-    fn test_bq_to_pci_zero() {
-        let result = bq_to_pci(0);
-        assert!((result - 0.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_bq_to_pci_100() {
-        // 100 Bq/m³ = 2.7 pCi/L
-        let result = bq_to_pci(100);
-        assert!((result - 2.7).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_bq_to_pci_who_action_level() {
-        // WHO action level is ~100-300 Bq/m³
-        // 300 Bq/m³ = 8.1 pCi/L
-        let result = bq_to_pci(300);
-        assert!((result - 8.1).abs() < 0.01);
-    }
-
-    // ========================================================================
-    // format_temperature tests
-    // ========================================================================
-
-    #[test]
-    fn test_format_temperature_no_settings_defaults_celsius() {
-        let (value, unit) = format_temperature(20.5, None);
-        assert_eq!(value, "20.5");
-        assert_eq!(unit, "C");
-    }
-
-    #[test]
-    fn test_format_temperature_celsius_setting() {
-        let settings = DeviceSettings {
-            temperature_unit: TemperatureUnit::Celsius,
-            ..Default::default()
-        };
-        let (value, unit) = format_temperature(20.5, Some(&settings));
-        assert_eq!(value, "20.5");
-        assert_eq!(unit, "C");
-    }
-
-    #[test]
-    fn test_format_temperature_fahrenheit_setting() {
-        let settings = DeviceSettings {
-            temperature_unit: TemperatureUnit::Fahrenheit,
-            ..Default::default()
-        };
-        let (value, unit) = format_temperature(20.0, Some(&settings));
-        // 20°C = 68°F
-        assert_eq!(value, "68.0");
-        assert_eq!(unit, "F");
-    }
-
-    #[test]
-    fn test_format_temperature_fahrenheit_decimal() {
-        let settings = DeviceSettings {
-            temperature_unit: TemperatureUnit::Fahrenheit,
-            ..Default::default()
-        };
-        let (value, unit) = format_temperature(21.5, Some(&settings));
-        // 21.5°C = 70.7°F
-        assert_eq!(value, "70.7");
-        assert_eq!(unit, "F");
-    }
-
-    // ========================================================================
-    // format_radon tests
-    // ========================================================================
-
-    #[test]
-    fn test_format_radon_no_settings_defaults_bq() {
-        let (value, unit) = format_radon(150, None);
-        assert_eq!(value, "150");
-        assert_eq!(unit, "Bq/m3");
-    }
-
-    #[test]
-    fn test_format_radon_bq_setting() {
-        let settings = DeviceSettings {
-            radon_unit: RadonUnit::BqM3,
-            ..Default::default()
-        };
-        let (value, unit) = format_radon(150, Some(&settings));
-        assert_eq!(value, "150");
-        assert_eq!(unit, "Bq/m3");
-    }
-
-    #[test]
-    fn test_format_radon_pci_setting() {
-        let settings = DeviceSettings {
-            radon_unit: RadonUnit::PciL,
-            ..Default::default()
-        };
-        let (value, unit) = format_radon(100, Some(&settings));
-        // 100 Bq/m³ = 2.70 pCi/L
-        assert_eq!(value, "2.70");
-        assert_eq!(unit, "pCi/L");
-    }
-
-    #[test]
-    fn test_format_radon_pci_zero() {
-        let settings = DeviceSettings {
-            radon_unit: RadonUnit::PciL,
-            ..Default::default()
-        };
-        let (value, unit) = format_radon(0, Some(&settings));
-        assert_eq!(value, "0.00");
-        assert_eq!(unit, "pCi/L");
-    }
-
-    #[test]
-    fn test_format_radon_pci_high_value() {
-        let settings = DeviceSettings {
-            radon_unit: RadonUnit::PciL,
-            ..Default::default()
-        };
-        let (value, unit) = format_radon(300, Some(&settings));
-        // 300 Bq/m³ = 8.10 pCi/L
-        assert_eq!(value, "8.10");
-        assert_eq!(unit, "pCi/L");
     }
 }

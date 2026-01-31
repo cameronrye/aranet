@@ -12,9 +12,18 @@ pub struct Config {
     pub server: ServerConfig,
     /// Storage settings.
     pub storage: StorageConfig,
+    /// Security settings.
+    #[serde(default)]
+    pub security: SecurityConfig,
     /// Devices to monitor.
     #[serde(default)]
     pub devices: Vec<DeviceConfig>,
+    /// Prometheus metrics settings.
+    #[serde(default)]
+    pub prometheus: PrometheusConfig,
+    /// MQTT publisher settings.
+    #[serde(default)]
+    pub mqtt: MqttConfig,
 }
 
 impl Config {
@@ -84,6 +93,9 @@ impl Config {
         // Validate storage config
         errors.extend(self.storage.validate());
 
+        // Validate security config
+        errors.extend(self.security.validate());
+
         // Validate devices
         let mut seen_addresses = std::collections::HashSet::new();
         for (i, device) in self.devices.iter().enumerate() {
@@ -99,6 +111,12 @@ impl Config {
                 });
             }
         }
+
+        // Validate Prometheus config
+        errors.extend(self.prometheus.validate());
+
+        // Validate MQTT config
+        errors.extend(self.mqtt.validate());
 
         if errors.is_empty() {
             Ok(())
@@ -123,12 +141,29 @@ impl Config {
 pub struct ServerConfig {
     /// Bind address (e.g., "127.0.0.1:8080").
     pub bind: String,
+    /// Broadcast channel buffer size for real-time reading updates.
+    ///
+    /// This determines how many messages can be buffered before slow
+    /// subscribers start missing messages. A larger buffer uses more memory
+    /// but is more tolerant of slow WebSocket clients.
+    ///
+    /// Default: 100
+    #[serde(default = "default_broadcast_buffer")]
+    pub broadcast_buffer: usize,
+}
+
+/// Default broadcast buffer size.
+pub const DEFAULT_BROADCAST_BUFFER: usize = 100;
+
+fn default_broadcast_buffer() -> usize {
+    DEFAULT_BROADCAST_BUFFER
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8080".to_string(),
+            broadcast_buffer: DEFAULT_BROADCAST_BUFFER,
         }
     }
 }
@@ -208,6 +243,262 @@ impl StorageConfig {
                 field: "storage.path".to_string(),
                 message: "database path cannot be empty".to_string(),
             });
+        }
+
+        errors
+    }
+}
+
+/// Security configuration for API protection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Enable API key authentication.
+    /// When enabled, clients must provide the API key in the `X-API-Key` header.
+    pub api_key_enabled: bool,
+    /// The API key required for authentication (if enabled).
+    /// Should be a secure random string of at least 32 characters.
+    pub api_key: Option<String>,
+    /// Enable rate limiting.
+    pub rate_limit_enabled: bool,
+    /// Maximum requests per window.
+    #[serde(default = "default_rate_limit_requests")]
+    pub rate_limit_requests: u32,
+    /// Rate limit window in seconds.
+    #[serde(default = "default_rate_limit_window")]
+    pub rate_limit_window_secs: u64,
+}
+
+fn default_rate_limit_requests() -> u32 {
+    100
+}
+
+fn default_rate_limit_window() -> u64 {
+    60
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            api_key_enabled: false,
+            api_key: None,
+            rate_limit_enabled: false,
+            rate_limit_requests: default_rate_limit_requests(),
+            rate_limit_window_secs: default_rate_limit_window(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// Validate security configuration.
+    pub fn validate(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+
+        if self.api_key_enabled {
+            match &self.api_key {
+                None => {
+                    errors.push(ValidationError {
+                        field: "security.api_key".to_string(),
+                        message: "API key must be set when authentication is enabled".to_string(),
+                    });
+                }
+                Some(key) if key.len() < 16 => {
+                    errors.push(ValidationError {
+                        field: "security.api_key".to_string(),
+                        message: "API key must be at least 16 characters for security".to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if self.rate_limit_enabled {
+            if self.rate_limit_requests == 0 {
+                errors.push(ValidationError {
+                    field: "security.rate_limit_requests".to_string(),
+                    message: "rate limit requests must be greater than 0".to_string(),
+                });
+            }
+            if self.rate_limit_window_secs < 1 {
+                errors.push(ValidationError {
+                    field: "security.rate_limit_window_secs".to_string(),
+                    message: "rate limit window must be at least 1 second".to_string(),
+                });
+            }
+        }
+
+        errors
+    }
+}
+
+/// Prometheus metrics configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrometheusConfig {
+    /// Whether Prometheus metrics endpoint is enabled.
+    pub enabled: bool,
+    /// Optional push gateway URL for pushing metrics.
+    /// If not set, metrics are only available via the /metrics endpoint.
+    pub push_gateway: Option<String>,
+    /// Push interval in seconds (only used with push_gateway).
+    #[serde(default = "default_push_interval")]
+    pub push_interval: u64,
+}
+
+fn default_push_interval() -> u64 {
+    60
+}
+
+impl Default for PrometheusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            push_gateway: None,
+            push_interval: default_push_interval(),
+        }
+    }
+}
+
+impl PrometheusConfig {
+    /// Validate Prometheus configuration.
+    pub fn validate(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+
+        if let Some(url) = &self.push_gateway
+            && url.is_empty()
+        {
+            errors.push(ValidationError {
+                field: "prometheus.push_gateway".to_string(),
+                message: "push gateway URL cannot be empty (use null/omit instead)".to_string(),
+            });
+        }
+
+        if self.push_interval < 10 {
+            errors.push(ValidationError {
+                field: "prometheus.push_interval".to_string(),
+                message: format!(
+                    "push interval {} is too short (minimum 10 seconds)",
+                    self.push_interval
+                ),
+            });
+        }
+
+        errors
+    }
+}
+
+/// MQTT publisher configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MqttConfig {
+    /// Whether MQTT publishing is enabled.
+    pub enabled: bool,
+    /// MQTT broker URL (e.g., "mqtt://localhost:1883" or "mqtts://broker.example.com:8883").
+    pub broker: String,
+    /// Topic prefix for published messages (e.g., "aranet" -> "aranet/{device}/co2").
+    #[serde(default = "default_topic_prefix")]
+    pub topic_prefix: String,
+    /// MQTT client ID.
+    #[serde(default = "default_client_id")]
+    pub client_id: String,
+    /// Quality of Service level (0 = AtMostOnce, 1 = AtLeastOnce, 2 = ExactlyOnce).
+    #[serde(default = "default_qos")]
+    pub qos: u8,
+    /// Whether to retain messages on the broker.
+    #[serde(default)]
+    pub retain: bool,
+    /// Optional username for authentication.
+    pub username: Option<String>,
+    /// Optional password for authentication.
+    pub password: Option<String>,
+    /// Keep-alive interval in seconds.
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive: u64,
+}
+
+fn default_topic_prefix() -> String {
+    "aranet".to_string()
+}
+
+fn default_client_id() -> String {
+    "aranet-service".to_string()
+}
+
+fn default_qos() -> u8 {
+    1
+}
+
+fn default_keep_alive() -> u64 {
+    60
+}
+
+impl Default for MqttConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            broker: "mqtt://localhost:1883".to_string(),
+            topic_prefix: default_topic_prefix(),
+            client_id: default_client_id(),
+            qos: default_qos(),
+            retain: false,
+            username: None,
+            password: None,
+            keep_alive: default_keep_alive(),
+        }
+    }
+}
+
+impl MqttConfig {
+    /// Validate MQTT configuration.
+    pub fn validate(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+
+        if self.enabled {
+            if self.broker.is_empty() {
+                errors.push(ValidationError {
+                    field: "mqtt.broker".to_string(),
+                    message: "broker URL cannot be empty when MQTT is enabled".to_string(),
+                });
+            } else if !self.broker.starts_with("mqtt://") && !self.broker.starts_with("mqtts://") {
+                errors.push(ValidationError {
+                    field: "mqtt.broker".to_string(),
+                    message: format!(
+                        "invalid broker URL '{}': must start with mqtt:// or mqtts://",
+                        self.broker
+                    ),
+                });
+            }
+
+            if self.topic_prefix.is_empty() {
+                errors.push(ValidationError {
+                    field: "mqtt.topic_prefix".to_string(),
+                    message: "topic prefix cannot be empty".to_string(),
+                });
+            }
+
+            if self.client_id.is_empty() {
+                errors.push(ValidationError {
+                    field: "mqtt.client_id".to_string(),
+                    message: "client ID cannot be empty".to_string(),
+                });
+            }
+
+            if self.qos > 2 {
+                errors.push(ValidationError {
+                    field: "mqtt.qos".to_string(),
+                    message: format!("invalid QoS level {}: must be 0, 1, or 2", self.qos),
+                });
+            }
+
+            if self.keep_alive < 5 {
+                errors.push(ValidationError {
+                    field: "mqtt.keep_alive".to_string(),
+                    message: format!(
+                        "keep-alive interval {} is too short (minimum 5 seconds)",
+                        self.keep_alive
+                    ),
+                });
+            }
         }
 
         errors
@@ -397,6 +688,7 @@ mod tests {
         let config = Config {
             server: ServerConfig {
                 bind: "0.0.0.0:9090".to_string(),
+                ..Default::default()
             },
             storage: StorageConfig {
                 path: PathBuf::from("/tmp/test.db"),
@@ -406,6 +698,7 @@ mod tests {
                 alias: Some("Test Device".to_string()),
                 poll_interval: 30,
             }],
+            ..Default::default()
         };
 
         config.save(&config_path).unwrap();
@@ -494,22 +787,26 @@ mod tests {
         // Valid bind addresses
         let valid = ServerConfig {
             bind: "127.0.0.1:8080".to_string(),
+            ..Default::default()
         };
         assert!(valid.validate().is_empty());
 
         let valid_ipv6 = ServerConfig {
             bind: "[::1]:8080".to_string(),
+            ..Default::default()
         };
         assert!(valid_ipv6.validate().is_empty());
 
         let valid_hostname = ServerConfig {
             bind: "localhost:8080".to_string(),
+            ..Default::default()
         };
         assert!(valid_hostname.validate().is_empty());
 
         // Invalid: empty
         let empty = ServerConfig {
             bind: "".to_string(),
+            ..Default::default()
         };
         let errors = empty.validate();
         assert_eq!(errors.len(), 1);
@@ -518,6 +815,7 @@ mod tests {
         // Invalid: no port
         let no_port = ServerConfig {
             bind: "127.0.0.1".to_string(),
+            ..Default::default()
         };
         let errors = no_port.validate();
         assert_eq!(errors.len(), 1);
@@ -526,6 +824,7 @@ mod tests {
         // Invalid: port 0
         let port_zero = ServerConfig {
             bind: "127.0.0.1:0".to_string(),
+            ..Default::default()
         };
         let errors = port_zero.validate();
         assert_eq!(errors.len(), 1);
@@ -534,6 +833,7 @@ mod tests {
         // Invalid: non-numeric port
         let bad_port = ServerConfig {
             bind: "127.0.0.1:abc".to_string(),
+            ..Default::default()
         };
         let errors = bad_port.validate();
         assert_eq!(errors.len(), 1);
@@ -635,6 +935,7 @@ mod tests {
                     poll_interval: 60,
                 },
             ],
+            ..Default::default()
         };
 
         let result = config.validate();
@@ -661,6 +962,7 @@ mod tests {
                     poll_interval: 60,
                 },
             ],
+            ..Default::default()
         };
 
         let result = config.validate();
@@ -692,5 +994,223 @@ mod tests {
         let display = format!("{}", error);
         assert!(display.contains("server.bind"));
         assert!(display.contains("devices[0].address"));
+    }
+
+    // ==========================================================================
+    // Prometheus config tests
+    // ==========================================================================
+
+    #[test]
+    fn test_prometheus_config_default() {
+        let config = PrometheusConfig::default();
+        assert!(!config.enabled);
+        assert!(config.push_gateway.is_none());
+        assert_eq!(config.push_interval, 60);
+    }
+
+    #[test]
+    fn test_prometheus_config_validates() {
+        let config = PrometheusConfig::default();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_prometheus_config_empty_push_gateway() {
+        let config = PrometheusConfig {
+            enabled: true,
+            push_gateway: Some("".to_string()),
+            push_interval: 60,
+        };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_prometheus_config_short_push_interval() {
+        let config = PrometheusConfig {
+            enabled: true,
+            push_gateway: None,
+            push_interval: 5,
+        };
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("too short"));
+    }
+
+    #[test]
+    fn test_prometheus_config_serde() {
+        let toml = r#"
+            enabled = true
+            push_gateway = "http://localhost:9091"
+            push_interval = 30
+        "#;
+        let config: PrometheusConfig = toml::from_str(toml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(
+            config.push_gateway,
+            Some("http://localhost:9091".to_string())
+        );
+        assert_eq!(config.push_interval, 30);
+    }
+
+    // ==========================================================================
+    // MQTT config tests
+    // ==========================================================================
+
+    #[test]
+    fn test_mqtt_config_default() {
+        let config = MqttConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.broker, "mqtt://localhost:1883");
+        assert_eq!(config.topic_prefix, "aranet");
+        assert_eq!(config.client_id, "aranet-service");
+        assert_eq!(config.qos, 1);
+        assert!(!config.retain);
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
+        assert_eq!(config.keep_alive, 60);
+    }
+
+    #[test]
+    fn test_mqtt_config_validates_when_disabled() {
+        let config = MqttConfig::default();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_mqtt_config_validates_when_enabled() {
+        let config = MqttConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_mqtt_config_empty_broker() {
+        let config = MqttConfig {
+            enabled: true,
+            broker: "".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("broker URL cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_mqtt_config_invalid_broker_scheme() {
+        let config = MqttConfig {
+            enabled: true,
+            broker: "http://localhost:1883".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.message.contains("mqtt://")));
+    }
+
+    #[test]
+    fn test_mqtt_config_empty_topic_prefix() {
+        let config = MqttConfig {
+            enabled: true,
+            topic_prefix: "".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("topic prefix cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_mqtt_config_empty_client_id() {
+        let config = MqttConfig {
+            enabled: true,
+            client_id: "".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("client ID cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_mqtt_config_invalid_qos() {
+        let config = MqttConfig {
+            enabled: true,
+            qos: 5,
+            ..Default::default()
+        };
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.message.contains("invalid QoS")));
+    }
+
+    #[test]
+    fn test_mqtt_config_short_keep_alive() {
+        let config = MqttConfig {
+            enabled: true,
+            keep_alive: 2,
+            ..Default::default()
+        };
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("keep-alive interval"))
+        );
+    }
+
+    #[test]
+    fn test_mqtt_config_serde() {
+        let toml = r#"
+            enabled = true
+            broker = "mqtts://broker.example.com:8883"
+            topic_prefix = "home/sensors"
+            client_id = "my-service"
+            qos = 2
+            retain = true
+            username = "user"
+            password = "secret"
+            keep_alive = 30
+        "#;
+        let config: MqttConfig = toml::from_str(toml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.broker, "mqtts://broker.example.com:8883");
+        assert_eq!(config.topic_prefix, "home/sensors");
+        assert_eq!(config.client_id, "my-service");
+        assert_eq!(config.qos, 2);
+        assert!(config.retain);
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.password, Some("secret".to_string()));
+        assert_eq!(config.keep_alive, 30);
+    }
+
+    #[test]
+    fn test_config_with_prometheus_and_mqtt() {
+        let toml = r#"
+            [server]
+            bind = "127.0.0.1:8080"
+
+            [prometheus]
+            enabled = true
+
+            [mqtt]
+            enabled = true
+            broker = "mqtt://localhost:1883"
+            topic_prefix = "aranet"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.prometheus.enabled);
+        assert!(config.mqtt.enabled);
+        assert!(config.validate().is_ok());
     }
 }

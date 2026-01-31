@@ -1,0 +1,382 @@
+---
+title: Service Deployment
+description: Deploy aranet-service as a background system service.
+---
+
+import { Aside, Steps, Tabs, TabItem, Badge } from '@astrojs/starlight/components';
+
+This guide covers deploying aranet-service as a persistent background service on various platforms.
+
+## Deployment Options
+
+| Platform | Service Manager | Config Location |
+|----------|----------------|-----------------|
+| macOS | launchd | `~/Library/LaunchAgents/` |
+| Linux | systemd | `/etc/systemd/system/` |
+| Docker | docker-compose | Container orchestration |
+| Windows | NSSM | Windows Service |
+
+## macOS (launchd)
+
+### User-Level Service
+
+<Steps>
+1. Install aranet-service
+   ```bash
+   cargo install aranet-service --features full
+   ```
+
+2. Install as user service
+   ```bash
+   aranet-service service install --user
+   ```
+
+3. Start the service
+   ```bash
+   aranet-service service start --user
+   ```
+
+4. Check status
+   ```bash
+   aranet-service service status --user
+   ```
+</Steps>
+
+### Manual Configuration
+
+Create `~/Library/LaunchAgents/dev.rye.aranet.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.rye.aranet</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/aranet-service</string>
+        <string>run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/aranet.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/aranet.err</string>
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/aranet</string>
+</dict>
+</plist>
+```
+
+Load the service:
+
+```bash
+launchctl load ~/Library/LaunchAgents/dev.rye.aranet.plist
+```
+
+## Linux (systemd)
+
+### System-Level Service
+
+<Steps>
+1. Build and install
+   ```bash
+   cargo build --release -p aranet-service --features full
+   sudo cp target/release/aranet-service /usr/local/bin/
+   ```
+
+2. Create service user
+   ```bash
+   sudo useradd -r -s /bin/false aranet
+   sudo mkdir -p /var/lib/aranet
+   sudo chown aranet:aranet /var/lib/aranet
+   ```
+
+3. Install the service file
+   ```bash
+   aranet-service service install
+   # Or manually: sudo cp distribution/systemd/aranet.service /etc/systemd/system/
+   ```
+
+4. Enable and start
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable aranet
+   sudo systemctl start aranet
+   ```
+</Steps>
+
+### Service File
+
+Create `/etc/systemd/system/aranet.service`:
+
+```ini
+[Unit]
+Description=Aranet Sensor Collector Service
+Documentation=https://github.com/cameronrye/aranet
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aranet
+Group=aranet
+ExecStart=/usr/local/bin/aranet-service run
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Paths
+WorkingDirectory=/var/lib/aranet
+ReadWritePaths=/var/lib/aranet
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Bluetooth access
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### User-Level Service
+
+```bash
+# Create user service directory
+mkdir -p ~/.config/systemd/user
+
+# Copy service file
+cp distribution/systemd/aranet.service ~/.config/systemd/user/
+
+# Edit to remove User/Group and adjust paths
+# Then enable
+systemctl --user daemon-reload
+systemctl --user enable aranet
+systemctl --user start aranet
+```
+
+## Docker
+
+See [Docker Setup](/aranet/docker/README.md) for detailed Docker deployment.
+
+### Quick Start
+
+```bash
+cd docker
+docker-compose up -d
+```
+
+### Production Deployment
+
+```yaml
+# docker-compose.prod.yml
+services:
+  aranet-service:
+    image: ghcr.io/cameronrye/aranet-service:latest
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - aranet-data:/data
+      - ./server.toml:/app/server.toml:ro
+    environment:
+      - RUST_LOG=aranet_service=info
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+```
+
+<Aside type="caution">
+  Docker containers cannot access Bluetooth by default. For BLE support, run in privileged mode or use the host network.
+</Aside>
+
+## Configuration
+
+### Server Configuration
+
+Create `~/.config/aranet/server.toml`:
+
+```toml
+[server]
+bind = "127.0.0.1:8080"
+
+[storage]
+path = "~/.local/share/aranet/data.db"
+
+[prometheus]
+enabled = true
+
+[[devices]]
+address = "Aranet4 XXXXX"
+alias = "office"
+poll_interval = 60
+```
+
+### Security Configuration
+
+For production deployments, enable API authentication and rate limiting:
+
+```toml
+[security]
+api_key_enabled = true
+api_key = "your-secure-random-key-at-least-16-chars"
+rate_limit_enabled = true
+rate_limit_requests = 100
+rate_limit_window_secs = 60
+```
+
+See [API Security](/docs/service/security/) for detailed configuration.
+
+### Environment Variables
+
+```bash
+# Log level
+export RUST_LOG=aranet_service=info
+
+# Config file location
+export ARANET_CONFIG=/path/to/server.toml
+```
+
+## Prometheus Integration
+
+### Scrape Configuration
+
+Add to `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'aranet'
+    static_configs:
+      - targets: ['localhost:8080']
+    metrics_path: /metrics
+    scrape_interval: 60s
+```
+
+### Available Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `aranet_co2_ppm` | gauge | CO₂ concentration |
+| `aranet_temperature_celsius` | gauge | Temperature |
+| `aranet_humidity_percent` | gauge | Relative humidity |
+| `aranet_pressure_hpa` | gauge | Atmospheric pressure |
+| `aranet_battery_percent` | gauge | Battery level |
+| `aranet_reading_age_seconds` | gauge | Time since last reading |
+| `aranet_collector_running` | gauge | Collector status (1/0) |
+| `aranet_collector_uptime_seconds` | gauge | Collector uptime |
+| `aranet_device_poll_success_total` | counter | Successful polls |
+| `aranet_device_poll_failure_total` | counter | Failed polls |
+
+## Multi-Device Setup
+
+### Multiple Sensors
+
+Configure multiple devices in `server.toml`:
+
+```toml
+[[devices]]
+address = "Aranet4 AAAAA"
+alias = "office"
+poll_interval = 60
+
+[[devices]]
+address = "Aranet4 BBBBB"
+alias = "bedroom"
+poll_interval = 120
+
+[[devices]]
+address = "Aranet4 CCCCC"
+alias = "kitchen"
+poll_interval = 60
+
+[[devices]]
+address = "AranetRn+ DDDDD"
+alias = "basement"
+poll_interval = 300  # Radon updates slowly
+```
+
+### Multi-Location Deployment
+
+For sensors spread across multiple locations:
+
+1. **Option A: Central collector** - One aranet-service with MQTT forwarding
+2. **Option B: Distributed collectors** - Multiple aranet-service instances pushing to central Prometheus
+
+```
+┌─────────────────┐     ┌─────────────────┐
+│ Location A      │     │ Location B      │
+│ aranet-service  │────▶│ aranet-service  │
+│ :8080           │     │ :8080           │
+└────────┬────────┘     └────────┬────────┘
+         │                       │
+         └──────────┬────────────┘
+                    ▼
+           ┌────────────────┐
+           │   Prometheus   │
+           │   (Central)    │
+           └───────┬────────┘
+                   │
+                   ▼
+           ┌────────────────┐
+           │    Grafana     │
+           └────────────────┘
+```
+
+## Monitoring & Logging
+
+### View Logs
+
+```bash
+# systemd
+journalctl -u aranet -f
+
+# launchd
+tail -f /usr/local/var/log/aranet.log
+
+# Docker
+docker logs -f aranet-service
+```
+
+### Health Check
+
+```bash
+curl http://localhost:8080/api/health
+# {"status":"ok","version":"0.1.11","timestamp":"2024-01-15T10:30:00Z"}
+```
+
+### Prometheus Metrics
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+## Troubleshooting
+
+### Service Won't Start
+
+1. Check logs for errors
+2. Verify configuration file syntax: `toml-cli check server.toml`
+3. Ensure Bluetooth permissions (Linux: CAP_NET_ADMIN)
+
+### No Bluetooth Access
+
+- **Linux**: Add user to `bluetooth` group: `sudo usermod -aG bluetooth $USER`
+- **macOS**: Grant Bluetooth permission in System Preferences
+- **Docker**: Run with `--privileged` or mount `/var/run/dbus`
+
+### Connection Timeouts
+
+1. Check device is powered on and in range
+2. Increase poll_interval (device may be busy)
+3. Verify no other app is connected to the device

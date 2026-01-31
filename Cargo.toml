@@ -7,18 +7,6 @@ members = [
     "crates/aranet-cli",
     "crates/aranet-tui",
     "crates/aranet-gui",
-    "crates/aranet-wasm",
-]
-# Default members exclude WASM (which requires special tooling)
-# Build WASM explicitly with: cargo build -p aranet-wasm --target wasm32-unknown-unknown
-default-members = [
-    "crates/aranet-types",
-    "crates/aranet-core",
-    "crates/aranet-store",
-    "crates/aranet-service",
-    "crates/aranet-cli",
-    "crates/aranet-tui",
-    "crates/aranet-gui",
 ]
 resolver = "2"
 
@@ -34,7 +22,7 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
-time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "local-offset"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
@@ -50,13 +38,13 @@ async-trait = "0.1"
 rand = "0.9"
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.9"
+reqwest = { version = "0.12", features = ["json"] }
 
 [workspace.metadata.features]
 default = ["cli"]
 cli = []
 tui = []
 gui = []
-wasm = []
 
 # Build profile for cargo-dist releases
 [profile.dist]

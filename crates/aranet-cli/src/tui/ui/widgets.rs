@@ -364,4 +364,206 @@ mod tests {
         assert_eq!(arrow, "→");
         assert_eq!(color, Color::DarkGray);
     }
+
+    // ========================================================================
+    // co2_trend tests
+    // ========================================================================
+
+    #[test]
+    fn test_co2_trend_no_previous() {
+        let result = co2_trend(800, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_co2_trend_rising() {
+        let result = co2_trend(850, Some(800));
+        assert!(result.is_some());
+        let (arrow, color) = result.unwrap();
+        assert_eq!(arrow, "↑");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn test_co2_trend_falling() {
+        let result = co2_trend(750, Some(800));
+        assert!(result.is_some());
+        let (arrow, color) = result.unwrap();
+        assert_eq!(arrow, "↓");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn test_co2_trend_stable() {
+        let result = co2_trend(805, Some(800));
+        assert!(result.is_some());
+        let (arrow, _) = result.unwrap();
+        assert_eq!(arrow, "→");
+    }
+
+    // ========================================================================
+    // radon_unit_for_device tests
+    // ========================================================================
+
+    #[test]
+    fn test_radon_unit_no_settings() {
+        let result = radon_unit_for_device(None);
+        assert_eq!(result, "Bq/m³");
+    }
+
+    #[test]
+    fn test_radon_unit_bq_setting() {
+        let settings = DeviceSettings {
+            radon_unit: RadonUnit::BqM3,
+            ..Default::default()
+        };
+        let result = radon_unit_for_device(Some(&settings));
+        assert_eq!(result, "Bq/m³");
+    }
+
+    #[test]
+    fn test_radon_unit_pci_setting() {
+        let settings = DeviceSettings {
+            radon_unit: RadonUnit::PciL,
+            ..Default::default()
+        };
+        let result = radon_unit_for_device(Some(&settings));
+        assert_eq!(result, "pCi/L");
+    }
+
+    // ========================================================================
+    // convert_radon_for_device tests
+    // ========================================================================
+
+    #[test]
+    fn test_convert_radon_no_settings() {
+        let result = convert_radon_for_device(100, None);
+        assert_eq!(result, 100.0);
+    }
+
+    #[test]
+    fn test_convert_radon_bq_setting() {
+        let settings = DeviceSettings {
+            radon_unit: RadonUnit::BqM3,
+            ..Default::default()
+        };
+        let result = convert_radon_for_device(100, Some(&settings));
+        assert_eq!(result, 100.0);
+    }
+
+    #[test]
+    fn test_convert_radon_pci_setting() {
+        let settings = DeviceSettings {
+            radon_unit: RadonUnit::PciL,
+            ..Default::default()
+        };
+        let result = convert_radon_for_device(100, Some(&settings));
+        // 100 Bq/m3 = 2.7 pCi/L
+        assert!((result - 2.7).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // sparkline_data tests
+    // ========================================================================
+
+    #[test]
+    fn test_sparkline_data_empty() {
+        let result = sparkline_data(&[], None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_sparkline_data_aranet4() {
+        use aranet_types::DeviceType;
+        use time::OffsetDateTime;
+
+        let history = vec![
+            HistoryRecord {
+                timestamp: OffsetDateTime::now_utc(),
+                co2: 800,
+                temperature: 22.5,
+                humidity: 45,
+                pressure: 1013.0,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+            HistoryRecord {
+                timestamp: OffsetDateTime::now_utc(),
+                co2: 850,
+                temperature: 22.5,
+                humidity: 45,
+                pressure: 1013.0,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+        ];
+
+        let result = sparkline_data(&history, Some(DeviceType::Aranet4));
+        assert_eq!(result, vec![800, 850]);
+    }
+
+    #[test]
+    fn test_sparkline_data_radon() {
+        use aranet_types::DeviceType;
+        use time::OffsetDateTime;
+
+        let history = vec![
+            HistoryRecord {
+                timestamp: OffsetDateTime::now_utc(),
+                co2: 0,
+                temperature: 22.5,
+                humidity: 45,
+                pressure: 1013.0,
+                radon: Some(100),
+                radiation_rate: None,
+                radiation_total: None,
+            },
+            HistoryRecord {
+                timestamp: OffsetDateTime::now_utc(),
+                co2: 0,
+                temperature: 22.5,
+                humidity: 45,
+                pressure: 1013.0,
+                radon: Some(150),
+                radiation_rate: None,
+                radiation_total: None,
+            },
+        ];
+
+        let result = sparkline_data(&history, Some(DeviceType::AranetRadon));
+        assert_eq!(result, vec![100, 150]);
+    }
+
+    #[test]
+    fn test_sparkline_data_filters_zero_co2() {
+        use time::OffsetDateTime;
+
+        let history = vec![
+            HistoryRecord {
+                timestamp: OffsetDateTime::now_utc(),
+                co2: 0, // Should be filtered out
+                temperature: 22.5,
+                humidity: 45,
+                pressure: 1013.0,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+            HistoryRecord {
+                timestamp: OffsetDateTime::now_utc(),
+                co2: 800,
+                temperature: 22.5,
+                humidity: 45,
+                pressure: 1013.0,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+        ];
+
+        let result = sparkline_data(&history, None);
+        assert_eq!(result, vec![800]); // Zero CO2 filtered out
+    }
 }

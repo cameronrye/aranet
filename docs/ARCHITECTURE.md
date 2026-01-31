@@ -1,7 +1,7 @@
-# Aranet Roadmap
+# Aranet Architecture
 
-A complete Rust implementation for Aranet environmental sensors,
-designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aranet4-Python) and beyond.
+Technical architecture and reference documentation for the Aranet Rust implementation.
+This project provides feature parity with [Aranet4-Python](https://github.com/Anrijs/Aranet4-Python) and beyond.
 
 > **Dependency Policy**: Always use the **latest stable versions** of all libraries, frameworks, and tools.
 > Pin to major versions only (e.g., `btleplug = "0.11"` not `"0.11.4"`). Run `cargo update` regularly.
@@ -9,7 +9,7 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 ---
 
-## Current Progress (Updated Jan 22, 2026)
+## Current Progress (Updated Jan 30, 2026)
 
 | Phase | Component | Status | Progress |
 |-------|-----------|--------|----------|
@@ -18,9 +18,8 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 | 2 | CLI Tool | Done | All core commands: scan, read, status, info, history, set, watch, config |
 | 3 | TUI Dashboard | Done | Full dashboard with tabs, sparklines, help overlay, multi-device support |
 | 4 | GUI Application | Done | Full MVP: device scan, connect, real-time readings with color coding |
-| 5 | WASM Module | WIP | Basic init/log; Web Bluetooth pending |
-| 6 | Data Persistence & API | Done | aranet-store complete; aranet-service complete |
-| 7 | Unified Data Architecture | Done | Shared database across all tools; auto-connect; auto-sync |
+| 5 | Data Persistence & API | Done | aranet-store complete; aranet-service complete |
+| 6 | Unified Data Architecture | Done | Shared database across all tools; auto-connect; auto-sync |
 
 **Legend**: [ ] Not started - [~] In progress/partial - [x] Complete
 
@@ -37,6 +36,8 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 
 ### Recent Improvements (Jan 2026)
 
+- **GUI enhancements**: Auto-connect/sync preferences UI, data export settings, multiple metrics overlay chart, comparison view
+- **GUI polish**: Escape key closes dialogs, notification sound toggle, Do Not Disturb mode, launch minimized, compact mode
 - **Code coverage with cargo-llvm-cov**: CI now reports test coverage via Codecov
 - **Property-based testing with proptest**: Fuzz testing for all byte parsers to catch edge cases
 - **310+ tests**: Expanded from 268 to 310+ tests across the workspace
@@ -67,10 +68,9 @@ designed for feature parity with [Aranet4-Python](https://github.com/Anrijs/Aran
 1. ~~Add sensor data display to TUI shell~~ - Complete (v0.3.0)
 2. ~~**TUI Polish**: Auto-refresh, trend indicators, scrollable history, settings editing~~ - Complete (v0.1.8)
 3. ~~Add sensor data display to GUI shell~~ - Complete (v0.4.0)
-4. **Unified Data Architecture** - All tools share same database, auto-connect, auto-sync (see below)
-5. Implement Web Bluetooth in WASM module
-6. ~~**Data persistence layer (aranet-store)**~~ - Complete (v0.1.7)
-7. ~~**Background service (aranet-service)**~~ - Complete (v0.1.8)
+4. ~~**Unified Data Architecture**~~ - All tools share same database, auto-connect, auto-sync - Complete
+5. ~~**Data persistence layer (aranet-store)**~~ - Complete (v0.1.7)
+6. ~~**Background service (aranet-service)**~~ - Complete (v0.1.8)
 
 ## Vision
 
@@ -83,7 +83,6 @@ Build the definitive Rust ecosystem for Aranet devices:
 - **aranet-cli** - Feature-complete command-line interface
 - **aranet-tui** - Real-time terminal UI for monitoring
 - **aranet-gui** - Native desktop app (egui-based)
-- **aranet-wasm** - Web Bluetooth integration for browsers
 
 ---
 
@@ -534,6 +533,118 @@ Features include Dashboard/History/Settings tabs, time filtering (All/24h/7d/30d
 measurement interval editing, Smart Home and Bluetooth Range toggles, and auto-refresh.
 Run with `cargo run --package aranet-gui`.
 
+### GUI Enhancement Roadmap
+
+The current GUI is functional but has room for polish. Below are planned enhancements organized by priority:
+
+#### Visual & Layout Improvements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Responsive window sizing | P2 | [x] | Remember window size/position between sessions |
+| Collapsible sidebar | P2 | [x] | Toggle device list visibility for more chart space (`[` key) |
+| Compact mode | P3 | [x] | Dense layout option for smaller screens |
+| Custom color themes | P3 | [ ] | User-defined color schemes beyond light/dark |
+| Reading trend indicators | P2 | [x] | Show ↑↓→ arrows next to readings based on recent history |
+| Device status badges | P2 | [x] | Visual badges for battery low, stale readings |
+
+#### Settings Tab Improvements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Edit measurement interval | P1 | [x] | Change device interval (1, 2, 5, 10 min) |
+| Edit Bluetooth range | P1 | [x] | Toggle standard/extended range |
+| Toggle Smart Home mode | P1 | [x] | Enable/disable Smart Home integrations |
+| Device alias/rename | P2 | [x] | Set friendly name for devices |
+| Alert threshold config | P1 | [x] | Customize CO2/radon alert thresholds with sliders |
+| Auto-connect preferences | P2 | [x] | Configure auto-connect, auto-sync, remember devices, load cache |
+| Notification preferences | P2 | [x] | Notifications enabled toggle, sound toggle, Do Not Disturb |
+| Data export settings | P2 | [x] | Default export format (CSV/JSON) and location |
+| Temperature unit toggle | P2 | [x] | Switch between Celsius and Fahrenheit |
+| Pressure unit toggle | P2 | [x] | Switch between hPa and inHg |
+
+#### History Tab Improvements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Time range filter | P1 | [x] | Filter by All/24h/7d/30d |
+| Export to CSV/JSON | P2 | [x] | Export visible history with button click |
+| Multiple metrics overlay | P2 | [x] | Toggle to show temp/humidity on same chart |
+| Date range picker | P2 | [x] | Custom date range selection |
+| Sync status indicator | P2 | [x] | Show last sync timestamp and progress |
+
+#### Multi-Device Features
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Device filter by type | P2 | [x] | Filter sidebar by Aranet4/Radon/Radiation |
+| Device filter by status | P2 | [x] | Show only connected or disconnected devices |
+| Comparison view | P2 | [x] | Side-by-side readings from multiple devices with Compare button |
+| Bulk actions | P2 | [x] | Connect/disconnect/refresh all devices at once |
+| Device grouping | P3 | [ ] | Organize devices into custom groups (e.g., "Office", "Home") |
+
+#### Notifications & Alerts
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Threshold notifications | P2 | [x] | System notifications when CO2/radon exceeds limit |
+| Alert history log | P2 | [x] | View past alerts with timestamps in app |
+| Alert severity levels | P2 | [x] | Info/Warning/Critical with different notification styles |
+| Notification sound toggle | P2 | [x] | Enable/disable alert sounds |
+| Do Not Disturb mode | P3 | [x] | Temporarily suppress all notifications |
+
+#### System Tray Enhancements
+
+| Feature | Priority | Status | Description |
+|---------|----------|--------|-------------|
+| Dynamic CO2 color icon | P2 | [x] | Tray icon color reflects CO2 status |
+| Close to tray | P2 | [x] | Window closes to tray instead of quitting |
+| Tray context menu | P2 | [x] | Quick actions: Scan, Refresh All, Open Settings |
+| Current reading tooltip | P2 | [x] | Hover tray icon to see current CO2/temp |
+| Launch minimized option | P2 | [x] | Start app minimized to tray on login |
+| Quick device switcher | P3 | [ ] | Select device to display in tray from menu |
+
+#### Keyboard Shortcuts
+
+| Shortcut | Action | Status |
+|----------|--------|--------|
+| `Cmd+R` | Refresh all connected devices | [x] |
+| `Cmd+S` | Sync history for selected device | [x] |
+| `Cmd+,` | Open settings tab | [x] |
+| `1/2/3/4` | Switch to Dashboard/History/Settings/Service tab | [x] |
+| `Cmd+↑/↓` | Navigate device list | [x] |
+| `[` | Toggle sidebar collapse | [x] |
+| `T` | Toggle dark/light theme | [x] |
+| `A` | Toggle auto-refresh | [x] |
+| `F5` | Scan for devices | [x] |
+| `Ctrl+E` / `Cmd+E` | Export data | [x] |
+| `Escape` | Close dialogs/popups | [x] |
+
+#### Configuration Integration
+
+The GUI reads and writes settings from the unified config file at `~/.config/aranet/config.toml`:
+
+```toml
+[behavior]
+auto_connect = true       # Auto-connect to known devices on startup
+auto_sync = true          # Auto-sync history on connection
+remember_devices = true   # Save devices to database after connection
+
+[gui]
+theme = "system"          # "light", "dark", or "system"
+start_minimized = false   # Launch minimized to system tray
+show_tray_icon = true     # Show system tray icon
+temperature_unit = "C"    # "C" or "F"
+pressure_unit = "hPa"     # "hPa" or "inHg"
+
+[alerts]
+co2_warning = 1000        # CO2 warning threshold (ppm)
+co2_critical = 1400       # CO2 critical threshold (ppm)
+radon_warning = 100       # Radon warning threshold (Bq/m³)
+notifications = true      # Enable system notifications
+sound = true              # Play sound on alerts
+```
+
 ### AppState Design
 
 ```rust
@@ -581,70 +692,7 @@ pub struct AppState {
 
 ---
 
-## Phase 5: WASM Web App (v0.5.0)
-
-### Milestone: Browser-Based Aranet Monitor
-
-| Feature | Priority | Status |
-|---------|----------|--------|
-| Basic WASM module | P0 | [x] Init, greet, log work |
-| Web Bluetooth device discovery | P0 | [ ] |
-| Connect and read current values | P0 | [ ] |
-| Real-time dashboard UI | P0 | [ ] |
-| Historical data download | P1 | [ ] |
-| PWA (installable, offline) | P1 | [ ] |
-| Export to CSV | P2 | [ ] |
-| Chart visualizations | P2 | [ ] |
-
-### WASM Dependencies (use latest versions)
-
-| Dependency | Purpose | Check Latest |
-|------------|---------|--------------|
-| `wasm-bindgen` | Rust/JS interop | [crates.io/crates/wasm-bindgen](https://crates.io/crates/wasm-bindgen) |
-| `web-sys` | Web API bindings | [crates.io/crates/web-sys](https://crates.io/crates/web-sys) |
-| `js-sys` | JS type bindings | [crates.io/crates/js-sys](https://crates.io/crates/js-sys) |
-| `wasm-bindgen-futures` | Async/Promise interop | [crates.io/crates/wasm-bindgen-futures](https://crates.io/crates/wasm-bindgen-futures) |
-
-### Frontend Framework Options (use latest versions)
-
-| Option | Style | Check Latest |
-|--------|-------|--------------|
-| `yew` | React-like, mature | [crates.io/crates/yew](https://crates.io/crates/yew) |
-| `leptos` | Signals-based, fast, SSR | [crates.io/crates/leptos](https://crates.io/crates/leptos) |
-| `dioxus` | React-like, multi-platform | [crates.io/crates/dioxus](https://crates.io/crates/dioxus) |
-| `sycamore` | Reactive, fine-grained | [crates.io/crates/sycamore](https://crates.io/crates/sycamore) |
-
-> **Recommendation**: `leptos` is currently the most modern and performant choice for new WASM projects.
-
-### Technical Approach
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   Browser (Chrome)                  │
-├─────────────────────────────────────────────────────┤
-│  ┌─────────────┐    ┌─────────────────────────────┐ │
-│  │  Leptos/Yew │◄───│  aranet (WASM compiled)     │ │
-│  │   Frontend  │    └──────────────┬──────────────┘ │
-│  └─────────────┘                   │                │
-│                                    ▼                │
-│                    ┌───────────────────────────────┐│
-│                    │   Web Bluetooth API (JS glue) ││
-│                    └───────────────────────────────┘│
-└─────────────────────────────────────────────────────┘
-```
-
-**Key Considerations:**
-
-- Web Bluetooth only works in Chrome/Edge (~50% browser support)
-- iOS Safari does NOT support Web Bluetooth (no workaround)
-- Need `wasm-bindgen` for JS interop
-- Consider `web-sys` for Web Bluetooth bindings
-
-**Existing Reference**: [Sensor Pilot](https://github.com/kasparsd/sensor-pilot) - vanilla JS implementation (uses OLD UUID only, needs update)
-
----
-
-## Phase 6: Data Persistence & API (v0.6.0)
+## Phase 5: Data Persistence & API (v0.5.0)
 
 ### Milestone: Local Storage + HTTP API for Integrations
 
@@ -832,7 +880,7 @@ poll_interval = 300                # radon changes slowly
 +---------------------------------------------------------------+
 ```
 
-### Phase 6 Dependencies (use latest versions)
+### Phase 5 Dependencies (use latest versions)
 
 | Dependency | Purpose | Crate | Check Latest |
 |------------|---------|-------|--------------|
@@ -923,7 +971,7 @@ aranet/
 ├── README.md
 ├── LICENSE
 ├── CHANGELOG.md
-├── ROADMAP.md
+├── docs/ARCHITECTURE.md
 ├── .github/
 │   └── workflows/
 │       └── ci.yml          # GitHub Actions CI
@@ -971,11 +1019,8 @@ aranet/
 │   ├── aranet-tui/         # TUI dashboard
 │   │   ├── src/main.rs
 │   │   └── Cargo.toml
-│   ├── aranet-gui/         # GUI application
-│   │   ├── src/main.rs
-│   │   └── Cargo.toml
-│   └── aranet-wasm/        # WASM web app (Web Bluetooth)
-│       ├── src/lib.rs
+│   └── aranet-gui/         # GUI application
+│       ├── src/main.rs
 │       └── Cargo.toml
 └── docs/
     ├── PROTOCOL.md
@@ -991,11 +1036,10 @@ aranet/
 | 0 | Foundation | Done | README, LICENSE, CI, examples |
 | 1 | Core Library | Done | btleplug, tokio, thiserror |
 | 2 | CLI Tool | Done | Phase 1 + clap, serde |
-| 3 | TUI Dashboard (basic) | Done | Phase 1 + ratatui, crossterm |
-| 3+ | TUI Polish & Features | 1-2 weeks | Auto-refresh, settings, history scrolling |
-| 4 | GUI App | 2-3 weeks | Phase 1 + egui/iced |
-| 5 | WASM Web | 2-3 weeks | aranet-types + wasm-bindgen |
-| 6 | Data Persistence & API | 1-2 weeks | Phase 1 + rusqlite, axum |
+| 3 | TUI Dashboard | Done | Phase 1 + ratatui, crossterm |
+| 4 | GUI App | Done | Phase 1 + egui/iced |
+| 5 | Data Persistence & API | Done | Phase 1 + rusqlite, axum |
+| 6 | Unified Data Architecture | Done | Shared database, auto-connect, auto-sync |
 
 ---
 
@@ -1059,8 +1103,6 @@ When testing with real Aranet devices:
 |------|---------|---------------|
 | Rust | Compiler | `rustup update stable` |
 | cargo | Package manager | Comes with Rust |
-| wasm-pack | WASM builds | `cargo install wasm-pack` |
-| trunk | WASM dev server | `cargo install trunk` |
 | cargo-watch | Auto-rebuild | `cargo install cargo-watch` |
 | cargo-audit | Security audit | `cargo install cargo-audit` |
 | cargo-outdated | Dep version check | `cargo install cargo-outdated` |
@@ -1112,23 +1154,17 @@ rust-version = "1.90"  # Updated Jan 2026
 - [aranet-btle](https://github.com/DDRBoxman/aranet-btle) - advertisement scanning
 - [aranet4-rs](https://github.com/lpraneis/aranet4-rs) - history support
 
-### Web Bluetooth
-
-- [Sensor Pilot](https://github.com/kasparsd/sensor-pilot) - JS reference
-- [Web Bluetooth API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API)
-
 ---
 
 ## Success Metrics
 
-- [ ] All Python library features working in Rust
-- [ ] Single binary CLI with no runtime dependencies
-- [ ] TUI that can monitor multiple devices simultaneously
-- [ ] GUI app installable on macOS, Windows, Linux
-- [ ] WASM app deployed to GitHub Pages
-- [ ] Published to crates.io as `aranet`
-- [ ] All dependencies on latest stable versions
-- [ ] Zero `cargo audit` warnings
+- [x] All Python library features working in Rust
+- [x] Single binary CLI with no runtime dependencies
+- [x] TUI that can monitor multiple devices simultaneously
+- [x] GUI app installable on macOS, Windows, Linux
+- [x] Published to crates.io as `aranet`
+- [x] All dependencies on latest stable versions
+- [x] Zero `cargo audit` vulnerabilities (10 allowed warnings for unmaintained GTK3 transitive deps)
 
 ---
 

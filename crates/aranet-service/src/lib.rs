@@ -5,10 +5,11 @@
 //! - Stores readings in the local database
 //! - Exposes a REST API for querying data
 //! - Provides WebSocket connections for real-time updates
+//! - Optional API key authentication and rate limiting
 //!
 //! # REST API Endpoints
 //!
-//! - `GET /api/health` - Service health check
+//! - `GET /api/health` - Service health check (no auth required)
 //! - `GET /api/devices` - List all known devices
 //! - `GET /api/devices/:id` - Get device info
 //! - `GET /api/devices/:id/current` - Latest reading for device
@@ -33,13 +34,36 @@
 //! alias = "office"
 //! poll_interval = 60
 //! ```
+//!
+//! # Security
+//!
+//! Optional security features can be enabled:
+//!
+//! ```toml
+//! [security]
+//! # Require X-API-Key header for all requests (except /api/health)
+//! api_key_enabled = true
+//! api_key = "your-secure-random-key-at-least-16-chars"
+//!
+//! # Rate limit requests per IP address
+//! rate_limit_enabled = true
+//! rate_limit_requests = 100   # max requests per window
+//! rate_limit_window_secs = 60 # window duration
+//! ```
 
 pub mod api;
 pub mod collector;
 pub mod config;
+pub mod middleware;
 pub mod state;
 pub mod ws;
 
 pub use collector::Collector;
-pub use config::{Config, ConfigError, DeviceConfig, ServerConfig, StorageConfig};
+pub use config::{
+    Config, ConfigError, DeviceConfig, MqttConfig, PrometheusConfig, SecurityConfig, ServerConfig,
+    StorageConfig,
+};
 pub use state::{AppState, ReadingEvent};
+
+#[cfg(feature = "mqtt")]
+pub mod mqtt;

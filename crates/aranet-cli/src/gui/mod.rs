@@ -17,6 +17,11 @@
 mod app;
 mod components;
 pub mod demo;
+mod export;
+mod helpers;
+mod menu;
+mod panels;
+mod readings;
 mod theme;
 mod tray;
 mod types;
@@ -30,9 +35,11 @@ use anyhow::Result;
 use aranet_store::default_db_path;
 use eframe::egui::{self, IconData};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use aranet_core::messages::{Command, SensorEvent};
+
+use crate::config::Config;
 
 /// Embedded icon PNG data (64x64 RGBA)
 const ICON_PNG: &[u8] = include_bytes!("../../assets/aranet-icon.png");
@@ -49,12 +56,16 @@ fn load_icon() -> Option<Arc<IconData>> {
 }
 
 pub use app::AranetApp;
+pub use menu::{MenuCommand, MenuManager};
 pub use theme::{Theme, ThemeMode};
 pub use tray::{
     TrayCommand, TrayError, TrayManager, TrayState, check_co2_threshold, hide_dock_icon,
-    show_dock_icon,
+    set_egui_context, show_dock_icon,
 };
-pub use types::{Co2Level, ConnectionState, DeviceState, HistoryFilter, Tab, Trend};
+pub use types::{
+    AlertEntry, AlertSeverity, AlertType, Co2Level, ConnectionFilter, ConnectionState, DeviceState,
+    DeviceTypeFilter, HistoryFilter, RadonLevel, Tab, Trend,
+};
 pub use worker::SensorWorker;
 
 /// Options for running the GUI application.
@@ -94,6 +105,10 @@ impl GuiOptions {
 pub fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Load config to get service URL
+    let config = Config::load();
+    let service_url = config.gui.service_url.clone();
+
     // Get store path (shared database location)
     let store_path = default_db_path();
     info!("Using database at: {:?}", store_path);
@@ -112,10 +127,12 @@ pub fn run() -> Result<()> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
-            let worker = SensorWorker::new(command_rx, event_tx, store_path);
+            let worker =
+                SensorWorker::with_service_url(command_rx, event_tx, store_path, &service_url);
 
-            // Send LoadCachedData command to load devices from store on startup
+            // Send startup commands: load cached data and fetch service status
             let _ = startup_command_tx.send(Command::LoadCachedData).await;
+            let _ = startup_command_tx.send(Command::RefreshServiceStatus).await;
 
             // Forward events from worker to std channel
             let mut event_rx = event_rx_tokio;
@@ -133,14 +150,21 @@ pub fn run() -> Result<()> {
         });
     });
 
-    // Create shared tray state
-    let tray_state = Arc::new(Mutex::new(TrayState {
-        window_visible: true,
+    // Reuse config loaded earlier for GUI settings
+    let gui_config = &config.gui;
+    let default_width = 800.0;
+    let default_height = 600.0;
+    let window_width = gui_config.window_width.unwrap_or(default_width);
+    let window_height = gui_config.window_height.unwrap_or(default_height);
+
+    // Create system tray icon (must be on main thread before event loop)
+    // We need to create a temporary tray state first
+    let tray_state_temp = Arc::new(Mutex::new(TrayState {
+        window_visible: true, // Will be updated below
         ..Default::default()
     }));
 
-    // Create system tray icon (must be on main thread before event loop)
-    let tray_manager = match TrayManager::new(tray_state.clone()) {
+    let tray_manager = match TrayManager::new(tray_state_temp.clone()) {
         Ok(manager) => Some(manager),
         Err(e) => {
             warn!(
@@ -151,11 +175,36 @@ pub fn run() -> Result<()> {
         }
     };
 
-    // Build viewport with icon and close-to-tray behavior
+    // Check if we should start minimized (requires tray to be available)
+    let start_minimized = gui_config.start_minimized && tray_manager.is_some();
+    if start_minimized {
+        info!("Starting minimized to system tray");
+        // Update tray state to reflect hidden window
+        if let Ok(mut state) = tray_state_temp.lock() {
+            state.window_visible = false;
+        }
+        // Hide the dock icon on macOS
+        hide_dock_icon();
+    }
+
+    // Use the properly initialized tray state
+    let tray_state = tray_state_temp;
+
+    // Build viewport with icon, saved size, and close-to-tray behavior
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([800.0, 600.0])
+        .with_inner_size([window_width, window_height])
         .with_min_inner_size([600.0, 400.0])
-        .with_close_button(true);
+        .with_close_button(true)
+        .with_visible(!start_minimized); // Start hidden if start_minimized is enabled
+
+    // Restore window position if saved
+    if let (Some(x), Some(y)) = (gui_config.window_x, gui_config.window_y) {
+        // Validate the position is reasonable
+        if x >= -500.0 && y >= -500.0 && x < 5000.0 && y < 5000.0 {
+            debug!("Restoring window position: ({}, {})", x, y);
+            viewport = viewport.with_position([x, y]);
+        }
+    }
 
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
@@ -170,13 +219,33 @@ pub fn run() -> Result<()> {
         "Aranet",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(AranetApp::new(
-                cc,
-                command_tx,
-                std_rx,
-                tray_state,
-                tray_manager,
-            )))
+            // Set the egui context for tray event handling.
+            // This allows tray events to wake up the event loop when the window is hidden.
+            set_egui_context(cc.egui_ctx.clone());
+
+            // Create app first without menu
+            let mut app = AranetApp::new(cc, command_tx, std_rx, tray_state, tray_manager, None);
+
+            // Create native menu bar AFTER eframe has initialized NSApp (required for macOS)
+            let menu_manager = match MenuManager::new() {
+                Ok(manager) => {
+                    // Initialize for macOS - now safe because NSApp is ready
+                    manager.init_for_macos();
+                    Some(manager)
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to create native menu: {}. Continuing without menu.",
+                        e
+                    );
+                    None
+                }
+            };
+
+            // Set the menu manager on the app
+            app.set_menu_manager(menu_manager);
+
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
@@ -193,6 +262,10 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
     if options.demo {
         info!("Running in demo mode with mock data");
     }
+
+    // Load config to get service URL and GUI settings
+    let config = Config::load();
+    let service_url = config.gui.service_url.clone();
 
     // Get store path (shared database location) - not used in demo mode
     let store_path = default_db_path();
@@ -215,12 +288,13 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
-            let worker = SensorWorker::new(command_rx, event_tx, store_path);
+            let worker =
+                SensorWorker::with_service_url(command_rx, event_tx, store_path, &service_url);
 
-            // Send LoadCachedData command to load devices from store on startup
-            // (In demo mode, the app will ignore this and use mock data)
+            // Send startup commands (skip in demo mode)
             if !is_demo {
                 let _ = startup_command_tx.send(Command::LoadCachedData).await;
+                let _ = startup_command_tx.send(Command::RefreshServiceStatus).await;
             }
 
             // Forward events from worker to std channel
@@ -238,10 +312,24 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
             forward_handle.abort();
         });
     });
+    let gui_config = &config.gui;
+    let default_width = 800.0;
+    let default_height = 600.0;
+    // Use 900x600 for screenshots to match VHS tape dimensions
+    let screenshot_width = 900.0;
+    let screenshot_height = 600.0;
+    let (window_width, window_height) = if options.demo {
+        (screenshot_width, screenshot_height)
+    } else {
+        (
+            gui_config.window_width.unwrap_or(default_width),
+            gui_config.window_height.unwrap_or(default_height),
+        )
+    };
 
     // Create shared tray state
-    let tray_state = Arc::new(Mutex::new(TrayState {
-        window_visible: true,
+    let tray_state_temp = Arc::new(Mutex::new(TrayState {
+        window_visible: true, // Will be updated below if start_minimized
         ..Default::default()
     }));
 
@@ -250,7 +338,7 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
     let tray_manager = if options.demo {
         None
     } else {
-        match TrayManager::new(tray_state.clone()) {
+        match TrayManager::new(tray_state_temp.clone()) {
             Ok(manager) => Some(manager),
             Err(e) => {
                 warn!(
@@ -262,11 +350,39 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
         }
     };
 
-    // Build viewport with icon and close-to-tray behavior
+    // Check if we should start minimized (requires tray and not in demo mode)
+    let start_minimized = !options.demo && gui_config.start_minimized && tray_manager.is_some();
+    if start_minimized {
+        info!("Starting minimized to system tray");
+        // Update tray state to reflect hidden window
+        if let Ok(mut state) = tray_state_temp.lock() {
+            state.window_visible = false;
+        }
+        // Hide the dock icon on macOS
+        hide_dock_icon();
+    }
+
+    // Use the properly initialized tray state
+    let tray_state = tray_state_temp;
+
+    // Build viewport with icon, saved size, and close-to-tray behavior
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([800.0, 600.0])
+        .with_inner_size([window_width, window_height])
         .with_min_inner_size([600.0, 400.0])
-        .with_close_button(true);
+        .with_close_button(true)
+        .with_visible(!start_minimized); // Start hidden if start_minimized is enabled
+
+    // Restore window position if saved (skip in demo mode)
+    if !options.demo
+        && let (Some(x), Some(y)) = (gui_config.window_x, gui_config.window_y)
+        && x >= -500.0
+        && y >= -500.0
+        && x < 5000.0
+        && y < 5000.0
+    {
+        debug!("Restoring window position: ({}, {})", x, y);
+        viewport = viewport.with_position([x, y]);
+    }
 
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
@@ -279,21 +395,54 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
 
     let screenshot_path = options.screenshot.clone();
     let screenshot_delay = options.screenshot_delay_frames;
+    let demo_mode = options.demo;
 
     eframe::run_native(
         "Aranet",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(AranetApp::new_with_options(
+            // Set the egui context for tray event handling.
+            // This allows tray events to wake up the event loop when the window is hidden.
+            set_egui_context(cc.egui_ctx.clone());
+
+            // Create app first without menu
+            let mut app = AranetApp::new_with_options(
                 cc,
                 command_tx,
                 std_rx,
                 tray_state,
                 tray_manager,
-                options.demo,
+                None,
+                demo_mode,
                 screenshot_path,
                 screenshot_delay,
-            )))
+            );
+
+            // Create native menu bar AFTER eframe has initialized NSApp (required for macOS)
+            // Skip menu in demo mode for cleaner screenshots
+            let menu_manager = if demo_mode {
+                None
+            } else {
+                match MenuManager::new() {
+                    Ok(manager) => {
+                        // Initialize for macOS - now safe because NSApp is ready
+                        manager.init_for_macos();
+                        Some(manager)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create native menu: {}. Continuing without menu.",
+                            e
+                        );
+                        None
+                    }
+                }
+            };
+
+            // Set the menu manager on the app
+            app.set_menu_manager(menu_manager);
+
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;

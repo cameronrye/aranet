@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use aranet_core::service_client::ServiceClient;
 use aranet_core::settings::{DeviceSettings, MeasurementInterval};
 use aranet_core::{BluetoothRange, Device, ScanOptions, scan::scan_with_options};
 use aranet_store::Store;
@@ -27,6 +28,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use super::messages::{CachedDevice, Command, SensorEvent};
+use aranet_core::messages::ServiceDeviceStats;
 
 /// Maximum time to wait for a BLE connect-and-read operation.
 const CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,12 +48,13 @@ pub struct SensorWorker {
     /// Sender for events back to the UI thread.
     event_tx: mpsc::Sender<SensorEvent>,
     /// Path to persistent storage.
-    #[allow(dead_code)]
     store_path: PathBuf,
-    /// Interval between automatic sensor polls.
-    #[allow(dead_code)]
-    poll_interval: Duration,
+    /// Service client for aranet-service communication.
+    service_client: Option<ServiceClient>,
 }
+
+/// Default URL for the aranet-service.
+const DEFAULT_SERVICE_URL: &str = "http://localhost:8080";
 
 impl SensorWorker {
     /// Create a new sensor worker.
@@ -61,18 +64,19 @@ impl SensorWorker {
     /// * `command_rx` - Channel receiver for commands from the UI
     /// * `event_tx` - Channel sender for events to the UI
     /// * `store_path` - Path to persistent storage
-    ///
-    /// The worker is created with a default poll interval of 60 seconds.
     pub fn new(
         command_rx: mpsc::Receiver<Command>,
         event_tx: mpsc::Sender<SensorEvent>,
         store_path: PathBuf,
     ) -> Self {
+        // Try to create service client with default URL
+        let service_client = ServiceClient::new(DEFAULT_SERVICE_URL).ok();
+
         Self {
             command_rx,
             event_tx,
             store_path,
-            poll_interval: Duration::from_secs(60),
+            service_client,
         }
     }
 
@@ -160,6 +164,29 @@ impl SensorWorker {
             }
             Command::SetSmartHome { device_id, enabled } => {
                 self.handle_set_smart_home(&device_id, enabled).await;
+            }
+            Command::RefreshServiceStatus => {
+                self.handle_refresh_service_status().await;
+            }
+            Command::StartServiceCollector => {
+                self.handle_start_service_collector().await;
+            }
+            Command::StopServiceCollector => {
+                self.handle_stop_service_collector().await;
+            }
+            Command::SetAlias { device_id, alias } => {
+                self.handle_set_alias(&device_id, alias).await;
+            }
+            Command::ForgetDevice { device_id } => {
+                // TUI doesn't fully support forget device yet, but handle the command gracefully
+                info!(
+                    device_id,
+                    "Forget device requested (not implemented in TUI)"
+                );
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::DeviceForgotten { device_id })
+                    .await;
             }
             Command::Shutdown => {
                 // Handled in run() loop
@@ -320,8 +347,8 @@ impl SensorWorker {
         }
 
         match timeout(CONNECT_READ_TIMEOUT, self.connect_and_read(device_id)).await {
-            Ok(Ok((name, device_type, reading, settings))) => {
-                info!(device_id, ?name, ?device_type, "Device connected");
+            Ok(Ok((name, device_type, reading, settings, rssi))) => {
+                info!(device_id, ?name, ?device_type, ?rssi, "Device connected");
 
                 // Update device metadata in store
                 self.update_device_metadata(device_id, name.as_deref(), device_type);
@@ -333,8 +360,7 @@ impl SensorWorker {
                         device_id: device_id.to_string(),
                         name,
                         device_type,
-                        // TODO: RSSI should be obtained from device.read_rssi() in connect_and_read
-                        rssi: None,
+                        rssi,
                     })
                     .await
                 {
@@ -432,7 +458,7 @@ impl SensorWorker {
         info!(device_id, "Refreshing reading for device");
 
         match timeout(CONNECT_READ_TIMEOUT, self.connect_and_read(device_id)).await {
-            Ok(Ok((_, _, reading, settings))) => {
+            Ok(Ok((_, _, reading, settings, _rssi))) => {
                 // Send settings if we got them
                 if let Some(settings) = settings
                     && let Err(e) = self
@@ -735,7 +761,7 @@ impl SensorWorker {
 
     /// Connect to a device and read its current values.
     ///
-    /// Returns the device name, type, and current reading if successful.
+    /// Returns the device name, type, current reading, settings, and RSSI if successful.
     /// The device is disconnected after reading.
     async fn connect_and_read(
         &self,
@@ -746,6 +772,7 @@ impl SensorWorker {
             Option<DeviceType>,
             Option<CurrentReading>,
             Option<DeviceSettings>,
+            Option<i16>,
         ),
         aranet_core::Error,
     > {
@@ -778,12 +805,15 @@ impl SensorWorker {
             }
         };
 
+        // Try to read RSSI signal strength
+        let rssi = device.read_rssi().await.ok();
+
         // Disconnect from the device
         if let Err(e) = device.disconnect().await {
             warn!(device_id, error = %e, "Failed to disconnect from device");
         }
 
-        Ok((name, device_type, reading, settings))
+        Ok((name, device_type, reading, settings, rssi))
     }
 
     /// Save a reading to the store.
@@ -1059,5 +1089,182 @@ impl SensorWorker {
 
         // Send history to UI for sparklines
         self.load_and_send_history(device_id).await;
+    }
+
+    /// Handle refreshing the aranet-service status.
+    async fn handle_refresh_service_status(&self) {
+        info!("Refreshing service status");
+
+        let Some(ref client) = self.service_client else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ServiceStatusError {
+                    error: "Service client not available".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match client.status().await {
+            Ok(status) => {
+                // Convert device stats to our message type
+                let devices: Vec<ServiceDeviceStats> = status
+                    .devices
+                    .into_iter()
+                    .map(|d| ServiceDeviceStats {
+                        device_id: d.device_id,
+                        alias: d.alias,
+                        poll_interval: d.poll_interval,
+                        polling: d.polling,
+                        success_count: d.success_count,
+                        failure_count: d.failure_count,
+                        last_poll_at: d.last_poll_at,
+                        last_error: d.last_error,
+                    })
+                    .collect();
+
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceStatusRefreshed {
+                        reachable: true,
+                        collector_running: status.collector.running,
+                        uptime_seconds: status.collector.uptime_seconds,
+                        devices,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                // Check if it's a connection error (service not running)
+                let (reachable, error_msg) = match &e {
+                    aranet_core::service_client::ServiceClientError::NotReachable { .. } => {
+                        (false, "Service not reachable".to_string())
+                    }
+                    _ => (false, e.to_string()),
+                };
+
+                if reachable {
+                    let _ = self
+                        .event_tx
+                        .send(SensorEvent::ServiceStatusError { error: error_msg })
+                        .await;
+                } else {
+                    // Send status with reachable=false
+                    let _ = self
+                        .event_tx
+                        .send(SensorEvent::ServiceStatusRefreshed {
+                            reachable: false,
+                            collector_running: false,
+                            uptime_seconds: None,
+                            devices: vec![],
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Handle starting the aranet-service collector.
+    async fn handle_start_service_collector(&self) {
+        info!("Starting service collector");
+
+        let Some(ref client) = self.service_client else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ServiceCollectorError {
+                    error: "Service client not available".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match client.start_collector().await {
+            Ok(_) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorStarted)
+                    .await;
+                // Refresh status to get updated state
+                self.handle_refresh_service_status().await;
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorError {
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Handle stopping the aranet-service collector.
+    async fn handle_stop_service_collector(&self) {
+        info!("Stopping service collector");
+
+        let Some(ref client) = self.service_client else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ServiceCollectorError {
+                    error: "Service client not available".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match client.stop_collector().await {
+            Ok(_) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorStopped)
+                    .await;
+                // Refresh status to get updated state
+                self.handle_refresh_service_status().await;
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorError {
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_set_alias(&self, device_id: &str, alias: Option<String>) {
+        info!("Setting alias for device {} to {:?}", device_id, alias);
+
+        let Some(store) = self.open_store() else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::AliasError {
+                    device_id: device_id.to_string(),
+                    error: "Could not open database".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match store.update_device_metadata(device_id, alias.as_deref(), None) {
+            Ok(()) => {
+                info!("Alias updated successfully for {}", device_id);
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::AliasChanged {
+                        device_id: device_id.to_string(),
+                        alias,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::AliasError {
+                        device_id: device_id.to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
     }
 }

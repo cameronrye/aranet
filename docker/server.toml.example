@@ -1,0 +1,59 @@
+# Aranet Service Configuration Example
+#
+# Copy this file to server.toml and customize for your setup.
+# Default location: ~/.config/aranet/server.toml
+
+[server]
+# HTTP server bind address
+bind = "127.0.0.1:8080"
+# Buffer size for WebSocket broadcast channel
+broadcast_buffer = 100
+
+[storage]
+# SQLite database path
+# Default: ~/.local/share/aranet/data.db
+path = "/data/aranet.db"
+
+[prometheus]
+# Enable Prometheus metrics endpoint at /metrics
+enabled = true
+# Optional: Push gateway URL (for environments where scraping isn't possible)
+# push_gateway = "http://prometheus-pushgateway:9091"
+# push_interval = 60
+
+[mqtt]
+# Enable MQTT publishing (requires 'mqtt' feature)
+enabled = false
+# MQTT broker URL
+broker = "mqtt://localhost:1883"
+# Topic prefix (readings published to {prefix}/{device}/co2, etc.)
+topic_prefix = "aranet"
+# Client identifier
+client_id = "aranet-service"
+# Quality of Service (0=AtMostOnce, 1=AtLeastOnce, 2=ExactlyOnce)
+qos = 1
+# Retain messages on broker
+retain = true
+# Optional authentication
+# username = "user"
+# password = "secret"
+# Keep-alive interval in seconds
+keep_alive = 60
+
+# Device configurations
+# Each device needs an address (Bluetooth name or MAC) and optional alias
+
+[[devices]]
+address = "Aranet4 XXXXX"
+alias = "office"
+poll_interval = 60
+
+# [[devices]]
+# address = "Aranet4 YYYYY"
+# alias = "bedroom"
+# poll_interval = 120
+
+# [[devices]]
+# address = "AA:BB:CC:DD:EE:FF"
+# alias = "kitchen"
+# poll_interval = 60

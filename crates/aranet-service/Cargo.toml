@@ -1,6 +1,6 @@
 [package]
 name = "aranet-service"
-version = "0.1.9"
+version = "0.1.11"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Background collector and HTTP REST API for Aranet sensors"
 keywords = ["aranet", "api", "rest", "service", "sensors"]
 categories = ["web-programming::http-server", "network-programming"]
+include = ["src/**/*", "Cargo.toml", "README.md", "assets/**/*"]
 
 [[bin]]
 name = "aranet-service"
@@ -17,10 +18,16 @@ path = "src/main.rs"
 [package.metadata.dist]
 dist = false
 
+[features]
+default = []
+prometheus = []
+mqtt = ["dep:rumqttc"]
+full = ["prometheus", "mqtt"]
+
 [dependencies]
-aranet-core = { version = "0.1.9", path = "../aranet-core" }
-aranet-store = { version = "0.1.9", path = "../aranet-store" }
-aranet-types = { version = "0.1.9", path = "../aranet-types" }
+aranet-core = { version = "0.1.11", path = "../aranet-core" }
+aranet-store = { version = "0.1.11", path = "../aranet-store" }
+aranet-types = { version = "0.1.11", path = "../aranet-types" }
 
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
@@ -53,6 +60,9 @@ time.workspace = true
 # Config paths
 dirs = "6"
 service-manager = "0.10.0"
+
+# MQTT support (optional)
+rumqttc = { version = "0.24", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

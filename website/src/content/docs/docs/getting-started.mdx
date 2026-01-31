@@ -33,7 +33,7 @@ Before you begin, ensure you have:
 
 ## Project Structure
 
-The Aranet ecosystem consists of six crates:
+The Aranet ecosystem consists of seven crates:
 
 ```
 aranet/
@@ -41,10 +41,10 @@ aranet/
 │   ├── aranet-types/    # Shared types (platform-agnostic)
 │   ├── aranet-core/     # Core BLE library
 │   ├── aranet-store/    # Local SQLite data persistence
+│   ├── aranet-service/  # Background collector and REST API
 │   ├── aranet-cli/      # Command-line interface
 │   ├── aranet-tui/      # Terminal UI dashboard
-│   ├── aranet-gui/      # Desktop GUI (egui)
-│   └── aranet-wasm/     # WebAssembly module
+│   └── aranet-gui/      # Desktop GUI (egui)
 └── docs/                # Protocol documentation
 ```
 

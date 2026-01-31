@@ -527,3 +527,637 @@ pub fn apply_table_style(table: &mut tabled::Table, style: StyleMode) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== Threshold Constants Tests ====================
+    // These are compile-time assertions to ensure threshold ordering invariants
+
+    const _: () = {
+        assert!(co2::GOOD < co2::MODERATE);
+        assert!(co2::MODERATE < co2::POOR);
+        assert!(radon::GOOD < radon::MODERATE);
+        assert!(battery::LOW < battery::MEDIUM);
+        assert!(humidity::LOW < humidity::HIGH);
+        assert!(humidity::LOW > 0);
+        assert!(humidity::HIGH <= 100);
+        assert!(temperature::COLD < temperature::WARM);
+    };
+
+    // ==================== CO2 Formatting Tests ====================
+
+    #[test]
+    fn test_format_co2_colored_no_color() {
+        assert_eq!(format_co2_colored(500, true), "500");
+        assert_eq!(format_co2_colored(800, true), "800");
+        assert_eq!(format_co2_colored(1500, true), "1500");
+    }
+
+    #[test]
+    fn test_format_co2_colored_excellent() {
+        let result = format_co2_colored(400, false);
+        // Should contain ANSI escape codes for green
+        assert!(!result.is_empty());
+        assert!(result.contains("400"));
+    }
+
+    #[test]
+    fn test_format_co2_colored_good() {
+        let result = format_co2_colored(850, false);
+        assert!(result.contains("850"));
+    }
+
+    #[test]
+    fn test_format_co2_colored_moderate() {
+        let result = format_co2_colored(1200, false);
+        assert!(result.contains("1200"));
+    }
+
+    #[test]
+    fn test_format_co2_colored_poor() {
+        let result = format_co2_colored(2000, false);
+        assert!(result.contains("2000"));
+    }
+
+    #[test]
+    fn test_format_co2_colored_boundary_values() {
+        // Test exact boundary values
+        let _ = format_co2_colored(co2::GOOD, false);
+        let _ = format_co2_colored(co2::GOOD - 1, false);
+        let _ = format_co2_colored(co2::MODERATE, false);
+        let _ = format_co2_colored(co2::POOR, false);
+    }
+
+    // ==================== Radon Formatting Tests ====================
+
+    #[test]
+    fn test_format_radon_colored_no_color() {
+        assert_eq!(format_radon_colored(50, true), "50");
+        assert_eq!(format_radon_colored(100, true), "100");
+        assert_eq!(format_radon_colored(200, true), "200");
+    }
+
+    #[test]
+    fn test_format_radon_colored_levels() {
+        let good = format_radon_colored(50, false);
+        assert!(good.contains("50"));
+
+        let moderate = format_radon_colored(100, false);
+        assert!(moderate.contains("100"));
+
+        let high = format_radon_colored(200, false);
+        assert!(high.contains("200"));
+    }
+
+    #[test]
+    fn test_format_radon_pci_colored_no_color() {
+        let result = format_radon_pci_colored(50, 1.35, true);
+        assert_eq!(result, "1.35");
+    }
+
+    #[test]
+    fn test_format_radon_pci_colored_with_color() {
+        let good = format_radon_pci_colored(50, 1.35, false);
+        assert!(good.contains("1.35"));
+
+        let moderate = format_radon_pci_colored(100, 2.70, false);
+        assert!(moderate.contains("2.70"));
+
+        let high = format_radon_pci_colored(200, 5.40, false);
+        assert!(high.contains("5.40"));
+    }
+
+    // ==================== Battery Formatting Tests ====================
+
+    #[test]
+    fn test_format_battery_colored_no_color() {
+        assert_eq!(format_battery_colored(10, true), "10%");
+        assert_eq!(format_battery_colored(50, true), "50%");
+        assert_eq!(format_battery_colored(100, true), "100%");
+    }
+
+    #[test]
+    fn test_format_battery_colored_levels() {
+        let low = format_battery_colored(10, false);
+        // Contains the number and % (possibly with ANSI codes between)
+        assert!(low.contains("10"));
+        assert!(low.contains('%'));
+
+        let medium = format_battery_colored(30, false);
+        assert!(medium.contains("30"));
+        assert!(medium.contains('%'));
+
+        let high = format_battery_colored(80, false);
+        assert!(high.contains("80"));
+        assert!(high.contains('%'));
+    }
+
+    #[test]
+    fn test_format_battery_colored_boundaries() {
+        let _ = format_battery_colored(battery::LOW, false);
+        let _ = format_battery_colored(battery::LOW - 1, false);
+        let _ = format_battery_colored(battery::MEDIUM, false);
+        let _ = format_battery_colored(battery::MEDIUM + 1, false);
+    }
+
+    // ==================== Humidity Formatting Tests ====================
+
+    #[test]
+    fn test_format_humidity_colored_no_color() {
+        assert_eq!(format_humidity_colored(45, true), "45%");
+        assert_eq!(format_humidity_colored(20, true), "20%");
+        assert_eq!(format_humidity_colored(80, true), "80%");
+    }
+
+    #[test]
+    fn test_format_humidity_colored_comfort_range() {
+        // In comfort range (30-70%)
+        let comfortable = format_humidity_colored(50, false);
+        // Contains the number and % (possibly with ANSI codes between)
+        assert!(comfortable.contains("50"));
+        assert!(comfortable.contains('%'));
+    }
+
+    #[test]
+    fn test_format_humidity_colored_too_dry() {
+        let dry = format_humidity_colored(20, false);
+        assert!(dry.contains("20"));
+        assert!(dry.contains('%'));
+    }
+
+    #[test]
+    fn test_format_humidity_colored_too_humid() {
+        let humid = format_humidity_colored(80, false);
+        assert!(humid.contains("80"));
+        assert!(humid.contains('%'));
+    }
+
+    #[test]
+    fn test_format_humidity_colored_boundaries() {
+        let _ = format_humidity_colored(humidity::LOW, false);
+        let _ = format_humidity_colored(humidity::LOW - 1, false);
+        let _ = format_humidity_colored(humidity::HIGH, false);
+        let _ = format_humidity_colored(humidity::HIGH + 1, false);
+    }
+
+    // ==================== Temperature Formatting Tests ====================
+
+    #[test]
+    fn test_format_temp_colored_no_color() {
+        assert_eq!(format_temp_colored(22.5, true), "22.5");
+        assert_eq!(format_temp_colored(15.0, true), "15.0");
+        assert_eq!(format_temp_colored(30.0, true), "30.0");
+    }
+
+    #[test]
+    fn test_format_temp_colored_comfortable() {
+        let comfortable = format_temp_colored(22.0, false);
+        assert!(comfortable.contains("22.0"));
+    }
+
+    #[test]
+    fn test_format_temp_colored_cold() {
+        let cold = format_temp_colored(15.0, false);
+        assert!(cold.contains("15.0"));
+    }
+
+    #[test]
+    fn test_format_temp_colored_warm() {
+        let warm = format_temp_colored(30.0, false);
+        assert!(warm.contains("30.0"));
+    }
+
+    #[test]
+    fn test_format_temp_colored_precision() {
+        // Test decimal precision
+        let result = format_temp_colored(22.567, true);
+        assert_eq!(result, "22.6"); // Should round to 1 decimal
+    }
+
+    // ==================== Signal Bar Tests ====================
+
+    #[test]
+    fn test_format_signal_bar_none() {
+        assert_eq!(format_signal_bar(None, true), "N/A");
+        assert_eq!(format_signal_bar(None, false), "N/A");
+    }
+
+    #[test]
+    fn test_format_signal_bar_strong() {
+        let bar = format_signal_bar(Some(-30), true);
+        assert!(bar.contains("█")); // Should have filled bars
+        assert!(bar.contains("-30"));
+    }
+
+    #[test]
+    fn test_format_signal_bar_weak() {
+        let bar = format_signal_bar(Some(-100), true);
+        assert!(bar.contains("░")); // Should have empty bars
+        assert!(bar.contains("-100"));
+    }
+
+    #[test]
+    fn test_format_signal_bar_medium() {
+        let bar = format_signal_bar(Some(-65), false);
+        assert!(bar.contains("█"));
+        assert!(bar.contains("-65"));
+    }
+
+    #[test]
+    fn test_format_signal_bar_extreme_values() {
+        // Very strong signal
+        let strong = format_signal_bar(Some(-20), true);
+        assert!(strong.contains("-20"));
+
+        // Very weak signal
+        let weak = format_signal_bar(Some(-120), true);
+        assert!(weak.contains("-120"));
+    }
+
+    // ==================== Air Quality Summary Tests ====================
+
+    #[test]
+    fn test_air_quality_summary_excellent() {
+        assert_eq!(air_quality_summary(400), "Excellent");
+        assert_eq!(air_quality_summary(0), "Excellent");
+    }
+
+    #[test]
+    fn test_air_quality_summary_good() {
+        assert_eq!(air_quality_summary(850), "Good");
+    }
+
+    #[test]
+    fn test_air_quality_summary_moderate() {
+        assert_eq!(air_quality_summary(1200), "Moderate");
+    }
+
+    #[test]
+    fn test_air_quality_summary_poor() {
+        assert_eq!(air_quality_summary(2000), "Poor");
+        assert_eq!(air_quality_summary(10000), "Poor");
+    }
+
+    #[test]
+    fn test_air_quality_summary_boundaries() {
+        // Just below good
+        assert_eq!(air_quality_summary(co2::GOOD - 1), "Excellent");
+        // At good threshold
+        assert_eq!(air_quality_summary(co2::GOOD), "Good");
+        // Just below moderate
+        assert_eq!(air_quality_summary(co2::MODERATE - 1), "Good");
+        // At moderate threshold
+        assert_eq!(air_quality_summary(co2::MODERATE), "Moderate");
+    }
+
+    #[test]
+    fn test_air_quality_summary_colored_no_color() {
+        assert_eq!(air_quality_summary_colored(400, true), "Excellent");
+        assert_eq!(air_quality_summary_colored(850, true), "Good");
+        assert_eq!(air_quality_summary_colored(1200, true), "Moderate");
+        assert_eq!(air_quality_summary_colored(2000, true), "Poor");
+    }
+
+    #[test]
+    fn test_air_quality_summary_colored_with_color() {
+        let excellent = air_quality_summary_colored(400, false);
+        assert!(excellent.contains("Excellent"));
+
+        let poor = air_quality_summary_colored(2000, false);
+        assert!(poor.contains("Poor"));
+    }
+
+    // ==================== Radon Risk Summary Tests ====================
+
+    #[test]
+    fn test_radon_risk_summary() {
+        assert_eq!(radon_risk_summary(50), "Low Risk");
+        assert_eq!(radon_risk_summary(100), "Moderate Risk");
+        assert_eq!(radon_risk_summary(200), "High Risk - Action Recommended");
+    }
+
+    #[test]
+    fn test_radon_risk_summary_boundaries() {
+        assert_eq!(radon_risk_summary(radon::GOOD - 1), "Low Risk");
+        assert_eq!(radon_risk_summary(radon::GOOD), "Moderate Risk");
+        assert_eq!(radon_risk_summary(radon::MODERATE - 1), "Moderate Risk");
+        assert_eq!(
+            radon_risk_summary(radon::MODERATE),
+            "High Risk - Action Recommended"
+        );
+    }
+
+    // ==================== Message Formatting Tests ====================
+
+    #[test]
+    fn test_format_success_no_color() {
+        let result = format_success("Test message", true);
+        assert_eq!(result, "[OK] Test message");
+    }
+
+    #[test]
+    fn test_format_success_with_color() {
+        let result = format_success("Test message", false);
+        assert!(result.contains("[OK]"));
+        assert!(result.contains("Test message"));
+    }
+
+    #[test]
+    fn test_format_info_no_color() {
+        let result = format_info("Info message", true);
+        assert_eq!(result, "[--] Info message");
+    }
+
+    #[test]
+    fn test_format_info_with_color() {
+        let result = format_info("Info message", false);
+        assert!(result.contains("[--]"));
+        assert!(result.contains("Info message"));
+    }
+
+    #[test]
+    fn test_format_warning_no_color() {
+        let result = format_warning("Warning message", true);
+        assert_eq!(result, "[!!] Warning message");
+    }
+
+    #[test]
+    fn test_format_warning_with_color() {
+        let result = format_warning("Warning message", false);
+        assert!(result.contains("[!!]"));
+        assert!(result.contains("Warning message"));
+    }
+
+    // ==================== Trend Indicator Tests ====================
+
+    #[test]
+    fn test_trend_indicator_stable() {
+        assert_eq!(trend_indicator(22.0, 22.0, true), "-");
+        assert_eq!(trend_indicator(22.0, 22.0, false), "-");
+        assert_eq!(trend_indicator(22.3, 22.0, true), "-"); // Diff < 0.5
+    }
+
+    #[test]
+    fn test_trend_indicator_increasing() {
+        assert_eq!(trend_indicator(25.0, 22.0, true), "^");
+        assert_eq!(trend_indicator(25.0, 22.0, false), "↑");
+    }
+
+    #[test]
+    fn test_trend_indicator_decreasing() {
+        assert_eq!(trend_indicator(20.0, 25.0, true), "v");
+        assert_eq!(trend_indicator(20.0, 25.0, false), "↓");
+    }
+
+    #[test]
+    fn test_trend_indicator_int_stable() {
+        assert_eq!(trend_indicator_int(800, 800, true), "-");
+        assert_eq!(trend_indicator_int(802, 800, true), "-"); // Diff < 5
+    }
+
+    #[test]
+    fn test_trend_indicator_int_increasing() {
+        assert_eq!(trend_indicator_int(850, 800, true), "^");
+        assert_eq!(trend_indicator_int(850, 800, false), "↑");
+    }
+
+    #[test]
+    fn test_trend_indicator_int_decreasing() {
+        assert_eq!(trend_indicator_int(750, 800, true), "v");
+        assert_eq!(trend_indicator_int(750, 800, false), "↓");
+    }
+
+    // ==================== Error Box Tests ====================
+
+    #[test]
+    fn test_format_error_box_basic() {
+        let box_str = format_error_box("Error", "Something went wrong", &[]);
+        assert!(box_str.contains("Error"));
+        assert!(box_str.contains("Something went wrong"));
+        assert!(box_str.contains("┌"));
+        assert!(box_str.contains("└"));
+    }
+
+    #[test]
+    fn test_format_error_box_with_suggestions() {
+        let suggestions = ["Check connection", "Try again"];
+        let box_str = format_error_box("Error", "Connection failed", &suggestions);
+        assert!(box_str.contains("Troubleshooting"));
+        assert!(box_str.contains("1. Check connection"));
+        assert!(box_str.contains("2. Try again"));
+    }
+
+    #[test]
+    fn test_format_error_box_multiline_message() {
+        let box_str = format_error_box("Error", "Line 1\nLine 2\nLine 3", &[]);
+        assert!(box_str.contains("Line 1"));
+        assert!(box_str.contains("Line 2"));
+        assert!(box_str.contains("Line 3"));
+    }
+
+    // ==================== Title Formatting Tests ====================
+
+    #[test]
+    fn test_format_title_no_color() {
+        let result = format_title("Test Title", true);
+        assert!(result.contains("Test Title"));
+        assert!(result.contains("━")); // Underline
+    }
+
+    #[test]
+    fn test_format_title_with_color() {
+        let result = format_title("Test Title", false);
+        assert!(result.contains("Test Title"));
+        assert!(result.contains("━"));
+    }
+
+    // ==================== Air Quality Bar Tests ====================
+
+    #[test]
+    fn test_format_air_quality_bar_excellent() {
+        let bar = format_air_quality_bar(300, true);
+        assert_eq!(bar.matches('█').count(), 5); // All filled
+    }
+
+    #[test]
+    fn test_format_air_quality_bar_good() {
+        let bar = format_air_quality_bar(600, true);
+        assert_eq!(bar.matches('█').count(), 4);
+        assert_eq!(bar.matches('░').count(), 1);
+    }
+
+    #[test]
+    fn test_format_air_quality_bar_moderate() {
+        let bar = format_air_quality_bar(900, true);
+        assert_eq!(bar.matches('█').count(), 3);
+        assert_eq!(bar.matches('░').count(), 2);
+    }
+
+    #[test]
+    fn test_format_air_quality_bar_poor() {
+        let bar = format_air_quality_bar(1200, true);
+        assert_eq!(bar.matches('█').count(), 2);
+        assert_eq!(bar.matches('░').count(), 3);
+    }
+
+    #[test]
+    fn test_format_air_quality_bar_very_poor() {
+        let bar = format_air_quality_bar(2000, true);
+        assert_eq!(bar.matches('█').count(), 1);
+        assert_eq!(bar.matches('░').count(), 4);
+    }
+
+    #[test]
+    fn test_format_air_quality_bar_with_color() {
+        let _ = format_air_quality_bar(300, false);
+        let _ = format_air_quality_bar(900, false);
+        let _ = format_air_quality_bar(2000, false);
+    }
+
+    // ==================== Terminal Width Tests ====================
+
+    #[test]
+    fn test_terminal_width() {
+        let width = terminal_width();
+        // Should return a reasonable value
+        assert!(width >= 20);
+        assert!(width <= 1000);
+    }
+
+    // ==================== Device Header Tests ====================
+
+    #[test]
+    fn test_format_device_header_no_color() {
+        let result = format_device_header("Aranet4 12345", true);
+        assert!(result.contains("Aranet4 12345"));
+        assert!(result.contains("─"));
+    }
+
+    #[test]
+    fn test_format_device_header_with_color() {
+        let result = format_device_header("Aranet4 12345", false);
+        assert!(result.contains("Aranet4 12345"));
+    }
+
+    // ==================== Table Style Tests ====================
+
+    #[test]
+    fn test_apply_table_style_rich() {
+        use tabled::builder::Builder;
+
+        let mut builder = Builder::default();
+        builder.push_record(["Header1", "Header2"]);
+        builder.push_record(["Value1", "Value2"]);
+        let mut table = builder.build();
+
+        apply_table_style(&mut table, StyleMode::Rich);
+        let output = table.to_string();
+        // Rich mode uses rounded style with curved corners
+        assert!(output.contains("╭") || output.contains("│") || output.contains("─"));
+    }
+
+    #[test]
+    fn test_apply_table_style_minimal() {
+        use tabled::builder::Builder;
+
+        let mut builder = Builder::default();
+        builder.push_record(["Header1", "Header2"]);
+        builder.push_record(["Value1", "Value2"]);
+        let mut table = builder.build();
+
+        apply_table_style(&mut table, StyleMode::Minimal);
+        let output = table.to_string();
+        // Minimal mode also uses rounded style
+        assert!(output.contains("Value1"));
+    }
+
+    #[test]
+    fn test_apply_table_style_plain() {
+        use tabled::builder::Builder;
+
+        let mut builder = Builder::default();
+        builder.push_record(["Header1", "Header2"]);
+        builder.push_record(["Value1", "Value2"]);
+        let mut table = builder.build();
+
+        apply_table_style(&mut table, StyleMode::Plain);
+        let output = table.to_string();
+        // Plain mode uses blank style - no border characters
+        assert!(output.contains("Value1"));
+        assert!(!output.contains("╭")); // No curved corners
+    }
+
+    // ==================== Progress Bar Creation Tests ====================
+
+    #[test]
+    fn test_scanning_spinner_creates_successfully() {
+        let pb = scanning_spinner(30);
+        // Just verify it creates without panicking
+        pb.finish_and_clear();
+    }
+
+    #[test]
+    fn test_connecting_spinner_creates_successfully() {
+        let pb = connecting_spinner("test-device");
+        pb.finish_and_clear();
+    }
+
+    #[test]
+    fn test_download_progress_bar_creates_successfully() {
+        let pb = download_progress_bar();
+        pb.set_position(50);
+        assert_eq!(pb.position(), 50);
+        pb.finish_and_clear();
+    }
+
+    #[test]
+    fn test_progress_bar_style_creates_successfully() {
+        let style = progress_bar_style();
+        // Just verify it creates without panicking
+        let _ = style;
+    }
+
+    // ==================== Signal Bar Tests (additional) ====================
+
+    #[test]
+    fn test_format_signal_bar_boundary_values() {
+        // Test at exact threshold boundaries
+        let _ = format_signal_bar(Some(-50), true); // Strong/Good boundary
+        let _ = format_signal_bar(Some(-70), true); // Good/Moderate boundary
+        let _ = format_signal_bar(Some(-90), true); // Moderate/Weak boundary
+    }
+
+    // ==================== Edge Cases ====================
+
+    #[test]
+    fn test_format_co2_colored_zero() {
+        let result = format_co2_colored(0, true);
+        assert_eq!(result, "0");
+    }
+
+    #[test]
+    fn test_format_battery_colored_zero() {
+        let result = format_battery_colored(0, true);
+        assert_eq!(result, "0%");
+    }
+
+    #[test]
+    fn test_format_humidity_colored_zero() {
+        let result = format_humidity_colored(0, true);
+        assert_eq!(result, "0%");
+    }
+
+    #[test]
+    fn test_format_humidity_colored_hundred() {
+        let result = format_humidity_colored(100, true);
+        assert_eq!(result, "100%");
+    }
+
+    #[test]
+    fn test_format_temp_colored_negative() {
+        let result = format_temp_colored(-5.0, true);
+        assert_eq!(result, "-5.0");
+    }
+}

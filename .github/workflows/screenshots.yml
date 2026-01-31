@@ -43,8 +43,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-screenshots-
 
-      - name: Build aranet-gui
-        run: cargo build -p aranet-gui --release
+      - name: Build aranet binaries
+        run: |
+          cargo build -p aranet-cli --release
+          cargo build -p aranet-gui --release
 
       - name: Generate VHS recordings
         run: |

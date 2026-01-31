@@ -20,10 +20,6 @@ Cargo.lock
 *.dylib
 *.dll
 
-# WASM build output
-/crates/aranet-wasm/pkg/
-*.wasm
-
 # Environment
 .env
 .env.local

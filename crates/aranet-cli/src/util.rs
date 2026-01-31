@@ -19,8 +19,14 @@ use crate::style;
 pub fn require_device(device: Option<String>) -> Result<String> {
     device.ok_or_else(|| {
         anyhow::anyhow!(
-            "No device specified. Use --device <ADDRESS> or set ARANET_DEVICE environment variable.\n\
-             Run 'aranet scan' to find nearby devices, or omit --device for interactive selection."
+            "No device specified.\n\n\
+             How to fix:\n  \
+             1. Run 'aranet scan' to discover nearby devices\n  \
+             2. Use --device <ADDRESS> with the device address\n  \
+             3. Set ARANET_DEVICE environment variable\n  \
+             4. Set a default with 'aranet config set device <ADDRESS>'\n  \
+             5. Omit --device for interactive selection (if TTY)\n\n\
+             Example: aranet read --device AA:BB:CC:DD:EE:FF"
         )
     })
 }
@@ -34,8 +40,13 @@ pub async fn require_device_interactive(device: Option<String>) -> Result<String
     // Check if we're in an interactive terminal
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         bail!(
-            "No device specified. Use --device <ADDRESS> or set ARANET_DEVICE environment variable.\n\
-             Run 'aranet scan' to find nearby devices."
+            "No device specified (non-interactive mode).\n\n\
+             How to fix:\n  \
+             1. Run 'aranet scan' to discover nearby devices\n  \
+             2. Use --device <ADDRESS> with the device address\n  \
+             3. Set ARANET_DEVICE environment variable\n  \
+             4. Set a default with 'aranet config set device <ADDRESS>'\n\n\
+             Example: aranet read --device AA:BB:CC:DD:EE:FF"
         );
     }
 
@@ -52,8 +63,14 @@ pub async fn require_device_interactive(device: Option<String>) -> Result<String
 
     if devices.is_empty() {
         bail!(
-            "No Aranet devices found nearby.\n\
-             Make sure your device is powered on and in range."
+            "No Aranet devices found nearby.\n\n\
+             Troubleshooting:\n  \
+             - Ensure your device is powered on\n  \
+             - Move closer to the device (within 10m)\n  \
+             - Check that Bluetooth is enabled on your computer\n  \
+             - Run 'aranet doctor' to diagnose Bluetooth issues\n\n\
+             If your device has Smart Home mode disabled, it may not be visible.\n\
+             Enable it in the Aranet mobile app: Settings > Smart Home Integration"
         );
     }
 

@@ -14,6 +14,7 @@ pub mod widgets;
 mod dashboard;
 mod history;
 mod overlays;
+mod service;
 mod settings;
 
 use chrono::Local;
@@ -114,6 +115,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tab::Dashboard => dashboard::draw_readings_panel(frame, content_layout[1], app),
         Tab::History => history::draw_history_panel(frame, content_layout[1], app),
         Tab::Settings => settings::draw_settings_panel(frame, content_layout[1], app),
+        Tab::Service => service::draw_service_panel(frame, content_layout[1], app),
     }
 
     draw_status_bar(frame, main_layout[3], app);
@@ -254,6 +256,11 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints.push(("+/-", "adjust"));
             hints.push(("n", "alias"));
         }
+        Tab::Service => {
+            hints.push(("r", "refresh"));
+            hints.push(("Enter", "start/stop"));
+            hints.push(("j/k", "select"));
+        }
     }
 
     hints.push(("q", "quit"));
@@ -356,6 +363,7 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
         ("Dashboard", Tab::Dashboard),
         ("History", Tab::History),
         ("Settings", Tab::Settings),
+        ("Service", Tab::Service),
     ];
 
     // Build custom tab line with underline indicator for active tab
@@ -396,6 +404,7 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
             Tab::Dashboard => 0,
             Tab::History => 1,
             Tab::Settings => 2,
+            Tab::Service => 3,
         });
 
     frame.render_widget(tabs_widget, area);

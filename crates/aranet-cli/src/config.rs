@@ -53,6 +53,189 @@ pub struct Config {
     /// Behavior settings for unified data architecture
     #[serde(default)]
     pub behavior: BehaviorConfig,
+
+    /// GUI-specific settings
+    #[serde(default)]
+    pub gui: GuiConfig,
+}
+
+/// GUI-specific configuration settings.
+///
+/// Controls appearance and behavior of the native GUI application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuiConfig {
+    /// Theme preference: "dark", "light", or "system"
+    #[serde(default = "default_theme")]
+    pub theme: String,
+
+    /// Show colored tray icon for elevated CO2 levels.
+    /// When false, always uses native template icon (auto dark/light).
+    /// When true, shows colored icons (yellow/orange/red) for elevated CO2.
+    #[serde(default = "default_true")]
+    pub colored_tray_icon: bool,
+
+    /// Enable desktop notifications for CO2 threshold alerts.
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
+
+    /// Play sound with desktop notifications.
+    #[serde(default = "default_true")]
+    pub notification_sound: bool,
+
+    /// Start the application minimized to system tray.
+    #[serde(default)]
+    pub start_minimized: bool,
+
+    /// Minimize to tray instead of quitting when closing window.
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+
+    /// Temperature unit preference: "celsius" or "fahrenheit".
+    /// Used when device settings are not available.
+    #[serde(default = "default_celsius")]
+    pub temperature_unit: String,
+
+    /// Pressure unit preference: "hpa" or "inhg".
+    /// Used for pressure display.
+    #[serde(default = "default_hpa")]
+    pub pressure_unit: String,
+
+    /// Whether the sidebar is collapsed.
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+
+    /// Enable compact mode for denser layout on smaller screens.
+    #[serde(default)]
+    pub compact_mode: bool,
+
+    /// Remembered window width.
+    #[serde(default)]
+    pub window_width: Option<f32>,
+
+    /// Remembered window height.
+    #[serde(default)]
+    pub window_height: Option<f32>,
+
+    /// Remembered window X position.
+    #[serde(default)]
+    pub window_x: Option<f32>,
+
+    /// Remembered window Y position.
+    #[serde(default)]
+    pub window_y: Option<f32>,
+
+    /// CO2 warning threshold in ppm (yellow/amber indicator).
+    #[serde(default = "default_co2_warning")]
+    pub co2_warning_threshold: u16,
+
+    /// CO2 danger threshold in ppm (red indicator).
+    #[serde(default = "default_co2_danger")]
+    pub co2_danger_threshold: u16,
+
+    /// Radon warning threshold in Bq/m³.
+    #[serde(default = "default_radon_warning")]
+    pub radon_warning_threshold: u32,
+
+    /// Radon danger threshold in Bq/m³.
+    #[serde(default = "default_radon_danger")]
+    pub radon_danger_threshold: u32,
+
+    /// Default export format: "csv" or "json".
+    #[serde(default = "default_export_format")]
+    pub default_export_format: String,
+
+    /// Custom export directory path. Empty string means use default (Downloads).
+    #[serde(default)]
+    pub export_directory: String,
+
+    /// URL for the aranet-service REST API.
+    /// Default: "http://localhost:8080"
+    #[serde(default = "default_service_url")]
+    pub service_url: String,
+
+    /// Show CO2 readings in dashboard.
+    #[serde(default = "default_true")]
+    pub show_co2: bool,
+
+    /// Show temperature readings in dashboard.
+    #[serde(default = "default_true")]
+    pub show_temperature: bool,
+
+    /// Show humidity readings in dashboard.
+    #[serde(default = "default_true")]
+    pub show_humidity: bool,
+
+    /// Show pressure readings in dashboard.
+    #[serde(default = "default_true")]
+    pub show_pressure: bool,
+}
+
+fn default_service_url() -> String {
+    "http://localhost:8080".to_string()
+}
+
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
+fn default_celsius() -> String {
+    "celsius".to_string()
+}
+
+fn default_hpa() -> String {
+    "hpa".to_string()
+}
+
+fn default_co2_warning() -> u16 {
+    1000
+}
+
+fn default_co2_danger() -> u16 {
+    1400
+}
+
+fn default_radon_warning() -> u32 {
+    100
+}
+
+fn default_radon_danger() -> u32 {
+    150
+}
+
+fn default_export_format() -> String {
+    "csv".to_string()
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+            colored_tray_icon: true,
+            notifications_enabled: true,
+            notification_sound: true,
+            start_minimized: false,
+            close_to_tray: true,
+            temperature_unit: default_celsius(),
+            pressure_unit: default_hpa(),
+            sidebar_collapsed: false,
+            compact_mode: false,
+            window_width: None,
+            window_height: None,
+            window_x: None,
+            window_y: None,
+            co2_warning_threshold: default_co2_warning(),
+            co2_danger_threshold: default_co2_danger(),
+            radon_warning_threshold: default_radon_warning(),
+            radon_danger_threshold: default_radon_danger(),
+            default_export_format: default_export_format(),
+            export_directory: String::new(),
+            service_url: default_service_url(),
+            show_co2: true,
+            show_temperature: true,
+            show_humidity: true,
+            show_pressure: true,
+        }
+    }
 }
 
 /// Behavior configuration for unified data architecture.
@@ -162,6 +345,37 @@ pub fn resolve_alias(device: &str, config: &Config) -> String {
         .get(device)
         .cloned()
         .unwrap_or_else(|| device.to_string())
+}
+
+/// Resolve an alias and return information about the resolution.
+/// Returns (resolved_address, was_alias, original_alias_name).
+pub fn resolve_alias_with_info(device: &str, config: &Config) -> (String, bool, Option<String>) {
+    if let Some(address) = config.aliases.get(device) {
+        (address.clone(), true, Some(device.to_string()))
+    } else {
+        (device.to_string(), false, None)
+    }
+}
+
+/// Print alias resolution feedback if the user is not in quiet mode.
+/// Call this after resolving an alias to inform the user which device was selected.
+pub fn print_alias_feedback(original: &str, resolved: &str, quiet: bool) {
+    if !quiet && original != resolved {
+        eprintln!("Using device '{}' -> {}", original, resolved);
+    }
+}
+
+/// Print device source feedback (e.g., "Using last connected device: ...").
+pub fn print_device_source_feedback(device: &str, source: Option<&str>, quiet: bool) {
+    if quiet {
+        return;
+    }
+    match source {
+        Some("default") => eprintln!("Using default device: {}", device),
+        Some("last") => eprintln!("Using last connected device: {}", device),
+        Some("store") => eprintln!("Using known device from database: {}", device),
+        _ => {}
+    }
 }
 
 /// Update the last connected device in config.
@@ -320,5 +534,158 @@ mod tests {
         assert!(parsed.auto_sync);
         assert!(!parsed.remember_devices);
         assert!(parsed.load_cache);
+    }
+
+    // ========================================================================
+    // resolve_alias tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_alias_found() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("living-room".to_string(), "AA:BB:CC:DD:EE:FF".to_string());
+        aliases.insert("bedroom".to_string(), "11:22:33:44:55:66".to_string());
+
+        let config = Config {
+            aliases,
+            ..Default::default()
+        };
+
+        let result = resolve_alias("living-room", &config);
+        assert_eq!(result, "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn test_resolve_alias_not_found() {
+        let config = Config::default();
+        let result = resolve_alias("unknown-alias", &config);
+        assert_eq!(result, "unknown-alias");
+    }
+
+    #[test]
+    fn test_resolve_alias_empty_aliases() {
+        let config = Config::default();
+        let result = resolve_alias("some-device", &config);
+        assert_eq!(result, "some-device");
+    }
+
+    #[test]
+    fn test_resolve_alias_returns_address_unchanged() {
+        let config = Config::default();
+        // If you pass an actual address, it should return unchanged
+        let result = resolve_alias("AA:BB:CC:DD:EE:FF", &config);
+        assert_eq!(result, "AA:BB:CC:DD:EE:FF");
+    }
+
+    // ========================================================================
+    // resolve_devices tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_devices_empty() {
+        let config = Config::default();
+        let result = resolve_devices(vec![], &config);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_devices_multiple() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("room1".to_string(), "AA:BB:CC:DD:EE:FF".to_string());
+        aliases.insert("room2".to_string(), "11:22:33:44:55:66".to_string());
+
+        let config = Config {
+            aliases,
+            ..Default::default()
+        };
+
+        let devices = vec![
+            "room1".to_string(),
+            "room2".to_string(),
+            "direct-address".to_string(),
+        ];
+        let result = resolve_devices(devices, &config);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], "AA:BB:CC:DD:EE:FF");
+        assert_eq!(result[1], "11:22:33:44:55:66");
+        assert_eq!(result[2], "direct-address");
+    }
+
+    #[test]
+    fn test_resolve_devices_no_aliases() {
+        let config = Config::default();
+        let devices = vec!["device1".to_string(), "device2".to_string()];
+        let result = resolve_devices(devices, &config);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "device1");
+        assert_eq!(result[1], "device2");
+    }
+
+    // ========================================================================
+    // get_device_source tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_device_source_explicit() {
+        let config = Config::default();
+        let (device, source) = get_device_source(Some("explicit-device"), &config);
+
+        assert_eq!(device, Some("explicit-device".to_string()));
+        assert_eq!(source, None); // No fallback source when explicit
+    }
+
+    #[test]
+    fn test_get_device_source_from_default() {
+        let config = Config {
+            device: Some("default-device".to_string()),
+            ..Default::default()
+        };
+        let (device, source) = get_device_source(None, &config);
+
+        assert_eq!(device, Some("default-device".to_string()));
+        assert_eq!(source, Some("default"));
+    }
+
+    #[test]
+    fn test_get_device_source_from_last() {
+        let config = Config {
+            last_device: Some("last-device".to_string()),
+            ..Default::default()
+        };
+        let (device, source) = get_device_source(None, &config);
+
+        assert_eq!(device, Some("last-device".to_string()));
+        assert_eq!(source, Some("last"));
+    }
+
+    #[test]
+    fn test_get_device_source_prefers_default_over_last() {
+        let config = Config {
+            device: Some("default-device".to_string()),
+            last_device: Some("last-device".to_string()),
+            ..Default::default()
+        };
+        let (device, source) = get_device_source(None, &config);
+
+        // Default should take precedence over last
+        assert_eq!(device, Some("default-device".to_string()));
+        assert_eq!(source, Some("default"));
+    }
+
+    #[test]
+    fn test_get_device_source_resolves_alias() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("my-sensor".to_string(), "AA:BB:CC:DD:EE:FF".to_string());
+
+        let config = Config {
+            aliases,
+            ..Default::default()
+        };
+        let (device, source) = get_device_source(Some("my-sensor"), &config);
+
+        assert_eq!(device, Some("AA:BB:CC:DD:EE:FF".to_string()));
+        assert_eq!(source, None);
     }
 }

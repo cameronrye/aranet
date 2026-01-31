@@ -87,6 +87,9 @@
 pub use aranet_core;
 pub use aranet_types;
 
+// Config module - needed by both TUI and GUI
+pub mod config;
+
 // TUI module - publicly exposed for aranet-tui crate to use
 #[cfg(feature = "tui")]
 pub mod tui;

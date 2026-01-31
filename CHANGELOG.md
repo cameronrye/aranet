@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-01-31
+
+### Added
+
+- **MQTT Integration** - Publish sensor readings to MQTT brokers for IoT integration
+  - Real-time publishing of all sensor readings to configurable topics
+  - Topic structure: `{prefix}/{device}/co2`, `/temperature`, `/humidity`, `/pressure`, `/battery`, `/status`, `/json`
+  - Support for radon (`/radon`) and radiation (`/radiation_rate`, `/radiation_total`) when available
+  - TLS support via `mqtts://` scheme
+  - Configurable QoS levels (0, 1, 2), retain flag, and authentication
+  - Automatic reconnection with 5-second retry intervals
+  - Feature flag: `mqtt` (included in `full` feature)
+
+- **Prometheus Metrics Endpoint** - Export sensor data for monitoring and alerting
+  - `/metrics` endpoint with Prometheus text format (0.0.4)
+  - Sensor metrics: `aranet_co2_ppm`, `aranet_temperature_celsius`, `aranet_humidity_percent`, `aranet_pressure_hpa`, `aranet_battery_percent`, `aranet_reading_age_seconds`
+  - Radon/radiation metrics when available: `aranet_radon_bqm3`, `aranet_radiation_rate_usvh`, `aranet_radiation_total_msv`
+  - Collector statistics: `aranet_collector_running`, `aranet_collector_uptime_seconds`, `aranet_device_poll_success_total`, `aranet_device_poll_failure_total`
+  - Optional push gateway support with configurable interval
+  - Feature flag: `prometheus` (included in `full` feature)
+
+- **Service Management Commands** - Control aranet-service from CLI
+  - `aranet-service service install [--user]` - Install as system/user service
+  - `aranet-service service uninstall [--user]` - Uninstall service
+  - `aranet-service service start/stop/status [--user]` - Control service
+
+- **REST API Enhancements**
+  - `POST /api/collector/start` and `POST /api/collector/stop` - Control background collector
+  - `GET /api/status` - Full service status with collector state and device statistics
+  - `GET/PUT /api/config` - Runtime configuration management
+  - `POST/PUT/DELETE /api/config/devices` - Dynamic device management
+
+- **GUI Improvements**
+  - Multi-panel architecture: Device List, Device Detail, History, Comparison, Alerts, Service, Settings
+  - Export functionality (CSV/JSON) for historical data
+  - Comparison view for side-by-side multi-device analysis
+  - Alert system with threshold management and alert history
+  - Service panel for background collector control
+  - macOS native menu bar integration
+  - System tray with quick access to readings
+  - Light/dark theme support
+
+- **TUI Service Tab** - Monitor and control aranet-service from terminal dashboard
+  - Service status display with collector state and uptime
+  - Per-device polling statistics
+  - Start/stop collector controls
+
+- **Service Client Library** - `service-client` feature in aranet-core
+  - Type-safe HTTP client for aranet-service API
+  - Service status, collector control, and configuration management
+
+- Downloads page on website with direct download links for all platforms
+- New icon assets with multiple resolutions (16px to 1024px)
+- `docs/ARCHITECTURE.md` with comprehensive technical documentation
+- Troubleshooting guide on website
+- Entitlements for Bluetooth access on macOS GUI app
+
+### Changed
+
+- Updated screenshots in README and website
+- Improved CI workflow for screenshots and site deployment
+- Synchronized all crate versions to 0.1.11
+
+### Removed
+
+- `aranet-wasm` crate removed from workspace (was not published)
+- `ROADMAP.md` removed in favor of website roadmap page
+
+### Fixed
+
+- Icon asset included in aranet-cli for crates.io publishing
+- Screenshots and deploy-site workflow failures
+- Removed references to non-existent CLI flags from troubleshooting documentation
+
 ## [0.1.9] - 2026-01-22
 
 ### Changed

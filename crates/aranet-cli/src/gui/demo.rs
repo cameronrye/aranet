@@ -10,25 +10,22 @@ use time::{Duration, OffsetDateTime};
 use super::types::{ConnectionState, DeviceState};
 
 /// Generate demo devices with realistic mock data for screenshots.
+/// Matches the real devices: Aranet4 17C3C (office) and AranetRn+ 306B8 (radon).
 pub fn create_demo_devices() -> Vec<DeviceState> {
-    vec![
-        create_aranet4_device(),
-        create_radon_device(),
-        create_aranet2_device(),
-    ]
+    vec![create_aranet4_device(), create_radon_device()]
 }
 
-/// Create an Aranet4 device with typical office readings.
+/// Create an Aranet4 device matching real device: Aranet4 17C3C (office).
 fn create_aranet4_device() -> DeviceState {
     let reading = CurrentReading {
-        co2: 847,
-        temperature: 22.5,
-        pressure: 1013.2,
-        humidity: 45,
-        battery: 87,
+        co2: 633,
+        temperature: 18.0,
+        pressure: 1002.6,
+        humidity: 19,
+        battery: 96,
         status: Status::Green,
         interval: 300,
-        age: 120,
+        age: 8,
         captured_at: Some(OffsetDateTime::now_utc()),
         radon: None,
         radon_avg_24h: None,
@@ -50,10 +47,10 @@ fn create_aranet4_device() -> DeviceState {
     let history = generate_co2_history(24 * 12); // 24 hours at 5-min intervals
 
     DeviceState {
-        id: "DEMO-ARANET4-001".to_string(),
-        name: Some("Living Room".to_string()),
+        id: "921df903-d89b-9c97-6ffa-bb80d7c8e471".to_string(),
+        name: Some("Aranet4 17C3C".to_string()),
         device_type: Some(DeviceType::Aranet4),
-        rssi: Some(-45),
+        rssi: Some(-75),
         connection: ConnectionState::Connected,
         reading: Some(reading),
         previous_reading: None,
@@ -61,34 +58,36 @@ fn create_aranet4_device() -> DeviceState {
         syncing_history: false,
         settings: Some(settings),
         reading_from_cache: false,
+        last_sync: Some(OffsetDateTime::now_utc() - Duration::minutes(5)),
     }
 }
 
-/// Create an AranetRn+ device with typical basement readings.
+/// Create an AranetRn+ device matching real device: AranetRn+ 306B8 (radon).
 fn create_radon_device() -> DeviceState {
+    // 2.97 pCi/L = ~110 Bq/m³
     let reading = CurrentReading {
         co2: 0,
-        temperature: 18.5,
-        pressure: 1012.8,
-        humidity: 55,
-        battery: 92,
-        status: Status::Green,
-        interval: 3600,
-        age: 1800,
+        temperature: 13.4,
+        pressure: 992.5,
+        humidity: 23,
+        battery: 94,
+        status: Status::Yellow,
+        interval: 600,
+        age: 175,
         captured_at: Some(OffsetDateTime::now_utc()),
-        radon: Some(85),
-        radon_avg_24h: Some(80),
-        radon_avg_7d: Some(75),
-        radon_avg_30d: Some(70),
+        radon: Some(110),
+        radon_avg_24h: Some(118),
+        radon_avg_7d: Some(103),
+        radon_avg_30d: Some(128),
         radiation_rate: None,
         radiation_total: None,
     };
 
     DeviceState {
-        id: "DEMO-RADON-001".to_string(),
-        name: Some("Basement".to_string()),
+        id: "387c18c7-299f-cc32-d01c-6cf29a8d3ca5".to_string(),
+        name: Some("AranetRn+ 306B8".to_string()),
         device_type: Some(DeviceType::AranetRadon),
-        rssi: Some(-52),
+        rssi: Some(-77),
         connection: ConnectionState::Connected,
         reading: Some(reading),
         previous_reading: None,
@@ -96,41 +95,7 @@ fn create_radon_device() -> DeviceState {
         syncing_history: false,
         settings: None,
         reading_from_cache: false,
-    }
-}
-
-/// Create an Aranet2 device with typical readings.
-fn create_aranet2_device() -> DeviceState {
-    let reading = CurrentReading {
-        co2: 0,
-        temperature: 24.2,
-        pressure: 0.0,
-        humidity: 42,
-        battery: 78,
-        status: Status::Green,
-        interval: 300,
-        age: 60,
-        captured_at: Some(OffsetDateTime::now_utc()),
-        radon: None,
-        radon_avg_24h: None,
-        radon_avg_7d: None,
-        radon_avg_30d: None,
-        radiation_rate: None,
-        radiation_total: None,
-    };
-
-    DeviceState {
-        id: "DEMO-ARANET2-001".to_string(),
-        name: Some("Bedroom".to_string()),
-        device_type: Some(DeviceType::Aranet2),
-        rssi: Some(-60),
-        connection: ConnectionState::Disconnected,
-        reading: Some(reading),
-        previous_reading: None,
-        history: Vec::new(),
-        syncing_history: false,
-        settings: None,
-        reading_from_cache: true,
+        last_sync: Some(OffsetDateTime::now_utc() - Duration::minutes(3)),
     }
 }
 

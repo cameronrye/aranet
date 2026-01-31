@@ -166,6 +166,8 @@ pub enum Tab {
     History,
     /// Application settings.
     Settings,
+    /// Service management.
+    Service,
 }
 
 /// Time range filter for history.
@@ -489,6 +491,37 @@ pub struct App {
     pub ble_range: BleRange,
     /// Whether a history sync is in progress.
     pub syncing: bool,
+    /// Service client for aranet-service communication.
+    /// Currently unused as communication goes through the worker.
+    #[allow(dead_code)]
+    pub service_client: Option<aranet_core::service_client::ServiceClient>,
+    /// Service URL (default: http://localhost:8080).
+    pub service_url: String,
+    /// Last known service status.
+    pub service_status: Option<ServiceState>,
+    /// Whether the service is being refreshed.
+    pub service_refreshing: bool,
+    /// Selected item in service tab (0=start/stop, 1+=devices).
+    pub service_selected_item: usize,
+}
+
+/// State of the aranet-service.
+#[derive(Debug, Clone)]
+pub struct ServiceState {
+    /// Whether the service is reachable.
+    pub reachable: bool,
+    /// Whether the collector is running.
+    pub collector_running: bool,
+    /// When the collector was started (for display purposes).
+    #[allow(dead_code)]
+    pub started_at: Option<time::OffsetDateTime>,
+    /// Uptime in seconds.
+    pub uptime_seconds: Option<u64>,
+    /// Per-device collection statistics.
+    pub devices: Vec<aranet_core::service_client::DeviceCollectionStats>,
+    /// Last status fetch time (for staleness detection).
+    #[allow(dead_code)]
+    pub fetched_at: Instant,
 }
 
 impl App {
@@ -538,6 +571,14 @@ impl App {
             smart_home_enabled: false,
             ble_range: BleRange::default(),
             syncing: false,
+            service_client: aranet_core::service_client::ServiceClient::new(
+                "http://localhost:8080",
+            )
+            .ok(),
+            service_url: "http://localhost:8080".to_string(),
+            service_status: None,
+            service_refreshing: false,
+            service_selected_item: 0,
         }
     }
 
@@ -874,6 +915,85 @@ impl App {
                     "Set Smart Home failed: {} (press E for details)",
                     error.chars().take(40).collect::<String>()
                 ));
+            }
+            SensorEvent::ServiceStatusRefreshed {
+                reachable,
+                collector_running,
+                uptime_seconds,
+                devices,
+            } => {
+                self.service_refreshing = false;
+                self.service_status = Some(ServiceState {
+                    reachable,
+                    collector_running,
+                    started_at: None, // We could compute from uptime if needed
+                    uptime_seconds,
+                    devices: devices
+                        .into_iter()
+                        .map(|d| aranet_core::service_client::DeviceCollectionStats {
+                            device_id: d.device_id,
+                            alias: d.alias,
+                            poll_interval: d.poll_interval,
+                            polling: d.polling,
+                            success_count: d.success_count,
+                            failure_count: d.failure_count,
+                            last_poll_at: d.last_poll_at,
+                            last_error_at: None, // Not tracked in messages, derived from last_error
+                            last_error: d.last_error,
+                        })
+                        .collect(),
+                    fetched_at: Instant::now(),
+                });
+                if reachable {
+                    let status = if collector_running {
+                        "running"
+                    } else {
+                        "stopped"
+                    };
+                    self.push_status_message(format!("Service collector: {}", status));
+                } else {
+                    self.push_status_message("Service not reachable".to_string());
+                }
+            }
+            SensorEvent::ServiceStatusError { error } => {
+                self.service_refreshing = false;
+                self.push_status_message(format!("Service error: {}", error));
+            }
+            SensorEvent::ServiceCollectorStarted => {
+                self.push_status_message("Collector started".to_string());
+            }
+            SensorEvent::ServiceCollectorStopped => {
+                self.push_status_message("Collector stopped".to_string());
+            }
+            SensorEvent::ServiceCollectorError { error } => {
+                self.push_status_message(format!("Collector error: {}", error));
+            }
+            SensorEvent::AliasChanged { device_id, alias } => {
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.name = alias;
+                }
+                self.push_status_message("Device renamed".to_string());
+            }
+            SensorEvent::AliasError {
+                device_id: _,
+                error,
+            } => {
+                self.push_status_message(format!("Rename failed: {}", error));
+            }
+            SensorEvent::DeviceForgotten { device_id } => {
+                if let Some(pos) = self.devices.iter().position(|d| d.id == device_id) {
+                    self.devices.remove(pos);
+                    if self.selected_device >= self.devices.len() && !self.devices.is_empty() {
+                        self.selected_device = self.devices.len() - 1;
+                    }
+                }
+                self.push_status_message("Device forgotten".to_string());
+            }
+            SensorEvent::ForgetDeviceError {
+                device_id: _,
+                error,
+            } => {
+                self.push_status_message(format!("Forget failed: {}", error));
             }
         }
 

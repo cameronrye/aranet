@@ -1,6 +1,6 @@
 [package]
 name = "aranet-cli"
-version = "0.1.10"
+version = "0.1.11"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "hardware-support"]
 include = ["src/**/*", "Cargo.toml", "README.md", "assets/**/*"]
 
 [[bin]]
-name = "aranet"
+name = "Aranet"
 path = "src/main.rs"
 
 [features]
@@ -21,14 +21,15 @@ default = ["cli", "tui"]
 cli = ["dep:clap", "dep:clap_complete", "dep:dialoguer", "dep:indicatif", "dep:tabled"]
 # TUI feature - enables terminal user interface dashboard
 tui = ["dep:ratatui", "dep:crossterm"]
-# GUI feature - enables native desktop GUI (egui/eframe) with system tray
-gui = ["dep:egui", "dep:eframe", "dep:egui_plot", "dep:image", "dep:tray-icon", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+# GUI feature - enables native desktop GUI (egui/eframe) with system tray and native menus
+# Note: tray-icon re-exports muda, so we use that for menu bar to avoid Obj-C class conflicts
+gui = ["dep:egui", "dep:eframe", "dep:egui_plot", "dep:image", "dep:tray-icon", "dep:notify-rust", "dep:open", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]
-aranet-core = { version = "0.1.9", path = "../aranet-core" }
-aranet-service = { version = "0.1.9", path = "../aranet-service" }
-aranet-store = { version = "0.1.9", path = "../aranet-store" }
-aranet-types = { version = "0.1.9", path = "../aranet-types" }
+aranet-core = { version = "0.1.11", path = "../aranet-core", features = ["service-client"] }
+aranet-service = { version = "0.1.11", path = "../aranet-service" }
+aranet-store = { version = "0.1.11", path = "../aranet-store" }
+aranet-types = { version = "0.1.11", path = "../aranet-types" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -63,9 +64,11 @@ eframe = { workspace = true, optional = true }
 egui_plot = { version = "0.34.0", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
-# System tray support (GUI only)
-tray-icon = { version = "0.19", optional = true }
+# System tray and native menu support (GUI only)
+# Note: tray-icon re-exports muda internally for menu bar support
+tray-icon = { version = "0.21", optional = true }
 notify-rust = { version = "4", optional = true }
+open = { version = "5", optional = true }
 
 # macOS dock icon control (for hide-to-tray)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -113,7 +116,7 @@ priority = "optional"
 # Assets to include in the package
 assets = [
     # Binary
-    ["target/release/aranet", "usr/bin/", "755"],
+    ["target/release/Aranet", "usr/bin/aranet", "755"],
     # Man page (if exists)
     # ["target/release/aranet.1", "usr/share/man/man1/", "644"],
     # Shell completions

@@ -1,0 +1,39 @@
+# Cargo audit configuration
+# See https://rustsec.org/advisories/ for advisory details
+
+[advisories]
+# These dependencies are transitive from tray-icon (Linux system tray support)
+# and wgpu/metal (GPU rendering for egui). They cannot be updated directly.
+
+# GTK3 bindings are unmaintained (moved to GTK4), but still required by
+# libappindicator for Linux system tray support. The tray-icon crate
+# depends on these for cross-platform tray functionality.
+ignore = [
+    # GTK3 unmaintained warnings - required for Linux system tray
+    "RUSTSEC-2024-0412",  # gdk
+    "RUSTSEC-2024-0413",  # atk
+    "RUSTSEC-2024-0415",  # gtk
+    "RUSTSEC-2024-0416",  # atk-sys
+    "RUSTSEC-2024-0418",  # gdk-sys
+    "RUSTSEC-2024-0419",  # gtk3-macros
+    "RUSTSEC-2024-0420",  # gtk-sys
+
+    # proc-macro-error is unmaintained but still widely used and functional
+    "RUSTSEC-2024-0370",  # proc-macro-error (used by gtk3-macros, glib-macros)
+
+    # paste crate is unmaintained but used by metal/wgpu for GPU rendering
+    "RUSTSEC-2024-0436",  # paste (via wgpu -> metal)
+
+    # glib VariantStrIter unsoundness - we don't use this API directly.
+    # The bug affects VariantStrIter iteration, which is not used by our code.
+    # This is a transitive dependency from libappindicator for Linux tray.
+    "RUSTSEC-2024-0429",  # glib unsound VariantStrIter
+
+    # rustls-pemfile is unmaintained - used by rumqttc for MQTT TLS support.
+    # The functionality still works and is a transitive dependency.
+    "RUSTSEC-2025-0134",  # rustls-pemfile
+]
+
+# Informational warnings about unmaintained crates - these are acceptable
+# as they are still functional and we cannot control transitive dependencies.
+informational_warnings = ["unmaintained"]

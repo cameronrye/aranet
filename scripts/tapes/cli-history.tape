@@ -7,23 +7,23 @@ Output assets/screenshots/cli-history.gif
 
 Set Shell bash
 Set FontSize 16
-Set Width 900
-Set Height 600
+Set Width 1200
+Set Height 800
 Set Theme "Catppuccin Mocha"
-Set Padding 20
+Set Padding 24
 Set TypingSpeed 50ms
 
-# Download measurement history
-Type "aranet history --device living-room --count 10"
+# Download measurement history from Aranet4
+Type "aranet history --device office --count 10"
 Enter
-Sleep 4s
+Sleep 6s
 
-# Show CSV export
+# Show CSV export from radon monitor
 Sleep 1s
 
-Type "aranet history --device living-room --count 5 --format csv"
+Type "aranet history --device radon --count 5 --format csv"
 Enter
-Sleep 3s
+Sleep 5s
 
 Sleep 2s
 

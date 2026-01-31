@@ -1,18 +1,21 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 50" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 48" fill="none">
   <defs>
-    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#22c55e"/>
-      <stop offset="50%" style="stop-color:#eab308"/>
-      <stop offset="100%" style="stop-color:#ef4444"/>
+    <linearGradient id="aqGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="50%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#ef4444"/>
     </linearGradient>
   </defs>
-  <!-- CO2 molecule icon -->
-  <circle cx="20" cy="25" r="8" fill="url(#logoGradient)" opacity="0.9"/>
-  <circle cx="32" cy="18" r="5" fill="url(#logoGradient)" opacity="0.7"/>
-  <circle cx="32" cy="32" r="5" fill="url(#logoGradient)" opacity="0.7"/>
-  <!-- Text - black for light theme -->
-  <text x="50" y="35" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="700" fill="#1a1a2e">
+
+  <!-- Icon mark - Wind design scaled -->
+  <g transform="translate(2, 4) scale(1.6)">
+    <path d="M18.2785 7C19.7816 7 21 8.11929 21 9.5C21 10.8807 19.7816 12 18.2785 12H3" stroke="url(#aqGradient)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M17.9375 20C19.0766 20 20.5 19.5 20.5 17.5C20.5 15.5 19.0766 15 17.9375 15H3" stroke="url(#aqGradient)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M10.4118 4C11.8412 4 13 5.11929 13 6.5C13 7.88071 11.8412 9 10.4118 9H3" stroke="url(#aqGradient)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Wordmark - dark text for light backgrounds -->
+  <text x="56" y="34" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="30" font-weight="600" fill="#0f172a" letter-spacing="-0.01em">
     Aranet
   </text>
 </svg>
-

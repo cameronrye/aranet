@@ -101,7 +101,7 @@ pub fn section_header(ui: &mut Ui, theme: &Theme, title: &str) {
 
 /// Render a styled status badge.
 pub fn status_badge(ui: &mut Ui, theme: &Theme, text: &str, color: Color32) {
-    let bg = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 30);
+    let bg = theme.tint_medium(color);
     egui::Frame::new()
         .fill(bg)
         .inner_margin(egui::Margin::symmetric(8, 4))
@@ -222,14 +222,14 @@ pub fn cached_data_banner(
 ) {
     let (bg_color, border_color, icon, message) = if is_stale {
         (
-            theme.tint_bg(theme.warning, 15),
+            theme.tint_subtle(theme.warning),
             theme.warning.gamma_multiply(0.5),
             "[!]",
             "Cached data - reading may be outdated",
         )
     } else {
         (
-            theme.tint_bg(theme.info, 15),
+            theme.tint_subtle(theme.info),
             theme.info.gamma_multiply(0.5),
             "[i]",
             "Showing cached data - device offline",

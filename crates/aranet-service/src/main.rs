@@ -12,6 +12,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use aranet_service::middleware::{self, RateLimitState};
 use aranet_service::{AppState, Collector, Config, api, ws};
 use aranet_store::Store;
 
@@ -184,18 +185,38 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
     // Create application state
     let state = AppState::new(store, config.clone());
 
+    // Create security middleware state
+    let security_config = Arc::new(config.security.clone());
+    let rate_limit_state = Arc::new(RateLimitState::new());
+
     // Start the background collector
     if !args.no_collector {
         let collector = Collector::new(Arc::clone(&state));
-        collector.start();
+        collector.start().await;
     } else {
         info!("Background collector disabled");
+    }
+
+    // Start MQTT publisher if enabled
+    #[cfg(feature = "mqtt")]
+    {
+        use aranet_service::mqtt::MqttPublisher;
+        let mqtt_publisher = MqttPublisher::new(Arc::clone(&state));
+        mqtt_publisher.start().await;
     }
 
     // Build the router
     let app = Router::new()
         .merge(api::router())
         .merge(ws::router())
+        .layer(axum::middleware::from_fn_with_state(
+            security_config.clone(),
+            middleware::api_key_auth,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            (security_config, rate_limit_state),
+            middleware::rate_limit,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()
@@ -212,7 +233,11 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
 
     // Run the server
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

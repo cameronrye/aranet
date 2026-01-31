@@ -117,4 +117,38 @@ mod tests {
         assert!(!looks_like_address("bedroom-sensor"));
         assert!(!looks_like_address("Aranet4"));
     }
+
+    #[test]
+    fn test_looks_like_address_short_mac() {
+        // Incomplete MAC addresses should not match
+        assert!(!looks_like_address("AA:BB:CC"));
+        assert!(!looks_like_address("AA:BB"));
+    }
+
+    #[test]
+    fn test_looks_like_address_mixed_case() {
+        assert!(looks_like_address("Aa:Bb:Cc:Dd:Ee:Ff"));
+        assert!(looks_like_address("aA:bB:cC:dD:eE:fF"));
+    }
+
+    #[test]
+    fn test_looks_like_address_empty_and_short() {
+        assert!(!looks_like_address(""));
+        assert!(!looks_like_address("a"));
+        assert!(!looks_like_address("abc"));
+    }
+
+    #[test]
+    fn test_looks_like_address_numbers_only() {
+        // Just numbers shouldn't look like an address
+        assert!(!looks_like_address("12345"));
+        assert!(!looks_like_address("123456"));
+    }
+
+    #[test]
+    fn test_looks_like_address_with_spaces() {
+        // Spaces in name should not match
+        assert!(!looks_like_address("my sensor"));
+        assert!(!looks_like_address("living room"));
+    }
 }

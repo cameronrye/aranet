@@ -55,7 +55,7 @@ pub async fn cmd_server(args: ServerArgs) -> Result<()> {
     // Start the background collector
     if !args.no_collector {
         let collector = Collector::new(Arc::clone(&state));
-        collector.start();
+        collector.start().await;
         info!("Background collector started");
     } else {
         info!("Background collector disabled");

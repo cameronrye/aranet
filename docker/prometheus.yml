@@ -1,0 +1,43 @@
+# Prometheus configuration for Aranet monitoring
+#
+# This file is used by the docker-compose setup.
+# For standalone Prometheus, copy this to your Prometheus config directory.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Rule files for alerts (optional)
+# rule_files:
+#   - "aranet_alerts.yml"
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Aranet Service metrics
+  - job_name: 'aranet'
+    static_configs:
+      - targets: ['aranet-service:8080']
+    metrics_path: /metrics
+    scrape_interval: 60s
+    scrape_timeout: 10s
+
+  # Alternative: If running aranet-service outside Docker
+  # - job_name: 'aranet-local'
+  #   static_configs:
+  #     - targets: ['host.docker.internal:8080']
+  #   metrics_path: /metrics
+
+# Remote write configuration (optional, for long-term storage)
+# remote_write:
+#   - url: "http://influxdb:8086/api/v1/prom/write?db=prometheus"

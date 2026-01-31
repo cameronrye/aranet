@@ -316,3 +316,232 @@ fn cmd_history_from_cache(options: CacheQueryOptions<'_>) -> Result<()> {
     write_output(output, &content)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // parse_relative_duration tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_relative_duration_empty() {
+        assert!(parse_relative_duration("").is_none());
+        assert!(parse_relative_duration("   ").is_none());
+    }
+
+    #[test]
+    fn test_parse_relative_duration_minutes() {
+        assert_eq!(
+            parse_relative_duration("30m"),
+            Some(time::Duration::minutes(30))
+        );
+        assert_eq!(
+            parse_relative_duration("30min"),
+            Some(time::Duration::minutes(30))
+        );
+        assert_eq!(
+            parse_relative_duration("30mins"),
+            Some(time::Duration::minutes(30))
+        );
+        assert_eq!(
+            parse_relative_duration("1minute"),
+            Some(time::Duration::minutes(1))
+        );
+        assert_eq!(
+            parse_relative_duration("5minutes"),
+            Some(time::Duration::minutes(5))
+        );
+    }
+
+    #[test]
+    fn test_parse_relative_duration_hours() {
+        assert_eq!(
+            parse_relative_duration("24h"),
+            Some(time::Duration::hours(24))
+        );
+        assert_eq!(
+            parse_relative_duration("1hr"),
+            Some(time::Duration::hours(1))
+        );
+        assert_eq!(
+            parse_relative_duration("2hrs"),
+            Some(time::Duration::hours(2))
+        );
+        assert_eq!(
+            parse_relative_duration("1hour"),
+            Some(time::Duration::hours(1))
+        );
+        assert_eq!(
+            parse_relative_duration("12hours"),
+            Some(time::Duration::hours(12))
+        );
+    }
+
+    #[test]
+    fn test_parse_relative_duration_days() {
+        assert_eq!(parse_relative_duration("7d"), Some(time::Duration::days(7)));
+        assert_eq!(
+            parse_relative_duration("1day"),
+            Some(time::Duration::days(1))
+        );
+        assert_eq!(
+            parse_relative_duration("30days"),
+            Some(time::Duration::days(30))
+        );
+    }
+
+    #[test]
+    fn test_parse_relative_duration_weeks() {
+        assert_eq!(
+            parse_relative_duration("1w"),
+            Some(time::Duration::weeks(1))
+        );
+        assert_eq!(
+            parse_relative_duration("2wk"),
+            Some(time::Duration::weeks(2))
+        );
+        assert_eq!(
+            parse_relative_duration("4wks"),
+            Some(time::Duration::weeks(4))
+        );
+        assert_eq!(
+            parse_relative_duration("1week"),
+            Some(time::Duration::weeks(1))
+        );
+        assert_eq!(
+            parse_relative_duration("2weeks"),
+            Some(time::Duration::weeks(2))
+        );
+    }
+
+    #[test]
+    fn test_parse_relative_duration_invalid() {
+        // Invalid unit
+        assert!(parse_relative_duration("7x").is_none());
+        assert!(parse_relative_duration("7y").is_none());
+        assert!(parse_relative_duration("7s").is_none()); // seconds not supported
+
+        // No number
+        assert!(parse_relative_duration("d").is_none());
+        assert!(parse_relative_duration("days").is_none());
+
+        // Zero or negative not allowed
+        assert!(parse_relative_duration("0d").is_none());
+        assert!(parse_relative_duration("-1d").is_none());
+    }
+
+    // ========================================================================
+    // parse_datetime tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_datetime_now() {
+        let before = OffsetDateTime::now_utc();
+        let result = parse_datetime("now").unwrap();
+        let after = OffsetDateTime::now_utc();
+
+        assert!(result >= before);
+        assert!(result <= after);
+    }
+
+    #[test]
+    fn test_parse_datetime_now_case_insensitive() {
+        // Should work with any case
+        assert!(parse_datetime("NOW").is_ok());
+        assert!(parse_datetime("Now").is_ok());
+    }
+
+    #[test]
+    fn test_parse_datetime_today() {
+        let result = parse_datetime("today").unwrap();
+        let now = OffsetDateTime::now_utc();
+
+        assert_eq!(result.date(), now.date());
+        assert_eq!(result.hour(), 0);
+        assert_eq!(result.minute(), 0);
+        assert_eq!(result.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_yesterday() {
+        let result = parse_datetime("yesterday").unwrap();
+        let now = OffsetDateTime::now_utc();
+        let expected_date = now.date() - time::Duration::days(1);
+
+        assert_eq!(result.date(), expected_date);
+        assert_eq!(result.hour(), 0);
+        assert_eq!(result.minute(), 0);
+        assert_eq!(result.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_rfc3339() {
+        let result = parse_datetime("2024-01-15T10:30:00Z").unwrap();
+
+        assert_eq!(result.year(), 2024);
+        assert_eq!(result.month(), time::Month::January);
+        assert_eq!(result.day(), 15);
+        assert_eq!(result.hour(), 10);
+        assert_eq!(result.minute(), 30);
+        assert_eq!(result.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_date_only() {
+        let result = parse_datetime("2024-01-15").unwrap();
+
+        assert_eq!(result.year(), 2024);
+        assert_eq!(result.month(), time::Month::January);
+        assert_eq!(result.day(), 15);
+        // Date-only should be start of day
+        assert_eq!(result.hour(), 0);
+        assert_eq!(result.minute(), 0);
+        assert_eq!(result.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_relative_days() {
+        let before = OffsetDateTime::now_utc();
+        let result = parse_datetime("7d").unwrap();
+        let after = OffsetDateTime::now_utc();
+
+        // Result should be approximately 7 days ago
+        let expected_min = before - time::Duration::days(7);
+        let expected_max = after - time::Duration::days(7);
+
+        assert!(result >= expected_min);
+        assert!(result <= expected_max);
+    }
+
+    #[test]
+    fn test_parse_datetime_relative_hours() {
+        let before = OffsetDateTime::now_utc();
+        let result = parse_datetime("24h").unwrap();
+        let after = OffsetDateTime::now_utc();
+
+        let expected_min = before - time::Duration::hours(24);
+        let expected_max = after - time::Duration::hours(24);
+
+        assert!(result >= expected_min);
+        assert!(result <= expected_max);
+    }
+
+    #[test]
+    fn test_parse_datetime_invalid() {
+        assert!(parse_datetime("invalid").is_err());
+        assert!(parse_datetime("2024/01/15").is_err()); // Wrong format
+        assert!(parse_datetime("").is_err());
+        assert!(parse_datetime("not-a-date").is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_error_message() {
+        let result = parse_datetime("invalid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Invalid date format"));
+        assert!(err.to_string().contains("invalid"));
+    }
+}

@@ -1,0 +1,253 @@
+---
+title: Home Assistant Integration
+description: Integrate Aranet sensors with Home Assistant using MQTT auto-discovery.
+---
+
+import { Aside, Steps, Tabs, TabItem, Badge } from '@astrojs/starlight/components';
+
+Connect your Aranet sensors to Home Assistant using the aranet-service MQTT integration with automatic device discovery.
+
+## Prerequisites
+
+- **aranet-service** running with MQTT feature enabled
+- **Home Assistant** with MQTT integration configured
+- An **MQTT broker** (Mosquitto, EMQX, etc.)
+
+<Aside type="tip">
+  If you're using Home Assistant OS, the Mosquitto add-on provides an easy-to-configure MQTT broker.
+</Aside>
+
+## Quick Setup
+
+<Steps>
+1. Install and configure an MQTT broker
+2. Enable MQTT in aranet-service configuration
+3. Add MQTT integration to Home Assistant
+4. Sensors appear automatically via MQTT Discovery
+</Steps>
+
+## Configuration
+
+### aranet-service Configuration
+
+Edit your `~/.config/aranet/server.toml`:
+
+```toml
+[mqtt]
+enabled = true
+broker = "mqtt://localhost:1883"
+topic_prefix = "homeassistant"  # Use HA discovery prefix
+client_id = "aranet-service"
+qos = 1
+retain = true
+
+# If your broker requires authentication
+username = "aranet"
+password = "your-password"
+
+[[devices]]
+address = "Aranet4 XXXXX"
+alias = "office"
+poll_interval = 60
+```
+
+### Home Assistant MQTT Configuration
+
+Add to your `configuration.yaml`:
+
+```yaml
+mqtt:
+  broker: localhost
+  port: 1883
+  # username: your-username
+  # password: your-password
+```
+
+Or configure via UI: **Settings → Devices & Services → Add Integration → MQTT**
+
+## MQTT Topics
+
+aranet-service publishes readings to these topics:
+
+| Topic | Description | Example Value |
+|-------|-------------|---------------|
+| `{prefix}/{device}/json` | Full reading as JSON | `{"co2":750,...}` |
+| `{prefix}/{device}/co2` | CO₂ concentration (ppm) | `750` |
+| `{prefix}/{device}/temperature` | Temperature (°C) | `23.50` |
+| `{prefix}/{device}/humidity` | Relative humidity (%) | `48` |
+| `{prefix}/{device}/pressure` | Atmospheric pressure (hPa) | `1013.25` |
+| `{prefix}/{device}/battery` | Battery level (%) | `85` |
+| `{prefix}/{device}/status` | Air quality status | `green` |
+
+Where `{device}` is the device alias or sanitized address.
+
+## Manual MQTT Sensors (Alternative)
+
+If auto-discovery isn't working, manually configure sensors:
+
+```yaml
+# configuration.yaml
+mqtt:
+  sensor:
+    - name: "Office CO2"
+      state_topic: "aranet/office/co2"
+      unit_of_measurement: "ppm"
+      device_class: carbon_dioxide
+      state_class: measurement
+      icon: mdi:molecule-co2
+
+    - name: "Office Temperature"
+      state_topic: "aranet/office/temperature"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+
+    - name: "Office Humidity"
+      state_topic: "aranet/office/humidity"
+      unit_of_measurement: "%"
+      device_class: humidity
+      state_class: measurement
+
+    - name: "Office Pressure"
+      state_topic: "aranet/office/pressure"
+      unit_of_measurement: "hPa"
+      device_class: atmospheric_pressure
+      state_class: measurement
+
+    - name: "Office Battery"
+      state_topic: "aranet/office/battery"
+      unit_of_measurement: "%"
+      device_class: battery
+      state_class: measurement
+```
+
+## MQTT Auto-Discovery
+
+To enable Home Assistant auto-discovery, aranet-service can publish discovery messages. Add this configuration:
+
+```toml
+[mqtt]
+enabled = true
+broker = "mqtt://localhost:1883"
+# Use Home Assistant's discovery prefix
+topic_prefix = "homeassistant"
+ha_discovery = true  # Enable HA auto-discovery
+```
+
+<Aside type="note">
+  MQTT auto-discovery support is a planned feature. Currently, use manual sensor configuration as shown above.
+</Aside>
+
+## Automation Examples
+
+### CO₂ Alert
+
+```yaml
+automation:
+  - alias: "High CO2 Alert"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.office_co2
+        above: 1000
+        for:
+          minutes: 5
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "High CO₂ Level"
+          message: "Office CO₂ is {{ states('sensor.office_co2') }} ppm"
+```
+
+### Ventilation Control
+
+```yaml
+automation:
+  - alias: "Control Ventilation Fan"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.office_co2
+        above: 800
+    action:
+      - service: switch.turn_on
+        target:
+          entity_id: switch.ventilation_fan
+
+  - alias: "Turn Off Ventilation"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.office_co2
+        below: 600
+        for:
+          minutes: 10
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.ventilation_fan
+```
+
+## Dashboard Card
+
+Add an entities card to your Lovelace dashboard:
+
+```yaml
+type: entities
+title: Air Quality - Office
+entities:
+  - entity: sensor.office_co2
+    name: CO₂
+  - entity: sensor.office_temperature
+    name: Temperature
+  - entity: sensor.office_humidity
+    name: Humidity
+  - entity: sensor.office_pressure
+    name: Pressure
+  - entity: sensor.office_battery
+    name: Battery
+```
+
+Or use a custom gauge card for CO₂:
+
+```yaml
+type: gauge
+entity: sensor.office_co2
+name: CO₂ Level
+min: 400
+max: 2000
+severity:
+  green: 0
+  yellow: 800
+  red: 1000
+```
+
+## Troubleshooting
+
+### Sensors not appearing
+
+1. Verify MQTT broker is running: `mosquitto_pub -t test -m hello`
+2. Check aranet-service logs: `aranet-service run`
+3. Subscribe to topics: `mosquitto_sub -t 'aranet/#' -v`
+
+### Stale readings
+
+1. Ensure device is in range
+2. Check poll_interval in config
+3. Verify Bluetooth is working: `aranet scan`
+
+### Authentication errors
+
+1. Check username/password in both aranet-service and HA config
+2. Verify MQTT broker ACLs allow the aranet client
+
+## Running Alongside Home Assistant
+
+aranet-service complements Home Assistant's native Bluetooth integration:
+
+| Feature | aranet-service | HA Bluetooth |
+|---------|---------------|--------------|
+| Polling control | Configurable interval | Fixed |
+| History storage | Local SQLite | HA database |
+| Grafana export | Yes (Prometheus) | Via InfluxDB |
+| Multi-device | Excellent | Good |
+| Bluetooth range | Host only | Host or ESPHome proxy |
+
+For extended range, consider using ESPHome Bluetooth proxies with Home Assistant's native integration, or run aranet-service on a dedicated Raspberry Pi near your sensors.

@@ -6,8 +6,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aranet_core::messages::{CachedDevice, Command, SensorEvent};
+use aranet_core::messages::{CachedDevice, Command, SensorEvent, ServiceDeviceStats};
 use aranet_core::scan::scan_with_options;
+use aranet_core::service_client::ServiceClient;
 use aranet_core::settings::{DeviceSettings, MeasurementInterval};
 use aranet_core::{BluetoothRange, Device, ScanOptions};
 use aranet_store::Store;
@@ -19,11 +20,18 @@ use tracing::{debug, error, info, warn};
 /// Maximum time to wait for a BLE connect-and-read operation.
 const CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default URL for the aranet-service.
+const DEFAULT_SERVICE_URL: &str = "http://localhost:8080";
+
 /// Background worker that handles BLE operations.
 pub struct SensorWorker {
     command_rx: mpsc::Receiver<Command>,
     event_tx: mpsc::Sender<SensorEvent>,
     store_path: PathBuf,
+    /// Service client for aranet-service communication.
+    service_client: Option<ServiceClient>,
+    /// The service URL being used (for error messages).
+    service_url: String,
 }
 
 impl SensorWorker {
@@ -33,10 +41,38 @@ impl SensorWorker {
         event_tx: mpsc::Sender<SensorEvent>,
         store_path: PathBuf,
     ) -> Self {
+        Self::with_service_url(command_rx, event_tx, store_path, DEFAULT_SERVICE_URL)
+    }
+
+    /// Create a new sensor worker with a custom service URL.
+    pub fn with_service_url(
+        command_rx: mpsc::Receiver<Command>,
+        event_tx: mpsc::Sender<SensorEvent>,
+        store_path: PathBuf,
+        service_url: &str,
+    ) -> Self {
+        // Try to create service client, logging any errors
+        let service_client = match ServiceClient::new(service_url) {
+            Ok(client) => {
+                info!(url = service_url, "Service client initialized");
+                Some(client)
+            }
+            Err(e) => {
+                warn!(
+                    url = service_url,
+                    error = %e,
+                    "Failed to initialize service client - service features will be unavailable"
+                );
+                None
+            }
+        };
+
         Self {
             command_rx,
             event_tx,
             store_path,
+            service_client,
+            service_url: service_url.to_string(),
         }
     }
 
@@ -90,6 +126,21 @@ impl SensorWorker {
             }
             Command::SetSmartHome { device_id, enabled } => {
                 self.handle_set_smart_home(&device_id, enabled).await;
+            }
+            Command::RefreshServiceStatus => {
+                self.handle_refresh_service_status().await;
+            }
+            Command::StartServiceCollector => {
+                self.handle_start_service_collector().await;
+            }
+            Command::StopServiceCollector => {
+                self.handle_stop_service_collector().await;
+            }
+            Command::SetAlias { device_id, alias } => {
+                self.handle_set_alias(&device_id, alias).await;
+            }
+            Command::ForgetDevice { device_id } => {
+                self.handle_forget_device(&device_id).await;
             }
             Command::Shutdown => {} // Handled in run() loop
         }
@@ -260,7 +311,7 @@ impl SensorWorker {
             .await;
 
         match timeout(CONNECT_READ_TIMEOUT, self.connect_and_read(device_id)).await {
-            Ok(Ok((name, device_type, reading, settings))) => {
+            Ok(Ok((name, device_type, reading, settings, rssi))) => {
                 self.save_device_connection(device_id, name.as_deref(), device_type);
                 let _ = self
                     .event_tx
@@ -268,7 +319,7 @@ impl SensorWorker {
                         device_id: device_id.to_string(),
                         name,
                         device_type,
-                        rssi: None,
+                        rssi,
                     })
                     .await;
 
@@ -330,7 +381,7 @@ impl SensorWorker {
 
     async fn handle_refresh(&self, device_id: &str) {
         match timeout(CONNECT_READ_TIMEOUT, self.connect_and_read(device_id)).await {
-            Ok(Ok((_, _, reading, settings))) => {
+            Ok(Ok((_, _, reading, settings, _rssi))) => {
                 // Send settings if we got them
                 if let Some(settings) = settings {
                     let _ = self
@@ -583,6 +634,7 @@ impl SensorWorker {
             Option<DeviceType>,
             Option<CurrentReading>,
             Option<DeviceSettings>,
+            Option<i16>,
         ),
         aranet_core::Error,
     > {
@@ -591,8 +643,9 @@ impl SensorWorker {
         let device_type = device.device_type();
         let reading = device.read_current().await.ok();
         let settings = device.get_settings().await.ok();
+        let rssi = device.read_rssi().await.ok();
         let _ = device.disconnect().await;
-        Ok((name, device_type, reading, settings))
+        Ok((name, device_type, reading, settings, rssi))
     }
 
     async fn handle_set_interval(&self, device_id: &str, interval_secs: u16) {
@@ -819,6 +872,232 @@ impl SensorWorker {
             warn!(device_id, error = %e, "Failed to update device metadata");
         } else {
             debug!(device_id, ?name, ?device_type, "Device connection saved");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Service Handler Methods
+    // -------------------------------------------------------------------------
+
+    /// Handle refreshing the aranet-service status.
+    async fn handle_refresh_service_status(&self) {
+        info!("Refreshing service status");
+
+        let Some(ref client) = self.service_client else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ServiceStatusError {
+                    error: format!(
+                        "Service client not initialized. Check if the service URL '{}' is valid.",
+                        self.service_url
+                    ),
+                })
+                .await;
+            return;
+        };
+
+        match client.status().await {
+            Ok(status) => {
+                let devices: Vec<ServiceDeviceStats> = status
+                    .devices
+                    .into_iter()
+                    .map(|d| ServiceDeviceStats {
+                        device_id: d.device_id,
+                        alias: d.alias,
+                        poll_interval: d.poll_interval,
+                        polling: d.polling,
+                        success_count: d.success_count,
+                        failure_count: d.failure_count,
+                        last_poll_at: d.last_poll_at,
+                        last_error: d.last_error,
+                    })
+                    .collect();
+
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceStatusRefreshed {
+                        reachable: true,
+                        collector_running: status.collector.running,
+                        uptime_seconds: status.collector.uptime_seconds,
+                        devices,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                // Check if it's a connection error (service not running)
+                let error_msg = match &e {
+                    aranet_core::service_client::ServiceClientError::NotReachable {
+                        url, ..
+                    } => {
+                        format!(
+                            "Service not reachable at {}. Run 'aranet-service run' to start it.",
+                            url
+                        )
+                    }
+                    _ => e.to_string(),
+                };
+
+                warn!(error = %error_msg, "Failed to refresh service status");
+
+                // Send partial status with reachable=false so UI can show "not running"
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceStatusRefreshed {
+                        reachable: false,
+                        collector_running: false,
+                        uptime_seconds: None,
+                        devices: vec![],
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Handle starting the aranet-service collector.
+    async fn handle_start_service_collector(&self) {
+        info!("Starting service collector");
+
+        let Some(ref client) = self.service_client else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ServiceCollectorError {
+                    error: "Service client not initialized. Run 'aranet-service run' first, then restart the GUI.".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match client.start_collector().await {
+            Ok(_) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorStarted)
+                    .await;
+                // Refresh status to get updated state
+                self.handle_refresh_service_status().await;
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorError {
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Handle stopping the aranet-service collector.
+    async fn handle_stop_service_collector(&self) {
+        info!("Stopping service collector");
+
+        let Some(ref client) = self.service_client else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ServiceCollectorError {
+                    error: "Service client not initialized. Run 'aranet-service run' first, then restart the GUI.".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match client.stop_collector().await {
+            Ok(_) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorStopped)
+                    .await;
+                // Refresh status to get updated state
+                self.handle_refresh_service_status().await;
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ServiceCollectorError {
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_set_alias(&self, device_id: &str, alias: Option<String>) {
+        info!("Setting alias for device {} to {:?}", device_id, alias);
+
+        let Some(store) = self.open_store() else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::AliasError {
+                    device_id: device_id.to_string(),
+                    error: "Could not open database".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match store.update_device_metadata(device_id, alias.as_deref(), None) {
+            Ok(()) => {
+                info!("Alias updated successfully for {}", device_id);
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::AliasChanged {
+                        device_id: device_id.to_string(),
+                        alias,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::AliasError {
+                        device_id: device_id.to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_forget_device(&self, device_id: &str) {
+        info!("Forgetting device {}", device_id);
+
+        let Some(store) = self.open_store() else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ForgetDeviceError {
+                    device_id: device_id.to_string(),
+                    error: "Could not open database".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match store.delete_device(device_id) {
+            Ok(deleted) => {
+                if deleted {
+                    info!("Device {} forgotten (deleted from store)", device_id);
+                } else {
+                    info!(
+                        "Device {} not found in store (removing from UI only)",
+                        device_id
+                    );
+                }
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::DeviceForgotten {
+                        device_id: device_id.to_string(),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ForgetDeviceError {
+                        device_id: device_id.to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
         }
     }
 }

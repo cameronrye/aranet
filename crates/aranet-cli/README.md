@@ -8,7 +8,12 @@
 
 # aranet-cli
 
+[![crates.io](https://img.shields.io/crates/v/aranet-cli.svg)](https://crates.io/crates/aranet-cli)
+[![docs.rs](https://docs.rs/aranet-cli/badge.svg)](https://docs.rs/aranet-cli)
+
 Command-line interface for Aranet environmental sensors.
+
+**[Full Documentation](https://cameronrye.github.io/aranet/)**
 
 A fast, scriptable CLI for reading sensor data, downloading history, and configuring Aranet devices (Aranet4, Aranet2, AranetRn+, Aranet Radiation).
 
@@ -269,9 +274,8 @@ This CLI is part of the [aranet](https://github.com/cameronrye/aranet) workspace
 | [aranet-types](../aranet-types/) | [![crates.io](https://img.shields.io/crates/v/aranet-types.svg)](https://crates.io/crates/aranet-types) | Shared types for sensor data |
 | [aranet-store](../aranet-store/) | [![crates.io](https://img.shields.io/crates/v/aranet-store.svg)](https://crates.io/crates/aranet-store) | Local data persistence |
 | [aranet-tui](../aranet-tui/) | [![crates.io](https://img.shields.io/crates/v/aranet-tui.svg)](https://crates.io/crates/aranet-tui) | Terminal UI dashboard |
-| [aranet-service](../aranet-service/) | - | Background collector and REST API |
-| [aranet-gui](../aranet-gui/) | - | Desktop GUI application |
-| [aranet-wasm](../aranet-wasm/) | - | WebAssembly module |
+| [aranet-service](../aranet-service/) | [![crates.io](https://img.shields.io/crates/v/aranet-service.svg)](https://crates.io/crates/aranet-service) | Background collector and REST API |
+| [aranet-gui](../aranet-gui/) | [![crates.io](https://img.shields.io/crates/v/aranet-gui.svg)](https://crates.io/crates/aranet-gui) | Desktop GUI application |
 
 ## License
 
