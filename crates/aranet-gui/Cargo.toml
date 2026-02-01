@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Native desktop GUI for Aranet environmental sensors"
 
+[lib]
+name = "aranet_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aranet-gui"
 path = "src/main.rs"
