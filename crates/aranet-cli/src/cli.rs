@@ -123,7 +123,7 @@ impl OutputArgs {
 
 #[derive(Parser)]
 #[command(name = "aranet")]
-#[command(author, version, about = "CLI for Aranet environmental sensors", long_about = None)]
+#[command(author, version, about = "CLI for Aranet environmental sensors", long_about = "CLI for Aranet environmental sensors\n\nMade with ❤️ by Cameron Rye\nhttps://rye.dev")]
 pub struct Cli {
     /// Enable verbose output
     #[arg(short, long, global = true)]

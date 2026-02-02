@@ -1,6 +1,8 @@
 //! Type definitions for the GUI module.
 
-use aranet_core::messages::CachedDevice;
+use std::time::Instant;
+
+use aranet_core::messages::{CachedDevice, SignalQuality};
 use aranet_core::scan::DiscoveredDevice;
 use aranet_core::settings::DeviceSettings;
 use aranet_types::{CurrentReading, DeviceType, HistoryRecord};
@@ -149,6 +151,136 @@ impl HistoryFilter {
     }
 }
 
+/// Session statistics for a device (tracks min/max/avg during current session).
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    /// Minimum CO2 reading in session.
+    pub co2_min: Option<u16>,
+    /// Maximum CO2 reading in session.
+    pub co2_max: Option<u16>,
+    /// Sum of CO2 readings for average calculation.
+    pub co2_sum: u64,
+    /// Count of CO2 readings.
+    pub co2_count: u32,
+    /// Minimum temperature in session.
+    pub temp_min: Option<f32>,
+    /// Maximum temperature in session.
+    pub temp_max: Option<f32>,
+    /// Minimum radon reading in session.
+    pub radon_min: Option<u32>,
+    /// Maximum radon reading in session.
+    pub radon_max: Option<u32>,
+    /// Sum of radon readings for average calculation.
+    pub radon_sum: u64,
+    /// Count of radon readings.
+    pub radon_count: u32,
+}
+
+impl SessionStats {
+    /// Update statistics with a new reading.
+    pub fn update(&mut self, reading: &CurrentReading) {
+        // Only track non-zero CO2 (Aranet4)
+        if reading.co2 > 0 {
+            self.co2_min = Some(self.co2_min.map_or(reading.co2, |m| m.min(reading.co2)));
+            self.co2_max = Some(self.co2_max.map_or(reading.co2, |m| m.max(reading.co2)));
+            self.co2_sum += reading.co2 as u64;
+            self.co2_count += 1;
+        }
+
+        // Temperature
+        self.temp_min = Some(
+            self.temp_min
+                .map_or(reading.temperature, |m| m.min(reading.temperature)),
+        );
+        self.temp_max = Some(
+            self.temp_max
+                .map_or(reading.temperature, |m| m.max(reading.temperature)),
+        );
+
+        // Radon (Aranet Radon)
+        if let Some(radon) = reading.radon {
+            self.radon_min = Some(self.radon_min.map_or(radon, |m| m.min(radon)));
+            self.radon_max = Some(self.radon_max.map_or(radon, |m| m.max(radon)));
+            self.radon_sum += radon as u64;
+            self.radon_count += 1;
+        }
+    }
+
+    /// Get average CO2.
+    pub fn co2_avg(&self) -> Option<u16> {
+        if self.co2_count > 0 {
+            Some((self.co2_sum / self.co2_count as u64) as u16)
+        } else {
+            None
+        }
+    }
+
+    /// Get average radon.
+    pub fn radon_avg(&self) -> Option<u32> {
+        if self.radon_count > 0 {
+            Some((self.radon_sum / self.radon_count as u64) as u32)
+        } else {
+            None
+        }
+    }
+}
+
+/// Calculate radon averages from history records (24h, 7d, 30d).
+pub fn calculate_radon_averages(history: &[HistoryRecord]) -> (Option<u32>, Option<u32>, Option<u32>) {
+    use time::OffsetDateTime;
+
+    let now = OffsetDateTime::now_utc();
+    let day_ago = now - time::Duration::days(1);
+    let week_ago = now - time::Duration::days(7);
+    let month_ago = now - time::Duration::days(30);
+
+    let mut day_sum: u64 = 0;
+    let mut day_count: u32 = 0;
+    let mut week_sum: u64 = 0;
+    let mut week_count: u32 = 0;
+    let mut month_sum: u64 = 0;
+    let mut month_count: u32 = 0;
+
+    for record in history {
+        if let Some(radon) = record.radon
+            && record.timestamp >= month_ago
+        {
+            month_sum += radon as u64;
+            month_count += 1;
+
+            if record.timestamp >= week_ago {
+                week_sum += radon as u64;
+                week_count += 1;
+
+                if record.timestamp >= day_ago {
+                    day_sum += radon as u64;
+                    day_count += 1;
+                }
+            }
+        }
+    }
+
+    let day_avg = if day_count > 0 {
+        Some((day_sum / day_count as u64) as u32)
+    } else {
+        None
+    };
+
+    let week_avg = if week_count > 0 {
+        Some((week_sum / week_count as u64) as u32)
+    } else {
+        None
+    };
+
+    let month_avg = if month_count > 0 {
+        Some((month_sum / month_count as u64) as u32)
+    } else {
+        None
+    };
+
+    (day_avg, week_avg, month_avg)
+}
+
 /// Trend direction for a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Trend {
@@ -188,16 +320,26 @@ pub struct DeviceState {
     pub name: Option<String>,
     pub device_type: Option<DeviceType>,
     pub rssi: Option<i16>,
+    /// Signal quality assessment based on RSSI.
+    pub signal_quality: Option<SignalQuality>,
     pub connection: ConnectionState,
     pub reading: Option<CurrentReading>,
     pub previous_reading: Option<CurrentReading>,
     pub history: Vec<HistoryRecord>,
     pub syncing_history: bool,
+    /// Progress of history sync: (downloaded, total).
+    pub sync_progress: Option<(usize, usize)>,
     pub settings: Option<DeviceSettings>,
     /// Whether the current reading was loaded from cache (not live from device).
     pub reading_from_cache: bool,
     /// When history was last synced from the device.
     pub last_sync: Option<time::OffsetDateTime>,
+    /// Background polling interval in seconds (None if not polling).
+    pub background_polling: Option<u64>,
+    /// Session statistics for this device (min/max/avg values).
+    pub session_stats: SessionStats,
+    /// When the device was connected (for uptime calculation).
+    pub connected_at: Option<Instant>,
 }
 
 impl DeviceState {
@@ -208,14 +350,19 @@ impl DeviceState {
             name: device.name.clone(),
             device_type: device.device_type,
             rssi: device.rssi,
+            signal_quality: device.rssi.map(SignalQuality::from_rssi),
             connection: ConnectionState::Disconnected,
             reading: None,
             previous_reading: None,
             history: Vec::new(),
             syncing_history: false,
+            sync_progress: None,
             settings: None,
             reading_from_cache: false,
             last_sync: None,
+            background_polling: None,
+            session_stats: SessionStats::default(),
+            connected_at: None,
         }
     }
 
@@ -226,14 +373,19 @@ impl DeviceState {
             name: cached.name.clone(),
             device_type: cached.device_type,
             rssi: None,
+            signal_quality: None,
             connection: ConnectionState::Disconnected,
             reading: cached.reading,
             previous_reading: None,
             history: Vec::new(),
             syncing_history: false,
+            sync_progress: None,
             settings: None,
             reading_from_cache: cached.reading.is_some(), // Mark as cached if reading exists
             last_sync: cached.last_sync,
+            background_polling: None,
+            session_stats: SessionStats::default(),
+            connected_at: None,
         }
     }
 
@@ -246,9 +398,28 @@ impl DeviceState {
     ///
     /// This marks the reading as live (not from cache) since it came from the device.
     pub fn update_reading(&mut self, reading: CurrentReading) {
+        // Update session statistics
+        self.session_stats.update(&reading);
         self.previous_reading = self.reading;
         self.reading = Some(reading);
         self.reading_from_cache = false; // Live reading from device
+    }
+
+    /// Get uptime as formatted string if connected.
+    pub fn uptime(&self) -> Option<String> {
+        let connected_at = self.connected_at?;
+        let elapsed = connected_at.elapsed();
+        let secs = elapsed.as_secs();
+
+        if secs < 60 {
+            Some(format!("{}s", secs))
+        } else if secs < 3600 {
+            Some(format!("{}m {}s", secs / 60, secs % 60))
+        } else {
+            let hours = secs / 3600;
+            let mins = (secs % 3600) / 60;
+            Some(format!("{}h {}m", hours, mins))
+        }
     }
 
     /// Check if showing cached/offline data (disconnected but has reading).

@@ -21,11 +21,15 @@ This crate provides low-level Bluetooth Low Energy (BLE) communication with Aran
 
 - **Device discovery** — Scan for nearby Aranet devices via BLE
 - **Current readings** — CO₂, temperature, pressure, humidity, radon, radiation
-- **Historical data** — Download measurement history with timestamps
+- **Historical data** — Download measurement history with timestamps and resumable checkpoints
 - **Device settings** — Read/write measurement interval, Bluetooth range
-- **Auto-reconnection** — Configurable backoff and retry logic
+- **Auto-reconnection** — Configurable backoff and retry logic with exponential delays
 - **Real-time streaming** — Subscribe to sensor value changes
-- **Multi-device support** — Manage multiple sensors simultaneously
+- **Multi-device support** — Manage multiple sensors simultaneously with adaptive polling
+- **Passive monitoring** — Monitor devices via BLE advertisements without connecting
+- **Platform support** — Platform-specific configuration for macOS, Linux, and Windows
+- **Diagnostics** — Bluetooth adapter diagnostics, connection stats, and error tracking
+- **Cross-platform aliases** — Device aliasing system for consistent identification
 
 ## Supported Devices
 

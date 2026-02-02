@@ -23,14 +23,18 @@
 //! broadcast_buffer = 200  # Larger buffer for slow clients
 //! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use aranet_store::Store;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::task::JoinSet;
+use tracing::warn;
 
-use crate::config::Config;
+use crate::config::{Config, default_config_path};
 
 /// Shared application state.
 pub struct AppState {
@@ -38,6 +42,8 @@ pub struct AppState {
     pub store: Mutex<Store>,
     /// Configuration (RwLock for runtime updates).
     pub config: RwLock<Config>,
+    /// Path to the configuration file (for saving changes).
+    pub config_path: PathBuf,
     /// Broadcast channel for real-time reading updates.
     pub readings_tx: broadcast::Sender<ReadingEvent>,
     /// Collector control state.
@@ -50,14 +56,48 @@ impl AppState {
     /// The broadcast channel buffer size is determined by `config.server.broadcast_buffer`.
     /// If the buffer fills (slow subscribers), old messages are dropped without blocking.
     pub fn new(store: Store, config: Config) -> Arc<Self> {
+        Self::with_config_path(store, config, default_config_path())
+    }
+
+    /// Create new application state with a custom config path.
+    pub fn with_config_path(store: Store, config: Config, config_path: PathBuf) -> Arc<Self> {
         let buffer_size = config.server.broadcast_buffer;
         let (readings_tx, _) = broadcast::channel(buffer_size);
         Arc::new(Self {
             store: Mutex::new(store),
             config: RwLock::new(config),
+            config_path,
             readings_tx,
             collector: CollectorState::new(),
         })
+    }
+
+    /// Save the current configuration to disk.
+    ///
+    /// This should be called after any configuration changes made via the API.
+    pub async fn save_config(&self) -> Result<(), crate::config::ConfigError> {
+        let config = self.config.read().await;
+        config.save(&self.config_path)
+    }
+
+    /// Save the configuration to disk, logging any errors.
+    ///
+    /// This is a convenience method for fire-and-forget saves.
+    pub async fn save_config_or_log(&self) {
+        if let Err(e) = self.save_config().await {
+            warn!("Failed to save configuration: {}", e);
+        }
+    }
+
+    /// Signal that the device configuration has changed.
+    ///
+    /// This saves the config to disk and signals the collector to reload
+    /// if it is currently running.
+    pub async fn on_devices_changed(&self) {
+        self.save_config_or_log().await;
+        if self.collector.is_running() {
+            self.collector.signal_reload();
+        }
     }
 }
 
@@ -71,20 +111,33 @@ pub struct CollectorState {
     stop_tx: watch::Sender<bool>,
     /// Receiver for stop signal (cloned by collector tasks).
     stop_rx: watch::Receiver<bool>,
+    /// Channel to signal configuration reload.
+    reload_tx: watch::Sender<u64>,
+    /// Receiver for reload signal.
+    reload_rx: watch::Receiver<u64>,
     /// Per-device collection stats.
     pub device_stats: RwLock<Vec<DeviceCollectionStats>>,
+    /// Shared JoinSet for device polling tasks.
+    ///
+    /// This allows both the initial collector start and the reload watcher
+    /// to track spawned tasks, ensuring proper cleanup on stop.
+    pub device_tasks: Mutex<JoinSet<()>>,
 }
 
 impl CollectorState {
     /// Create a new collector state.
     pub fn new() -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (reload_tx, reload_rx) = watch::channel(0u64);
         Self {
             running: AtomicBool::new(false),
             started_at: AtomicU64::new(0),
             stop_tx,
             stop_rx,
+            reload_tx,
+            reload_rx,
             device_stats: RwLock::new(Vec::new()),
+            device_tasks: Mutex::new(JoinSet::new()),
         }
     }
 
@@ -126,6 +179,51 @@ impl CollectorState {
     /// Reset the stop signal (for restarting).
     pub fn reset_stop(&self) {
         let _ = self.stop_tx.send(false);
+    }
+
+    /// Get a receiver for the reload signal.
+    pub fn subscribe_reload(&self) -> watch::Receiver<u64> {
+        self.reload_rx.clone()
+    }
+
+    /// Signal the collector to reload its configuration.
+    ///
+    /// This is used when devices are added, removed, or modified via the API.
+    /// The collector will restart its tasks with the new configuration.
+    pub fn signal_reload(&self) {
+        // Increment the counter to trigger the reload
+        let current = *self.reload_rx.borrow();
+        let _ = self.reload_tx.send(current.wrapping_add(1));
+    }
+
+    /// Wait for all device tasks to complete, with a timeout.
+    ///
+    /// Returns `true` if all tasks stopped cleanly within the timeout,
+    /// `false` if the timeout was reached and tasks were aborted.
+    pub async fn wait_for_device_tasks(&self, timeout: Duration) -> bool {
+        let wait_result = tokio::time::timeout(timeout, async {
+            let mut tasks = self.device_tasks.lock().await;
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+
+        if wait_result.is_err() {
+            // Timeout - abort remaining tasks
+            let mut tasks = self.device_tasks.lock().await;
+            tasks.abort_all();
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Spawn a device task into the shared JoinSet.
+    pub async fn spawn_device_task<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.device_tasks.lock().await;
+        tasks.spawn(future);
     }
 }
 
@@ -523,5 +621,44 @@ mod tests {
             let device = store.get_device("test-device").unwrap().unwrap();
             assert_eq!(device.name, Some("Test".to_string()));
         }
+    }
+
+    #[test]
+    fn test_collector_state_reload_signal() {
+        let collector = CollectorState::new();
+        let rx = collector.subscribe_reload();
+
+        // Initial value
+        assert_eq!(*rx.borrow(), 0);
+
+        // Signal reload
+        collector.signal_reload();
+        assert_eq!(*rx.borrow(), 1);
+
+        // Signal reload again
+        collector.signal_reload();
+        assert_eq!(*rx.borrow(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_collector_state_reload_with_receiver() {
+        let collector = CollectorState::new();
+        let mut rx = collector.subscribe_reload();
+
+        // Start a task that waits for reload
+        let handle = tokio::spawn(async move {
+            rx.changed().await.unwrap();
+            *rx.borrow()
+        });
+
+        // Give the task time to start waiting
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Signal reload
+        collector.signal_reload();
+
+        // Task should complete with the new value
+        let result = handle.await.unwrap();
+        assert_eq!(result, 1);
     }
 }

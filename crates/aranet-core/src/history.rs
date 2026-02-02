@@ -10,11 +10,13 @@
 //! | Aranet4 | Full | CO₂, temperature, pressure, humidity |
 //! | Aranet2 | Full | Temperature, humidity |
 //! | AranetRn+ (Radon) | Full | Radon, temperature, pressure, humidity |
-//! | Aranet Radiation | Partial | **History download not yet implemented** |
+//! | Aranet Radiation | Not supported | Returns error - protocol undocumented |
 //!
-//! **Note:** Aranet Radiation devices do not currently support history download.
-//! The `radiation_rate` and `radiation_total` fields in [`HistoryRecord`] are
-//! reserved for future implementation but are currently always `None`.
+//! **Note:** Aranet Radiation devices do not support history download. Attempting
+//! to download history from an Aranet Radiation device will return an error.
+//! Use [`Device::read_current()`](crate::device::Device::read_current) for
+//! current radiation readings. The `radiation_rate` and `radiation_total` fields
+//! in [`HistoryRecord`] are reserved for future implementation.
 //!
 //! # Index Convention
 //!
@@ -94,6 +96,11 @@ impl HistoryProgress {
         } else {
             1.0
         };
+        // Guard against division by zero when total_params is 0
+        if self.total_params == 0 {
+            self.overall_progress = 1.0;
+            return;
+        }
         let base_progress = (self.param_index - 1) as f32 / self.total_params as f32;
         let param_contribution = param_progress / self.total_params as f32;
         self.overall_progress = base_progress + param_contribution;
@@ -102,6 +109,122 @@ impl HistoryProgress {
 
 /// Type alias for progress callback function.
 pub type ProgressCallback = Arc<dyn Fn(HistoryProgress) + Send + Sync>;
+
+/// Type alias for checkpoint callback function.
+pub type CheckpointCallback = Arc<dyn Fn(HistoryCheckpoint) + Send + Sync>;
+
+/// Checkpoint data for resuming interrupted history downloads.
+///
+/// This can be serialized and saved to disk to allow resuming downloads
+/// after disconnection or application restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryCheckpoint {
+    /// Device identifier this checkpoint belongs to.
+    pub device_id: String,
+    /// The parameter currently being downloaded.
+    pub current_param: HistoryParamCheckpoint,
+    /// Index where download should resume for current parameter.
+    pub resume_index: u16,
+    /// Total readings on the device when checkpoint was created.
+    pub total_readings: u16,
+    /// Which parameters have been fully downloaded.
+    pub completed_params: Vec<HistoryParamCheckpoint>,
+    /// Timestamp when checkpoint was created.
+    pub created_at: time::OffsetDateTime,
+    /// Downloaded values for completed parameters (serialized).
+    pub downloaded_data: Option<PartialHistoryData>,
+}
+
+/// Serializable version of HistoryParam for checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HistoryParamCheckpoint {
+    Temperature,
+    Humidity,
+    Pressure,
+    Co2,
+    Humidity2,
+    Radon,
+}
+
+impl From<HistoryParam> for HistoryParamCheckpoint {
+    fn from(param: HistoryParam) -> Self {
+        match param {
+            HistoryParam::Temperature => HistoryParamCheckpoint::Temperature,
+            HistoryParam::Humidity => HistoryParamCheckpoint::Humidity,
+            HistoryParam::Pressure => HistoryParamCheckpoint::Pressure,
+            HistoryParam::Co2 => HistoryParamCheckpoint::Co2,
+            HistoryParam::Humidity2 => HistoryParamCheckpoint::Humidity2,
+            HistoryParam::Radon => HistoryParamCheckpoint::Radon,
+        }
+    }
+}
+
+impl From<HistoryParamCheckpoint> for HistoryParam {
+    fn from(param: HistoryParamCheckpoint) -> Self {
+        match param {
+            HistoryParamCheckpoint::Temperature => HistoryParam::Temperature,
+            HistoryParamCheckpoint::Humidity => HistoryParam::Humidity,
+            HistoryParamCheckpoint::Pressure => HistoryParam::Pressure,
+            HistoryParamCheckpoint::Co2 => HistoryParam::Co2,
+            HistoryParamCheckpoint::Humidity2 => HistoryParam::Humidity2,
+            HistoryParamCheckpoint::Radon => HistoryParam::Radon,
+        }
+    }
+}
+
+/// Partially downloaded history data for checkpoint resume.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PartialHistoryData {
+    pub co2_values: Vec<u16>,
+    pub temp_values: Vec<u16>,
+    pub pressure_values: Vec<u16>,
+    pub humidity_values: Vec<u16>,
+    pub radon_values: Vec<u32>,
+}
+
+impl HistoryCheckpoint {
+    /// Create a new checkpoint for starting a fresh download.
+    pub fn new(device_id: &str, total_readings: u16, first_param: HistoryParam) -> Self {
+        Self {
+            device_id: device_id.to_string(),
+            current_param: first_param.into(),
+            resume_index: 1,
+            total_readings,
+            completed_params: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+            downloaded_data: Some(PartialHistoryData::default()),
+        }
+    }
+
+    /// Check if this checkpoint is still valid for the given device state.
+    pub fn is_valid(&self, current_total_readings: u16) -> bool {
+        // Checkpoint is valid if the device hasn't collected more readings
+        // (which would shift the indices)
+        self.total_readings == current_total_readings
+    }
+
+    /// Update the checkpoint after completing a parameter.
+    pub fn complete_param(&mut self, param: HistoryParam, values: Vec<u16>) {
+        self.completed_params.push(param.into());
+        if let Some(ref mut data) = self.downloaded_data {
+            match param {
+                HistoryParam::Co2 => data.co2_values = values,
+                HistoryParam::Temperature => data.temp_values = values,
+                HistoryParam::Pressure => data.pressure_values = values,
+                HistoryParam::Humidity | HistoryParam::Humidity2 => data.humidity_values = values,
+                HistoryParam::Radon => {} // Radon uses u32, handled separately
+            }
+        }
+    }
+
+    /// Update the checkpoint after completing a radon parameter.
+    pub fn complete_radon_param(&mut self, values: Vec<u32>) {
+        self.completed_params.push(HistoryParamCheckpoint::Radon);
+        if let Some(ref mut data) = self.downloaded_data {
+            data.radon_values = values;
+        }
+    }
+}
 
 /// Parameter types for history requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +257,21 @@ pub enum HistoryParam {
 /// let options = HistoryOptions::default()
 ///     .with_progress(|p| println!("Progress: {:.1}%", p.overall_progress * 100.0));
 /// ```
+///
+/// # Adaptive Read Delay
+///
+/// Use `adaptive_delay` to automatically adjust delay based on signal quality:
+/// ```ignore
+/// let options = HistoryOptions::default().adaptive_delay(true);
+/// ```
+///
+/// # Resume Support
+///
+/// For long downloads, use checkpointing to allow resume on failure:
+/// ```ignore
+/// let checkpoint = HistoryCheckpoint::load("device_123")?;
+/// let options = HistoryOptions::default().resume_from(checkpoint);
+/// ```
 #[derive(Clone)]
 pub struct HistoryOptions {
     /// Starting index (1-based, inclusive). If None, downloads from the beginning (index 1).
@@ -144,6 +282,13 @@ pub struct HistoryOptions {
     pub read_delay: Duration,
     /// Progress callback (optional).
     pub progress_callback: Option<ProgressCallback>,
+    /// Whether to use adaptive delay based on signal quality.
+    pub use_adaptive_delay: bool,
+    /// Checkpoint callback for saving progress during download (optional).
+    /// Called periodically with the current checkpoint state.
+    pub checkpoint_callback: Option<CheckpointCallback>,
+    /// How often to call the checkpoint callback (in records).
+    pub checkpoint_interval: usize,
 }
 
 impl std::fmt::Debug for HistoryOptions {
@@ -153,6 +298,9 @@ impl std::fmt::Debug for HistoryOptions {
             .field("end_index", &self.end_index)
             .field("read_delay", &self.read_delay)
             .field("progress_callback", &self.progress_callback.is_some())
+            .field("use_adaptive_delay", &self.use_adaptive_delay)
+            .field("checkpoint_callback", &self.checkpoint_callback.is_some())
+            .field("checkpoint_interval", &self.checkpoint_interval)
             .finish()
     }
 }
@@ -164,6 +312,9 @@ impl Default for HistoryOptions {
             end_index: None,
             read_delay: Duration::from_millis(50),
             progress_callback: None,
+            use_adaptive_delay: false,
+            checkpoint_callback: None,
+            checkpoint_interval: 100, // Checkpoint every 100 records
         }
     }
 }
@@ -211,6 +362,68 @@ impl HistoryOptions {
         if let Some(cb) = &self.progress_callback {
             cb(progress.clone());
         }
+    }
+
+    /// Enable or disable adaptive delay based on signal quality.
+    ///
+    /// When enabled, the read delay will be automatically adjusted based on
+    /// the connection's signal strength:
+    /// - Excellent signal: 30ms delay
+    /// - Good signal: 50ms delay
+    /// - Fair signal: 100ms delay
+    /// - Poor signal: 200ms delay
+    #[must_use]
+    pub fn adaptive_delay(mut self, enable: bool) -> Self {
+        self.use_adaptive_delay = enable;
+        self
+    }
+
+    /// Set a checkpoint callback for saving download progress.
+    ///
+    /// The callback will be invoked periodically (based on `checkpoint_interval`)
+    /// with the current checkpoint state, allowing recovery from interruptions.
+    #[must_use]
+    pub fn with_checkpoint<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(HistoryCheckpoint) + Send + Sync + 'static,
+    {
+        self.checkpoint_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set how often to call the checkpoint callback (in records).
+    ///
+    /// Default: 100 records
+    #[must_use]
+    pub fn checkpoint_interval(mut self, interval: usize) -> Self {
+        self.checkpoint_interval = interval;
+        self
+    }
+
+    /// Resume from a previous checkpoint.
+    ///
+    /// This sets the start_index based on the checkpoint's resume position.
+    #[must_use]
+    pub fn resume_from(mut self, checkpoint: &HistoryCheckpoint) -> Self {
+        self.start_index = Some(checkpoint.resume_index);
+        self
+    }
+
+    /// Report a checkpoint if a callback is set.
+    pub fn report_checkpoint(&self, checkpoint: &HistoryCheckpoint) {
+        if let Some(cb) = &self.checkpoint_callback {
+            cb(checkpoint.clone());
+        }
+    }
+
+    /// Get the effective read delay, optionally adjusted for signal quality.
+    pub fn effective_read_delay(&self, signal_quality: Option<crate::device::SignalQuality>) -> Duration {
+        if self.use_adaptive_delay {
+            if let Some(quality) = signal_quality {
+                return quality.recommended_read_delay();
+            }
+        }
+        self.read_delay
     }
 }
 
@@ -274,9 +487,20 @@ impl Device {
     /// - **Aranet4**: Downloads CO₂, temperature, pressure, humidity
     /// - **Aranet2**: Downloads temperature, humidity
     /// - **AranetRn+ (Radon)**: Downloads radon, temperature, pressure, humidity
-    /// - **Aranet Radiation**: **Not yet supported** - will return Aranet4-style records
-    ///   with placeholder values. The `radiation_rate` and `radiation_total` fields
-    ///   in the returned records will be `None`.
+    /// - **Aranet Radiation**: **Not supported** - returns an error. The device protocol
+    ///   for historical radiation data requires additional documentation. Use
+    ///   [`Device::read_current()`](crate::device::Device::read_current) to get
+    ///   current radiation readings.
+    ///
+    /// # Adaptive Delay
+    ///
+    /// If `options.use_adaptive_delay` is enabled, the read delay will be
+    /// automatically adjusted based on the connection's signal quality.
+    ///
+    /// # Checkpointing
+    ///
+    /// If a checkpoint callback is set, progress will be saved periodically
+    /// to allow resuming interrupted downloads.
     pub async fn download_history_with_options(
         &self,
         options: HistoryOptions,
@@ -296,17 +520,47 @@ impl Device {
         let start_idx = options.start_index.unwrap_or(1);
         let end_idx = options.end_index.unwrap_or(info.total_readings);
 
-        // Check if this is a radon device
-        let is_radon = matches!(self.device_type(), Some(DeviceType::AranetRadon));
-
-        if is_radon {
-            // For radon devices, download radon instead of CO2, and use Humidity2
-            self.download_radon_history_internal(&info, start_idx, end_idx, &options)
-                .await
+        // Get signal quality for adaptive delay if enabled
+        let signal_quality = if options.use_adaptive_delay {
+            match self.signal_quality().await {
+                Some(quality) => {
+                    info!("Signal quality: {:?} - using {} ms read delay",
+                        quality, quality.recommended_read_delay().as_millis());
+                    Some(quality)
+                }
+                None => {
+                    debug!("Could not read signal quality, using default delay");
+                    None
+                }
+            }
         } else {
-            // For Aranet4, download CO2 and standard humidity
-            self.download_aranet4_history_internal(&info, start_idx, end_idx, &options)
-                .await
+            None
+        };
+
+        // Calculate effective read delay
+        let effective_delay = options.effective_read_delay(signal_quality);
+
+        // Dispatch based on device type
+        match self.device_type() {
+            Some(DeviceType::AranetRadiation) => {
+                // Aranet Radiation history download is not yet implemented.
+                // The device protocol for historical radiation data is different from
+                // other Aranet devices and requires additional research/documentation.
+                Err(Error::InvalidData(
+                    "History download for Aranet Radiation devices is not yet implemented. \
+                     Current readings are available via read_current().".to_string()
+                ))
+            }
+            Some(DeviceType::AranetRadon) => {
+                // For radon devices, download radon instead of CO2, and use Humidity2
+                self.download_radon_history_internal(&info, start_idx, end_idx, &options, effective_delay)
+                    .await
+            }
+            _ => {
+                // For Aranet4 and Aranet2, download CO2 (or 0 for Aranet2) and standard humidity
+                self.download_aranet4_history_internal(&info, start_idx, end_idx, &options, effective_delay)
+                    .await
+            }
         }
     }
 
@@ -317,8 +571,17 @@ impl Device {
         start_idx: u16,
         end_idx: u16,
         options: &HistoryOptions,
+        effective_delay: Duration,
     ) -> Result<Vec<HistoryRecord>> {
         let total_values = (end_idx - start_idx + 1) as usize;
+
+        // Create checkpoint if callback is set
+        let device_id = self.address().to_string();
+        let mut checkpoint = if options.checkpoint_callback.is_some() {
+            Some(HistoryCheckpoint::new(&device_id, info.total_readings, HistoryParam::Co2))
+        } else {
+            None
+        };
 
         // Download each parameter type with progress reporting
         let mut progress = HistoryProgress::new(HistoryParam::Co2, 1, 4, total_values);
@@ -329,13 +592,21 @@ impl Device {
                 HistoryParam::Co2,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after CO2
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_param(HistoryParam::Co2, co2_values.clone());
+            cp.current_param = HistoryParamCheckpoint::Temperature;
+            cp.resume_index = start_idx;
+            options.report_checkpoint(cp);
+        }
 
         progress = HistoryProgress::new(HistoryParam::Temperature, 2, 4, total_values);
         options.report_progress(&progress);
@@ -345,13 +616,21 @@ impl Device {
                 HistoryParam::Temperature,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after Temperature
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_param(HistoryParam::Temperature, temp_values.clone());
+            cp.current_param = HistoryParamCheckpoint::Pressure;
+            cp.resume_index = start_idx;
+            options.report_checkpoint(cp);
+        }
 
         progress = HistoryProgress::new(HistoryParam::Pressure, 3, 4, total_values);
         options.report_progress(&progress);
@@ -361,13 +640,21 @@ impl Device {
                 HistoryParam::Pressure,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after Pressure
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_param(HistoryParam::Pressure, pressure_values.clone());
+            cp.current_param = HistoryParamCheckpoint::Humidity;
+            cp.resume_index = start_idx;
+            options.report_checkpoint(cp);
+        }
 
         progress = HistoryProgress::new(HistoryParam::Humidity, 4, 4, total_values);
         options.report_progress(&progress);
@@ -377,13 +664,19 @@ impl Device {
                 HistoryParam::Humidity,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after Humidity (download complete)
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_param(HistoryParam::Humidity, humidity_values.clone());
+            options.report_checkpoint(cp);
+        }
 
         // Calculate timestamps for each record
         let now = OffsetDateTime::now_utc();
@@ -423,8 +716,17 @@ impl Device {
         start_idx: u16,
         end_idx: u16,
         options: &HistoryOptions,
+        effective_delay: Duration,
     ) -> Result<Vec<HistoryRecord>> {
         let total_values = (end_idx - start_idx + 1) as usize;
+
+        // Create checkpoint if callback is set
+        let device_id = self.address().to_string();
+        let mut checkpoint = if options.checkpoint_callback.is_some() {
+            Some(HistoryCheckpoint::new(&device_id, info.total_readings, HistoryParam::Radon))
+        } else {
+            None
+        };
 
         // Download radon values (4 bytes each)
         let mut progress = HistoryProgress::new(HistoryParam::Radon, 1, 4, total_values);
@@ -435,13 +737,21 @@ impl Device {
                 HistoryParam::Radon,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after Radon
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_radon_param(radon_values.clone());
+            cp.current_param = HistoryParamCheckpoint::Temperature;
+            cp.resume_index = start_idx;
+            options.report_checkpoint(cp);
+        }
 
         progress = HistoryProgress::new(HistoryParam::Temperature, 2, 4, total_values);
         options.report_progress(&progress);
@@ -451,13 +761,20 @@ impl Device {
                 HistoryParam::Temperature,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after Temperature
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_param(HistoryParam::Temperature, temp_values.clone());
+            cp.current_param = HistoryParamCheckpoint::Pressure;
+            options.report_checkpoint(cp);
+        }
 
         progress = HistoryProgress::new(HistoryParam::Pressure, 3, 4, total_values);
         options.report_progress(&progress);
@@ -467,13 +784,20 @@ impl Device {
                 HistoryParam::Pressure,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after Pressure
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_param(HistoryParam::Pressure, pressure_values.clone());
+            cp.current_param = HistoryParamCheckpoint::Humidity2;
+            options.report_checkpoint(cp);
+        }
 
         // Radon devices use Humidity2 (different encoding, 2 bytes, divide by 10)
         progress = HistoryProgress::new(HistoryParam::Humidity2, 4, 4, total_values);
@@ -484,13 +808,19 @@ impl Device {
                 HistoryParam::Humidity2,
                 start_idx,
                 end_idx,
-                options.read_delay,
+                effective_delay,
                 |downloaded| {
                     progress.update(downloaded);
                     options.report_progress(&progress);
                 },
             )
             .await?;
+
+        // Update checkpoint after Humidity2 (download complete)
+        if let Some(ref mut cp) = checkpoint {
+            cp.complete_param(HistoryParam::Humidity2, humidity_values.clone());
+            options.report_checkpoint(cp);
+        }
 
         // Calculate timestamps for each record
         let now = OffsetDateTime::now_utc();
@@ -744,7 +1074,9 @@ impl Device {
 
         // Set up notification handler
         self.subscribe_to_notifications(HISTORY_V1, move |data| {
-            let _ = tx.try_send(data.to_vec());
+            if let Err(e) = tx.try_send(data.to_vec()) {
+                warn!("V1 history notification channel full or closed, data may be lost: {}", e);
+            }
         })
         .await?;
 
@@ -776,9 +1108,13 @@ impl Device {
             let mut values = Vec::new();
             let expected = info.total_readings as usize;
 
+            let mut consecutive_timeouts = 0;
+            const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
             while values.len() < expected {
                 match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
                     Ok(Some(data)) => {
+                        consecutive_timeouts = 0; // Reset on successful receive
                         // Parse notification data
                         if data.len() >= 3 {
                             let resp_param = data[0];
@@ -790,12 +1126,45 @@ impl Device {
                             }
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => {
-                        warn!("Timeout waiting for V1 history notification");
+                    Ok(None) => {
+                        warn!(
+                            "V1 history channel closed for {:?}: got {}/{} values",
+                            param,
+                            values.len(),
+                            expected
+                        );
                         break;
                     }
+                    Err(_) => {
+                        consecutive_timeouts += 1;
+                        warn!(
+                            "Timeout waiting for V1 history notification ({}/{}), {:?}: {}/{} values",
+                            consecutive_timeouts,
+                            MAX_CONSECUTIVE_TIMEOUTS,
+                            param,
+                            values.len(),
+                            expected
+                        );
+                        if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                            warn!(
+                                "Too many consecutive timeouts for {:?}, proceeding with partial data",
+                                param
+                            );
+                            break;
+                        }
+                    }
                 }
+            }
+
+            // Log if we got incomplete data
+            if values.len() < expected {
+                warn!(
+                    "V1 history download incomplete for {:?}: got {}/{} values ({:.1}%)",
+                    param,
+                    values.len(),
+                    expected,
+                    (values.len() as f64 / expected as f64) * 100.0
+                );
             }
 
             match param {

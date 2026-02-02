@@ -3,8 +3,6 @@
 //! Performs BLE diagnostics and permission checks to help troubleshoot
 //! connectivity issues.
 
-use std::time::Duration;
-
 use anyhow::Result;
 use aranet_core::scan::{self, ScanOptions};
 use owo_colors::OwoColorize;
@@ -174,10 +172,9 @@ async fn check_adapter() -> Check {
 }
 
 async fn check_scan() -> Check {
-    let options = ScanOptions {
-        duration: Duration::from_secs(3),
-        filter_aranet_only: true,
-    };
+    let options = ScanOptions::default()
+        .duration_secs(3)
+        .filter_aranet_only(true);
 
     match scan::scan_with_options(options).await {
         Ok(devices) => {

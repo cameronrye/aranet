@@ -61,34 +61,70 @@ pub fn metric_card(
         });
 }
 
+/// Kind of empty state for visual differentiation.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum EmptyStateKind {
+    /// No data available (neutral)
+    #[default]
+    NoData,
+    /// No matches for current filters
+    NoMatch,
+}
+
 /// Render an empty state with icon and message.
 pub fn empty_state(ui: &mut Ui, theme: &Theme, title: &str, description: &str) {
+    empty_state_with_kind(ui, theme, title, description, EmptyStateKind::NoData);
+}
+
+/// Render an empty state with a specific visual kind.
+pub fn empty_state_with_kind(
+    ui: &mut Ui,
+    theme: &Theme,
+    title: &str,
+    description: &str,
+    kind: EmptyStateKind,
+) {
+    let (icon, icon_color, title_color) = match kind {
+        EmptyStateKind::NoData => ("○", theme.text_muted, theme.text_secondary),
+        EmptyStateKind::NoMatch => ("◇", theme.info, theme.text_secondary),
+    };
+
     ui.vertical_centered(|ui| {
         ui.add_space(theme.spacing.xl * 2.0);
         ui.label(
-            RichText::new("---")
-                .color(theme.text_muted)
+            RichText::new(icon)
+                .color(icon_color)
                 .size(theme.typography.display),
         );
         ui.add_space(theme.spacing.md);
         ui.label(
             RichText::new(title)
-                .color(theme.text_secondary)
+                .color(title_color)
                 .size(theme.typography.subheading)
                 .strong(),
         );
         ui.add_space(theme.spacing.xs);
         ui.label(
             RichText::new(description)
-                .color(theme.text_muted)
+                .color(theme.text_secondary)
                 .size(theme.typography.body),
         );
     });
 }
 
-/// Render a section header with optional action button.
+/// Render a section header with left accent border for visual separation.
 pub fn section_header(ui: &mut Ui, theme: &Theme, title: &str) {
     ui.horizontal(|ui| {
+        // Left accent bar
+        let bar_height = theme.typography.subheading + 4.0;
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(3.0, bar_height), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(1),
+            theme.accent,
+        );
+        ui.add_space(theme.spacing.sm);
         ui.label(
             RichText::new(title)
                 .color(theme.text_primary)
@@ -99,13 +135,16 @@ pub fn section_header(ui: &mut Ui, theme: &Theme, title: &str) {
     ui.add_space(theme.spacing.sm);
 }
 
-/// Render a styled status badge.
+/// Render a styled status badge (pill-shaped).
 pub fn status_badge(ui: &mut Ui, theme: &Theme, text: &str, color: Color32) {
     let bg = theme.tint_medium(color);
     egui::Frame::new()
         .fill(bg)
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .corner_radius(egui::CornerRadius::same(theme.rounding.sm as u8))
+        .inner_margin(egui::Margin::symmetric(
+            theme.spacing.sm as i8,
+            theme.spacing.xs as i8,
+        ))
+        .corner_radius(egui::CornerRadius::same(theme.rounding.full as u8))
         .show(ui, |ui| {
             ui.label(
                 RichText::new(text)
@@ -126,21 +165,25 @@ pub fn status_dot(ui: &mut Ui, color: Color32, tooltip: &str) -> egui::Response 
     response.on_hover_text(tooltip)
 }
 
-/// Render a CO2 level gauge bar.
+/// Render a CO2 level gauge bar with current value indicator.
 pub fn co2_gauge(ui: &mut Ui, theme: &Theme, co2: u16) {
     let max_ppm = 2500.0_f32;
     let pct = (co2 as f32 / max_ppm).min(1.0);
 
     let available_width = ui.available_width().min(280.0);
     let bar_height = 14.0;
+    let indicator_height = 20.0; // Space above bar for value indicator
     let label_height = 18.0;
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(available_width, bar_height + label_height),
+        egui::vec2(available_width, indicator_height + bar_height + label_height),
         Sense::hover(),
     );
 
     let painter = ui.painter();
-    let bar_rect = egui::Rect::from_min_size(rect.min, egui::vec2(available_width, bar_height));
+    let bar_rect = egui::Rect::from_min_size(
+        rect.min + egui::vec2(0.0, indicator_height),
+        egui::vec2(available_width, bar_height),
+    );
 
     // Draw zone backgrounds
     let zones = [
@@ -180,7 +223,32 @@ pub fn co2_gauge(ui: &mut Ui, theme: &Theme, co2: u16) {
         fill_color.gamma_multiply(0.85),
     );
 
-    // Draw tick marks and labels
+    // Draw current value indicator (triangle pointer + value label above bar)
+    let indicator_x = bar_rect.min.x + pct * available_width;
+
+    // Draw triangle pointer pointing down at the bar
+    let triangle_size = 6.0;
+    let triangle_y = bar_rect.min.y - 2.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(indicator_x, triangle_y),
+            egui::pos2(indicator_x - triangle_size / 2.0, triangle_y - triangle_size),
+            egui::pos2(indicator_x + triangle_size / 2.0, triangle_y - triangle_size),
+        ],
+        fill_color,
+        egui::Stroke::NONE,
+    ));
+
+    // Draw value label above the triangle
+    painter.text(
+        egui::pos2(indicator_x, triangle_y - triangle_size - 2.0),
+        egui::Align2::CENTER_BOTTOM,
+        format!("{}", co2),
+        egui::FontId::proportional(theme.typography.caption),
+        fill_color,
+    );
+
+    // Draw tick marks and labels below bar
     let label_y = bar_rect.max.y + 3.0;
     let ticks = [(800.0, "800"), (1000.0, "1k"), (1500.0, "1.5k")];
     for (ppm, label) in ticks {
@@ -222,43 +290,51 @@ pub fn cached_data_banner(
 ) {
     let (bg_color, border_color, icon, message) = if is_stale {
         (
-            theme.tint_subtle(theme.warning),
-            theme.warning.gamma_multiply(0.5),
-            "[!]",
+            theme.tint_light(theme.warning),
+            theme.warning,
+            "⚠",
             "Cached data - reading may be outdated",
         )
     } else {
         (
-            theme.tint_subtle(theme.info),
-            theme.info.gamma_multiply(0.5),
-            "[i]",
+            theme.tint_light(theme.info),
+            theme.info,
+            "ℹ",
             "Showing cached data - device offline",
         )
     };
 
     egui::Frame::new()
         .fill(bg_color)
-        .inner_margin(egui::Margin::symmetric(12, 8))
+        .inner_margin(egui::Margin::symmetric(
+            theme.spacing.md as i8,
+            theme.spacing.sm as i8,
+        ))
         .corner_radius(egui::CornerRadius::same(theme.rounding.md as u8))
-        .stroke(egui::Stroke::new(1.0, border_color))
+        .stroke(egui::Stroke::new(2.0, border_color))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let icon_color = if is_stale { theme.warning } else { theme.info };
-                ui.label(RichText::new(icon).color(icon_color).strong());
+                ui.label(
+                    RichText::new(icon)
+                        .color(icon_color)
+                        .size(theme.typography.subheading),
+                );
                 ui.add_space(theme.spacing.sm);
 
                 ui.vertical(|ui| {
                     ui.label(
                         RichText::new(message)
                             .color(theme.text_primary)
-                            .size(theme.typography.body),
+                            .size(theme.typography.body)
+                            .strong(),
                     );
 
                     if let Some(ts) = captured_at {
                         let age = format_reading_age(ts);
                         ui.label(
                             RichText::new(format!("Last reading: {}", age))
-                                .color(theme.text_muted)
+                                .color(theme.text_secondary)
                                 .size(theme.typography.caption),
                         );
                     }

@@ -236,10 +236,9 @@ async fn cmd_watch_passive(
         }
 
         // Scan for advertisements
-        let options = ScanOptions {
-            duration: timeout,
-            filter_aranet_only: true,
-        };
+        let options = ScanOptions::default()
+            .duration(timeout)
+            .filter_aranet_only(true);
 
         match scan_with_options(options).await {
             Ok(devices) => {

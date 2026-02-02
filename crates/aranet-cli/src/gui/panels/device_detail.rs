@@ -48,6 +48,16 @@ impl AranetApp {
                         );
                     }
 
+                    // Uptime badge for connected devices
+                    if let Some(uptime) = device.uptime() {
+                        ui.add_space(self.theme.spacing.sm);
+                        ui.label(
+                            RichText::new(format!("⏱ {}", uptime))
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
+                    }
+
                     // Status badges for warnings
                     if let Some(ref reading) = device.reading {
                         // Low battery badge

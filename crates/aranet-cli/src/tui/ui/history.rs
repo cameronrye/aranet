@@ -277,6 +277,12 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
                 let cutoff = now - time::Duration::days(30);
                 record.timestamp >= cutoff
             }
+            HistoryFilter::Custom { start, end } => {
+                let record_date = record.timestamp.date();
+                let after_start = start.is_none_or(|s| record_date >= s);
+                let before_end = end.is_none_or(|e| record_date <= e);
+                after_start && before_end
+            }
         })
         .collect();
 

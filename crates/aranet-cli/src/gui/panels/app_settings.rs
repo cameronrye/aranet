@@ -35,7 +35,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Choose light or dark appearance")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -88,7 +88,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Denser layout for smaller screens")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -133,7 +133,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Show colored icon when CO2 is elevated")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -183,7 +183,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Alert when CO2 reaches threshold levels")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -230,7 +230,7 @@ impl AranetApp {
                             ui.label(
                                 RichText::new("Play sound with notifications")
                                     .size(self.theme.typography.caption)
-                                    .color(self.theme.text_muted),
+                                    .color(self.theme.text_secondary),
                             );
                         });
 
@@ -278,7 +278,7 @@ impl AranetApp {
                             ui.label(
                                 RichText::new("Temporarily silence all notifications")
                                     .size(self.theme.typography.caption)
-                                    .color(self.theme.text_muted),
+                                    .color(self.theme.text_secondary),
                             );
                         });
 
@@ -308,9 +308,16 @@ impl AranetApp {
 
                                 if ui.add(btn).clicked() && !is_selected {
                                     self.do_not_disturb = val;
+                                    // Persist to config
+                                    self.gui_config.do_not_disturb = val;
+                                    config_changed = true;
                                     // Update tray state
                                     if let Ok(mut state) = self.tray_state.lock() {
                                         state.do_not_disturb = val;
+                                    }
+                                    // Update menu if available
+                                    if let Some(ref menu) = self.menu_manager {
+                                        menu.set_do_not_disturb(val);
                                     }
                                     // Show toast to confirm
                                     if val {
@@ -344,7 +351,7 @@ impl AranetApp {
                             ui.label(
                                 RichText::new("Keep running in background when window closes")
                                     .size(self.theme.typography.caption)
-                                    .color(self.theme.text_muted),
+                                    .color(self.theme.text_secondary),
                             );
                         });
 
@@ -389,7 +396,7 @@ impl AranetApp {
                             ui.label(
                                 RichText::new("Launch hidden in menu bar")
                                     .size(self.theme.typography.caption)
-                                    .color(self.theme.text_muted),
+                                    .color(self.theme.text_secondary),
                             );
                         });
 
@@ -445,7 +452,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Used when device preference is unavailable")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -487,7 +494,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Atmospheric pressure display unit")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -546,19 +553,39 @@ impl AranetApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut co2_warning = self.gui_config.co2_warning_threshold as f32;
+                        // Current value (rightmost)
                         ui.label(
                             RichText::new(format!("{} ppm", self.gui_config.co2_warning_threshold))
                                 .size(self.theme.typography.caption)
                                 .color(self.theme.warning),
                         );
                         ui.add_space(self.theme.spacing.sm);
+                        // Max label
+                        ui.label(
+                            RichText::new("1200")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                         let slider = egui::Slider::new(&mut co2_warning, 600.0..=1200.0)
                             .show_value(false)
                             .step_by(50.0);
                         if ui.add(slider).changed() {
                             self.gui_config.co2_warning_threshold = co2_warning as u16;
+                            // Ensure warning < danger (maintain at least 50 ppm gap)
+                            if self.gui_config.co2_warning_threshold
+                                >= self.gui_config.co2_danger_threshold
+                            {
+                                self.gui_config.co2_danger_threshold =
+                                    (self.gui_config.co2_warning_threshold + 50).min(2000);
+                            }
                             config_changed = true;
                         }
+                        // Min label (leftmost)
+                        ui.label(
+                            RichText::new("600")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                     });
                 });
 
@@ -581,19 +608,39 @@ impl AranetApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut co2_danger = self.gui_config.co2_danger_threshold as f32;
+                        // Current value (rightmost)
                         ui.label(
                             RichText::new(format!("{} ppm", self.gui_config.co2_danger_threshold))
                                 .size(self.theme.typography.caption)
                                 .color(self.theme.danger),
                         );
                         ui.add_space(self.theme.spacing.sm);
+                        // Max label
+                        ui.label(
+                            RichText::new("2000")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                         let slider = egui::Slider::new(&mut co2_danger, 1000.0..=2000.0)
                             .show_value(false)
                             .step_by(50.0);
                         if ui.add(slider).changed() {
                             self.gui_config.co2_danger_threshold = co2_danger as u16;
+                            // Ensure danger > warning (maintain at least 50 ppm gap)
+                            if self.gui_config.co2_danger_threshold
+                                <= self.gui_config.co2_warning_threshold
+                            {
+                                self.gui_config.co2_warning_threshold =
+                                    self.gui_config.co2_danger_threshold.saturating_sub(50).max(600);
+                            }
                             config_changed = true;
                         }
+                        // Min label (leftmost)
+                        ui.label(
+                            RichText::new("1000")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                     });
                 });
 
@@ -616,6 +663,7 @@ impl AranetApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut radon_warning = self.gui_config.radon_warning_threshold as f32;
+                        // Current value (rightmost)
                         ui.label(
                             RichText::new(format!(
                                 "{} Bq/m³",
@@ -625,13 +673,32 @@ impl AranetApp {
                             .color(self.theme.warning),
                         );
                         ui.add_space(self.theme.spacing.sm);
+                        // Max label
+                        ui.label(
+                            RichText::new("200")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                         let slider = egui::Slider::new(&mut radon_warning, 50.0..=200.0)
                             .show_value(false)
                             .step_by(10.0);
                         if ui.add(slider).changed() {
                             self.gui_config.radon_warning_threshold = radon_warning as u32;
+                            // Ensure warning < danger (maintain at least 10 Bq/m³ gap)
+                            if self.gui_config.radon_warning_threshold
+                                >= self.gui_config.radon_danger_threshold
+                            {
+                                self.gui_config.radon_danger_threshold =
+                                    (self.gui_config.radon_warning_threshold + 10).min(300);
+                            }
                             config_changed = true;
                         }
+                        // Min label (leftmost)
+                        ui.label(
+                            RichText::new("50")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                     });
                 });
 
@@ -654,6 +721,7 @@ impl AranetApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut radon_danger = self.gui_config.radon_danger_threshold as f32;
+                        // Current value (rightmost)
                         ui.label(
                             RichText::new(format!(
                                 "{} Bq/m³",
@@ -663,13 +731,32 @@ impl AranetApp {
                             .color(self.theme.danger),
                         );
                         ui.add_space(self.theme.spacing.sm);
+                        // Max label
+                        ui.label(
+                            RichText::new("300")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                         let slider = egui::Slider::new(&mut radon_danger, 100.0..=300.0)
                             .show_value(false)
                             .step_by(10.0);
                         if ui.add(slider).changed() {
                             self.gui_config.radon_danger_threshold = radon_danger as u32;
+                            // Ensure danger > warning (maintain at least 10 Bq/m³ gap)
+                            if self.gui_config.radon_danger_threshold
+                                <= self.gui_config.radon_warning_threshold
+                            {
+                                self.gui_config.radon_warning_threshold =
+                                    self.gui_config.radon_danger_threshold.saturating_sub(10).max(50);
+                            }
                             config_changed = true;
                         }
+                        // Min label (leftmost)
+                        ui.label(
+                            RichText::new("100")
+                                .size(self.theme.typography.caption)
+                                .color(self.theme.text_muted),
+                        );
                     });
                 });
 
@@ -697,7 +784,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Format used for history exports")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -800,7 +887,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Connect to known devices on startup")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -844,7 +931,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Download history when connecting to device")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -887,7 +974,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Save connected devices to database")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 
@@ -930,7 +1017,7 @@ impl AranetApp {
                         ui.label(
                             RichText::new("Load devices and readings from database on startup")
                                 .size(self.theme.typography.caption)
-                                .color(self.theme.text_muted),
+                                .color(self.theme.text_secondary),
                         );
                     });
 

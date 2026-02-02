@@ -52,10 +52,9 @@ pub async fn require_device_interactive(device: Option<String>) -> Result<String
 
     eprintln!("No device specified. Scanning for nearby devices...");
 
-    let options = ScanOptions {
-        duration: Duration::from_secs(5),
-        filter_aranet_only: true,
-    };
+    let options = ScanOptions::default()
+        .duration_secs(5)
+        .filter_aranet_only(true);
 
     let devices = scan::scan_with_options(options)
         .await
@@ -156,10 +155,9 @@ pub async fn connect_device_with_progress(
         None
     };
 
-    let options = ScanOptions {
-        duration: timeout,
-        filter_aranet_only: false,
-    };
+    let options = ScanOptions::default()
+        .duration(timeout)
+        .filter_aranet_only(false);
 
     // Find the device with progress
     let result = find_device_with_progress(identifier, options, progress_callback).await;

@@ -1,0 +1,133 @@
+# Hardware Test Configuration
+#
+# This file specifies which physical Aranet devices are available for testing.
+# Copy to tests/hardware-test.local.toml and configure with your actual devices.
+#
+# Run tests with: ./scripts/hardware-test.sh
+#
+# Device identifiers can be:
+# - Device name (e.g., "Aranet4 12345")
+# - MAC address (e.g., "AA:BB:CC:DD:EE:FF")
+# - UUID (macOS: "12345678-1234-1234-1234-123456789ABC")
+
+[settings]
+# Timeout for scan operations (seconds)
+scan_timeout = 15
+
+# Timeout for connection operations (seconds)
+connect_timeout = 30
+
+# Timeout for history download (seconds)
+history_timeout = 120
+
+# Number of watch iterations to perform
+watch_iterations = 3
+
+# Interval between watch readings (seconds)
+watch_interval = 5
+
+# Skip slow tests (history download, extended watch)
+skip_slow_tests = false
+
+# Validate output formats (JSON parsing, CSV structure)
+validate_output_formats = true
+
+# Test passive mode (requires Smart Home enabled on device)
+test_passive_mode = false
+
+# ==============================================================================
+# Device Configuration
+# ==============================================================================
+# Configure your actual devices below. Uncomment and fill in device identifiers.
+
+# Aranet4 (CO2/Temperature/Humidity/Pressure)
+[devices.aranet4]
+enabled = false
+identifier = ""  # e.g., "Aranet4 12345" or MAC address
+# Expected value ranges for validation (optional)
+co2_min = 400
+co2_max = 5000
+temperature_min = 10.0
+temperature_max = 35.0
+humidity_min = 20
+humidity_max = 80
+
+# Aranet2 (Temperature/Humidity only)
+[devices.aranet2]
+enabled = false
+identifier = ""
+temperature_min = 10.0
+temperature_max = 35.0
+humidity_min = 20
+humidity_max = 80
+
+# AranetRn+ (Radon monitor)
+[devices.aranet_radon]
+enabled = false
+identifier = ""
+radon_max = 300  # Bq/m³ - alert if higher (indicates potential issue)
+
+# Aranet Radiation
+[devices.aranet_radiation]
+enabled = false
+identifier = ""
+
+# ==============================================================================
+# Test Categories
+# ==============================================================================
+# Enable/disable specific test categories
+
+[tests]
+# Basic connectivity tests
+scan = true
+connect = true
+read = true
+
+# Data retrieval tests
+history = true
+info = true
+status = true
+
+# Continuous monitoring tests
+watch = true
+sync = true
+
+# Settings tests (CAUTION: modifies device settings)
+settings = false
+
+# Multi-device tests (requires 2+ devices)
+multi_device = true
+
+# CLI output format validation
+output_formats = true
+
+# Passive mode tests (requires Smart Home enabled)
+passive = false
+
+# ==============================================================================
+# Example Configurations
+# ==============================================================================
+#
+# Single Aranet4:
+# [devices.aranet4]
+# enabled = true
+# identifier = "Aranet4 12345"
+#
+# Multiple devices for concurrent testing:
+# [devices.aranet4]
+# enabled = true
+# identifier = "Aranet4 OFFICE"
+#
+# [devices.aranet2]
+# enabled = true
+# identifier = "Aranet2 BEDROOM"
+#
+# Using MAC address (Linux):
+# [devices.aranet4]
+# enabled = true
+# identifier = "AA:BB:CC:DD:EE:FF"
+#
+# Using UUID (macOS):
+# [devices.aranet4]
+# enabled = true
+# identifier = "12345678-1234-1234-1234-123456789ABC"

@@ -3,6 +3,7 @@
 //! This module contains the [`AranetApp`] struct which implements the egui application,
 //! handling user input, rendering, and coordinating with the background BLE worker.
 
+use std::collections::VecDeque;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -106,6 +107,16 @@ pub struct AranetApp {
     pub(crate) service_status: Option<ServiceState>,
     /// Whether the service status is being refreshed.
     pub(crate) service_refreshing: bool,
+    /// System service status (installed/running at OS level).
+    pub(crate) system_service_status: Option<(bool, bool)>, // (installed, running)
+    /// Whether a system service operation is in progress.
+    pub(crate) system_service_pending: bool,
+    /// Monitored devices in the service configuration.
+    pub(crate) service_monitored_devices: Vec<aranet_core::messages::ServiceMonitoredDevice>,
+    /// Whether the service config is loading.
+    pub(crate) service_config_loading: bool,
+    /// Add device dialog state: (address, alias, poll_interval).
+    pub(crate) add_device_dialog: Option<(String, String, u64)>,
     // -------------------------------------------------------------------------
     // Application Settings
     // -------------------------------------------------------------------------
@@ -125,8 +136,8 @@ pub struct AranetApp {
     // -------------------------------------------------------------------------
     // Alert History
     // -------------------------------------------------------------------------
-    /// History of alerts for the current session.
-    pub(crate) alert_history: Vec<super::types::AlertEntry>,
+    /// History of alerts for the current session (newest first).
+    pub(crate) alert_history: VecDeque<super::types::AlertEntry>,
     /// Maximum number of alerts to keep in history.
     pub(crate) alert_history_max: usize,
     /// Whether the alert history popup is visible.
@@ -139,6 +150,23 @@ pub struct AranetApp {
     pub(crate) comparison_mode: bool,
     /// Indices of devices selected for comparison.
     pub(crate) comparison_devices: Vec<usize>,
+    // -------------------------------------------------------------------------
+    // Data Logging
+    // -------------------------------------------------------------------------
+    /// Path to log file for data logging.
+    pub(crate) log_file: Option<std::path::PathBuf>,
+    /// Whether data logging is enabled.
+    pub(crate) logging_enabled: bool,
+    // -------------------------------------------------------------------------
+    // Alert Settings (feature parity with TUI)
+    // -------------------------------------------------------------------------
+    /// Whether alerts are sticky (don't auto-clear when condition improves).
+    pub(crate) sticky_alerts: bool,
+    // -------------------------------------------------------------------------
+    // Logo
+    // -------------------------------------------------------------------------
+    /// Texture handle for the app logo displayed in the header.
+    pub(crate) logo_texture: Option<egui::TextureHandle>,
 }
 
 impl AranetApp {
@@ -258,24 +286,36 @@ impl AranetApp {
             // Service state
             service_status: None,
             service_refreshing: false,
+            system_service_status: None,
+            system_service_pending: false,
+            service_monitored_devices: Vec::new(),
+            service_config_loading: false,
+            add_device_dialog: None,
             // Application settings
             sidebar_collapsed: gui_config.sidebar_collapsed,
             last_window_size: None,
             last_window_pos: None,
+            // Do Not Disturb mode (persisted in config, read before moving gui_config)
+            do_not_disturb: gui_config.do_not_disturb,
             gui_config,
             // Alias edit state
             alias_edit: None,
             // Alert history
-            alert_history: Vec::new(),
+            alert_history: VecDeque::new(),
             alert_history_max: 100, // Keep last 100 alerts
             alert_history_visible: false,
-            // Do Not Disturb mode (off by default)
-            do_not_disturb: false,
             // Temperature & Humidity overlay chart (off by default)
             show_temp_humidity_overlay: false,
             // Comparison mode (off by default)
             comparison_mode: false,
             comparison_devices: Vec::new(),
+            // Data logging (off by default)
+            log_file: None,
+            logging_enabled: false,
+            // Alert settings (feature parity with TUI)
+            sticky_alerts: false,
+            // Logo texture (loaded on first frame)
+            logo_texture: None,
         }
     }
 
@@ -303,6 +343,9 @@ impl AranetApp {
                 self.gui_config.show_pressure,
             );
 
+            // Do Not Disturb (from config)
+            menu.set_do_not_disturb(self.do_not_disturb);
+
             // Export enabled based on whether we have devices with history
             let has_history = self.devices.iter().any(|d| !d.history.is_empty());
             menu.set_export_enabled(has_history);
@@ -322,10 +365,10 @@ impl AranetApp {
 
     /// Add an alert to the history log.
     fn log_alert(&mut self, alert: super::types::AlertEntry) {
-        self.alert_history.insert(0, alert); // Add to front (most recent first)
-        // Trim to max size
-        if self.alert_history.len() > self.alert_history_max {
-            self.alert_history.truncate(self.alert_history_max);
+        self.alert_history.push_front(alert); // Add to front (most recent first), O(1)
+        // Trim to max size by removing from back (oldest)
+        while self.alert_history.len() > self.alert_history_max {
+            self.alert_history.pop_back();
         }
     }
 
@@ -535,6 +578,34 @@ impl AranetApp {
                     self.save_gui_config();
                 }
 
+                // === View menu - alerts ===
+                super::MenuCommand::ToggleDoNotDisturb => {
+                    self.do_not_disturb = !self.do_not_disturb;
+                    if let Some(ref menu) = self.menu_manager {
+                        menu.set_do_not_disturb(self.do_not_disturb);
+                    }
+                    let msg = if self.do_not_disturb {
+                        "Do Not Disturb enabled - alerts silenced"
+                    } else {
+                        "Do Not Disturb disabled"
+                    };
+                    self.add_toast(msg.to_string(), ToastType::Info);
+                }
+                super::MenuCommand::ToggleStickyAlerts => {
+                    self.toggle_sticky_alerts();
+                    if let Some(ref menu) = self.menu_manager {
+                        menu.set_sticky_alerts(self.sticky_alerts);
+                    }
+                }
+
+                // === View menu - data logging ===
+                super::MenuCommand::ToggleDataLogging => {
+                    self.toggle_logging();
+                    if let Some(ref menu) = self.menu_manager {
+                        menu.set_data_logging(self.logging_enabled);
+                    }
+                }
+
                 // === View menu - display toggles ===
                 super::MenuCommand::ToggleCo2Display => {
                     self.gui_config.show_co2 = !self.gui_config.show_co2;
@@ -622,7 +693,7 @@ impl AranetApp {
                 super::MenuCommand::ShowAbout => {
                     // Show about info via toast for now
                     self.add_toast(
-                        format!("Aranet v{}", env!("CARGO_PKG_VERSION")),
+                        format!("Aranet v{}\nMade with ❤️ by Cameron Rye\nrye.dev", env!("CARGO_PKG_VERSION")),
                         ToastType::Info,
                     );
                 }
@@ -788,6 +859,7 @@ impl AranetApp {
             } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.connection = ConnectionState::Connected;
+                    device.connected_at = Some(std::time::Instant::now());
                     if name.is_some() {
                         device.name = name;
                     }
@@ -803,13 +875,26 @@ impl AranetApp {
             SensorEvent::DeviceDisconnected { device_id } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.connection = ConnectionState::Disconnected;
+                    device.connected_at = None;
                 }
             }
-            SensorEvent::ConnectionError { device_id, error } => {
+            SensorEvent::ConnectionError {
+                device_id,
+                error,
+                context,
+            } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.connection = ConnectionState::Error(error.clone());
                 }
-                self.add_toast(format!("Connection failed: {}", error), ToastType::Error);
+                // Show suggestion if available
+                let msg = if let Some(ctx) = context
+                    && let Some(suggestion) = ctx.suggestion
+                {
+                    format!("{}\n{}", error, suggestion)
+                } else {
+                    format!("Connection failed: {}", error)
+                };
+                self.add_toast(msg, ToastType::Error);
             }
             SensorEvent::ReadingUpdated { device_id, reading } => {
                 // Extract CO2 for tray notification before consuming reading
@@ -825,6 +910,9 @@ impl AranetApp {
                     .map(|d| d.display_name().to_string())
                     .unwrap_or_else(|| device_id.clone());
 
+                // Log reading to file if logging is enabled
+                self.log_reading(&device_id, &reading);
+
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.update_reading(reading);
                 }
@@ -839,17 +927,34 @@ impl AranetApp {
 
                 self.status = "Reading updated".to_string();
             }
-            SensorEvent::ReadingError { device_id, error } => {
-                self.add_toast(
-                    format!("Reading error for {}: {}", device_id, error),
-                    ToastType::Error,
-                );
+            SensorEvent::ReadingError {
+                device_id,
+                error,
+                context,
+            } => {
+                // Show suggestion if available
+                let msg = if let Some(ctx) = context
+                    && let Some(suggestion) = ctx.suggestion
+                {
+                    format!("{}: {}\n{}", device_id, error, suggestion)
+                } else {
+                    format!("Reading error for {}: {}", device_id, error)
+                };
+                self.add_toast(msg, ToastType::Error);
             }
-            SensorEvent::HistorySyncStarted { device_id } => {
+            SensorEvent::HistorySyncStarted {
+                device_id,
+                total_records,
+            } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.syncing_history = true;
+                    device.sync_progress = Some((0, total_records.unwrap_or(0) as usize));
                 }
-                self.status = "Syncing history...".to_string();
+                if let Some(total) = total_records {
+                    self.status = format!("Syncing {} records...", total);
+                } else {
+                    self.status = "Syncing history...".to_string();
+                }
             }
             SensorEvent::HistoryLoaded { device_id, records } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
@@ -860,15 +965,29 @@ impl AranetApp {
             SensorEvent::HistorySynced { device_id, count } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.syncing_history = false;
+                    device.sync_progress = None;
                     device.last_sync = Some(time::OffsetDateTime::now_utc());
                 }
                 self.status = format!("Synced {} history records", count);
             }
-            SensorEvent::HistorySyncError { device_id, error } => {
+            SensorEvent::HistorySyncError {
+                device_id,
+                error,
+                context,
+            } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.syncing_history = false;
+                    device.sync_progress = None;
                 }
-                self.add_toast(format!("History sync failed: {}", error), ToastType::Error);
+                // Show suggestion if available
+                let msg = if let Some(ctx) = context
+                    && let Some(suggestion) = ctx.suggestion
+                {
+                    format!("History sync failed: {}\n{}", error, suggestion)
+                } else {
+                    format!("History sync failed: {}", error)
+                };
+                self.add_toast(msg, ToastType::Error);
             }
             SensorEvent::SettingsLoaded {
                 device_id,
@@ -893,12 +1012,20 @@ impl AranetApp {
             SensorEvent::IntervalError {
                 device_id: _,
                 error,
+                context,
             } => {
                 self.updating_settings = false;
-                self.add_toast(
-                    format!("Failed to set interval: {}", error),
-                    ToastType::Error,
-                );
+                // Include suggestion from context if available
+                let msg = if let Some(ctx) = context {
+                    if let Some(suggestion) = ctx.suggestion {
+                        format!("Failed to set interval: {}. {}", error, suggestion)
+                    } else {
+                        format!("Failed to set interval: {}", error)
+                    }
+                } else {
+                    format!("Failed to set interval: {}", error)
+                };
+                self.add_toast(msg, ToastType::Error);
             }
             SensorEvent::BluetoothRangeChanged {
                 device_id: _,
@@ -911,12 +1038,20 @@ impl AranetApp {
             SensorEvent::BluetoothRangeError {
                 device_id: _,
                 error,
+                context,
             } => {
                 self.updating_settings = false;
-                self.add_toast(
-                    format!("Failed to set BT range: {}", error),
-                    ToastType::Error,
-                );
+                // Include suggestion from context if available
+                let msg = if let Some(ctx) = context {
+                    if let Some(suggestion) = ctx.suggestion {
+                        format!("Failed to set BT range: {}. {}", error, suggestion)
+                    } else {
+                        format!("Failed to set BT range: {}", error)
+                    }
+                } else {
+                    format!("Failed to set BT range: {}", error)
+                };
+                self.add_toast(msg, ToastType::Error);
             }
             SensorEvent::SmartHomeChanged {
                 device_id: _,
@@ -929,12 +1064,20 @@ impl AranetApp {
             SensorEvent::SmartHomeError {
                 device_id: _,
                 error,
+                context,
             } => {
                 self.updating_settings = false;
-                self.add_toast(
-                    format!("Failed to set Smart Home: {}", error),
-                    ToastType::Error,
-                );
+                // Include suggestion from context if available
+                let msg = if let Some(ctx) = context {
+                    if let Some(suggestion) = ctx.suggestion {
+                        format!("Failed to set Smart Home: {}. {}", error, suggestion)
+                    } else {
+                        format!("Failed to set Smart Home: {}", error)
+                    }
+                } else {
+                    format!("Failed to set Smart Home: {}", error)
+                };
+                self.add_toast(msg, ToastType::Error);
             }
             SensorEvent::AliasChanged { device_id, alias } => {
                 self.updating_settings = false;
@@ -1009,6 +1152,15 @@ impl AranetApp {
             }
             SensorEvent::ServiceStatusError { error } => {
                 self.service_refreshing = false;
+                // Clear stale status and mark as unreachable
+                self.service_status = Some(ServiceState {
+                    reachable: false,
+                    collector_running: false,
+                    uptime_seconds: None,
+                    devices: vec![],
+                    fetched_at: Instant::now(),
+                });
+                self.status = "Service not reachable".to_string();
                 self.add_toast(format!("Service error: {}", error), ToastType::Error);
             }
             SensorEvent::ServiceCollectorStarted => {
@@ -1019,6 +1171,75 @@ impl AranetApp {
             }
             SensorEvent::ServiceCollectorError { error } => {
                 self.add_toast(format!("Collector error: {}", error), ToastType::Error);
+            }
+            SensorEvent::SystemServiceStatus { installed, running } => {
+                self.system_service_pending = false;
+                self.system_service_status = Some((installed, running));
+            }
+            SensorEvent::SystemServiceInstalled => {
+                self.system_service_pending = false;
+                self.system_service_status = Some((true, false));
+                self.add_toast("Service installed successfully", ToastType::Success);
+            }
+            SensorEvent::SystemServiceUninstalled => {
+                self.system_service_pending = false;
+                self.system_service_status = Some((false, false));
+                self.add_toast("Service uninstalled", ToastType::Success);
+            }
+            SensorEvent::SystemServiceStarted => {
+                self.system_service_pending = false;
+                if let Some((installed, _)) = self.system_service_status {
+                    self.system_service_status = Some((installed, true));
+                }
+                self.add_toast("Service started", ToastType::Success);
+            }
+            SensorEvent::SystemServiceStopped => {
+                self.system_service_pending = false;
+                if let Some((installed, _)) = self.system_service_status {
+                    self.system_service_status = Some((installed, false));
+                }
+                self.add_toast("Service stopped", ToastType::Success);
+            }
+            SensorEvent::SystemServiceError { operation, error } => {
+                self.system_service_pending = false;
+                self.add_toast(
+                    format!("Service {} failed: {}", operation, error),
+                    ToastType::Error,
+                );
+            }
+            SensorEvent::ServiceConfigFetched { devices } => {
+                self.service_config_loading = false;
+                self.service_monitored_devices = devices;
+            }
+            SensorEvent::ServiceConfigError { error } => {
+                self.service_config_loading = false;
+                self.add_toast(format!("Config error: {}", error), ToastType::Error);
+            }
+            SensorEvent::ServiceDeviceAdded { device } => {
+                self.add_device_dialog = None;
+                self.service_monitored_devices.push(device);
+                self.add_toast("Device added to monitoring", ToastType::Success);
+            }
+            SensorEvent::ServiceDeviceUpdated { device } => {
+                if let Some(existing) = self
+                    .service_monitored_devices
+                    .iter_mut()
+                    .find(|d| d.address == device.address)
+                {
+                    *existing = device;
+                }
+                self.add_toast("Device updated", ToastType::Success);
+            }
+            SensorEvent::ServiceDeviceRemoved { address } => {
+                self.service_monitored_devices
+                    .retain(|d| d.address != address);
+                self.add_toast("Device removed from monitoring", ToastType::Success);
+            }
+            SensorEvent::ServiceDeviceError { operation, error } => {
+                self.add_toast(
+                    format!("Device {} failed: {}", operation, error),
+                    ToastType::Error,
+                );
             }
             SensorEvent::DeviceForgotten { device_id } => {
                 // Remove device from list
@@ -1055,6 +1276,57 @@ impl AranetApp {
                     ToastType::Error,
                 );
             }
+            SensorEvent::HistorySyncProgress {
+                device_id,
+                downloaded,
+                total,
+            } => {
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.sync_progress = Some((downloaded, total));
+                }
+                // Update status with progress percentage
+                if total > 0 {
+                    let percent = (downloaded as f32 / total as f32 * 100.0) as u32;
+                    self.status = format!("Syncing history... {}%", percent);
+                }
+            }
+            SensorEvent::OperationCancelled { operation } => {
+                self.scanning = false;
+                // Reset any syncing states
+                for device in &mut self.devices {
+                    device.syncing_history = false;
+                    device.sync_progress = None;
+                }
+                self.status = format!("{} cancelled", operation);
+            }
+            SensorEvent::BackgroundPollingStarted {
+                device_id,
+                interval_secs,
+            } => {
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.background_polling = Some(interval_secs);
+                }
+                self.add_toast(
+                    format!("Auto-refresh enabled (every {}s)", interval_secs),
+                    ToastType::Success,
+                );
+            }
+            SensorEvent::BackgroundPollingStopped { device_id } => {
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.background_polling = None;
+                }
+                self.add_toast("Auto-refresh disabled".to_string(), ToastType::Success);
+            }
+            SensorEvent::SignalStrengthUpdate {
+                device_id,
+                rssi,
+                quality,
+            } => {
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.rssi = Some(rssi);
+                    device.signal_quality = Some(quality);
+                }
+            }
         }
     }
 }
@@ -1080,6 +1352,20 @@ impl eframe::App for AranetApp {
         self.cleanup_toasts();
         self.process_tray_events(ctx);
         self.process_menu_events(ctx);
+
+        // Load logo texture on first frame
+        if self.logo_texture.is_none() {
+            if let Ok(image) = image::load_from_memory(super::ICON_PNG) {
+                let image = image.into_rgba8();
+                let size = [image.width() as usize, image.height() as usize];
+                let pixels = image.into_flat_samples();
+                self.logo_texture = Some(ctx.load_texture(
+                    "logo",
+                    egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()),
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
 
         // Handle screenshot capture in demo mode
         if self.screenshot_path.is_some() {
@@ -1377,6 +1663,13 @@ impl eframe::App for AranetApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // App logo
+                    if let Some(texture) = &self.logo_texture {
+                        let logo_size = egui::vec2(24.0, 24.0);
+                        ui.image(egui::load::SizedTexture::new(texture.id(), logo_size));
+                        ui.add_space(self.theme.spacing.sm);
+                    }
+
                     // App title
                     ui.label(
                         RichText::new("Aranet")
@@ -1757,5 +2050,103 @@ impl AranetApp {
                 self.add_toast(format!("Export failed: {}", e), ToastType::Error);
             }
         }
+    }
+
+    /// Toggle data logging on/off.
+    pub(crate) fn toggle_logging(&mut self) {
+        if self.logging_enabled {
+            self.logging_enabled = false;
+            self.add_toast("Data logging disabled".to_string(), ToastType::Info);
+        } else {
+            // Create log file path
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let log_dir = dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("aranet")
+                .join("logs");
+
+            // Create directory if needed
+            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                self.add_toast(
+                    format!("Failed to create log directory: {}", e),
+                    ToastType::Error,
+                );
+                return;
+            }
+
+            let log_path = log_dir.join(format!("readings_{}.csv", timestamp));
+            self.log_file = Some(log_path.clone());
+            self.logging_enabled = true;
+            self.add_toast(
+                format!("Logging to {}", log_path.display()),
+                ToastType::Success,
+            );
+        }
+    }
+
+    /// Log a reading to file if logging is enabled.
+    pub(crate) fn log_reading(&self, device_id: &str, reading: &aranet_types::CurrentReading) {
+        if !self.logging_enabled {
+            return;
+        }
+
+        let Some(log_path) = &self.log_file else {
+            return;
+        };
+
+        use std::io::Write;
+
+        let file_exists = log_path.exists();
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let mut writer = std::io::BufWriter::new(file);
+
+        // Write header if new file
+        if !file_exists {
+            let _ = writeln!(
+                writer,
+                "timestamp,device_id,co2,temperature,humidity,pressure,battery,status,radon,radiation_rate"
+            );
+        }
+
+        let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+        let radon = reading.radon.map(|r| r.to_string()).unwrap_or_default();
+        let radiation = reading
+            .radiation_rate
+            .map(|r| format!("{:.3}", r))
+            .unwrap_or_default();
+
+        let _ = writeln!(
+            writer,
+            "{},{},{},{:.1},{},{:.1},{},{:?},{},{}",
+            timestamp,
+            device_id,
+            reading.co2,
+            reading.temperature,
+            reading.humidity,
+            reading.pressure,
+            reading.battery,
+            reading.status,
+            radon,
+            radiation
+        );
+    }
+
+    /// Toggle sticky alerts mode.
+    pub(crate) fn toggle_sticky_alerts(&mut self) {
+        self.sticky_alerts = !self.sticky_alerts;
+        let msg = if self.sticky_alerts {
+            "Sticky alerts enabled - alerts won't auto-clear"
+        } else {
+            "Sticky alerts disabled"
+        };
+        self.add_toast(msg.to_string(), ToastType::Info);
     }
 }

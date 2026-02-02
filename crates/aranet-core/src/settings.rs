@@ -133,6 +133,9 @@ impl Device {
     ///
     /// The device will start using the new interval after the current
     /// measurement cycle completes.
+    ///
+    /// Note: This method does not verify the write succeeded. For verified
+    /// writes, use [`set_interval_verified`].
     pub async fn set_interval(&self, interval: MeasurementInterval) -> Result<()> {
         info!("Setting measurement interval to {:?}", interval);
 
@@ -150,10 +153,44 @@ impl Device {
         Ok(())
     }
 
+    /// Set the measurement interval with verification.
+    ///
+    /// This method writes the new interval and then reads it back to verify
+    /// the change was applied successfully. Use this for critical settings
+    /// changes where confirmation is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::WriteFailed` if the read-back value doesn't match
+    /// the requested interval.
+    pub async fn set_interval_verified(&self, interval: MeasurementInterval) -> Result<()> {
+        self.set_interval(interval).await?;
+
+        // Small delay to allow the device to process the command
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let actual = self.get_interval().await?;
+        if actual != interval {
+            return Err(Error::WriteFailed {
+                uuid: COMMAND.to_string(),
+                reason: format!(
+                    "Interval verification failed: expected {:?}, got {:?}",
+                    interval, actual
+                ),
+            });
+        }
+
+        info!("Measurement interval verified: {:?}", interval);
+        Ok(())
+    }
+
     /// Enable or disable Smart Home integration.
     ///
     /// When enabled, the device advertises sensor data that can be read
     /// without connecting (passive scanning).
+    ///
+    /// Note: This method does not verify the write succeeded. For verified
+    /// writes, use [`set_smart_home_verified`].
     pub async fn set_smart_home(&self, enabled: bool) -> Result<()> {
         info!("Setting Smart Home integration to {}", enabled);
 
@@ -164,7 +201,40 @@ impl Device {
         Ok(())
     }
 
+    /// Enable or disable Smart Home integration with verification.
+    ///
+    /// This method writes the setting and then reads it back to verify
+    /// the change was applied successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::WriteFailed` if the read-back value doesn't match
+    /// the requested setting.
+    pub async fn set_smart_home_verified(&self, enabled: bool) -> Result<()> {
+        self.set_smart_home(enabled).await?;
+
+        // Small delay to allow the device to process the command
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let settings = self.get_settings().await?;
+        if settings.smart_home_enabled != enabled {
+            return Err(Error::WriteFailed {
+                uuid: COMMAND.to_string(),
+                reason: format!(
+                    "Smart Home verification failed: expected {}, got {}",
+                    enabled, settings.smart_home_enabled
+                ),
+            });
+        }
+
+        info!("Smart Home integration verified: {}", enabled);
+        Ok(())
+    }
+
     /// Set the Bluetooth range.
+    ///
+    /// Note: This method does not verify the write succeeded. For verified
+    /// writes, use [`set_bluetooth_range_verified`].
     pub async fn set_bluetooth_range(&self, range: BluetoothRange) -> Result<()> {
         info!("Setting Bluetooth range to {:?}", range);
 
@@ -172,6 +242,36 @@ impl Device {
         let cmd = [0x92, range as u8];
         self.write_characteristic(COMMAND, &cmd).await?;
 
+        Ok(())
+    }
+
+    /// Set the Bluetooth range with verification.
+    ///
+    /// This method writes the setting and then reads it back to verify
+    /// the change was applied successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::WriteFailed` if the read-back value doesn't match
+    /// the requested setting.
+    pub async fn set_bluetooth_range_verified(&self, range: BluetoothRange) -> Result<()> {
+        self.set_bluetooth_range(range).await?;
+
+        // Small delay to allow the device to process the command
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let settings = self.get_settings().await?;
+        if settings.bluetooth_range != range {
+            return Err(Error::WriteFailed {
+                uuid: COMMAND.to_string(),
+                reason: format!(
+                    "Bluetooth range verification failed: expected {:?}, got {:?}",
+                    range, settings.bluetooth_range
+                ),
+            });
+        }
+
+        info!("Bluetooth range verified: {:?}", range);
         Ok(())
     }
 

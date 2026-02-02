@@ -45,6 +45,12 @@ pub enum MenuCommand {
     SetRefreshInterval(u16),
     /// Toggle notifications
     ToggleNotifications,
+    /// Toggle Do Not Disturb mode
+    ToggleDoNotDisturb,
+    /// Toggle data logging to CSV file
+    ToggleDataLogging,
+    /// Toggle sticky alerts (don't auto-clear)
+    ToggleStickyAlerts,
     /// Toggle CO2 display
     ToggleCo2Display,
     /// Toggle temperature display
@@ -110,6 +116,12 @@ pub struct MenuManager {
     interval_10m_item: CheckMenuItem,
     /// Notifications toggle
     notifications_item: CheckMenuItem,
+    /// Do Not Disturb toggle
+    do_not_disturb_item: CheckMenuItem,
+    /// Data logging toggle
+    data_logging_item: CheckMenuItem,
+    /// Sticky alerts toggle
+    sticky_alerts_item: CheckMenuItem,
     /// Display toggles
     show_co2_item: CheckMenuItem,
     show_temp_item: CheckMenuItem,
@@ -154,15 +166,15 @@ impl MenuManager {
         #[cfg(target_os = "macos")]
         {
             let app_menu = Submenu::new("Aranet", true);
-            app_menu.append(&PredefinedMenuItem::about(Some("Aranet"), None))?;
+            app_menu.append(&PredefinedMenuItem::about(Some("About Aranet"), None))?;
             app_menu.append(&PredefinedMenuItem::separator())?;
-            app_menu.append(&PredefinedMenuItem::services(Some("Aranet")))?;
+            app_menu.append(&PredefinedMenuItem::services(None))?;
             app_menu.append(&PredefinedMenuItem::separator())?;
-            app_menu.append(&PredefinedMenuItem::hide(Some("Aranet")))?;
-            app_menu.append(&PredefinedMenuItem::hide_others(Some("Aranet")))?;
-            app_menu.append(&PredefinedMenuItem::show_all(Some("Aranet")))?;
+            app_menu.append(&PredefinedMenuItem::hide(Some("Hide Aranet")))?;
+            app_menu.append(&PredefinedMenuItem::hide_others(None))?;
+            app_menu.append(&PredefinedMenuItem::show_all(None))?;
             app_menu.append(&PredefinedMenuItem::separator())?;
-            app_menu.append(&PredefinedMenuItem::quit(Some("Aranet")))?;
+            app_menu.append(&PredefinedMenuItem::quit(Some("Quit Aranet")))?;
             menu.append(&app_menu)?;
         }
 
@@ -313,6 +325,30 @@ impl MenuManager {
         let notifications_item = CheckMenuItem::new("Enable Notifications", true, true, None);
         view_menu.append(&notifications_item)?;
 
+        // Alerts submenu
+        let alerts_menu = Submenu::new("Alerts", true);
+        let do_not_disturb_item = CheckMenuItem::new(
+            "Do Not Disturb",
+            true,
+            false,
+            Some(Accelerator::new(Some(cmd | Modifiers::SHIFT), Code::KeyD)),
+        );
+        let sticky_alerts_item = CheckMenuItem::new("Sticky Alerts", true, false, None);
+        alerts_menu.append(&do_not_disturb_item)?;
+        alerts_menu.append(&sticky_alerts_item)?;
+        view_menu.append(&alerts_menu)?;
+
+        view_menu.append(&PredefinedMenuItem::separator())?;
+
+        // Data logging
+        let data_logging_item = CheckMenuItem::new(
+            "Log Data to CSV",
+            true,
+            false,
+            Some(Accelerator::new(Some(cmd | Modifiers::SHIFT), Code::KeyL)),
+        );
+        view_menu.append(&data_logging_item)?;
+
         view_menu.append(&PredefinedMenuItem::separator())?;
         view_menu.append(&PredefinedMenuItem::fullscreen(None))?;
 
@@ -403,6 +439,13 @@ impl MenuManager {
 
             // View menu - notifications
             notifications_item,
+
+            // View menu - alerts
+            do_not_disturb_item,
+            sticky_alerts_item,
+
+            // View menu - data logging
+            data_logging_item,
 
             // View menu - display
             show_co2_item,
@@ -499,6 +542,19 @@ impl MenuManager {
             else if event.id == *self.notifications_item.id() {
                 debug!("Menu: Toggle Notifications clicked");
                 commands.push(MenuCommand::ToggleNotifications);
+            }
+            // === View menu - alerts ===
+            else if event.id == *self.do_not_disturb_item.id() {
+                debug!("Menu: Toggle Do Not Disturb clicked");
+                commands.push(MenuCommand::ToggleDoNotDisturb);
+            } else if event.id == *self.sticky_alerts_item.id() {
+                debug!("Menu: Toggle Sticky Alerts clicked");
+                commands.push(MenuCommand::ToggleStickyAlerts);
+            }
+            // === View menu - data logging ===
+            else if event.id == *self.data_logging_item.id() {
+                debug!("Menu: Toggle Data Logging clicked");
+                commands.push(MenuCommand::ToggleDataLogging);
             }
             // === View menu - display toggles ===
             else if event.id == *self.show_co2_item.id() {
@@ -604,6 +660,21 @@ impl MenuManager {
     /// Update the notifications enabled state.
     pub fn set_notifications_enabled(&self, enabled: bool) {
         self.notifications_item.set_checked(enabled);
+    }
+
+    /// Update the Do Not Disturb state.
+    pub fn set_do_not_disturb(&self, enabled: bool) {
+        self.do_not_disturb_item.set_checked(enabled);
+    }
+
+    /// Update the sticky alerts state.
+    pub fn set_sticky_alerts(&self, enabled: bool) {
+        self.sticky_alerts_item.set_checked(enabled);
+    }
+
+    /// Update the data logging state.
+    pub fn set_data_logging(&self, enabled: bool) {
+        self.data_logging_item.set_checked(enabled);
     }
 
     /// Update display toggle states.

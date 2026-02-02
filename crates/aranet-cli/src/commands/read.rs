@@ -206,10 +206,9 @@ async fn cmd_read_passive(
         eprintln!("Scanning for advertisements (passive mode)...");
     }
 
-    let options = ScanOptions {
-        duration: timeout,
-        filter_aranet_only: true,
-    };
+    let options = ScanOptions::default()
+        .duration(timeout)
+        .filter_aranet_only(true);
 
     let devices = scan_with_options(options)
         .await

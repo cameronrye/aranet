@@ -3,6 +3,7 @@
 //! This module contains the core state management for the terminal user interface,
 //! including device tracking, connection status, and UI navigation.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -184,6 +185,13 @@ pub enum HistoryFilter {
     Last7Days,
     /// Show last 30 days.
     Last30Days,
+    /// Custom date range.
+    /// Reserved for future UI support of custom date range selection.
+    #[allow(dead_code)]
+    Custom {
+        start: Option<time::Date>,
+        end: Option<time::Date>,
+    },
 }
 
 impl HistoryFilter {
@@ -195,6 +203,35 @@ impl HistoryFilter {
             HistoryFilter::Last24Hours => "24h",
             HistoryFilter::Last7Days => "7d",
             HistoryFilter::Last30Days => "30d",
+            HistoryFilter::Custom { .. } => "Custom",
+        }
+    }
+}
+
+/// Export format for history data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExportFormat {
+    /// CSV format.
+    #[default]
+    Csv,
+    /// JSON format.
+    Json,
+}
+
+impl ExportFormat {
+    /// Get file extension for this format.
+    pub fn extension(&self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Json => "json",
+        }
+    }
+
+    /// Toggle to the other format.
+    pub fn toggle(&self) -> Self {
+        match self {
+            ExportFormat::Csv => ExportFormat::Json,
+            ExportFormat::Json => ExportFormat::Csv,
         }
     }
 }
@@ -429,8 +466,8 @@ pub struct App {
     pub thresholds: aranet_core::Thresholds,
     /// Active alerts for devices.
     pub alerts: Vec<Alert>,
-    /// History of all alerts (for viewing).
-    pub alert_history: Vec<AlertRecord>,
+    /// History of all alerts (for viewing, newest last).
+    pub alert_history: VecDeque<AlertRecord>,
     /// Whether to show alert history overlay.
     pub show_alert_history: bool,
     /// Path to log file for data logging.
@@ -491,6 +528,10 @@ pub struct App {
     pub ble_range: BleRange,
     /// Whether a history sync is in progress.
     pub syncing: bool,
+    /// Export format for history (CSV or JSON).
+    pub export_format: ExportFormat,
+    /// Do Not Disturb mode - temporarily suppresses all alert notifications.
+    pub do_not_disturb: bool,
     /// Service client for aranet-service communication.
     /// Currently unused as communication goes through the worker.
     #[allow(dead_code)]
@@ -540,7 +581,7 @@ impl App {
             event_rx,
             thresholds: aranet_core::Thresholds::default(),
             alerts: Vec::new(),
-            alert_history: Vec::new(),
+            alert_history: VecDeque::new(),
             show_alert_history: false,
             log_file: None,
             logging_enabled: false,
@@ -571,6 +612,8 @@ impl App {
             smart_home_enabled: false,
             ble_range: BleRange::default(),
             syncing: false,
+            export_format: ExportFormat::default(),
+            do_not_disturb: false,
             service_client: aranet_core::service_client::ServiceClient::new(
                 "http://localhost:8080",
             )
@@ -748,7 +791,7 @@ impl App {
                     device.connected_at = None;
                 }
             }
-            SensorEvent::ConnectionError { device_id, error } => {
+            SensorEvent::ConnectionError { device_id, error, .. } => {
                 let device_name = self
                     .devices
                     .iter()
@@ -784,7 +827,7 @@ impl App {
                     device.error = None;
                 }
             }
-            SensorEvent::ReadingError { device_id, error } => {
+            SensorEvent::ReadingError { device_id, error, .. } => {
                 let device_name = self
                     .devices
                     .iter()
@@ -808,7 +851,7 @@ impl App {
                     device.last_updated = Some(Instant::now());
                 }
             }
-            SensorEvent::HistorySyncStarted { device_id } => {
+            SensorEvent::HistorySyncStarted { device_id, .. } => {
                 self.syncing = true;
                 self.push_status_message(format!("Syncing history for {}...", device_id));
             }
@@ -819,7 +862,7 @@ impl App {
                 }
                 self.push_status_message(format!("Synced {} records for {}", count, device_id));
             }
-            SensorEvent::HistorySyncError { device_id, error } => {
+            SensorEvent::HistorySyncError { device_id, error, .. } => {
                 self.syncing = false;
                 let device_name = self
                     .devices
@@ -848,14 +891,23 @@ impl App {
                 }
                 self.push_status_message(format!("Interval set to {}m", interval_secs / 60));
             }
-            SensorEvent::IntervalError { device_id, error } => {
+            SensorEvent::IntervalError { device_id, error, context } => {
                 let device_name = self
                     .devices
                     .iter()
                     .find(|d| d.id == device_id)
                     .map(|d| d.display_name().to_string())
                     .unwrap_or_else(|| device_id.clone());
-                let error_msg = format!("{}: {}", device_name, error);
+                // Include suggestion from context if available
+                let error_msg = if let Some(ref ctx) = context {
+                    if let Some(ref suggestion) = ctx.suggestion {
+                        format!("{}: {}. {}", device_name, error, suggestion)
+                    } else {
+                        format!("{}: {}", device_name, error)
+                    }
+                } else {
+                    format!("{}: {}", device_name, error)
+                };
                 self.set_error(error_msg);
                 self.push_status_message(format!(
                     "Set interval failed: {} (press E for details)",
@@ -881,14 +933,23 @@ impl App {
                 let range = if extended { "Extended" } else { "Standard" };
                 self.push_status_message(format!("Bluetooth range set to {}", range));
             }
-            SensorEvent::BluetoothRangeError { device_id, error } => {
+            SensorEvent::BluetoothRangeError { device_id, error, context } => {
                 let device_name = self
                     .devices
                     .iter()
                     .find(|d| d.id == device_id)
                     .and_then(|d| d.name.clone())
                     .unwrap_or_else(|| device_id.clone());
-                let error_msg = format!("{}: {}", device_name, error);
+                // Include suggestion from context if available
+                let error_msg = if let Some(ref ctx) = context {
+                    if let Some(ref suggestion) = ctx.suggestion {
+                        format!("{}: {}. {}", device_name, error, suggestion)
+                    } else {
+                        format!("{}: {}", device_name, error)
+                    }
+                } else {
+                    format!("{}: {}", device_name, error)
+                };
                 self.set_error(error_msg);
                 self.push_status_message(format!(
                     "Set BT range failed: {} (press E for details)",
@@ -902,14 +963,23 @@ impl App {
                 let mode = if enabled { "enabled" } else { "disabled" };
                 self.push_status_message(format!("Smart Home {}", mode));
             }
-            SensorEvent::SmartHomeError { device_id, error } => {
+            SensorEvent::SmartHomeError { device_id, error, context } => {
                 let device_name = self
                     .devices
                     .iter()
                     .find(|d| d.id == device_id)
                     .and_then(|d| d.name.clone())
                     .unwrap_or_else(|| device_id.clone());
-                let error_msg = format!("{}: {}", device_name, error);
+                // Include suggestion from context if available
+                let error_msg = if let Some(ref ctx) = context {
+                    if let Some(ref suggestion) = ctx.suggestion {
+                        format!("{}: {}. {}", device_name, error, suggestion)
+                    } else {
+                        format!("{}: {}", device_name, error)
+                    }
+                } else {
+                    format!("{}: {}", device_name, error)
+                };
                 self.set_error(error_msg);
                 self.push_status_message(format!(
                     "Set Smart Home failed: {} (press E for details)",
@@ -994,6 +1064,55 @@ impl App {
                 error,
             } => {
                 self.push_status_message(format!("Forget failed: {}", error));
+            }
+            SensorEvent::HistorySyncProgress {
+                device_id: _,
+                downloaded,
+                total,
+            } => {
+                self.push_status_message(format!(
+                    "Syncing history: {}/{} records",
+                    downloaded, total
+                ));
+            }
+            SensorEvent::OperationCancelled { operation } => {
+                self.push_status_message(format!("{} cancelled", operation));
+            }
+            SensorEvent::BackgroundPollingStarted {
+                device_id: _,
+                interval_secs,
+            } => {
+                self.push_status_message(format!(
+                    "Background polling started ({}s interval)",
+                    interval_secs
+                ));
+            }
+            SensorEvent::BackgroundPollingStopped { device_id: _ } => {
+                self.push_status_message("Background polling stopped".to_string());
+            }
+            SensorEvent::SignalStrengthUpdate {
+                device_id,
+                rssi,
+                quality: _,
+            } => {
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.rssi = Some(rssi);
+                }
+            }
+            // System service events - not displayed in TUI
+            SensorEvent::SystemServiceStatus { .. }
+            | SensorEvent::SystemServiceInstalled
+            | SensorEvent::SystemServiceUninstalled
+            | SensorEvent::SystemServiceStarted
+            | SensorEvent::SystemServiceStopped
+            | SensorEvent::SystemServiceError { .. }
+            | SensorEvent::ServiceConfigFetched { .. }
+            | SensorEvent::ServiceConfigError { .. }
+            | SensorEvent::ServiceDeviceAdded { .. }
+            | SensorEvent::ServiceDeviceUpdated { .. }
+            | SensorEvent::ServiceDeviceRemoved { .. }
+            | SensorEvent::ServiceDeviceError { .. } => {
+                // TUI doesn't display system service status
             }
         }
 
@@ -1207,8 +1326,8 @@ impl App {
                     severity,
                 });
 
-                // Add to alert history
-                self.alert_history.push(AlertRecord {
+                // Add to alert history (newest at back), O(1)
+                self.alert_history.push_back(AlertRecord {
                     device_name: device_name.unwrap_or_else(|| device_id.to_string()),
                     message,
                     timestamp: time::OffsetDateTime::now_utc(),
@@ -1217,11 +1336,11 @@ impl App {
 
                 // Keep history limited to last MAX_ALERT_HISTORY entries
                 while self.alert_history.len() > MAX_ALERT_HISTORY {
-                    self.alert_history.remove(0);
+                    self.alert_history.pop_front(); // Remove oldest (front), O(1)
                 }
 
-                // Ring terminal bell if enabled
-                if self.bell_enabled {
+                // Ring terminal bell if enabled and not in Do Not Disturb mode
+                if self.bell_enabled && !self.do_not_disturb {
                     print!("\x07"); // ASCII BEL character
                     use std::io::Write;
                     std::io::stdout().flush().ok();
@@ -1270,8 +1389,8 @@ impl App {
                     severity,
                 });
 
-                // Add to alert history
-                self.alert_history.push(AlertRecord {
+                // Add to alert history (newest at back), O(1)
+                self.alert_history.push_back(AlertRecord {
                     device_name: device_name.unwrap_or_else(|| device_id.to_string()),
                     message,
                     timestamp: time::OffsetDateTime::now_utc(),
@@ -1280,11 +1399,11 @@ impl App {
 
                 // Keep history limited to last MAX_ALERT_HISTORY entries
                 while self.alert_history.len() > MAX_ALERT_HISTORY {
-                    self.alert_history.remove(0);
+                    self.alert_history.pop_front(); // Remove oldest (front), O(1)
                 }
 
-                // Ring terminal bell if enabled
-                if self.bell_enabled {
+                // Ring terminal bell if enabled and not in Do Not Disturb mode
+                if self.bell_enabled && !self.do_not_disturb {
                     print!("\x07"); // ASCII BEL character
                     use std::io::Write;
                     std::io::stdout().flush().ok();
@@ -1330,8 +1449,8 @@ impl App {
                         severity,
                     });
 
-                    // Add to alert history
-                    self.alert_history.push(AlertRecord {
+                    // Add to alert history (newest at back), O(1)
+                    self.alert_history.push_back(AlertRecord {
                         device_name: device_name.unwrap_or_else(|| device_id.to_string()),
                         message,
                         timestamp: time::OffsetDateTime::now_utc(),
@@ -1340,11 +1459,11 @@ impl App {
 
                     // Keep history limited to last MAX_ALERT_HISTORY entries
                     while self.alert_history.len() > MAX_ALERT_HISTORY {
-                        self.alert_history.remove(0);
+                        self.alert_history.pop_front(); // Remove oldest (front), O(1)
                     }
 
-                    // Ring terminal bell if enabled
-                    if self.bell_enabled {
+                    // Ring terminal bell if enabled and not in Do Not Disturb mode
+                    if self.bell_enabled && !self.do_not_disturb {
                         print!("\x07"); // ASCII BEL character
                         use std::io::Write;
                         std::io::stdout().flush().ok();
@@ -1462,7 +1581,7 @@ impl App {
         );
     }
 
-    /// Export visible history to CSV file.
+    /// Export visible history to file (CSV or JSON based on export_format).
     pub fn export_history(&self) -> Option<String> {
         use std::io::Write;
 
@@ -1493,60 +1612,119 @@ impl App {
         let now =
             time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         let filename = format!(
-            "history_{}_{}.csv",
+            "history_{}_{}.{}",
             device
                 .name
                 .as_deref()
                 .unwrap_or(&device.id)
-                .replace(" ", "_"),
+                .replace(' ', "_"),
             now.format(
                 &time::format_description::parse("[year][month][day]_[hour][minute][second]")
                     .unwrap()
             )
-            .unwrap_or_default()
+            .unwrap_or_default(),
+            self.export_format.extension()
         );
         let path = export_dir.join(&filename);
 
-        // Write CSV
         let mut file = std::fs::File::create(&path).ok()?;
 
-        // Header
-        writeln!(
-            file,
-            "timestamp,co2,temperature,humidity,pressure,radon,radiation_rate"
-        )
-        .ok()?;
+        match self.export_format {
+            ExportFormat::Csv => {
+                // Write CSV header
+                writeln!(
+                    file,
+                    "timestamp,co2,temperature,humidity,pressure,radon,radiation_rate"
+                )
+                .ok()?;
 
-        // Records
-        for record in filtered {
-            writeln!(
-                file,
-                "{},{},{:.1},{},{:.1},{},{}",
-                record
-                    .timestamp
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default(),
-                record.co2,
-                record.temperature,
-                record.humidity,
-                record.pressure,
-                record.radon.map(|v| v.to_string()).unwrap_or_default(),
-                record
-                    .radiation_rate
-                    .map(|v| format!("{:.3}", v))
-                    .unwrap_or_default(),
-            )
-            .ok()?;
+                // Write CSV records
+                for record in filtered {
+                    writeln!(
+                        file,
+                        "{},{},{:.1},{},{:.1},{},{}",
+                        record
+                            .timestamp
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
+                        record.co2,
+                        record.temperature,
+                        record.humidity,
+                        record.pressure,
+                        record.radon.map(|v| v.to_string()).unwrap_or_default(),
+                        record
+                            .radiation_rate
+                            .map(|v| format!("{:.3}", v))
+                            .unwrap_or_default(),
+                    )
+                    .ok()?;
+                }
+            }
+            ExportFormat::Json => {
+                // Build JSON records
+                let json_records: Vec<serde_json::Value> = filtered
+                    .iter()
+                    .map(|record| {
+                        let mut obj = serde_json::json!({
+                            "timestamp": record.timestamp
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .unwrap_or_default(),
+                            "co2": record.co2,
+                            "temperature": record.temperature,
+                            "humidity": record.humidity,
+                            "pressure": record.pressure,
+                        });
+                        if let Some(radon) = record.radon {
+                            obj["radon"] = serde_json::json!(radon);
+                        }
+                        if let Some(rate) = record.radiation_rate {
+                            obj["radiation_rate"] = serde_json::json!(rate);
+                        }
+                        if let Some(total) = record.radiation_total {
+                            obj["radiation_total"] = serde_json::json!(total);
+                        }
+                        obj
+                    })
+                    .collect();
+
+                let json_output = serde_json::json!({
+                    "device": device.name.as_deref().unwrap_or(&device.id),
+                    "device_id": device.id,
+                    "device_type": device.device_type.map(|dt| format!("{:?}", dt)),
+                    "export_time": now.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                    "record_count": json_records.len(),
+                    "records": json_records,
+                });
+
+                serde_json::to_writer_pretty(&file, &json_output).ok()?;
+            }
         }
 
         Some(path.to_string_lossy().to_string())
+    }
+
+    /// Toggle export format between CSV and JSON.
+    pub fn toggle_export_format(&mut self) {
+        self.export_format = self.export_format.toggle();
+        self.push_status_message(format!("Export format: {}", self.export_format.extension().to_uppercase()));
+    }
+
+    /// Toggle Do Not Disturb mode.
+    pub fn toggle_do_not_disturb(&mut self) {
+        self.do_not_disturb = !self.do_not_disturb;
+        let status = if self.do_not_disturb {
+            "enabled - alerts silenced"
+        } else {
+            "disabled"
+        };
+        self.push_status_message(format!("Do Not Disturb {}", status));
     }
 
     /// Check if a record matches the current history filter.
     fn filter_matches_record(&self, record: &HistoryRecord) -> bool {
         use time::OffsetDateTime;
 
-        match self.history_filter {
+        match &self.history_filter {
             HistoryFilter::All => true,
             HistoryFilter::Today => {
                 let now = OffsetDateTime::now_utc();
@@ -1564,7 +1742,22 @@ impl App {
                 let cutoff = OffsetDateTime::now_utc() - time::Duration::days(30);
                 record.timestamp >= cutoff
             }
+            HistoryFilter::Custom { start, end } => {
+                let record_date = record.timestamp.date();
+                let after_start = start.is_none_or(|s| record_date >= s);
+                let before_end = end.is_none_or(|e| record_date <= e);
+                after_start && before_end
+            }
         }
+    }
+
+    /// Set a custom date range filter.
+    /// Reserved for future UI support of custom date range selection.
+    #[allow(dead_code)]
+    pub fn set_custom_date_filter(&mut self, start: Option<time::Date>, end: Option<time::Date>) {
+        self.history_filter = HistoryFilter::Custom { start, end };
+        self.history_scroll = 0;
+        self.push_status_message("Custom date range set".to_string());
     }
 
     /// Check if auto-refresh is due and return list of connected device IDs to refresh.

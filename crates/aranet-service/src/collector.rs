@@ -50,6 +50,7 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -62,19 +63,27 @@ use crate::state::{AppState, DeviceCollectionStats, ReadingEvent};
 /// Background collector that polls devices on their configured intervals.
 pub struct Collector {
     state: Arc<AppState>,
+    /// JoinSet to track spawned device polling tasks.
+    tasks: JoinSet<()>,
 }
 
 impl Collector {
     /// Create a new collector.
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            tasks: JoinSet::new(),
+        }
     }
 
     /// Start collecting data from all configured devices.
     ///
     /// This spawns a separate task for each device that polls at the configured interval.
     /// Returns immediately; collection happens in the background.
-    pub async fn start(&self) {
+    ///
+    /// Also spawns a reload watcher task that will restart the collector when
+    /// the device configuration changes via the API.
+    pub async fn start(&mut self) {
         // Reset stop signal if previously stopped
         self.state.collector.reset_stop();
 
@@ -111,24 +120,138 @@ impl Collector {
         // Mark as running
         self.state.collector.set_running(true);
 
+        // Spawn device tasks into the shared JoinSet on CollectorState
+        // This allows the reload watcher to also spawn tasks that are properly tracked
         for device_config in devices {
             let state = Arc::clone(&self.state);
             let stop_rx = self.state.collector.subscribe_stop();
-            tokio::spawn(async move {
-                collect_device(state, device_config, stop_rx).await;
-            });
+            self.state
+                .collector
+                .spawn_device_task(async move {
+                    collect_device(state, device_config, stop_rx).await;
+                })
+                .await;
         }
+
+        // Spawn reload watcher task
+        let state = Arc::clone(&self.state);
+        self.tasks.spawn(async move {
+            watch_for_reload(state).await;
+        });
     }
 
-    /// Stop the collector.
-    pub fn stop(&self) {
+    /// Stop the collector and wait for all tasks to complete.
+    pub async fn stop(&mut self) {
         info!("Stopping collector");
         self.state.collector.signal_stop();
+
+        // Wait for device tasks in the shared JoinSet (with timeout)
+        let stopped_cleanly = self
+            .state
+            .collector
+            .wait_for_device_tasks(Duration::from_secs(10))
+            .await;
+
+        if !stopped_cleanly {
+            warn!("Device tasks did not stop within timeout, aborted");
+        }
+
+        // Also wait for the reload watcher task in our local JoinSet
+        let timeout = tokio::time::timeout(Duration::from_secs(2), async {
+            while self.tasks.join_next().await.is_some() {}
+        });
+
+        if timeout.await.is_err() {
+            warn!("Reload watcher did not stop within timeout, aborting");
+            self.tasks.abort_all();
+        }
     }
 
     /// Check if the collector is running.
     pub fn is_running(&self) -> bool {
         self.state.collector.is_running()
+    }
+
+    /// Get the number of active collection tasks.
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+}
+
+/// Watch for configuration reload signals and restart collection tasks.
+async fn watch_for_reload(state: Arc<AppState>) {
+    let mut reload_rx = state.collector.subscribe_reload();
+    let mut stop_rx = state.collector.subscribe_stop();
+
+    loop {
+        tokio::select! {
+            result = reload_rx.changed() => {
+                if result.is_err() {
+                    // Sender dropped, exit
+                    break;
+                }
+
+                info!("Configuration reload requested, restarting device tasks");
+
+                // Signal current tasks to stop
+                state.collector.signal_stop();
+
+                // Wait a moment for tasks to notice the stop signal
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                // Reset stop signal
+                state.collector.reset_stop();
+
+                // Read new config
+                let config = state.config.read().await;
+                let devices = config.devices.clone();
+                drop(config);
+
+                // Re-initialize device stats
+                {
+                    let mut stats = state.collector.device_stats.write().await;
+                    stats.clear();
+                    for device in &devices {
+                        stats.push(DeviceCollectionStats {
+                            device_id: device.address.clone(),
+                            alias: device.alias.clone(),
+                            poll_interval: device.poll_interval,
+                            last_poll_at: None,
+                            last_error_at: None,
+                            last_error: None,
+                            success_count: 0,
+                            failure_count: 0,
+                            polling: false,
+                        });
+                    }
+                }
+
+                if devices.is_empty() {
+                    info!("No devices configured after reload");
+                    continue;
+                }
+
+                info!("Restarting collector for {} device(s)", devices.len());
+
+                // Spawn new device tasks into the shared JoinSet
+                for device_config in devices {
+                    let state_clone = Arc::clone(&state);
+                    let stop_rx = state.collector.subscribe_stop();
+                    state
+                        .collector
+                        .spawn_device_task(async move {
+                            collect_device(state_clone, device_config, stop_rx).await;
+                        })
+                        .await;
+                }
+            }
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    info!("Reload watcher received stop signal");
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -290,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn test_collector_start_no_devices() {
         let state = create_test_state();
-        let collector = Collector::new(Arc::clone(&state));
+        let mut collector = Collector::new(Arc::clone(&state));
 
         // Start with no devices configured
         collector.start().await;
@@ -316,7 +439,7 @@ mod tests {
             });
         }
 
-        let collector = Collector::new(Arc::clone(&state));
+        let mut collector = Collector::new(Arc::clone(&state));
         collector.start().await;
 
         // Wait a moment for async initialization
@@ -332,15 +455,15 @@ mod tests {
         // due to async collector activity, so we only verify initialization happened
     }
 
-    #[test]
-    fn test_collector_stop() {
+    #[tokio::test]
+    async fn test_collector_stop() {
         let state = create_test_state();
         state.collector.set_running(true);
 
-        let collector = Collector::new(Arc::clone(&state));
+        let mut collector = Collector::new(Arc::clone(&state));
         assert!(collector.is_running());
 
-        collector.stop();
+        collector.stop().await;
         assert!(!collector.is_running());
     }
 
@@ -488,7 +611,7 @@ mod tests {
             });
         }
 
-        let collector = Collector::new(Arc::clone(&state));
+        let mut collector = Collector::new(Arc::clone(&state));
         collector.start().await;
 
         // Wait for initialization

@@ -31,10 +31,9 @@ fn get_device_name() -> String {
 #[ignore = "requires BLE hardware"]
 async fn test_scan_for_devices() {
     // Use 15-second scan to catch multiple devices with different advertisement intervals
-    let options = ScanOptions {
-        duration: Duration::from_secs(15),
-        filter_aranet_only: true,
-    };
+    let options = ScanOptions::default()
+        .duration_secs(15)
+        .filter_aranet_only(true);
 
     let result = timeout(Duration::from_secs(30), scan_with_options(options)).await;
 

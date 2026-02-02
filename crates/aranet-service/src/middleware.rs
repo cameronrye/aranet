@@ -92,6 +92,9 @@ impl RateLimitState {
 /// API key authentication middleware.
 ///
 /// Checks for the `X-API-Key` header and validates against the configured key.
+/// For WebSocket connections (which cannot set custom headers from browsers),
+/// also accepts a `token` query parameter.
+///
 /// Returns 401 Unauthorized if the key is missing or invalid.
 pub async fn api_key_auth(
     headers: HeaderMap,
@@ -109,8 +112,24 @@ pub async fn api_key_auth(
         return next.run(request).await;
     }
 
-    // Get the API key from header
-    let provided_key = headers.get("X-API-Key").and_then(|v| v.to_str().ok());
+    // Get the API key from header first
+    let mut provided_key = headers.get("X-API-Key").and_then(|v| v.to_str().ok());
+
+    // For WebSocket connections, also check query parameter
+    // (browsers cannot set custom headers during WebSocket upgrade)
+    if provided_key.is_none() {
+        if let Some(query) = request.uri().query() {
+            provided_key = query
+                .split('&')
+                .find_map(|param| {
+                    let mut parts = param.splitn(2, '=');
+                    match (parts.next(), parts.next()) {
+                        (Some("token"), Some(value)) => Some(value),
+                        _ => None,
+                    }
+                });
+        }
+    }
 
     // Validate
     let valid = match (&config.api_key, provided_key) {
@@ -129,7 +148,7 @@ pub async fn api_key_auth(
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": "Invalid or missing API key",
-                "hint": "Provide a valid API key in the X-API-Key header"
+                "hint": "Provide a valid API key in the X-API-Key header or as a 'token' query parameter"
             })),
         )
             .into_response()
@@ -352,5 +371,26 @@ mod tests {
         // Cleanup (entries within 2x window are kept)
         state.cleanup(60).await;
         assert_eq!(state.requests.read().await.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_token_from_query() {
+        // Helper to extract token from query string (mirrors middleware logic)
+        fn extract_token(query: &str) -> Option<&str> {
+            query.split('&').find_map(|param| {
+                let mut parts = param.splitn(2, '=');
+                match (parts.next(), parts.next()) {
+                    (Some("token"), Some(value)) => Some(value),
+                    _ => None,
+                }
+            })
+        }
+
+        assert_eq!(extract_token("token=abc123"), Some("abc123"));
+        assert_eq!(extract_token("foo=bar&token=abc123"), Some("abc123"));
+        assert_eq!(extract_token("token=abc123&foo=bar"), Some("abc123"));
+        assert_eq!(extract_token("foo=bar"), None);
+        assert_eq!(extract_token(""), None);
+        assert_eq!(extract_token("tokenx=abc123"), None);
     }
 }

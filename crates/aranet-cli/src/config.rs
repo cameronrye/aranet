@@ -168,6 +168,10 @@ pub struct GuiConfig {
     /// Show pressure readings in dashboard.
     #[serde(default = "default_true")]
     pub show_pressure: bool,
+
+    /// Do Not Disturb mode - suppress all notifications.
+    #[serde(default)]
+    pub do_not_disturb: bool,
 }
 
 fn default_service_url() -> String {
@@ -234,6 +238,7 @@ impl Default for GuiConfig {
             show_temperature: true,
             show_humidity: true,
             show_pressure: true,
+            do_not_disturb: false,
         }
     }
 }

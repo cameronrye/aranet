@@ -957,24 +957,93 @@ impl Store {
     /// Returns the index to start downloading from (1-based).
     /// If the device has new readings since last sync, returns the next index.
     /// If this is the first sync, returns 1 to download all.
+    ///
+    /// # Buffer Wrap-Around Detection
+    ///
+    /// Aranet devices have a circular buffer (e.g., ~2016 readings for Aranet4 at 10-min
+    /// intervals). When the buffer fills up, new readings replace the oldest ones, but
+    /// `total_readings` stays constant. This function detects this wrap-around case by
+    /// comparing the latest stored timestamp with the expected time since last sync.
     pub fn calculate_sync_start(&self, device_id: &str, current_total: u16) -> Result<u16> {
         let state = self.get_sync_state(device_id)?;
 
         match state {
             Some(s) if s.total_readings == Some(current_total) => {
-                // No new readings since last sync
-                debug!("No new readings for {}", device_id);
-                Ok(current_total + 1) // Return beyond range to indicate no sync needed
+                // Same total readings as last sync - could mean:
+                // 1. No new readings (buffer not full, recent sync)
+                // 2. Buffer wrapped (old readings replaced with new)
+                // 3. History cache was cleared but sync state exists
+
+                // Check if buffer has likely wrapped by comparing timestamps
+                if s.last_sync_at.is_some() {
+                    let latest_stored = self.get_latest_history_timestamp(device_id)?;
+
+                    match latest_stored {
+                        Some(latest_ts) => {
+                            let now = OffsetDateTime::now_utc();
+                            let time_since_latest = now - latest_ts;
+
+                            // If more than 10 minutes since latest record, new data likely exists
+                            // (10 min is the longest standard Aranet4 interval)
+                            if time_since_latest > time::Duration::minutes(10) {
+                                debug!(
+                                    "Buffer may have wrapped for {} (latest record is {} min old), doing full sync",
+                                    device_id,
+                                    time_since_latest.whole_minutes()
+                                );
+                                return Ok(1);
+                            }
+
+                            // Recent sync and no indication of wrap-around
+                            debug!("No new readings for {}", device_id);
+                            Ok(current_total + 1)
+                        }
+                        None => {
+                            // Sync state exists but no history records - cache was likely cleared
+                            // Do a full sync to repopulate
+                            debug!(
+                                "Sync state exists but no history for {}, doing full sync",
+                                device_id
+                            );
+                            Ok(1)
+                        }
+                    }
+                } else {
+                    // No last_sync_at - shouldn't happen but do full sync to be safe
+                    debug!("No sync timestamp for {}, doing full sync", device_id);
+                    Ok(1)
+                }
             }
             Some(s) if s.last_history_index.is_some() => {
                 // We have previous state, calculate new records
                 let last_index = s.last_history_index.unwrap();
                 let prev_total = s.total_readings.unwrap_or(0);
+
+                // Check if device was reset (current_total < prev_total)
+                if current_total < prev_total {
+                    debug!(
+                        "Device total decreased ({} -> {}) for {}, device was reset - doing full sync",
+                        prev_total, current_total, device_id
+                    );
+                    return Ok(1);
+                }
+
                 let new_count = current_total.saturating_sub(prev_total);
 
                 if new_count > 0 {
                     // Start from where we left off
                     let start = last_index.saturating_add(1);
+
+                    // Validate start index doesn't exceed current total
+                    // This can happen if device buffer wrapped or was reset
+                    if start > current_total {
+                        debug!(
+                            "Start index {} exceeds device total {} for {}, doing full sync",
+                            start, current_total, device_id
+                        );
+                        return Ok(1);
+                    }
+
                     debug!(
                         "Incremental sync for {}: {} new readings, starting at {}",
                         device_id, new_count, start
@@ -993,6 +1062,23 @@ impl Store {
                 Ok(1)
             }
         }
+    }
+
+    /// Get the timestamp of the most recent history record for a device.
+    ///
+    /// Returns `None` if no history exists for the device.
+    fn get_latest_history_timestamp(&self, device_id: &str) -> Result<Option<OffsetDateTime>> {
+        let ts: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(timestamp) FROM history WHERE device_id = ?",
+                [device_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(ts.map(timestamp_from_unix))
     }
 }
 
@@ -1615,16 +1701,81 @@ mod tests {
         let start = store.calculate_sync_start("test-device", 100).unwrap();
         assert_eq!(start, 1);
 
-        // After syncing all 100, update state
+        // Simulate syncing: insert history records and update state
+        let now = OffsetDateTime::now_utc();
+        let records = vec![HistoryRecord {
+            timestamp: now,
+            co2: 800,
+            temperature: 22.0,
+            pressure: 1013.0,
+            humidity: 45,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        }];
+        store.insert_history("test-device", &records).unwrap();
         store.update_sync_state("test-device", 100, 100).unwrap();
 
-        // No new readings - should return beyond range
+        // No new readings and recent history exists - should return beyond range
         let start = store.calculate_sync_start("test-device", 100).unwrap();
         assert_eq!(start, 101);
 
         // New readings added - should start from 101
         let start = store.calculate_sync_start("test-device", 110).unwrap();
         assert_eq!(start, 101);
+    }
+
+    #[test]
+    fn test_calculate_sync_start_cache_cleared() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_device("test-device", None).unwrap();
+
+        // Simulate previous sync
+        store.update_sync_state("test-device", 100, 100).unwrap();
+
+        // No history records exist (cache was cleared) - should do full sync
+        let start = store.calculate_sync_start("test-device", 100).unwrap();
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn test_calculate_sync_start_buffer_wrapped() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_device("test-device", None).unwrap();
+
+        // Insert an old history record (more than 10 min ago)
+        let old_time = OffsetDateTime::now_utc() - time::Duration::minutes(30);
+        let records = vec![HistoryRecord {
+            timestamp: old_time,
+            co2: 800,
+            temperature: 22.0,
+            pressure: 1013.0,
+            humidity: 45,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        }];
+        store.insert_history("test-device", &records).unwrap();
+        store.update_sync_state("test-device", 100, 100).unwrap();
+
+        // Device still shows 100 readings but latest record is old
+        // This indicates buffer may have wrapped - should do full sync
+        let start = store.calculate_sync_start("test-device", 100).unwrap();
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn test_calculate_sync_start_index_overflow() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_device("test-device", None).unwrap();
+
+        // Simulate state where last_index exceeds current_total (buffer reset)
+        store.update_sync_state("test-device", 500, 500).unwrap();
+
+        // Device was reset and now has fewer readings
+        // start would be 501 which exceeds 200, should do full sync
+        let start = store.calculate_sync_start("test-device", 200).unwrap();
+        assert_eq!(start, 1);
     }
 
     #[test]

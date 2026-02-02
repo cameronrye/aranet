@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-02-01
+
+### Added
+
+- **Diagnostics Module** - Comprehensive Bluetooth diagnostics and troubleshooting
+  - `DiagnosticsCollector` for gathering adapter info, connection stats, and recent errors
+  - `AdapterInfo` with state detection (Available, PoweredOff, NotFound)
+  - `ConnectionStats` tracking success rates, connection times, and disconnection reasons
+  - `ErrorCategory` classification with recorded error history
+  - Global diagnostics collector accessible via `global_diagnostics()`
+
+- **Passive Monitoring** - Monitor devices via BLE advertisements without connecting
+  - `PassiveMonitor` for low-power, connectionless monitoring
+  - Support for more devices than the BLE connection limit
+  - Configurable deduplication and device filtering
+  - `PassiveReading` with device ID, name, RSSI, and parsed advertisement data
+
+- **Platform Module** - Platform-specific BLE configuration and tuning
+  - `Platform` detection (macOS, Linux, Windows) with appropriate defaults
+  - `PlatformConfig` with recommended timeouts and scan durations
+  - Cross-platform device aliasing with `DeviceAlias` and `AliasStore`
+  - Documentation of macOS UUID behavior and cross-platform considerations
+
+- **Retry Logic** - Configurable retry policies for BLE operations
+  - `RetryPolicy` with immediate, fixed, and exponential backoff strategies
+  - Configurable max attempts, delays, and jitter
+  - Integration with connection and read operations
+
+- **History Improvements**
+  - `HistoryCheckpoint` for resumable history downloads
+  - `PartialHistoryData` for incremental sync with checkpoint tracking
+  - History sync progress events with record counts
+
+- **Device Connection Improvements**
+  - `ConnectionConfig` for configurable connection settings
+  - `SignalQuality` enum (Excellent, Good, Fair, Poor, Unknown) for RSSI classification
+  - Improved connection state tracking
+
+- **Device Manager Improvements**
+  - `AdaptiveInterval` for smart polling that adjusts based on device activity
+  - `DevicePriority` for prioritizing certain devices during polling
+
+- **Error Context** - User-friendly error messages with actionable suggestions
+  - `ErrorContext` with message, retryable flag, and suggestion
+  - Automatic classification of errors from `aranet_core::Error`
+  - Suggestions for common issues (out of range, Bluetooth errors, etc.)
+
+- **New Commands**
+  - `CancelOperation` - Cancel long-running scans, syncs, and other operations
+  - `StartBackgroundPolling` / `StopBackgroundPolling` - Automatic device polling
+  - System service management from GUI/TUI
+
+- **GUI Service Panel** - Manage aranet-service from the desktop application
+  - View service status (installed, running)
+  - Install/uninstall system service (user-level, no admin required)
+  - Start/stop service controls
+  - Device collection statistics
+
+- **API Improvements**
+  - `/api/health/detailed` endpoint with database, collector, and platform diagnostics
+  - Improved Prometheus metrics with better lock management
+  - Enhanced error responses with context
+
+### Changed
+
+- Improved Prometheus metrics collection performance (shorter lock duration)
+- Enhanced history sync events with progress tracking
+- Better error propagation with context information
+- Synchronized all crate versions to 0.1.12
+
+### Fixed
+
+- Lock contention in Prometheus metrics endpoint
+
 ## [0.1.11] - 2026-01-31
 
 ### Added

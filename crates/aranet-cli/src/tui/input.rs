@@ -6,19 +6,21 @@
 //!
 //! # Key Bindings
 //!
-//! | Key       | Action          |
-//! |-----------|-----------------|
-//! | `q`       | Quit            |
-//! | `s`       | Scan            |
-//! | `r`       | Refresh         |
-//! | `c`       | Connect         |
-//! | `d`       | Disconnect      |
-//! | `y`       | Sync history    |
-//! | `↓` / `j` | Select next     |
-//! | `↑` / `k` | Select previous |
-//! | `Tab` / `l` | Next tab      |
+//! | Key       | Action            |
+//! |-----------|-------------------|
+//! | `q`       | Quit              |
+//! | `s`       | Scan              |
+//! | `r`       | Refresh           |
+//! | `c`       | Connect           |
+//! | `d`       | Disconnect        |
+//! | `y`       | Sync history      |
+//! | `↓` / `j` | Select next       |
+//! | `↑` / `k` | Select previous   |
+//! | `Tab` / `l` | Next tab        |
 //! | `BackTab` / `h` | Previous tab |
-//! | `?`       | Toggle help     |
+//! | `?`       | Toggle help       |
+//! | `D`       | Do Not Disturb    |
+//! | `F`       | Toggle export fmt |
 
 use std::time::Duration;
 
@@ -121,6 +123,10 @@ pub enum Action {
     ToggleBleRange,
     /// Toggle Smart Home mode.
     ToggleSmartHome,
+    /// Toggle Do Not Disturb mode.
+    ToggleDoNotDisturb,
+    /// Toggle export format (CSV/JSON).
+    ToggleExportFormat,
     /// No action (unrecognized key).
     None,
 }
@@ -201,6 +207,8 @@ pub fn handle_key(key: KeyCode, editing_text: bool, has_pending_confirmation: bo
         KeyCode::Char('H') => Action::ToggleChartHumidity,
         KeyCode::Char('B') => Action::ToggleBleRange,
         KeyCode::Char('I') => Action::ToggleSmartHome,
+        KeyCode::Char('D') => Action::ToggleDoNotDisturb,
+        KeyCode::Char('F') => Action::ToggleExportFormat,
         _ => Action::None,
     }
 }
@@ -602,6 +610,14 @@ pub fn apply_action(
         }
         Action::ToggleSmartHome => {
             app.toggle_smart_home();
+            None
+        }
+        Action::ToggleDoNotDisturb => {
+            app.toggle_do_not_disturb();
+            None
+        }
+        Action::ToggleExportFormat => {
+            app.toggle_export_format();
             None
         }
         Action::None => None,

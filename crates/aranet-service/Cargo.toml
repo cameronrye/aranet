@@ -1,6 +1,6 @@
 [package]
 name = "aranet-service"
-version = "0.1.11"
+version = "0.1.12"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,14 +20,14 @@ dist = false
 
 [features]
 default = []
-prometheus = []
+prometheus = ["dep:reqwest"]
 mqtt = ["dep:rumqttc"]
 full = ["prometheus", "mqtt"]
 
 [dependencies]
-aranet-core = { version = "0.1.11", path = "../aranet-core" }
-aranet-store = { version = "0.1.11", path = "../aranet-store" }
-aranet-types = { version = "0.1.11", path = "../aranet-types" }
+aranet-core = { version = "0.1.12", path = "../aranet-core" }
+aranet-store = { version = "0.1.12", path = "../aranet-store" }
+aranet-types = { version = "0.1.12", path = "../aranet-types" }
 
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
@@ -63,6 +63,9 @@ service-manager = "0.10.0"
 
 # MQTT support (optional)
 rumqttc = { version = "0.24", optional = true }
+
+# Prometheus push gateway (optional)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

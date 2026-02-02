@@ -2,7 +2,6 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aranet_core::{ScanOptions, scan};
@@ -31,10 +30,9 @@ pub async fn cmd_scan(
         None
     };
 
-    let options = ScanOptions {
-        duration: Duration::from_secs(timeout),
-        filter_aranet_only: true,
-    };
+    let options = ScanOptions::default()
+        .duration_secs(timeout)
+        .filter_aranet_only(true);
 
     let devices = scan::scan_with_options(options)
         .await

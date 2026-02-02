@@ -12,6 +12,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use aranet_service::config::default_config_path;
 use aranet_service::middleware::{self, RateLimitState};
 use aranet_service::{AppState, Collector, Config, api, ws};
 use aranet_store::Store;
@@ -164,10 +165,14 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
         )
         .init();
 
+    // Determine config path
+    let config_path = args.config.clone().unwrap_or_else(default_config_path);
+
     // Load configuration
-    let mut config = match &args.config {
-        Some(path) => Config::load(path)?,
-        None => Config::load_default().unwrap_or_default(),
+    let mut config = if config_path.exists() {
+        Config::load(&config_path)?
+    } else {
+        Config::default()
     };
 
     // Override config with CLI args
@@ -182,20 +187,35 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
     info!("Opening database at {:?}", config.storage.path);
     let store = Store::open(&config.storage.path)?;
 
-    // Create application state
-    let state = AppState::new(store, config.clone());
+    // Create application state with config path for persistence
+    let state = AppState::with_config_path(store, config.clone(), config_path);
 
     // Create security middleware state
     let security_config = Arc::new(config.security.clone());
     let rate_limit_state = Arc::new(RateLimitState::new());
 
+    // Start periodic rate limit cleanup (every 5 minutes)
+    {
+        let rate_limit_state = Arc::clone(&rate_limit_state);
+        let window_secs = config.security.rate_limit_window_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                rate_limit_state.cleanup(window_secs).await;
+            }
+        });
+    }
+
     // Start the background collector
-    if !args.no_collector {
-        let collector = Collector::new(Arc::clone(&state));
+    let collector = if !args.no_collector {
+        let mut collector = Collector::new(Arc::clone(&state));
         collector.start().await;
+        Some(collector)
     } else {
         info!("Background collector disabled");
-    }
+        None
+    };
 
     // Start MQTT publisher if enabled
     #[cfg(feature = "mqtt")]
@@ -203,6 +223,14 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
         use aranet_service::mqtt::MqttPublisher;
         let mqtt_publisher = MqttPublisher::new(Arc::clone(&state));
         mqtt_publisher.start().await;
+    }
+
+    // Start Prometheus push gateway if enabled
+    #[cfg(feature = "prometheus")]
+    {
+        use aranet_service::prometheus::PrometheusPusher;
+        let prometheus_pusher = PrometheusPusher::new(Arc::clone(&state));
+        prometheus_pusher.start().await;
     }
 
     // Build the router
@@ -224,20 +252,59 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
     // Parse bind address
     let addr: SocketAddr = config.server.bind.parse()?;
 
     info!("Starting server on {}", addr);
 
-    // Run the server
+    // Run the server with graceful shutdown
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal(collector, state))
     .await?;
 
     Ok(())
+}
+
+/// Wait for shutdown signal and perform cleanup.
+async fn shutdown_signal(mut collector: Option<Collector>, state: Arc<AppState>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("Shutdown signal received, stopping services...");
+
+    // Stop the collector and wait for tasks to finish
+    if let Some(ref mut collector) = collector {
+        collector.stop().await;
+    }
+
+    // Signal any remaining collector tasks to stop (in case of config reload)
+    state.collector.signal_stop();
+
+    info!("Graceful shutdown complete");
 }

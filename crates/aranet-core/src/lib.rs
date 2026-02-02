@@ -68,6 +68,7 @@
 pub mod advertisement;
 pub mod commands;
 pub mod device;
+pub mod diagnostics;
 pub mod error;
 pub mod events;
 pub mod guard;
@@ -76,6 +77,8 @@ pub mod manager;
 pub mod messages;
 pub mod metrics;
 pub mod mock;
+pub mod passive;
+pub mod platform;
 pub mod readings;
 pub mod reconnect;
 pub mod retry;
@@ -95,9 +98,9 @@ pub use aranet_types::types;
 pub use aranet_types::uuid;
 
 // Core exports
-pub use device::Device;
+pub use device::{ConnectionConfig, Device, SignalQuality};
 pub use error::{ConnectionFailureReason, DeviceNotFoundReason, Error, Result};
-pub use history::{HistoryInfo, HistoryOptions, HistoryParam};
+pub use history::{HistoryCheckpoint, HistoryInfo, HistoryOptions, HistoryParam, PartialHistoryData};
 pub use readings::ExtendedReading;
 pub use scan::{
     DiscoveredDevice, FindProgress, ProgressCallback, ScanOptions, find_device_with_progress,
@@ -201,7 +204,7 @@ pub use commands::{
 };
 pub use events::{DeviceEvent, EventReceiver, EventSender};
 pub use guard::{DeviceGuard, SharedDeviceGuard};
-pub use manager::{DeviceManager, ManagedDevice, ManagerConfig};
+pub use manager::{AdaptiveInterval, DeviceManager, DevicePriority, ManagedDevice, ManagerConfig};
 pub use messages::{CachedDevice, Command, SensorEvent};
 pub use metrics::{ConnectionMetrics, OperationMetrics};
 pub use mock::{MockDevice, MockDeviceBuilder};
@@ -211,6 +214,14 @@ pub use streaming::{ReadingStream, StreamOptions, StreamOptionsBuilder};
 pub use thresholds::{Co2Level, ThresholdConfig, Thresholds};
 pub use util::{create_identifier, format_peripheral_id};
 pub use validation::{ReadingValidator, ValidationResult, ValidationWarning};
+pub use platform::{
+    AliasStore, DeviceAlias, Platform, PlatformConfig, current_platform, platform_config,
+};
+pub use passive::{PassiveMonitor, PassiveMonitorOptions, PassiveReading};
+pub use diagnostics::{
+    AdapterInfo, AdapterState, BluetoothDiagnostics, ConnectionStats, DiagnosticsCollector,
+    ErrorCategory, OperationStats, RecordedError, global_diagnostics,
+};
 
 // Re-export from aranet-types
 pub use aranet_types::uuid as uuids;

@@ -26,10 +26,13 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
 
 - **aranet-core** — Core BLE library supporting Aranet4, Aranet2, AranetRn+ (Radon), and Aranet Radiation sensors
   - Current readings (CO₂, temperature, pressure, humidity, radon, radiation)
-  - Historical data download with timestamps
+  - Historical data download with timestamps and resumable checkpoints
   - Device settings (measurement interval, Bluetooth range)
-  - Auto-reconnection with configurable backoff
+  - Auto-reconnection with configurable backoff and retry policies
   - Real-time streaming and event system
+  - Passive monitoring via BLE advertisements (no connection required)
+  - Platform-specific configuration (macOS, Linux, Windows)
+  - Bluetooth diagnostics and troubleshooting utilities
 - **aranet-cli** — Command-line interface for quick readings and data export
   - Multi-device reading with parallel connections
   - Interactive device picker, device aliases
@@ -52,12 +55,13 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - Multi-panel interface with device list, detail, history, comparison views
   - Alert system with threshold management
   - Export to CSV/JSON, system tray, light/dark themes
+  - Service management panel for aranet-service control
 - **aranet-service** — Background daemon with REST API and integrations
   - HTTP API for devices, readings, history queries
   - WebSocket real-time streaming
-  - Prometheus metrics endpoint (`/metrics`)
+  - Prometheus metrics endpoint (`/metrics`) with detailed health checks
   - MQTT publisher for IoT integration
-  - Service management (install/start/stop)
+  - System service management (install/start/stop as launchd/systemd service)
 
 ## Screenshots
 

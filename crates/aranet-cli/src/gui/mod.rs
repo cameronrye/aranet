@@ -42,7 +42,7 @@ use aranet_core::messages::{Command, SensorEvent};
 use crate::config::Config;
 
 /// Embedded icon PNG data (64x64 RGBA)
-const ICON_PNG: &[u8] = include_bytes!("../../assets/aranet-icon.png");
+pub(crate) const ICON_PNG: &[u8] = include_bytes!("../../assets/aranet-icon.png");
 
 /// Load the application icon from embedded PNG data.
 fn load_icon() -> Option<Arc<IconData>> {
@@ -131,8 +131,12 @@ pub fn run() -> Result<()> {
                 SensorWorker::with_service_url(command_rx, event_tx, store_path, &service_url);
 
             // Send startup commands: load cached data and fetch service status
-            let _ = startup_command_tx.send(Command::LoadCachedData).await;
-            let _ = startup_command_tx.send(Command::RefreshServiceStatus).await;
+            if let Err(e) = startup_command_tx.send(Command::LoadCachedData).await {
+                tracing::error!("Failed to send LoadCachedData command at startup: {}", e);
+            }
+            if let Err(e) = startup_command_tx.send(Command::RefreshServiceStatus).await {
+                tracing::warn!("Failed to send RefreshServiceStatus command at startup: {}", e);
+            }
 
             // Forward events from worker to std channel
             let mut event_rx = event_rx_tokio;
@@ -293,8 +297,12 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
 
             // Send startup commands (skip in demo mode)
             if !is_demo {
-                let _ = startup_command_tx.send(Command::LoadCachedData).await;
-                let _ = startup_command_tx.send(Command::RefreshServiceStatus).await;
+                if let Err(e) = startup_command_tx.send(Command::LoadCachedData).await {
+                    tracing::error!("Failed to send LoadCachedData command at startup: {}", e);
+                }
+                if let Err(e) = startup_command_tx.send(Command::RefreshServiceStatus).await {
+                    tracing::warn!("Failed to send RefreshServiceStatus command at startup: {}", e);
+                }
             }
 
             // Forward events from worker to std channel

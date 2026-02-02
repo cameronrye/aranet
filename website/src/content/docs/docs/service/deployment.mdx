@@ -351,8 +351,13 @@ docker logs -f aranet-service
 ### Health Check
 
 ```bash
+# Basic health check
 curl http://localhost:8080/api/health
-# {"status":"ok","version":"0.1.11","timestamp":"2024-01-15T10:30:00Z"}
+# {"status":"ok","version":"0.1.12","timestamp":"2026-02-01T10:30:00Z"}
+
+# Detailed health check with diagnostics
+curl http://localhost:8080/api/health/detailed
+# Returns database, collector, and platform diagnostics
 ```
 
 ### Prometheus Metrics

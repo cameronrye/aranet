@@ -112,6 +112,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
         shortcut_line("Esc", "Dismiss alert", &theme),
         shortcut_line("A", "Toggle sticky alerts", &theme),
         shortcut_line("b", "Toggle bell", &theme),
+        shortcut_line("D", "Do Not Disturb", &theme),
         shortcut_line("+/-", "Adjust thresholds", &theme),
         Line::from(""),
         Line::from(Span::styled(
@@ -134,6 +135,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame) {
         )),
         Line::from(""),
         shortcut_line("e", "Export history", &theme),
+        shortcut_line("F", "Toggle export format", &theme),
         shortcut_line("E", "Show error details", &theme),
         shortcut_line("q/Ctrl+C", "Quit", &theme),
         Line::from(""),

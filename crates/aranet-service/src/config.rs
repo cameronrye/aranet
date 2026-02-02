@@ -282,7 +282,8 @@ impl Default for SecurityConfig {
         Self {
             api_key_enabled: false,
             api_key: None,
-            rate_limit_enabled: false,
+            // Rate limiting enabled by default to prevent DoS attacks
+            rate_limit_enabled: true,
             rate_limit_requests: default_rate_limit_requests(),
             rate_limit_window_secs: default_rate_limit_window(),
         }
@@ -302,10 +303,10 @@ impl SecurityConfig {
                         message: "API key must be set when authentication is enabled".to_string(),
                     });
                 }
-                Some(key) if key.len() < 16 => {
+                Some(key) if key.len() < 32 => {
                     errors.push(ValidationError {
                         field: "security.api_key".to_string(),
-                        message: "API key must be at least 16 characters for security".to_string(),
+                        message: "API key must be at least 32 characters for security".to_string(),
                     });
                 }
                 _ => {}

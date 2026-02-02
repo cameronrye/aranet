@@ -7,7 +7,9 @@ use eframe::egui::{self, RichText};
 use super::components;
 use super::helpers::{format_pressure, format_radon, format_temperature};
 use super::theme::Theme;
-use super::types::{Co2Level, DeviceState, RadiationLevel, RadonLevel, Trend};
+use super::types::{
+    calculate_radon_averages, Co2Level, DeviceState, RadiationLevel, RadonLevel, Trend,
+};
 
 /// Render sensor readings with styled cards.
 ///
@@ -175,6 +177,59 @@ fn render_co2_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, co2: 
                 });
                 ui.add_space(theme.spacing.md);
                 components::co2_gauge(ui, theme, co2);
+
+                // Session statistics (if we have any readings tracked)
+                if device.session_stats.co2_count > 0 {
+                    ui.add_space(theme.spacing.md);
+                    ui.separator();
+                    ui.add_space(theme.spacing.sm);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Session:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.add_space(theme.spacing.md);
+                        ui.label(
+                            RichText::new("Min:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{}",
+                                device.session_stats.co2_min.unwrap_or(0)
+                            ))
+                            .color(theme.success)
+                            .size(theme.typography.caption),
+                        );
+                        ui.add_space(theme.spacing.sm);
+                        ui.label(
+                            RichText::new("Max:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{}",
+                                device.session_stats.co2_max.unwrap_or(0)
+                            ))
+                            .color(theme.danger)
+                            .size(theme.typography.caption),
+                        );
+                        ui.add_space(theme.spacing.sm);
+                        ui.label(
+                            RichText::new("Avg:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.label(
+                            RichText::new(format!("{}", device.session_stats.co2_avg().unwrap_or(0)))
+                                .color(theme.warning)
+                                .size(theme.typography.caption),
+                        );
+                    });
+                }
             });
         });
 }
@@ -221,6 +276,116 @@ fn render_radon_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, rad
                         components::status_badge(ui, theme, level.status_text(), color);
                     });
                 });
+
+                // Session statistics for radon (if we have any readings tracked)
+                if device.session_stats.radon_count > 0 {
+                    ui.add_space(theme.spacing.md);
+                    ui.separator();
+                    ui.add_space(theme.spacing.sm);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Session:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.add_space(theme.spacing.md);
+                        ui.label(
+                            RichText::new("Min:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{}",
+                                device.session_stats.radon_min.unwrap_or(0)
+                            ))
+                            .color(theme.success)
+                            .size(theme.typography.caption),
+                        );
+                        ui.add_space(theme.spacing.sm);
+                        ui.label(
+                            RichText::new("Max:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{}",
+                                device.session_stats.radon_max.unwrap_or(0)
+                            ))
+                            .color(theme.danger)
+                            .size(theme.typography.caption),
+                        );
+                        ui.add_space(theme.spacing.sm);
+                        ui.label(
+                            RichText::new("Avg:")
+                                .color(theme.text_muted)
+                                .size(theme.typography.caption),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{}",
+                                device.session_stats.radon_avg().unwrap_or(0)
+                            ))
+                            .color(theme.warning)
+                            .size(theme.typography.caption),
+                        );
+                    });
+                }
+
+                // Historical radon averages (24h, 7d, 30d) if history is available
+                if !device.history.is_empty() {
+                    let (day_avg, week_avg, month_avg) = calculate_radon_averages(&device.history);
+                    if day_avg.is_some() || week_avg.is_some() || month_avg.is_some() {
+                        ui.add_space(theme.spacing.sm);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Averages:")
+                                    .color(theme.text_muted)
+                                    .size(theme.typography.caption),
+                            );
+                            ui.add_space(theme.spacing.sm);
+                            if let Some(avg) = day_avg {
+                                ui.label(
+                                    RichText::new("24h:")
+                                        .color(theme.text_muted)
+                                        .size(theme.typography.caption),
+                                );
+                                ui.label(
+                                    RichText::new(format!("{}", avg))
+                                        .color(theme.radon_color(avg))
+                                        .size(theme.typography.caption),
+                                );
+                                ui.add_space(theme.spacing.sm);
+                            }
+                            if let Some(avg) = week_avg {
+                                ui.label(
+                                    RichText::new("7d:")
+                                        .color(theme.text_muted)
+                                        .size(theme.typography.caption),
+                                );
+                                ui.label(
+                                    RichText::new(format!("{}", avg))
+                                        .color(theme.radon_color(avg))
+                                        .size(theme.typography.caption),
+                                );
+                                ui.add_space(theme.spacing.sm);
+                            }
+                            if let Some(avg) = month_avg {
+                                ui.label(
+                                    RichText::new("30d:")
+                                        .color(theme.text_muted)
+                                        .size(theme.typography.caption),
+                                );
+                                ui.label(
+                                    RichText::new(format!("{}", avg))
+                                        .color(theme.radon_color(avg))
+                                        .size(theme.typography.caption),
+                                );
+                            }
+                        });
+                    }
+                }
             });
         });
 }

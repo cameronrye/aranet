@@ -2,8 +2,9 @@
 //!
 //! This module provides deterministic mock data for reproducible screenshots.
 
-use aranet_core::BluetoothRange;
+use aranet_core::messages::SignalQuality;
 use aranet_core::settings::DeviceSettings;
+use aranet_core::BluetoothRange;
 use aranet_types::{CurrentReading, DeviceType, HistoryRecord, Status};
 use time::{Duration, OffsetDateTime};
 
@@ -51,14 +52,19 @@ fn create_aranet4_device() -> DeviceState {
         name: Some("Aranet4 17C3C".to_string()),
         device_type: Some(DeviceType::Aranet4),
         rssi: Some(-75),
+        signal_quality: Some(SignalQuality::Fair),
         connection: ConnectionState::Connected,
         reading: Some(reading),
         previous_reading: None,
         history,
         syncing_history: false,
+        sync_progress: None,
         settings: Some(settings),
         reading_from_cache: false,
         last_sync: Some(OffsetDateTime::now_utc() - Duration::minutes(5)),
+        background_polling: None,
+        session_stats: Default::default(),
+        connected_at: Some(std::time::Instant::now()),
     }
 }
 
@@ -88,14 +94,19 @@ fn create_radon_device() -> DeviceState {
         name: Some("AranetRn+ 306B8".to_string()),
         device_type: Some(DeviceType::AranetRadon),
         rssi: Some(-77),
+        signal_quality: Some(SignalQuality::Fair),
         connection: ConnectionState::Connected,
         reading: Some(reading),
         previous_reading: None,
         history: generate_radon_history(24 * 7), // 7 days at 1-hour intervals
         syncing_history: false,
+        sync_progress: None,
         settings: None,
         reading_from_cache: false,
         last_sync: Some(OffsetDateTime::now_utc() - Duration::minutes(3)),
+        background_polling: None,
+        session_stats: Default::default(),
+        connected_at: Some(std::time::Instant::now()),
     }
 }
 

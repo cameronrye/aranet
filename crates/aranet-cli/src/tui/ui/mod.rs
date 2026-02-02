@@ -150,6 +150,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("v0.3.0 ", Style::default().fg(theme.text_muted)),
+        Span::styled("• rye.dev ", Style::default().fg(theme.text_muted)),
     ];
 
     // Connected count

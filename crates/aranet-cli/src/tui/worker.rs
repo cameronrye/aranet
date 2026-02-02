@@ -15,23 +15,25 @@
 //!
 //! All BLE operations are performed here to avoid blocking the UI rendering loop.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use aranet_core::device::{ConnectionConfig, SignalQuality};
+use aranet_core::messages::{ErrorContext, ServiceDeviceStats};
 use aranet_core::service_client::ServiceClient;
 use aranet_core::settings::{DeviceSettings, MeasurementInterval};
-use aranet_core::{BluetoothRange, Device, ScanOptions, scan::scan_with_options};
+use aranet_core::{BluetoothRange, Device, RetryConfig, ScanOptions, scan::scan_with_options, with_retry};
 use aranet_store::Store;
 use aranet_types::{CurrentReading, DeviceType};
-use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::messages::{CachedDevice, Command, SensorEvent};
-use aranet_core::messages::ServiceDeviceStats;
 
-/// Maximum time to wait for a BLE connect-and-read operation.
-const CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Background worker that handles BLE operations.
 ///
@@ -51,6 +53,16 @@ pub struct SensorWorker {
     store_path: PathBuf,
     /// Service client for aranet-service communication.
     service_client: Option<ServiceClient>,
+    /// Connection configuration (platform-optimized timeouts).
+    connection_config: ConnectionConfig,
+    /// Background polling tasks indexed by device_id.
+    /// Each entry holds a cancel token that can be used to stop the polling task.
+    background_polling: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    /// Last known signal quality per device (for adaptive behavior).
+    signal_quality_cache: Arc<RwLock<HashMap<String, SignalQuality>>>,
+    /// Cancellation token for long-running operations.
+    /// Used to cancel scans, connections, and history syncs.
+    cancel_token: CancellationToken,
 }
 
 /// Default URL for the aranet-service.
@@ -72,11 +84,22 @@ impl SensorWorker {
         // Try to create service client with default URL
         let service_client = ServiceClient::new(DEFAULT_SERVICE_URL).ok();
 
+        // Use platform-optimized connection configuration
+        let connection_config = ConnectionConfig::for_current_platform();
+        info!(
+            ?connection_config,
+            "Using platform-optimized connection config"
+        );
+
         Self {
             command_rx,
             event_tx,
             store_path,
             service_client,
+            connection_config,
+            background_polling: Arc::new(RwLock::new(HashMap::new())),
+            signal_quality_cache: Arc::new(RwLock::new(HashMap::new())),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -178,18 +201,35 @@ impl SensorWorker {
                 self.handle_set_alias(&device_id, alias).await;
             }
             Command::ForgetDevice { device_id } => {
-                // TUI doesn't fully support forget device yet, but handle the command gracefully
-                info!(
-                    device_id,
-                    "Forget device requested (not implemented in TUI)"
-                );
-                let _ = self
-                    .event_tx
-                    .send(SensorEvent::DeviceForgotten { device_id })
+                self.handle_forget_device(&device_id).await;
+            }
+            Command::CancelOperation => {
+                self.handle_cancel_operation().await;
+            }
+            Command::StartBackgroundPolling {
+                device_id,
+                interval_secs,
+            } => {
+                self.handle_start_background_polling(&device_id, interval_secs)
                     .await;
+            }
+            Command::StopBackgroundPolling { device_id } => {
+                self.handle_stop_background_polling(&device_id).await;
             }
             Command::Shutdown => {
                 // Handled in run() loop
+            }
+            // System service commands not supported in TUI
+            Command::InstallSystemService { .. }
+            | Command::UninstallSystemService { .. }
+            | Command::StartSystemService { .. }
+            | Command::StopSystemService { .. }
+            | Command::CheckSystemServiceStatus { .. }
+            | Command::FetchServiceConfig
+            | Command::AddServiceDevice { .. }
+            | Command::UpdateServiceDevice { .. }
+            | Command::RemoveServiceDevice { .. } => {
+                info!("System service commands not supported in TUI");
             }
         }
     }
@@ -298,9 +338,26 @@ impl SensorWorker {
             return;
         }
 
-        // Perform the scan
+        // Clone the cancel token for this operation
+        let cancel_token = self.cancel_token.clone();
+
+        // Perform the scan with cancellation support
         let options = ScanOptions::default().duration(duration);
-        match scan_with_options(options).await {
+        let scan_result = tokio::select! {
+            result = scan_with_options(options) => result,
+            _ = cancel_token.cancelled() => {
+                info!("Scan cancelled by user");
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::OperationCancelled {
+                        operation: "Device scan".to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        match scan_result {
             Ok(devices) => {
                 info!(count = devices.len(), "Scan complete");
 
@@ -330,7 +387,7 @@ impl SensorWorker {
         }
     }
 
-    /// Handle a connect command.
+    /// Handle a connect command with retry logic and error context.
     async fn handle_connect(&self, device_id: &str) {
         info!(device_id, "Connecting to device");
 
@@ -346,9 +403,63 @@ impl SensorWorker {
             return;
         }
 
-        match timeout(CONNECT_READ_TIMEOUT, self.connect_and_read(device_id)).await {
-            Ok(Ok((name, device_type, reading, settings, rssi))) => {
-                info!(device_id, ?name, ?device_type, ?rssi, "Device connected");
+        // Clone the cancel token for this operation
+        let cancel_token = self.cancel_token.clone();
+
+        // Use retry logic for connection (connection can fail due to timing, signal, etc.)
+        let retry_config = RetryConfig::for_connect();
+        let device_id_owned = device_id.to_string();
+        let config = self.connection_config.clone();
+
+        let connect_future = with_retry(&retry_config, "connect_and_read", || {
+            let device_id = device_id_owned.clone();
+            let config = config.clone();
+            async move { Self::connect_and_read_with_config(&device_id, config).await }
+        });
+
+        // Wrap in select for cancellation support
+        let result = tokio::select! {
+            result = connect_future => result,
+            _ = cancel_token.cancelled() => {
+                info!(device_id, "Connection cancelled by user");
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::OperationCancelled {
+                        operation: format!("Connect to {}", device_id),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        match result {
+            Ok((name, device_type, reading, settings, rssi, signal_quality)) => {
+                info!(device_id, ?name, ?device_type, ?rssi, ?signal_quality, "Device connected");
+
+                // Cache signal quality for adaptive behavior
+                if let Some(quality) = signal_quality {
+                    self.signal_quality_cache
+                        .write()
+                        .await
+                        .insert(device_id.to_string(), quality);
+
+                    // Send signal strength update
+                    if let Some(rssi_val) = rssi {
+                        let _ = self
+                            .event_tx
+                            .send(SensorEvent::SignalStrengthUpdate {
+                                device_id: device_id.to_string(),
+                                rssi: rssi_val,
+                                quality: aranet_core::messages::SignalQuality::from_rssi(rssi_val),
+                            })
+                            .await;
+                    }
+
+                    // Warn about poor signal quality
+                    if quality == SignalQuality::Poor {
+                        warn!(device_id, "Poor signal quality - connection may be unstable");
+                    }
+                }
 
                 // Update device metadata in store
                 self.update_device_metadata(device_id, name.as_deref(), device_type);
@@ -400,30 +511,16 @@ impl SensorWorker {
                 // Load history for sparklines
                 self.load_and_send_history(device_id).await;
             }
-            Ok(Err(e)) => {
-                error!(device_id, error = %e, "Failed to connect to device");
+            Err(e) => {
+                error!(device_id, error = %e, "Failed to connect to device after retries");
+                // Populate error context with user-friendly information
+                let context = ErrorContext::from_error(&e);
                 if let Err(send_err) = self
                     .event_tx
                     .send(SensorEvent::ConnectionError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
-                    })
-                    .await
-                {
-                    error!("Failed to send ConnectionError event: {}", send_err);
-                }
-            }
-            Err(_) => {
-                // Timeout expired
-                error!(device_id, "Connection timed out");
-                if let Err(send_err) = self
-                    .event_tx
-                    .send(SensorEvent::ConnectionError {
-                        device_id: device_id.to_string(),
-                        error: format!(
-                            "Connection timed out after {}s",
-                            CONNECT_READ_TIMEOUT.as_secs()
-                        ),
+                        context: Some(context),
                     })
                     .await
                 {
@@ -453,12 +550,54 @@ impl SensorWorker {
         }
     }
 
-    /// Handle a refresh reading command.
+    /// Handle a refresh reading command with retry logic and adaptive timing.
     async fn handle_refresh_reading(&self, device_id: &str) {
         info!(device_id, "Refreshing reading for device");
 
-        match timeout(CONNECT_READ_TIMEOUT, self.connect_and_read(device_id)).await {
-            Ok(Ok((_, _, reading, settings, _rssi))) => {
+        // Get cached signal quality for adaptive retry configuration
+        let signal_quality = self.signal_quality_cache.read().await.get(device_id).copied();
+
+        // Use more aggressive retries for devices with known poor signal
+        let retry_config = match signal_quality {
+            Some(SignalQuality::Poor) | Some(SignalQuality::Fair) => {
+                debug!(device_id, ?signal_quality, "Using aggressive retry config for weak signal");
+                RetryConfig::aggressive()
+            }
+            _ => RetryConfig::for_read(),
+        };
+
+        let device_id_owned = device_id.to_string();
+        let config = self.connection_config.clone();
+
+        let result = with_retry(&retry_config, "refresh_reading", || {
+            let device_id = device_id_owned.clone();
+            let config = config.clone();
+            async move { Self::connect_and_read_with_config(&device_id, config).await }
+        })
+        .await;
+
+        match result {
+            Ok((_, _, reading, settings, rssi, new_signal_quality)) => {
+                // Update cached signal quality
+                if let Some(quality) = new_signal_quality {
+                    self.signal_quality_cache
+                        .write()
+                        .await
+                        .insert(device_id.to_string(), quality);
+                }
+
+                // Send signal strength update if available
+                if let Some(rssi_val) = rssi {
+                    let _ = self
+                        .event_tx
+                        .send(SensorEvent::SignalStrengthUpdate {
+                            device_id: device_id.to_string(),
+                            rssi: rssi_val,
+                            quality: aranet_core::messages::SignalQuality::from_rssi(rssi_val),
+                        })
+                        .await;
+                }
+
                 // Send settings if we got them
                 if let Some(settings) = settings
                     && let Err(e) = self
@@ -490,11 +629,16 @@ impl SensorWorker {
                     }
                 } else {
                     warn!(device_id, "Connected but failed to read current values");
+                    let context = ErrorContext::transient(
+                        "Failed to read current values",
+                        "Device connected but returned no data. Try again.",
+                    );
                     if let Err(e) = self
                         .event_tx
                         .send(SensorEvent::ReadingError {
                             device_id: device_id.to_string(),
                             error: "Failed to read current values".to_string(),
+                            context: Some(context),
                         })
                         .await
                     {
@@ -502,30 +646,15 @@ impl SensorWorker {
                     }
                 }
             }
-            Ok(Err(e)) => {
-                error!(device_id, error = %e, "Failed to refresh reading");
+            Err(e) => {
+                error!(device_id, error = %e, "Failed to refresh reading after retries");
+                let context = ErrorContext::from_error(&e);
                 if let Err(send_err) = self
                     .event_tx
                     .send(SensorEvent::ReadingError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
-                    })
-                    .await
-                {
-                    error!("Failed to send ReadingError event: {}", send_err);
-                }
-            }
-            Err(_) => {
-                // Timeout expired
-                error!(device_id, "Refresh reading timed out");
-                if let Err(send_err) = self
-                    .event_tx
-                    .send(SensorEvent::ReadingError {
-                        device_id: device_id.to_string(),
-                        error: format!(
-                            "Refresh timed out after {}s",
-                            CONNECT_READ_TIMEOUT.as_secs()
-                        ),
+                        context: Some(context),
                     })
                     .await
                 {
@@ -563,7 +692,7 @@ impl SensorWorker {
         info!("Completed refreshing all devices");
     }
 
-    /// Handle a set interval command.
+    /// Handle a set interval command with retry logic and error context.
     ///
     /// Connects to the device, sets the measurement interval, and sends
     /// the appropriate event back to the UI.
@@ -579,42 +708,63 @@ impl SensorWorker {
                     interval_secs
                 );
                 error!(device_id, %error, "Invalid interval value");
+                let context = ErrorContext::permanent(&error);
                 let _ = self
                     .event_tx
                     .send(SensorEvent::IntervalError {
                         device_id: device_id.to_string(),
                         error,
+                        context: Some(context),
                     })
                     .await;
                 return;
             }
         };
 
-        // Connect to the device
-        let device = match Device::connect(device_id).await {
+        // Connect to the device with retry
+        let retry_config = RetryConfig::for_connect();
+        let device_id_owned = device_id.to_string();
+        let config = self.connection_config.clone();
+
+        let device = match with_retry(&retry_config, "connect_for_interval", || {
+            let device_id = device_id_owned.clone();
+            let config = config.clone();
+            async move { Device::connect_with_config(&device_id, config).await }
+        })
+        .await
+        {
             Ok(d) => d,
             Err(e) => {
                 error!(device_id, error = %e, "Failed to connect for set interval");
+                let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
                     .send(SensorEvent::IntervalError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
+                        context: Some(context),
                     })
                     .await;
                 return;
             }
         };
 
-        // Set the interval
-        if let Err(e) = device.set_interval(interval).await {
+        // Set the interval with retry
+        let retry_config = RetryConfig::for_write();
+        if let Err(e) = with_retry(&retry_config, "set_interval", || async {
+            device.set_interval(interval).await
+        })
+        .await
+        {
             error!(device_id, error = %e, "Failed to set interval");
             let _ = device.disconnect().await;
+            let context = ErrorContext::from_error(&e);
             let _ = self
                 .event_tx
                 .send(SensorEvent::IntervalError {
                     device_id: device_id.to_string(),
                     error: e.to_string(),
+                    context: Some(context),
                 })
                 .await;
             return;
@@ -643,21 +793,33 @@ impl SensorWorker {
         }
     }
 
-    /// Handle a set bluetooth range command.
+    /// Handle a set bluetooth range command with retry logic and error context.
     async fn handle_set_bluetooth_range(&self, device_id: &str, extended: bool) {
         let range_name = if extended { "Extended" } else { "Standard" };
         info!(device_id, range_name, "Setting Bluetooth range");
 
-        // Connect to the device
-        let device = match Device::connect(device_id).await {
+        // Connect to the device with retry
+        let retry_config = RetryConfig::for_connect();
+        let device_id_owned = device_id.to_string();
+        let config = self.connection_config.clone();
+
+        let device = match with_retry(&retry_config, "connect_for_bt_range", || {
+            let device_id = device_id_owned.clone();
+            let config = config.clone();
+            async move { Device::connect_with_config(&device_id, config).await }
+        })
+        .await
+        {
             Ok(d) => d,
             Err(e) => {
                 error!(device_id, error = %e, "Failed to connect for set Bluetooth range");
+                let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
                     .send(SensorEvent::BluetoothRangeError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
+                        context: Some(context),
                     })
                     .await;
                 return;
@@ -671,14 +833,22 @@ impl SensorWorker {
             BluetoothRange::Standard
         };
 
-        if let Err(e) = device.set_bluetooth_range(range).await {
+        // Set range with retry
+        let retry_config = RetryConfig::for_write();
+        if let Err(e) = with_retry(&retry_config, "set_bt_range", || async {
+            device.set_bluetooth_range(range).await
+        })
+        .await
+        {
             error!(device_id, error = %e, "Failed to set Bluetooth range");
             let _ = device.disconnect().await;
+            let context = ErrorContext::from_error(&e);
             let _ = self
                 .event_tx
                 .send(SensorEvent::BluetoothRangeError {
                     device_id: device_id.to_string(),
                     error: e.to_string(),
+                    context: Some(context),
                 })
                 .await;
             return;
@@ -704,36 +874,55 @@ impl SensorWorker {
         }
     }
 
-    /// Handle a set smart home command.
+    /// Handle a set smart home command with retry logic and error context.
     async fn handle_set_smart_home(&self, device_id: &str, enabled: bool) {
         let mode = if enabled { "enabled" } else { "disabled" };
         info!(device_id, mode, "Setting Smart Home");
 
-        // Connect to the device
-        let device = match Device::connect(device_id).await {
+        // Connect to the device with retry
+        let retry_config = RetryConfig::for_connect();
+        let device_id_owned = device_id.to_string();
+        let config = self.connection_config.clone();
+
+        let device = match with_retry(&retry_config, "connect_for_smart_home", || {
+            let device_id = device_id_owned.clone();
+            let config = config.clone();
+            async move { Device::connect_with_config(&device_id, config).await }
+        })
+        .await
+        {
             Ok(d) => d,
             Err(e) => {
                 error!(device_id, error = %e, "Failed to connect for set Smart Home");
+                let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
                     .send(SensorEvent::SmartHomeError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
+                        context: Some(context),
                     })
                     .await;
                 return;
             }
         };
 
-        // Set Smart Home mode
-        if let Err(e) = device.set_smart_home(enabled).await {
+        // Set Smart Home mode with retry
+        let retry_config = RetryConfig::for_write();
+        if let Err(e) = with_retry(&retry_config, "set_smart_home", || async {
+            device.set_smart_home(enabled).await
+        })
+        .await
+        {
             error!(device_id, error = %e, "Failed to set Smart Home");
             let _ = device.disconnect().await;
+            let context = ErrorContext::from_error(&e);
             let _ = self
                 .event_tx
                 .send(SensorEvent::SmartHomeError {
                     device_id: device_id.to_string(),
                     error: e.to_string(),
+                    context: Some(context),
                 })
                 .await;
             return;
@@ -759,13 +948,16 @@ impl SensorWorker {
         }
     }
 
-    /// Connect to a device and read its current values.
+    /// Connect to a device and read its current values with custom configuration.
     ///
-    /// Returns the device name, type, current reading, settings, and RSSI if successful.
+    /// This is a static method that doesn't require `&self`, making it suitable
+    /// for use with retry closures.
+    ///
+    /// Returns the device name, type, current reading, settings, RSSI, and signal quality.
     /// The device is disconnected after reading.
-    async fn connect_and_read(
-        &self,
+    async fn connect_and_read_with_config(
         device_id: &str,
+        config: ConnectionConfig,
     ) -> Result<
         (
             Option<String>,
@@ -773,13 +965,39 @@ impl SensorWorker {
             Option<CurrentReading>,
             Option<DeviceSettings>,
             Option<i16>,
+            Option<SignalQuality>,
         ),
         aranet_core::Error,
     > {
-        let device = Device::connect(device_id).await?;
+        let device = Device::connect_with_config(device_id, config).await?;
+
+        // Validate connection is truly alive (especially important on macOS)
+        if !device.validate_connection().await {
+            warn!(device_id, "Connection validation failed - device may be out of range");
+            let _ = device.disconnect().await;
+            return Err(aranet_core::Error::NotConnected);
+        }
+        debug!(device_id, "Connection validated successfully");
 
         let name = device.name().map(String::from);
         let device_type = device.device_type();
+
+        // Read RSSI and determine signal quality for adaptive behavior
+        let rssi = device.read_rssi().await.ok();
+        let signal_quality = rssi.map(SignalQuality::from_rssi);
+
+        if let Some(quality) = signal_quality {
+            debug!(device_id, ?quality, rssi = ?rssi, "Signal quality assessed");
+        }
+
+        // Add adaptive delay for weak signals before reading
+        if let Some(quality) = signal_quality {
+            let delay = quality.recommended_read_delay();
+            if delay > Duration::from_millis(50) {
+                debug!(device_id, ?delay, "Adding read delay for signal quality");
+                tokio::time::sleep(delay).await;
+            }
+        }
 
         // Try to read current values
         let reading = match device.read_current().await {
@@ -805,14 +1023,34 @@ impl SensorWorker {
             }
         };
 
-        // Try to read RSSI signal strength
-        let rssi = device.read_rssi().await.ok();
-
         // Disconnect from the device
         if let Err(e) = device.disconnect().await {
             warn!(device_id, error = %e, "Failed to disconnect from device");
         }
 
+        Ok((name, device_type, reading, settings, rssi, signal_quality))
+    }
+
+    /// Connect to a device and read its current values (legacy method).
+    ///
+    /// Returns the device name, type, current reading, settings, and RSSI if successful.
+    /// The device is disconnected after reading.
+    #[allow(dead_code)]
+    async fn connect_and_read(
+        &self,
+        device_id: &str,
+    ) -> Result<
+        (
+            Option<String>,
+            Option<DeviceType>,
+            Option<CurrentReading>,
+            Option<DeviceSettings>,
+            Option<i16>,
+        ),
+        aranet_core::Error,
+    > {
+        let (name, device_type, reading, settings, rssi, _signal_quality) =
+            Self::connect_and_read_with_config(device_id, self.connection_config.clone()).await?;
         Ok((name, device_type, reading, settings, rssi))
     }
 
@@ -932,50 +1170,72 @@ impl SensorWorker {
     /// Sync history from device (download via BLE and save to store).
     ///
     /// Uses incremental sync - only downloads new records since the last sync.
+    /// Includes retry logic and progress reporting.
     async fn handle_sync_history(&self, device_id: &str) {
         use aranet_core::history::HistoryOptions;
 
         info!(device_id, "Syncing history from device");
 
-        // Notify UI that sync is starting
-        if let Err(e) = self
-            .event_tx
-            .send(SensorEvent::HistorySyncStarted {
-                device_id: device_id.to_string(),
-            })
-            .await
-        {
-            error!("Failed to send HistorySyncStarted event: {}", e);
-            return;
-        }
-
         // Open store first to check sync state
         let Some(store) = self.open_store() else {
+            let context = ErrorContext::permanent("Failed to open local database");
             let _ = self
                 .event_tx
                 .send(SensorEvent::HistorySyncError {
                     device_id: device_id.to_string(),
                     error: "Failed to open store".to_string(),
+                    context: Some(context),
                 })
                 .await;
             return;
         };
 
-        // Connect to the device
-        let device = match Device::connect(device_id).await {
+        // Connect to the device with retry logic
+        let retry_config = RetryConfig::for_connect();
+        let device_id_owned = device_id.to_string();
+        let config = self.connection_config.clone();
+
+        let device = match with_retry(&retry_config, "connect_for_history", || {
+            let device_id = device_id_owned.clone();
+            let config = config.clone();
+            async move { Device::connect_with_config(&device_id, config).await }
+        })
+        .await
+        {
             Ok(d) => d,
             Err(e) => {
                 error!(device_id, error = %e, "Failed to connect for history sync");
+                let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
                     .send(SensorEvent::HistorySyncError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
+                        context: Some(context),
                     })
                     .await;
                 return;
             }
         };
+
+        // Validate connection
+        if !device.validate_connection().await {
+            warn!(device_id, "Connection validation failed for history sync");
+            let _ = device.disconnect().await;
+            let context = ErrorContext::transient(
+                "Connection validation failed",
+                "Device connected but is not responding. Try moving closer.",
+            );
+            let _ = self
+                .event_tx
+                .send(SensorEvent::HistorySyncError {
+                    device_id: device_id.to_string(),
+                    error: "Connection validation failed".to_string(),
+                    context: Some(context),
+                })
+                .await;
+            return;
+        }
 
         // Get history info to know how many records are on the device
         let history_info = match device.get_history_info().await {
@@ -983,11 +1243,13 @@ impl SensorWorker {
             Err(e) => {
                 error!(device_id, error = %e, "Failed to get history info");
                 let _ = device.disconnect().await;
+                let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
                     .send(SensorEvent::HistorySyncError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
+                        context: Some(context),
                     })
                     .await;
                 return;
@@ -1030,23 +1292,116 @@ impl SensorWorker {
             "Downloading history (incremental sync)"
         );
 
+        // Notify UI that sync is starting with total count
+        if let Err(e) = self
+            .event_tx
+            .send(SensorEvent::HistorySyncStarted {
+                device_id: device_id.to_string(),
+                total_records: Some(records_to_download),
+            })
+            .await
+        {
+            error!("Failed to send HistorySyncStarted event: {}", e);
+        }
+
         // Download history with start_index for incremental sync
+        // Use adaptive read delay based on signal quality
+        let signal_quality = self.signal_quality_cache.read().await.get(device_id).copied();
+        let read_delay = signal_quality
+            .map(|q| q.recommended_read_delay())
+            .unwrap_or(Duration::from_millis(50));
+
         let history_options = HistoryOptions {
             start_index: Some(start_index),
             end_index: None, // Download to the end
+            read_delay,
+            use_adaptive_delay: true, // Use adaptive delay based on signal quality
             ..Default::default()
         };
 
-        let records = match device.download_history_with_options(history_options).await {
-            Ok(r) => r,
+        // Send periodic progress updates during download
+        let event_tx = self.event_tx.clone();
+        let device_id_for_progress = device_id.to_string();
+        let total = records_to_download as usize;
+
+        // Create a progress callback
+        let last_progress_update = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_progress_clone = last_progress_update.clone();
+
+        // Spawn a task to send progress updates every 10 records or 500ms
+        let progress_task = {
+            let event_tx = event_tx.clone();
+            let device_id = device_id_for_progress.clone();
+            tokio::spawn(async move {
+                let mut interval = interval(Duration::from_millis(500));
+                loop {
+                    interval.tick().await;
+                    let downloaded = last_progress_clone.load(std::sync::atomic::Ordering::Relaxed);
+                    if downloaded > 0 && downloaded < total {
+                        let _ = event_tx
+                            .send(SensorEvent::HistorySyncProgress {
+                                device_id: device_id.clone(),
+                                downloaded,
+                                total,
+                            })
+                            .await;
+                    }
+                    if downloaded >= total {
+                        break;
+                    }
+                }
+            })
+        };
+
+        // Clone the cancel token for this operation
+        let cancel_token = self.cancel_token.clone();
+
+        // Download with retry for the actual download operation
+        let retry_config = RetryConfig::for_history();
+        let download_future = with_retry(&retry_config, "download_history", || {
+            let options = history_options.clone();
+            let progress = last_progress_update.clone();
+            let device = &device;
+            async move {
+                let records = device.download_history_with_options(options).await?;
+                progress.store(records.len(), std::sync::atomic::Ordering::Relaxed);
+                Ok(records)
+            }
+        });
+
+        // Wrap download in select for cancellation support
+        let download_result = tokio::select! {
+            result = download_future => result,
+            _ = cancel_token.cancelled() => {
+                progress_task.abort();
+                info!(device_id, "History sync cancelled by user");
+                let _ = device.disconnect().await;
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::OperationCancelled {
+                        operation: format!("History sync for {}", device_id),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let records = match download_result {
+            Ok(r) => {
+                progress_task.abort();
+                r
+            }
             Err(e) => {
+                progress_task.abort();
                 error!(device_id, error = %e, "Failed to download history");
                 let _ = device.disconnect().await;
+                let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
                     .send(SensorEvent::HistorySyncError {
                         device_id: device_id.to_string(),
                         error: e.to_string(),
+                        context: Some(context),
                     })
                     .await;
                 return;
@@ -1060,19 +1415,40 @@ impl SensorWorker {
             "Downloaded history from device"
         );
 
+        // Send final progress update
+        let _ = self
+            .event_tx
+            .send(SensorEvent::HistorySyncProgress {
+                device_id: device_id.to_string(),
+                downloaded: record_count,
+                total,
+            })
+            .await;
+
         // Disconnect from device
         let _ = device.disconnect().await;
 
         // Insert history to store (with deduplication)
-        if let Err(e) = store.insert_history(device_id, &records) {
-            warn!(device_id, error = %e, "Failed to save history to store");
-        } else {
-            debug!(device_id, count = record_count, "History saved to store");
-        }
+        // Only update sync state if insert succeeds to avoid data loss on next sync
+        match store.insert_history(device_id, &records) {
+            Ok(inserted) => {
+                debug!(
+                    device_id,
+                    downloaded = record_count,
+                    inserted,
+                    "History saved to store"
+                );
 
-        // Update sync state for next incremental sync
-        if let Err(e) = store.update_sync_state(device_id, total_on_device, total_on_device) {
-            warn!(device_id, error = %e, "Failed to update sync state");
+                // Update sync state for next incremental sync
+                if let Err(e) =
+                    store.update_sync_state(device_id, total_on_device, total_on_device)
+                {
+                    warn!(device_id, error = %e, "Failed to update sync state");
+                }
+            }
+            Err(e) => {
+                warn!(device_id, error = %e, "Failed to save history to store - sync state not updated");
+            }
         }
 
         // Notify UI that sync is complete
@@ -1265,6 +1641,249 @@ impl SensorWorker {
                     })
                     .await;
             }
+        }
+    }
+
+    /// Start background polling for a device.
+    ///
+    /// Spawns a background task that periodically reads from the device
+    /// and sends updates to the UI. The task can be cancelled by calling
+    /// `handle_stop_background_polling`.
+    async fn handle_start_background_polling(&self, device_id: &str, interval_secs: u64) {
+        info!(device_id, interval_secs, "Starting background polling");
+
+        // Check if already polling this device
+        {
+            let polling = self.background_polling.read().await;
+            if polling.contains_key(device_id) {
+                warn!(device_id, "Background polling already active for device");
+                return;
+            }
+        }
+
+        // Create a cancel channel
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+
+        // Store the cancel sender
+        {
+            let mut polling = self.background_polling.write().await;
+            polling.insert(device_id.to_string(), cancel_tx);
+        }
+
+        // Clone necessary data for the spawned task
+        let device_id_owned = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let config = self.connection_config.clone();
+        let signal_quality_cache = self.signal_quality_cache.clone();
+        let store_path = self.store_path.clone();
+        let polling_interval = Duration::from_secs(interval_secs);
+
+        // Notify UI that polling has started
+        let _ = event_tx
+            .send(SensorEvent::BackgroundPollingStarted {
+                device_id: device_id.to_string(),
+                interval_secs,
+            })
+            .await;
+
+        // Spawn the polling task
+        tokio::spawn(async move {
+            let mut interval_timer = interval(polling_interval);
+            // Skip the first immediate tick
+            interval_timer.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            info!(device_id = %device_id_owned, "Background polling cancelled");
+                            break;
+                        }
+                    }
+                    _ = interval_timer.tick() => {
+                        debug!(device_id = %device_id_owned, "Background poll tick");
+
+                        // Get cached signal quality for adaptive behavior
+                        let signal_quality = signal_quality_cache.read().await.get(&device_id_owned).copied();
+
+                        // Use more aggressive retries for devices with known poor signal
+                        let retry_config = match signal_quality {
+                            Some(SignalQuality::Poor) | Some(SignalQuality::Fair) => {
+                                RetryConfig::aggressive()
+                            }
+                            _ => RetryConfig::for_read(),
+                        };
+
+                        // Attempt to read
+                        match with_retry(&retry_config, "background_poll", || {
+                            let device_id = device_id_owned.clone();
+                            let config = config.clone();
+                            async move {
+                                Self::connect_and_read_with_config(&device_id, config).await
+                            }
+                        })
+                        .await
+                        {
+                            Ok((_, _, reading, _, rssi, new_signal_quality)) => {
+                                // Update cached signal quality
+                                if let Some(quality) = new_signal_quality {
+                                    signal_quality_cache
+                                        .write()
+                                        .await
+                                        .insert(device_id_owned.clone(), quality);
+                                }
+
+                                // Send signal strength update if available
+                                if let Some(rssi_val) = rssi {
+                                    let _ = event_tx
+                                        .send(SensorEvent::SignalStrengthUpdate {
+                                            device_id: device_id_owned.clone(),
+                                            rssi: rssi_val,
+                                            quality: aranet_core::messages::SignalQuality::from_rssi(rssi_val),
+                                        })
+                                        .await;
+                                }
+
+                                if let Some(reading) = reading {
+                                    debug!(device_id = %device_id_owned, "Background poll successful");
+
+                                    // Save to store
+                                    if let Ok(store) = Store::open(&store_path) {
+                                        if let Err(e) = store.insert_reading(&device_id_owned, &reading) {
+                                            warn!(device_id = %device_id_owned, error = %e, "Failed to save background reading to store");
+                                        }
+                                    }
+
+                                    // Send reading update
+                                    let _ = event_tx
+                                        .send(SensorEvent::ReadingUpdated {
+                                            device_id: device_id_owned.clone(),
+                                            reading,
+                                        })
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(device_id = %device_id_owned, error = %e, "Background poll failed");
+                                let context = ErrorContext::from_error(&e);
+                                let _ = event_tx
+                                    .send(SensorEvent::ReadingError {
+                                        device_id: device_id_owned.clone(),
+                                        error: e.to_string(),
+                                        context: Some(context),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Notify UI that polling has stopped
+            let _ = event_tx
+                .send(SensorEvent::BackgroundPollingStopped {
+                    device_id: device_id_owned,
+                })
+                .await;
+        });
+
+        info!(device_id, "Background polling task spawned");
+    }
+
+    /// Cancel any currently running long-running operation (scan, connect, history sync).
+    ///
+    /// This method cancels the current cancellation token and creates a new one
+    /// for future operations.
+    async fn handle_cancel_operation(&mut self) {
+        info!("Cancelling current operation");
+
+        // Cancel the current token
+        self.cancel_token.cancel();
+
+        // Create a new token for future operations
+        self.cancel_token = CancellationToken::new();
+
+        // Notify the UI that the operation was cancelled
+        let _ = self
+            .event_tx
+            .send(SensorEvent::OperationCancelled {
+                operation: "Current operation".to_string(),
+            })
+            .await;
+    }
+
+    /// Forget (remove) a device from the store and stop any associated polling.
+    async fn handle_forget_device(&self, device_id: &str) {
+        info!(device_id, "Forgetting device");
+
+        // Stop any background polling for this device
+        {
+            let mut polling = self.background_polling.write().await;
+            if let Some(cancel_tx) = polling.remove(device_id) {
+                let _ = cancel_tx.send(true);
+                info!(device_id, "Stopped background polling for forgotten device");
+            }
+        }
+
+        // Clear signal quality cache for this device
+        {
+            let mut cache = self.signal_quality_cache.write().await;
+            cache.remove(device_id);
+        }
+
+        // Try to delete from the store
+        let Some(store) = self.open_store() else {
+            let _ = self
+                .event_tx
+                .send(SensorEvent::ForgetDeviceError {
+                    device_id: device_id.to_string(),
+                    error: "Could not open database".to_string(),
+                })
+                .await;
+            return;
+        };
+
+        match store.delete_device(device_id) {
+            Ok(deleted) => {
+                if deleted {
+                    info!(device_id, "Device forgotten (deleted from store)");
+                } else {
+                    info!(
+                        device_id,
+                        "Device not found in store (removing from UI only)"
+                    );
+                }
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::DeviceForgotten {
+                        device_id: device_id.to_string(),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                error!(device_id, error = %e, "Failed to forget device");
+                let _ = self
+                    .event_tx
+                    .send(SensorEvent::ForgetDeviceError {
+                        device_id: device_id.to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Stop background polling for a device.
+    async fn handle_stop_background_polling(&self, device_id: &str) {
+        info!(device_id, "Stopping background polling");
+
+        let mut polling = self.background_polling.write().await;
+        if let Some(cancel_tx) = polling.remove(device_id) {
+            // Signal the task to stop
+            let _ = cancel_tx.send(true);
+            info!(device_id, "Background polling stop signal sent");
+        } else {
+            warn!(device_id, "No active background polling found for device");
         }
     }
 }

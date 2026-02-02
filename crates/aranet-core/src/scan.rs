@@ -66,6 +66,9 @@ pub struct ScanOptions {
     pub duration: Duration,
     /// Only return devices that appear to be Aranet devices.
     pub filter_aranet_only: bool,
+    /// Use targeted BLE scan filter for Aranet service UUIDs.
+    /// This reduces noise from non-Aranet devices but may not work on all platforms.
+    pub use_service_filter: bool,
 }
 
 impl Default for ScanOptions {
@@ -73,6 +76,9 @@ impl Default for ScanOptions {
         Self {
             duration: Duration::from_secs(5),
             filter_aranet_only: true,
+            // Default to false for maximum compatibility - service filtering
+            // may not work on all platforms/adapters
+            use_service_filter: false,
         }
     }
 }
@@ -104,6 +110,29 @@ impl ScanOptions {
     /// Scan for all BLE devices, not just Aranet.
     pub fn all_devices(self) -> Self {
         self.filter_aranet_only(false)
+    }
+
+    /// Enable or disable BLE service UUID filtering.
+    ///
+    /// When enabled, the BLE scan will filter for Aranet service UUIDs at the
+    /// adapter level, reducing noise from non-Aranet devices. This may not
+    /// work on all platforms or with all BLE adapters.
+    ///
+    /// Default: `false` (for maximum compatibility)
+    pub fn use_service_filter(mut self, enable: bool) -> Self {
+        self.use_service_filter = enable;
+        self
+    }
+
+    /// Create optimized scan options for finding Aranet devices quickly.
+    ///
+    /// Uses service UUID filtering if available and a shorter scan duration.
+    pub fn optimized() -> Self {
+        Self {
+            duration: Duration::from_secs(3),
+            filter_aranet_only: true,
+            use_service_filter: true,
+        }
     }
 }
 
@@ -203,12 +232,22 @@ pub async fn scan_with_adapter(
     options: ScanOptions,
 ) -> Result<Vec<DiscoveredDevice>> {
     info!(
-        "Starting BLE scan for {} seconds...",
-        options.duration.as_secs()
+        "Starting BLE scan for {} seconds (service_filter={})...",
+        options.duration.as_secs(),
+        options.use_service_filter
     );
 
+    // Create scan filter - optionally filter for Aranet service UUIDs
+    let scan_filter = if options.use_service_filter {
+        ScanFilter {
+            services: vec![SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD],
+        }
+    } else {
+        ScanFilter::default()
+    };
+
     // Start scanning
-    adapter.start_scan(ScanFilter::default()).await?;
+    adapter.start_scan(scan_filter).await?;
 
     // Wait for the scan duration
     sleep(options.duration).await;

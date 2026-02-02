@@ -88,6 +88,177 @@ impl RetryConfig {
         }
     }
 
+    // ==================== Per-Operation Presets ====================
+    //
+    // Different operations have different characteristics and should
+    // be retried differently:
+    //
+    // - Scan: Fast retries, BLE scanning often needs multiple attempts
+    // - Connect: Patient retries, device may be busy or waking up
+    // - Read: Standard retries, transient BLE errors
+    // - Write: Careful retries, writes can fail transiently
+    // - History: Persistent retries, long operation, save progress
+
+    /// Retry configuration optimized for device scanning.
+    ///
+    /// Scanning often requires multiple attempts due to:
+    /// - BLE adapter warm-up
+    /// - Devices advertising at intervals (Aranet ~4s)
+    /// - RF interference
+    ///
+    /// Uses aggressive, fast retries with short delays.
+    pub fn for_scan() -> Self {
+        Self {
+            max_retries: 5,
+            initial_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(2),
+            backoff_multiplier: 1.5,
+            jitter: true,
+        }
+    }
+
+    /// Retry configuration optimized for device connection.
+    ///
+    /// Connections may fail due to:
+    /// - Device busy with another central
+    /// - Device in low-power mode (slower wake-up)
+    /// - Signal strength variations
+    ///
+    /// Uses patient retries with longer delays to allow device recovery.
+    pub fn for_connect() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            backoff_multiplier: 2.0,
+            jitter: true,
+        }
+    }
+
+    /// Retry configuration optimized for characteristic reads.
+    ///
+    /// Reads may fail due to:
+    /// - Transient BLE errors
+    /// - Connection instability
+    /// - Device processing delay
+    ///
+    /// Uses standard retries suitable for most read operations.
+    pub fn for_read() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(2),
+            backoff_multiplier: 2.0,
+            jitter: true,
+        }
+    }
+
+    /// Retry configuration optimized for characteristic writes.
+    ///
+    /// Writes may fail due to:
+    /// - BLE transmission errors
+    /// - Device busy processing previous write
+    /// - Connection instability
+    ///
+    /// Uses careful retries with moderate delays.
+    pub fn for_write() -> Self {
+        Self {
+            max_retries: 2,
+            initial_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(3),
+            backoff_multiplier: 2.0,
+            jitter: true,
+        }
+    }
+
+    /// Retry configuration optimized for history downloads.
+    ///
+    /// History downloads are long-running operations that may fail due to:
+    /// - Connection drops during extended transfer
+    /// - Device timeout during large transfers
+    /// - BLE congestion from repeated reads
+    ///
+    /// Uses persistent retries with longer delays, designed to work
+    /// with checkpoint-based resumption for large downloads.
+    pub fn for_history() -> Self {
+        Self {
+            max_retries: 5,
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(15),
+            backoff_multiplier: 2.0,
+            jitter: true,
+        }
+    }
+
+    /// Retry configuration optimized for reconnection attempts.
+    ///
+    /// After a connection loss, the device may need time to:
+    /// - Reset its BLE state
+    /// - Complete other operations
+    /// - Recover from low-power mode
+    ///
+    /// Uses very patient retries with long delays.
+    pub fn for_reconnect() -> Self {
+        Self {
+            max_retries: 5,
+            initial_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+            jitter: true,
+        }
+    }
+
+    /// Retry configuration for quick, time-sensitive operations.
+    ///
+    /// For operations where speed is more important than reliability,
+    /// uses minimal retries with very short delays.
+    pub fn quick() -> Self {
+        Self {
+            max_retries: 2,
+            initial_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(500),
+            backoff_multiplier: 2.0,
+            jitter: false,
+        }
+    }
+
+    // ==================== Builder Methods ====================
+
+    /// Set maximum number of retries.
+    #[must_use]
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = retries;
+        self
+    }
+
+    /// Set initial delay.
+    #[must_use]
+    pub fn initial_delay(mut self, delay: Duration) -> Self {
+        self.initial_delay = delay;
+        self
+    }
+
+    /// Set maximum delay.
+    #[must_use]
+    pub fn max_delay(mut self, delay: Duration) -> Self {
+        self.max_delay = delay;
+        self
+    }
+
+    /// Set backoff multiplier.
+    #[must_use]
+    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.backoff_multiplier = multiplier;
+        self
+    }
+
+    /// Enable or disable jitter.
+    #[must_use]
+    pub fn jitter(mut self, enabled: bool) -> Self {
+        self.jitter = enabled;
+        self
+    }
+
     /// Calculate delay for a given attempt number.
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let base_delay =

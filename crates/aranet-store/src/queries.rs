@@ -33,6 +33,10 @@
 
 use time::OffsetDateTime;
 
+/// Maximum allowed limit for queries to prevent DoS via large result sets.
+/// This caps LIMIT values to prevent memory exhaustion attacks.
+pub const MAX_QUERY_LIMIT: u32 = 1_000_000;
+
 /// Fluent query builder for current readings.
 ///
 /// Use this to construct queries for [`Store::query_readings`](crate::Store::query_readings).
@@ -123,9 +127,10 @@ impl ReadingQuery {
 
     /// Limit the maximum number of results returned.
     ///
-    /// Use with `offset()` for pagination.
+    /// Use with `offset()` for pagination. Values are capped at [`MAX_QUERY_LIMIT`]
+    /// to prevent resource exhaustion.
     pub fn limit(mut self, limit: u32) -> Self {
-        self.limit = Some(limit);
+        self.limit = Some(limit.min(MAX_QUERY_LIMIT));
         self
     }
 
@@ -286,9 +291,10 @@ impl HistoryQuery {
 
     /// Limit the maximum number of results returned.
     ///
-    /// Use with `offset()` for pagination.
+    /// Use with `offset()` for pagination. Values are capped at [`MAX_QUERY_LIMIT`]
+    /// to prevent resource exhaustion.
     pub fn limit(mut self, limit: u32) -> Self {
-        self.limit = Some(limit);
+        self.limit = Some(limit.min(MAX_QUERY_LIMIT));
         self
     }
 
@@ -644,9 +650,10 @@ mod tests {
 
     #[test]
     fn test_reading_query_large_pagination() {
+        // Limit is clamped to MAX_QUERY_LIMIT, but offset is not
         let query = ReadingQuery::new().limit(u32::MAX).offset(u32::MAX);
         let sql = query.build_sql();
-        assert!(sql.contains(&format!("LIMIT {}", u32::MAX)));
+        assert!(sql.contains(&format!("LIMIT {}", MAX_QUERY_LIMIT)));
         assert!(sql.contains(&format!("OFFSET {}", u32::MAX)));
     }
 }

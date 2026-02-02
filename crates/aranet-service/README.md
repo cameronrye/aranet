@@ -93,6 +93,7 @@ retain = true
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/health` | Service health check |
+| GET | `/api/health/detailed` | Detailed health with database, collector, and platform diagnostics |
 | GET | `/api/status` | Full service status with collector state |
 | GET | `/api/devices` | List all configured devices |
 | GET | `/api/devices/:id` | Get device details |

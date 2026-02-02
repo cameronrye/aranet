@@ -19,10 +19,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Scan with custom options
-    let options = ScanOptions {
-        duration: Duration::from_secs(10),
-        filter_aranet_only: true,
-    };
+    let options = ScanOptions::default()
+        .duration_secs(10)
+        .filter_aranet_only(true);
 
     let devices = scan::scan_with_options(options).await?;
 

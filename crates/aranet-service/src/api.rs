@@ -55,6 +55,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // Health and status
         .route("/api/health", get(health))
+        .route("/api/health/detailed", get(health_detailed))
         .route("/api/status", get(get_status))
         // Prometheus metrics
         .route("/metrics", get(prometheus_metrics))
@@ -93,6 +94,142 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         timestamp: OffsetDateTime::now_utc(),
+    })
+}
+
+/// Detailed health check response with diagnostics.
+#[derive(Debug, Serialize)]
+pub struct DetailedHealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
+    /// Database health status
+    pub database: DatabaseHealth,
+    /// Collector health status
+    pub collector: CollectorHealth,
+    /// Platform information
+    pub platform: PlatformInfo,
+}
+
+/// Database health information.
+#[derive(Debug, Serialize)]
+pub struct DatabaseHealth {
+    /// Whether the database is accessible
+    pub ok: bool,
+    /// Number of devices in database
+    pub device_count: usize,
+    /// Number of readings in database (if available)
+    pub reading_count: Option<usize>,
+    /// Error message if database is not ok
+    pub error: Option<String>,
+}
+
+/// Collector health information.
+#[derive(Debug, Serialize)]
+pub struct CollectorHealth {
+    /// Whether the collector is running
+    pub running: bool,
+    /// Number of configured devices
+    pub configured_devices: usize,
+    /// Number of devices with recent successful polls
+    pub healthy_devices: usize,
+    /// Number of devices with recent failures
+    pub failing_devices: usize,
+}
+
+/// Platform information.
+#[derive(Debug, Serialize)]
+pub struct PlatformInfo {
+    /// Operating system
+    pub os: &'static str,
+    /// CPU architecture
+    pub arch: &'static str,
+}
+
+/// Detailed health check endpoint with diagnostics.
+///
+/// This endpoint performs actual health checks on subsystems:
+/// - Database connectivity and counts
+/// - Collector status and device health
+/// - Platform information
+///
+/// Note: This endpoint acquires locks on store and device_stats.
+/// For high-frequency monitoring, prefer `/api/health`.
+async fn health_detailed(
+    State(state): State<Arc<AppState>>,
+) -> Json<DetailedHealthResponse> {
+    // Check database health
+    let database = {
+        let store = state.store.lock().await;
+        match store.list_devices() {
+            Ok(devices) => DatabaseHealth {
+                ok: true,
+                device_count: devices.len(),
+                reading_count: None, // Skip count for performance
+                error: None,
+            },
+            Err(e) => DatabaseHealth {
+                ok: false,
+                device_count: 0,
+                reading_count: None,
+                error: Some(e.to_string()),
+            },
+        }
+    };
+
+    // Check collector health
+    let collector = {
+        let config = state.config.read().await;
+        let configured_devices = config.devices.len();
+        drop(config);
+
+        let stats = state.collector.device_stats.read().await;
+        let healthy_devices = stats
+            .iter()
+            .filter(|s| {
+                // Consider healthy if last poll was within 3x poll interval
+                s.last_poll_at.map_or(false, |t| {
+                    let age = (OffsetDateTime::now_utc() - t).whole_seconds();
+                    age < (s.poll_interval as i64 * 3)
+                })
+            })
+            .count();
+        let failing_devices = stats
+            .iter()
+            .filter(|s| s.failure_count > 0 && s.last_error.is_some())
+            .count();
+
+        CollectorHealth {
+            running: state.collector.is_running(),
+            configured_devices,
+            healthy_devices,
+            failing_devices,
+        }
+    };
+
+    // Platform info
+    let platform = PlatformInfo {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+    };
+
+    // Determine overall status
+    let status = if database.ok && collector.running {
+        "ok"
+    } else if database.ok {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+
+    Json(DetailedHealthResponse {
+        status,
+        version: env!("CARGO_PKG_VERSION"),
+        timestamp: OffsetDateTime::now_utc(),
+        database,
+        collector,
+        platform,
     })
 }
 
@@ -234,10 +371,23 @@ async fn prometheus_metrics(
     drop(device_stats);
 
     // Get latest readings for all devices
-    let store = state.store.lock().await;
-    let devices = store.list_devices().unwrap_or_default();
+    // Clone the data we need while holding the lock briefly, then release it
+    let device_readings: Vec<_> = {
+        let store = state.store.lock().await;
+        let devices = store.list_devices().unwrap_or_default();
+        devices
+            .into_iter()
+            .filter_map(|device| {
+                store
+                    .get_latest_reading(&device.id)
+                    .ok()
+                    .flatten()
+                    .map(|reading| (device, reading))
+            })
+            .collect()
+    }; // Lock released here
 
-    if !devices.is_empty() {
+    if !device_readings.is_empty() {
         // Sensor reading metrics
         output.push_str("# HELP aranet_co2_ppm CO2 concentration in parts per million\n");
         output.push_str("# TYPE aranet_co2_ppm gauge\n");
@@ -252,61 +402,59 @@ async fn prometheus_metrics(
         let mut radiation_rate_metrics = Vec::new();
         let mut radiation_total_metrics = Vec::new();
 
-        for device in &devices {
-            if let Ok(Some(reading)) = store.get_latest_reading(&device.id) {
-                let device_name = device.name.as_deref().unwrap_or(&device.id);
+        for (device, reading) in &device_readings {
+            let device_name = device.name.as_deref().unwrap_or(&device.id);
 
-                let labels = format!(
-                    "device=\"{}\",address=\"{}\"",
-                    escape_label_value(device_name),
-                    escape_label_value(&device.id)
-                );
+            let labels = format!(
+                "device=\"{}\",address=\"{}\"",
+                escape_label_value(device_name),
+                escape_label_value(&device.id)
+            );
 
-                co2_metrics.push(format!("aranet_co2_ppm{{{}}} {}", labels, reading.co2));
-                temp_metrics.push(format!(
-                    "aranet_temperature_celsius{{{}}} {:.2}",
-                    labels, reading.temperature
-                ));
-                humidity_metrics.push(format!(
-                    "aranet_humidity_percent{{{}}} {}",
-                    labels, reading.humidity
-                ));
-                pressure_metrics.push(format!(
-                    "aranet_pressure_hpa{{{}}} {:.2}",
-                    labels, reading.pressure
-                ));
-                battery_metrics.push(format!(
-                    "aranet_battery_percent{{{}}} {}",
-                    labels, reading.battery
-                ));
+            co2_metrics.push(format!("aranet_co2_ppm{{{}}} {}", labels, reading.co2));
+            temp_metrics.push(format!(
+                "aranet_temperature_celsius{{{}}} {:.2}",
+                labels, reading.temperature
+            ));
+            humidity_metrics.push(format!(
+                "aranet_humidity_percent{{{}}} {}",
+                labels, reading.humidity
+            ));
+            pressure_metrics.push(format!(
+                "aranet_pressure_hpa{{{}}} {:.2}",
+                labels, reading.pressure
+            ));
+            battery_metrics.push(format!(
+                "aranet_battery_percent{{{}}} {}",
+                labels, reading.battery
+            ));
 
-                // Calculate reading age
-                let age_secs = (OffsetDateTime::now_utc() - reading.captured_at)
-                    .whole_seconds()
-                    .max(0);
-                age_metrics.push(format!(
-                    "aranet_reading_age_seconds{{{}}} {}",
-                    labels, age_secs
+            // Calculate reading age
+            let age_secs = (OffsetDateTime::now_utc() - reading.captured_at)
+                .whole_seconds()
+                .max(0);
+            age_metrics.push(format!(
+                "aranet_reading_age_seconds{{{}}} {}",
+                labels, age_secs
+            ));
+
+            // Radon (if available)
+            if let Some(radon) = reading.radon {
+                radon_metrics.push(format!("aranet_radon_bqm3{{{}}} {}", labels, radon));
+            }
+
+            // Radiation (if available)
+            if let Some(rate) = reading.radiation_rate {
+                radiation_rate_metrics.push(format!(
+                    "aranet_radiation_rate_usvh{{{}}} {:.4}",
+                    labels, rate
                 ));
-
-                // Radon (if available)
-                if let Some(radon) = reading.radon {
-                    radon_metrics.push(format!("aranet_radon_bqm3{{{}}} {}", labels, radon));
-                }
-
-                // Radiation (if available)
-                if let Some(rate) = reading.radiation_rate {
-                    radiation_rate_metrics.push(format!(
-                        "aranet_radiation_rate_usvh{{{}}} {:.4}",
-                        labels, rate
-                    ));
-                }
-                if let Some(total) = reading.radiation_total {
-                    radiation_total_metrics.push(format!(
-                        "aranet_radiation_total_msv{{{}}} {:.6}",
-                        labels, total
-                    ));
-                }
+            }
+            if let Some(total) = reading.radiation_total {
+                radiation_total_metrics.push(format!(
+                    "aranet_radiation_total_msv{{{}}} {:.6}",
+                    labels, total
+                ));
             }
         }
 
@@ -496,7 +644,7 @@ async fn collector_start(State(state): State<Arc<AppState>>) -> Json<CollectorAc
         });
     }
 
-    let collector = Collector::new(Arc::clone(&state));
+    let mut collector = Collector::new(Arc::clone(&state));
     collector.start().await;
 
     Json(CollectorActionResponse {
@@ -508,6 +656,8 @@ async fn collector_start(State(state): State<Arc<AppState>>) -> Json<CollectorAc
 
 /// Stop the collector.
 async fn collector_stop(State(state): State<Arc<AppState>>) -> Json<CollectorActionResponse> {
+    use std::time::Duration;
+
     if !state.collector.is_running() {
         return Json(CollectorActionResponse {
             success: false,
@@ -516,14 +666,28 @@ async fn collector_stop(State(state): State<Arc<AppState>>) -> Json<CollectorAct
         });
     }
 
-    let collector = Collector::new(Arc::clone(&state));
-    collector.stop();
+    // Signal all collector tasks to stop through the state
+    state.collector.signal_stop();
 
-    Json(CollectorActionResponse {
-        success: true,
-        message: "Collector stopped".to_string(),
-        running: false,
-    })
+    // Wait for device tasks to complete (with timeout)
+    let stopped_cleanly = state
+        .collector
+        .wait_for_device_tasks(Duration::from_secs(10))
+        .await;
+
+    if stopped_cleanly {
+        Json(CollectorActionResponse {
+            success: true,
+            message: "Collector stopped".to_string(),
+            running: false,
+        })
+    } else {
+        Json(CollectorActionResponse {
+            success: true,
+            message: "Collector stopped (some tasks timed out and were aborted)".to_string(),
+            running: false,
+        })
+    }
 }
 
 // ==========================================================================
@@ -601,41 +765,48 @@ async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(request): Json<UpdateConfigRequest>,
 ) -> Result<Json<ConfigResponse>, AppError> {
-    let mut config = state.config.write().await;
+    let response = {
+        let mut config = state.config.write().await;
 
-    if let Some(devices) = request.devices {
-        config.devices = devices
-            .into_iter()
-            .map(|d| DeviceConfig {
-                address: d.address,
-                alias: d.alias,
-                poll_interval: d.poll_interval,
-            })
-            .collect();
-    }
+        if let Some(devices) = request.devices {
+            config.devices = devices
+                .into_iter()
+                .map(|d| DeviceConfig {
+                    address: d.address,
+                    alias: d.alias,
+                    poll_interval: d.poll_interval,
+                })
+                .collect();
+        }
 
-    // Validate the new config
-    if let Err(e) = config.validate() {
-        return Err(AppError::BadRequest(format!(
-            "Invalid configuration: {}",
-            e
-        )));
-    }
+        // Validate the new config
+        if let Err(e) = config.validate() {
+            return Err(AppError::BadRequest(format!(
+                "Invalid configuration: {}",
+                e
+            )));
+        }
 
-    Ok(Json(ConfigResponse {
-        server: ServerConfigResponse {
-            bind: config.server.bind.clone(),
-        },
-        devices: config
-            .devices
-            .iter()
-            .map(|d| DeviceConfigResponse {
-                address: d.address.clone(),
-                alias: d.alias.clone(),
-                poll_interval: d.poll_interval,
-            })
-            .collect(),
-    }))
+        ConfigResponse {
+            server: ServerConfigResponse {
+                bind: config.server.bind.clone(),
+            },
+            devices: config
+                .devices
+                .iter()
+                .map(|d| DeviceConfigResponse {
+                    address: d.address.clone(),
+                    alias: d.alias.clone(),
+                    poll_interval: d.poll_interval,
+                })
+                .collect(),
+        }
+    };
+
+    // Persist config and signal reload if collector is running
+    state.on_devices_changed().await;
+
+    Ok(Json(response))
 }
 
 /// Request to add a device.
@@ -662,40 +833,45 @@ async fn add_device(
     State(state): State<Arc<AppState>>,
     Json(request): Json<AddDeviceRequest>,
 ) -> Result<(StatusCode, Json<DeviceConfigResponse>), AppError> {
-    let mut config = state.config.write().await;
-
-    // Check if device already exists
-    let addr_lower = request.address.to_lowercase();
-    if config
-        .devices
-        .iter()
-        .any(|d| d.address.to_lowercase() == addr_lower)
     {
-        return Err(AppError::Conflict(format!(
-            "Device {} is already being monitored",
-            request.address
-        )));
+        let mut config = state.config.write().await;
+
+        // Check if device already exists
+        let addr_lower = request.address.to_lowercase();
+        if config
+            .devices
+            .iter()
+            .any(|d| d.address.to_lowercase() == addr_lower)
+        {
+            return Err(AppError::Conflict(format!(
+                "Device {} is already being monitored",
+                request.address
+            )));
+        }
+
+        let device = DeviceConfig {
+            address: request.address.clone(),
+            alias: request.alias.clone(),
+            poll_interval: request.poll_interval,
+        };
+
+        // Validate the device config
+        let errors = device.validate("device");
+        if !errors.is_empty() {
+            return Err(AppError::BadRequest(
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+
+        config.devices.push(device);
     }
 
-    let device = DeviceConfig {
-        address: request.address.clone(),
-        alias: request.alias.clone(),
-        poll_interval: request.poll_interval,
-    };
-
-    // Validate the device config
-    let errors = device.validate("device");
-    if !errors.is_empty() {
-        return Err(AppError::BadRequest(
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ));
-    }
-
-    config.devices.push(device);
+    // Persist config and signal reload if collector is running
+    state.on_devices_changed().await;
 
     Ok((
         StatusCode::CREATED,
@@ -722,41 +898,48 @@ async fn update_device(
     Path(id): Path<String>,
     Json(request): Json<UpdateDeviceRequest>,
 ) -> Result<Json<DeviceConfigResponse>, AppError> {
-    let mut config = state.config.write().await;
+    let response = {
+        let mut config = state.config.write().await;
 
-    // Find the device (case-insensitive)
-    let id_lower = id.to_lowercase();
-    let device = config
-        .devices
-        .iter_mut()
-        .find(|d| d.address.to_lowercase() == id_lower)
-        .ok_or_else(|| AppError::NotFound(format!("Device {} not found in config", id)))?;
+        // Find the device (case-insensitive)
+        let id_lower = id.to_lowercase();
+        let device = config
+            .devices
+            .iter_mut()
+            .find(|d| d.address.to_lowercase() == id_lower)
+            .ok_or_else(|| AppError::NotFound(format!("Device {} not found in config", id)))?;
 
-    // Update fields if provided
-    if request.alias.is_some() {
-        device.alias = request.alias;
-    }
-    if let Some(poll_interval) = request.poll_interval {
-        device.poll_interval = poll_interval;
-    }
+        // Update fields if provided
+        if request.alias.is_some() {
+            device.alias = request.alias;
+        }
+        if let Some(poll_interval) = request.poll_interval {
+            device.poll_interval = poll_interval;
+        }
 
-    // Validate the updated device
-    let errors = device.validate("device");
-    if !errors.is_empty() {
-        return Err(AppError::BadRequest(
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ));
-    }
+        // Validate the updated device
+        let errors = device.validate("device");
+        if !errors.is_empty() {
+            return Err(AppError::BadRequest(
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
 
-    Ok(Json(DeviceConfigResponse {
-        address: device.address.clone(),
-        alias: device.alias.clone(),
-        poll_interval: device.poll_interval,
-    }))
+        DeviceConfigResponse {
+            address: device.address.clone(),
+            alias: device.alias.clone(),
+            poll_interval: device.poll_interval,
+        }
+    };
+
+    // Persist config and signal reload if collector is running
+    state.on_devices_changed().await;
+
+    Ok(Json(response))
 }
 
 /// Remove a device from monitoring.
@@ -764,21 +947,26 @@ async fn remove_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mut config = state.config.write().await;
+    {
+        let mut config = state.config.write().await;
 
-    // Find and remove the device (case-insensitive)
-    let id_lower = id.to_lowercase();
-    let original_len = config.devices.len();
-    config
-        .devices
-        .retain(|d| d.address.to_lowercase() != id_lower);
+        // Find and remove the device (case-insensitive)
+        let id_lower = id.to_lowercase();
+        let original_len = config.devices.len();
+        config
+            .devices
+            .retain(|d| d.address.to_lowercase() != id_lower);
 
-    if config.devices.len() == original_len {
-        return Err(AppError::NotFound(format!(
-            "Device {} not found in config",
-            id
-        )));
+        if config.devices.len() == original_len {
+            return Err(AppError::NotFound(format!(
+                "Device {} not found in config",
+                id
+            )));
+        }
     }
+
+    // Persist config and signal reload if collector is running
+    state.on_devices_changed().await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2182,5 +2370,68 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_health_detailed_endpoint() {
+        let state = create_test_state();
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health/detailed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response_body(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        // Check basic fields
+        assert!(json["status"].is_string());
+        assert!(json["version"].is_string());
+        assert!(json["timestamp"].is_string());
+
+        // Check database health
+        assert!(json["database"]["ok"].is_boolean());
+        assert!(json["database"]["device_count"].is_number());
+
+        // Check collector health
+        assert!(json["collector"]["running"].is_boolean());
+        assert!(json["collector"]["configured_devices"].is_number());
+
+        // Check platform info
+        assert!(json["platform"]["os"].is_string());
+        assert!(json["platform"]["arch"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_health_detailed_status_degraded_when_collector_stopped() {
+        let state = create_test_state();
+        // Collector is not running by default
+
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health/detailed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = response_body(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        // Should be degraded since collector is not running
+        assert_eq!(json["status"], "degraded");
+        assert!(!json["collector"]["running"].as_bool().unwrap());
     }
 }
