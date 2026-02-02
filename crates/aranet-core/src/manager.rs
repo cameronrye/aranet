@@ -4,8 +4,8 @@
 //! simultaneously, with connection pooling and concurrent operations.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -677,7 +677,11 @@ impl DeviceManager {
             return None;
         }
         let current = self.connected_count().await;
-        Some(self.config.max_concurrent_connections.saturating_sub(current))
+        Some(
+            self.config
+                .max_concurrent_connections
+                .saturating_sub(current),
+        )
     }
 
     /// Get the number of connected devices (verified via BLE).
@@ -1051,7 +1055,10 @@ impl DeviceManager {
         managed.reconnect_options = self.config.default_reconnect_options.clone();
         devices.insert(identifier.to_string(), managed);
 
-        info!("Added device to manager with priority {:?}: {}", priority, identifier);
+        info!(
+            "Added device to manager with priority {:?}: {}",
+            priority, identifier
+        );
         Ok(())
     }
 
@@ -1193,7 +1200,10 @@ impl DeviceManager {
                     // Check if the reading has a captured_at timestamp
                     if let Some(captured) = reading.captured_at {
                         let age = time::OffsetDateTime::now_utc() - captured;
-                        if age < time::Duration::try_from(max_age).unwrap_or(time::Duration::seconds(60)) {
+                        if age
+                            < time::Duration::try_from(max_age)
+                                .unwrap_or(time::Duration::seconds(60))
+                        {
                             debug!("Using cached passive reading for {}", identifier);
                             return Ok(reading);
                         }
@@ -1203,7 +1213,10 @@ impl DeviceManager {
         }
 
         // No recent passive reading, use active connection
-        debug!("No recent passive reading, using active connection for {}", identifier);
+        debug!(
+            "No recent passive reading, using active connection for {}",
+            identifier
+        );
         self.read_current(identifier).await
     }
 

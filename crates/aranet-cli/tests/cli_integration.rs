@@ -72,7 +72,10 @@ fn test_help_command() {
     );
     assert!(stdout.contains("scan"), "Help should list scan command");
     assert!(stdout.contains("read"), "Help should list read command");
-    assert!(stdout.contains("history"), "Help should list history command");
+    assert!(
+        stdout.contains("history"),
+        "Help should list history command"
+    );
 }
 
 #[test]
@@ -91,23 +94,17 @@ fn test_version_command() {
 
 #[test]
 fn test_subcommand_help() {
-    let subcommands = ["scan", "read", "watch", "history", "info", "status", "sync", "cache", "doctor"];
+    let subcommands = [
+        "scan", "read", "watch", "history", "info", "status", "sync", "cache", "doctor",
+    ];
 
     for cmd in subcommands {
         let output = run_aranet(&[cmd, "--help"]);
 
-        assert!(
-            output.status.success(),
-            "{} --help should succeed",
-            cmd
-        );
+        assert!(output.status.success(), "{} --help should succeed", cmd);
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !stdout.is_empty(),
-            "{} --help should produce output",
-            cmd
-        );
+        assert!(!stdout.is_empty(), "{} --help should produce output", cmd);
     }
 }
 
@@ -180,7 +177,10 @@ fn test_cache_info() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Should show database info
     assert!(
-        stdout.contains("database") || stdout.contains("path") || stdout.contains("cache") || stdout.contains("store"),
+        stdout.contains("database")
+            || stdout.contains("path")
+            || stdout.contains("cache")
+            || stdout.contains("store"),
         "Should show cache/database info"
     );
 }
@@ -254,7 +254,9 @@ fn test_scan_csv_output() {
     if !stdout.trim().is_empty() {
         let first_line = stdout.lines().next().unwrap_or("");
         assert!(
-            first_line.contains("name") || first_line.contains("address") || first_line.contains(','),
+            first_line.contains("name")
+                || first_line.contains("address")
+                || first_line.contains(','),
             "CSV should have header or be comma-separated"
         );
     }
@@ -344,8 +346,7 @@ fn test_read_json_compact() {
     );
 
     // But should still be valid JSON
-    let _: serde_json::Value =
-        serde_json::from_str(&stdout).expect("Compact JSON should be valid");
+    let _: serde_json::Value = serde_json::from_str(&stdout).expect("Compact JSON should be valid");
 }
 
 #[test]
@@ -437,7 +438,10 @@ fn test_read_fahrenheit() {
 
     let output = run_aranet(&["read", "--device", &device, "--fahrenheit"]);
 
-    assert!(output.status.success(), "Read with --fahrenheit should succeed");
+    assert!(
+        output.status.success(),
+        "Read with --fahrenheit should succeed"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -610,13 +614,7 @@ fn test_history_json() {
     };
 
     let output = run_aranet(&[
-        "history",
-        "--device",
-        &device,
-        "--count",
-        "5",
-        "--format",
-        "json",
+        "history", "--device", &device, "--count", "5", "--format", "json",
     ]);
 
     assert!(output.status.success(), "History JSON should succeed");
@@ -728,7 +726,11 @@ fn test_watch_json() {
     }
 
     // Should have at least one JSON reading
-    assert!(json_count >= 1, "Should have at least one JSON reading (found {})", json_count);
+    assert!(
+        json_count >= 1,
+        "Should have at least one JSON reading (found {})",
+        json_count
+    );
 }
 
 // =============================================================================
@@ -802,11 +804,15 @@ fn test_output_to_file() {
         "json",
     ]);
 
-    assert!(output.status.success(), "Read with output file should succeed");
+    assert!(
+        output.status.success(),
+        "Read with output file should succeed"
+    );
 
     // File should exist and contain JSON
     assert!(output_path.exists(), "Output file should be created");
 
     let content = std::fs::read_to_string(&output_path).expect("Should read output file");
-    let _: serde_json::Value = serde_json::from_str(&content).expect("File should contain valid JSON");
+    let _: serde_json::Value =
+        serde_json::from_str(&content).expect("File should contain valid JSON");
 }

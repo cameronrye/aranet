@@ -113,8 +113,8 @@ impl ReconnectOptions {
         // Cap attempt count to prevent overflow in exponentiation
         // With multiplier 2.0 and max 32 attempts, 2^32 * base_ms is safe within f64
         let capped_attempt = attempt.min(32);
-        let delay_ms =
-            self.initial_delay.as_millis() as f64 * self.backoff_multiplier.powi(capped_attempt as i32);
+        let delay_ms = self.initial_delay.as_millis() as f64
+            * self.backoff_multiplier.powi(capped_attempt as i32);
 
         // Guard against overflow/infinity when converting to u64
         let delay = if delay_ms.is_finite() && delay_ms <= u64::MAX as f64 {

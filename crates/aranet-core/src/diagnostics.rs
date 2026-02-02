@@ -17,8 +17,8 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -195,11 +195,13 @@ impl From<&Error> for ErrorCategory {
             Error::ConnectionFailed { .. } | Error::NotConnected => ErrorCategory::Connection,
             Error::Timeout { .. } => ErrorCategory::Timeout,
             Error::DeviceNotFound(_) => ErrorCategory::DeviceNotFound,
-            Error::InvalidData(_) | Error::InvalidHistoryData { .. } | Error::InvalidReadingFormat { .. } => {
-                ErrorCategory::DataParsing
-            }
+            Error::InvalidData(_)
+            | Error::InvalidHistoryData { .. }
+            | Error::InvalidReadingFormat { .. } => ErrorCategory::DataParsing,
             Error::InvalidConfig(_) => ErrorCategory::Configuration,
-            Error::CharacteristicNotFound { .. } | Error::WriteFailed { .. } => ErrorCategory::Operation,
+            Error::CharacteristicNotFound { .. } | Error::WriteFailed { .. } => {
+                ErrorCategory::Operation
+            }
             Error::Bluetooth(_) | Error::Io(_) | Error::Cancelled => ErrorCategory::Other,
         }
     }
@@ -263,7 +265,8 @@ impl From<&PlatformConfig> for PlatformConfigSnapshot {
     fn from(config: &PlatformConfig) -> Self {
         Self {
             recommended_scan_duration_ms: config.recommended_scan_duration.as_millis() as u64,
-            recommended_connection_timeout_ms: config.recommended_connection_timeout.as_millis() as u64,
+            recommended_connection_timeout_ms: config.recommended_connection_timeout.as_millis()
+                as u64,
             max_concurrent_connections: config.max_concurrent_connections,
             exposes_mac_address: config.exposes_mac_address,
         }
@@ -339,7 +342,10 @@ impl DiagnosticsCollector {
     /// Record a successful connection with duration.
     pub async fn record_connection_success(&self, duration: Duration) {
         self.connection_successes.fetch_add(1, Ordering::Relaxed);
-        self.connection_times.write().await.push(duration.as_millis() as u64);
+        self.connection_times
+            .write()
+            .await
+            .push(duration.as_millis() as u64);
     }
 
     /// Record a failed connection.
@@ -434,13 +440,8 @@ impl DiagnosticsCollector {
         let disconnection_reasons = self.disconnection_reasons.read().await.clone();
 
         // Collect recent errors
-        let recent_errors: Vec<RecordedError> = self
-            .recent_errors
-            .read()
-            .await
-            .iter()
-            .cloned()
-            .collect();
+        let recent_errors: Vec<RecordedError> =
+            self.recent_errors.read().await.iter().cloned().collect();
 
         BluetoothDiagnostics {
             platform: format!("{:?}", platform),
@@ -583,7 +584,10 @@ mod tests {
         assert_eq!(ErrorCategory::from(&timeout_err), ErrorCategory::Timeout);
 
         let not_connected = Error::NotConnected;
-        assert_eq!(ErrorCategory::from(&not_connected), ErrorCategory::Connection);
+        assert_eq!(
+            ErrorCategory::from(&not_connected),
+            ErrorCategory::Connection
+        );
     }
 
     #[tokio::test]
@@ -591,7 +595,9 @@ mod tests {
         let collector = DiagnosticsCollector::new();
 
         collector.record_connection_attempt();
-        collector.record_connection_success(Duration::from_millis(500)).await;
+        collector
+            .record_connection_success(Duration::from_millis(500))
+            .await;
 
         let diag = collector.collect().await;
         assert_eq!(diag.connection_stats.total_attempts, 1);

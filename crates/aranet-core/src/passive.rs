@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use btleplug::api::{Central, Peripheral as _, ScanFilter};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -259,10 +259,7 @@ impl PassiveMonitor {
                             }
                         }
                         Err(e) => {
-                            debug!(
-                                "Failed to parse advertisement from {}: {}",
-                                device_id, e
-                            );
+                            debug!("Failed to parse advertisement from {}: {}", device_id, e);
                         }
                     }
                 }

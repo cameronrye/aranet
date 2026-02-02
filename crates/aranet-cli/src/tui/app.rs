@@ -791,7 +791,9 @@ impl App {
                     device.connected_at = None;
                 }
             }
-            SensorEvent::ConnectionError { device_id, error, .. } => {
+            SensorEvent::ConnectionError {
+                device_id, error, ..
+            } => {
                 let device_name = self
                     .devices
                     .iter()
@@ -827,7 +829,9 @@ impl App {
                     device.error = None;
                 }
             }
-            SensorEvent::ReadingError { device_id, error, .. } => {
+            SensorEvent::ReadingError {
+                device_id, error, ..
+            } => {
                 let device_name = self
                     .devices
                     .iter()
@@ -862,7 +866,9 @@ impl App {
                 }
                 self.push_status_message(format!("Synced {} records for {}", count, device_id));
             }
-            SensorEvent::HistorySyncError { device_id, error, .. } => {
+            SensorEvent::HistorySyncError {
+                device_id, error, ..
+            } => {
                 self.syncing = false;
                 let device_name = self
                     .devices
@@ -891,7 +897,11 @@ impl App {
                 }
                 self.push_status_message(format!("Interval set to {}m", interval_secs / 60));
             }
-            SensorEvent::IntervalError { device_id, error, context } => {
+            SensorEvent::IntervalError {
+                device_id,
+                error,
+                context,
+            } => {
                 let device_name = self
                     .devices
                     .iter()
@@ -933,7 +943,11 @@ impl App {
                 let range = if extended { "Extended" } else { "Standard" };
                 self.push_status_message(format!("Bluetooth range set to {}", range));
             }
-            SensorEvent::BluetoothRangeError { device_id, error, context } => {
+            SensorEvent::BluetoothRangeError {
+                device_id,
+                error,
+                context,
+            } => {
                 let device_name = self
                     .devices
                     .iter()
@@ -963,7 +977,11 @@ impl App {
                 let mode = if enabled { "enabled" } else { "disabled" };
                 self.push_status_message(format!("Smart Home {}", mode));
             }
-            SensorEvent::SmartHomeError { device_id, error, context } => {
+            SensorEvent::SmartHomeError {
+                device_id,
+                error,
+                context,
+            } => {
                 let device_name = self
                     .devices
                     .iter()
@@ -1706,7 +1724,10 @@ impl App {
     /// Toggle export format between CSV and JSON.
     pub fn toggle_export_format(&mut self) {
         self.export_format = self.export_format.toggle();
-        self.push_status_message(format!("Export format: {}", self.export_format.extension().to_uppercase()));
+        self.push_status_message(format!(
+            "Export format: {}",
+            self.export_format.extension().to_uppercase()
+        ));
     }
 
     /// Toggle Do Not Disturb mode.

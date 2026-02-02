@@ -135,7 +135,10 @@ pub fn run() -> Result<()> {
                 tracing::error!("Failed to send LoadCachedData command at startup: {}", e);
             }
             if let Err(e) = startup_command_tx.send(Command::RefreshServiceStatus).await {
-                tracing::warn!("Failed to send RefreshServiceStatus command at startup: {}", e);
+                tracing::warn!(
+                    "Failed to send RefreshServiceStatus command at startup: {}",
+                    e
+                );
             }
 
             // Forward events from worker to std channel
@@ -301,7 +304,10 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
                     tracing::error!("Failed to send LoadCachedData command at startup: {}", e);
                 }
                 if let Err(e) = startup_command_tx.send(Command::RefreshServiceStatus).await {
-                    tracing::warn!("Failed to send RefreshServiceStatus command at startup: {}", e);
+                    tracing::warn!(
+                        "Failed to send RefreshServiceStatus command at startup: {}",
+                        e
+                    );
                 }
             }
 

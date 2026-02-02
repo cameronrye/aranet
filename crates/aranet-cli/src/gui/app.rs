@@ -693,7 +693,10 @@ impl AranetApp {
                 super::MenuCommand::ShowAbout => {
                     // Show about info via toast for now
                     self.add_toast(
-                        format!("Aranet v{}\nMade with ❤️ by Cameron Rye\nrye.dev", env!("CARGO_PKG_VERSION")),
+                        format!(
+                            "Aranet v{}\nMade with ❤️ by Cameron Rye\nrye.dev",
+                            env!("CARGO_PKG_VERSION")
+                        ),
                         ToastType::Info,
                     );
                 }

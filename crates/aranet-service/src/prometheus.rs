@@ -143,7 +143,10 @@ async fn generate_metrics(state: &AppState) -> String {
     if let Some(uptime_secs) = uptime {
         output.push_str("# HELP aranet_collector_uptime_seconds Collector uptime\n");
         output.push_str("# TYPE aranet_collector_uptime_seconds gauge\n");
-        output.push_str(&format!("aranet_collector_uptime_seconds {}\n", uptime_secs));
+        output.push_str(&format!(
+            "aranet_collector_uptime_seconds {}\n",
+            uptime_secs
+        ));
     }
 
     // Device collection stats
@@ -282,7 +285,11 @@ async fn push_metrics(
     metrics: &str,
 ) -> Result<(), PushError> {
     // Prometheus push gateway URL format: {gateway}/metrics/job/{job_name}
-    let url = format!("{}/metrics/job/{}", push_gateway.trim_end_matches('/'), job_name);
+    let url = format!(
+        "{}/metrics/job/{}",
+        push_gateway.trim_end_matches('/'),
+        job_name
+    );
 
     let response = client
         .post(&url)

@@ -100,7 +100,9 @@ pub use aranet_types::uuid;
 // Core exports
 pub use device::{ConnectionConfig, Device, SignalQuality};
 pub use error::{ConnectionFailureReason, DeviceNotFoundReason, Error, Result};
-pub use history::{HistoryCheckpoint, HistoryInfo, HistoryOptions, HistoryParam, PartialHistoryData};
+pub use history::{
+    HistoryCheckpoint, HistoryInfo, HistoryOptions, HistoryParam, PartialHistoryData,
+};
 pub use readings::ExtendedReading;
 pub use scan::{
     DiscoveredDevice, FindProgress, ProgressCallback, ScanOptions, find_device_with_progress,
@@ -202,26 +204,26 @@ pub use advertisement::{AdvertisementData, parse_advertisement, parse_advertisem
 pub use commands::{
     HISTORY_V1_REQUEST, HISTORY_V2_REQUEST, SET_BLUETOOTH_RANGE, SET_INTERVAL, SET_SMART_HOME,
 };
+pub use diagnostics::{
+    AdapterInfo, AdapterState, BluetoothDiagnostics, ConnectionStats, DiagnosticsCollector,
+    ErrorCategory, OperationStats, RecordedError, global_diagnostics,
+};
 pub use events::{DeviceEvent, EventReceiver, EventSender};
 pub use guard::{DeviceGuard, SharedDeviceGuard};
 pub use manager::{AdaptiveInterval, DeviceManager, DevicePriority, ManagedDevice, ManagerConfig};
 pub use messages::{CachedDevice, Command, SensorEvent};
 pub use metrics::{ConnectionMetrics, OperationMetrics};
 pub use mock::{MockDevice, MockDeviceBuilder};
+pub use passive::{PassiveMonitor, PassiveMonitorOptions, PassiveReading};
+pub use platform::{
+    AliasStore, DeviceAlias, Platform, PlatformConfig, current_platform, platform_config,
+};
 pub use reconnect::{ReconnectOptions, ReconnectingDevice};
 pub use retry::{RetryConfig, with_retry};
 pub use streaming::{ReadingStream, StreamOptions, StreamOptionsBuilder};
 pub use thresholds::{Co2Level, ThresholdConfig, Thresholds};
 pub use util::{create_identifier, format_peripheral_id};
 pub use validation::{ReadingValidator, ValidationResult, ValidationWarning};
-pub use platform::{
-    AliasStore, DeviceAlias, Platform, PlatformConfig, current_platform, platform_config,
-};
-pub use passive::{PassiveMonitor, PassiveMonitorOptions, PassiveReading};
-pub use diagnostics::{
-    AdapterInfo, AdapterState, BluetoothDiagnostics, ConnectionStats, DiagnosticsCollector,
-    ErrorCategory, OperationStats, RecordedError, global_diagnostics,
-};
 
 // Re-export from aranet-types
 pub use aranet_types::uuid as uuids;

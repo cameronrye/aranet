@@ -226,7 +226,9 @@ impl SessionStats {
 }
 
 /// Calculate radon averages from history records (24h, 7d, 30d).
-pub fn calculate_radon_averages(history: &[HistoryRecord]) -> (Option<u32>, Option<u32>, Option<u32>) {
+pub fn calculate_radon_averages(
+    history: &[HistoryRecord],
+) -> (Option<u32>, Option<u32>, Option<u32>) {
     use time::OffsetDateTime;
 
     let now = OffsetDateTime::now_utc();

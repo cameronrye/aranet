@@ -20,9 +20,9 @@
 use std::env;
 use std::time::Duration;
 
-use aranet_core::scan::{scan_with_options, ScanOptions};
-use aranet_core::settings::MeasurementInterval;
 use aranet_core::Device;
+use aranet_core::scan::{ScanOptions, scan_with_options};
+use aranet_core::settings::MeasurementInterval;
 use tokio::time::timeout;
 
 /// Default timeout for BLE operations
@@ -538,10 +538,13 @@ async fn test_download_history_partial() {
         start, info.total_readings
     );
 
-    let records = timeout(Duration::from_secs(60), device.download_history_with_options(options))
-        .await
-        .expect("History download timeout")
-        .expect("History download failed");
+    let records = timeout(
+        Duration::from_secs(60),
+        device.download_history_with_options(options),
+    )
+    .await
+    .expect("History download timeout")
+    .expect("History download failed");
 
     println!("Downloaded {} history records", records.len());
 
@@ -554,7 +557,10 @@ async fn test_download_history_partial() {
 
     // Records may be 0 if device doesn't support partial downloads
     // Just verify we didn't error
-    println!("Partial history download completed (got {} records)", records.len());
+    println!(
+        "Partial history download completed (got {} records)",
+        records.len()
+    );
 
     let _ = device.disconnect().await;
 }

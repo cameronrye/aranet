@@ -130,14 +130,12 @@ impl ErrorContext {
             | crate::Error::InvalidHistoryData { .. }
             | crate::Error::InvalidReadingFormat { .. } => Self::permanent(error.to_string()),
             crate::Error::Cancelled => Self::permanent("Operation was cancelled.".to_string()),
-            crate::Error::WriteFailed { .. } => Self::transient(
-                error.to_string(),
-                "Failed to write to device. Try again.",
-            ),
-            crate::Error::Io(_) => Self::transient(
-                error.to_string(),
-                "I/O error occurred. Try again.",
-            ),
+            crate::Error::WriteFailed { .. } => {
+                Self::transient(error.to_string(), "Failed to write to device. Try again.")
+            }
+            crate::Error::Io(_) => {
+                Self::transient(error.to_string(), "I/O error occurred. Try again.")
+            }
             crate::Error::InvalidConfig(_) => Self::permanent(error.to_string()),
         }
     }

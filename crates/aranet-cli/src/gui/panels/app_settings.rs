@@ -630,8 +630,11 @@ impl AranetApp {
                             if self.gui_config.co2_danger_threshold
                                 <= self.gui_config.co2_warning_threshold
                             {
-                                self.gui_config.co2_warning_threshold =
-                                    self.gui_config.co2_danger_threshold.saturating_sub(50).max(600);
+                                self.gui_config.co2_warning_threshold = self
+                                    .gui_config
+                                    .co2_danger_threshold
+                                    .saturating_sub(50)
+                                    .max(600);
                             }
                             config_changed = true;
                         }
@@ -746,8 +749,11 @@ impl AranetApp {
                             if self.gui_config.radon_danger_threshold
                                 <= self.gui_config.radon_warning_threshold
                             {
-                                self.gui_config.radon_warning_threshold =
-                                    self.gui_config.radon_danger_threshold.saturating_sub(10).max(50);
+                                self.gui_config.radon_warning_threshold = self
+                                    .gui_config
+                                    .radon_danger_threshold
+                                    .saturating_sub(10)
+                                    .max(50);
                             }
                             config_changed = true;
                         }

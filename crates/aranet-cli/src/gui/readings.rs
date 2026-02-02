@@ -8,7 +8,7 @@ use super::components;
 use super::helpers::{format_pressure, format_radon, format_temperature};
 use super::theme::Theme;
 use super::types::{
-    calculate_radon_averages, Co2Level, DeviceState, RadiationLevel, RadonLevel, Trend,
+    Co2Level, DeviceState, RadiationLevel, RadonLevel, Trend, calculate_radon_averages,
 };
 
 /// Render sensor readings with styled cards.
@@ -196,12 +196,9 @@ fn render_co2_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, co2: 
                                 .size(theme.typography.caption),
                         );
                         ui.label(
-                            RichText::new(format!(
-                                "{}",
-                                device.session_stats.co2_min.unwrap_or(0)
-                            ))
-                            .color(theme.success)
-                            .size(theme.typography.caption),
+                            RichText::new(format!("{}", device.session_stats.co2_min.unwrap_or(0)))
+                                .color(theme.success)
+                                .size(theme.typography.caption),
                         );
                         ui.add_space(theme.spacing.sm);
                         ui.label(
@@ -210,12 +207,9 @@ fn render_co2_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, co2: 
                                 .size(theme.typography.caption),
                         );
                         ui.label(
-                            RichText::new(format!(
-                                "{}",
-                                device.session_stats.co2_max.unwrap_or(0)
-                            ))
-                            .color(theme.danger)
-                            .size(theme.typography.caption),
+                            RichText::new(format!("{}", device.session_stats.co2_max.unwrap_or(0)))
+                                .color(theme.danger)
+                                .size(theme.typography.caption),
                         );
                         ui.add_space(theme.spacing.sm);
                         ui.label(
@@ -224,9 +218,12 @@ fn render_co2_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, co2: 
                                 .size(theme.typography.caption),
                         );
                         ui.label(
-                            RichText::new(format!("{}", device.session_stats.co2_avg().unwrap_or(0)))
-                                .color(theme.warning)
-                                .size(theme.typography.caption),
+                            RichText::new(format!(
+                                "{}",
+                                device.session_stats.co2_avg().unwrap_or(0)
+                            ))
+                            .color(theme.warning)
+                            .size(theme.typography.caption),
                         );
                     });
                 }

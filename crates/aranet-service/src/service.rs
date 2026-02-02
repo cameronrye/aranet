@@ -113,7 +113,8 @@ fn get_install_candidates() -> Vec<PathBuf> {
     {
         // Program Files
         if let Ok(program_files) = env::var("ProgramFiles") {
-            candidates.push(PathBuf::from(&program_files).join("aranet-service/aranet-service.exe"));
+            candidates
+                .push(PathBuf::from(&program_files).join("aranet-service/aranet-service.exe"));
         }
 
         // User-local installs
@@ -223,11 +224,7 @@ fn is_service_reachable() -> bool {
     use std::time::Duration;
 
     // Try to connect to the default service port
-    TcpStream::connect_timeout(
-        &"127.0.0.1:8080".parse().unwrap(),
-        Duration::from_secs(2),
-    )
-    .is_ok()
+    TcpStream::connect_timeout(&"127.0.0.1:8080".parse().unwrap(), Duration::from_secs(2)).is_ok()
 }
 
 /// Service status

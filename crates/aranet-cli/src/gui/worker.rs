@@ -12,7 +12,7 @@ use aranet_core::messages::{
     CachedDevice, Command, ErrorContext, SensorEvent, ServiceDeviceStats, ServiceMonitoredDevice,
     SignalQuality,
 };
-use aranet_core::retry::{with_retry, RetryConfig};
+use aranet_core::retry::{RetryConfig, with_retry};
 use aranet_core::scan::scan_with_options;
 use aranet_core::service_client::ServiceClient;
 use aranet_core::settings::{DeviceSettings, MeasurementInterval};
@@ -883,22 +883,21 @@ impl SensorWorker {
         let device_id_for_progress = device_id.to_string();
         let total_for_progress = records_to_download as usize;
 
-        let progress_callback =
-            Arc::new(move |progress: aranet_core::history::HistoryProgress| {
-                let event_tx = event_tx.clone();
-                let device_id = device_id_for_progress.clone();
-                let downloaded = progress.values_downloaded;
-                // Send progress event (fire and forget since we're in a sync callback)
-                tokio::spawn(async move {
-                    let _ = event_tx
-                        .send(SensorEvent::HistorySyncProgress {
-                            device_id,
-                            downloaded,
-                            total: total_for_progress,
-                        })
-                        .await;
-                });
+        let progress_callback = Arc::new(move |progress: aranet_core::history::HistoryProgress| {
+            let event_tx = event_tx.clone();
+            let device_id = device_id_for_progress.clone();
+            let downloaded = progress.values_downloaded;
+            // Send progress event (fire and forget since we're in a sync callback)
+            tokio::spawn(async move {
+                let _ = event_tx
+                    .send(SensorEvent::HistorySyncProgress {
+                        device_id,
+                        downloaded,
+                        total: total_for_progress,
+                    })
+                    .await;
             });
+        });
 
         // Download history with start_index for incremental sync
         let history_options = HistoryOptions {
@@ -1177,10 +1176,7 @@ impl SensorWorker {
         if let Err(e) = device.set_bluetooth_range(range).await {
             warn!("Failed to set Bluetooth range: {}", e);
             if let Err(disconnect_err) = device.disconnect().await {
-                warn!(
-                    "Failed to disconnect after range error: {}",
-                    disconnect_err
-                );
+                warn!("Failed to disconnect after range error: {}", disconnect_err);
             }
             let context = aranet_core::messages::ErrorContext::from_error(&e);
             self.send_event(SensorEvent::BluetoothRangeError {
@@ -1449,20 +1445,16 @@ impl SensorWorker {
                         )
                     }
                     ServiceClientError::InvalidUrl(url) => {
-                        format!(
-                            "Invalid service URL: '{}'. Check your configuration.",
-                            url
-                        )
+                        format!("Invalid service URL: '{}'. Check your configuration.", url)
                     }
-                    ServiceClientError::ApiError { status, message } => {
-                        match *status {
-                            401 => "Authentication required. Check your API key.".to_string(),
-                            403 => "Access denied. Check your API key permissions.".to_string(),
-                            404 => "Service endpoint not found. The service may be an older version.".to_string(),
-                            500..=599 => format!("Service error ({}): {}", status, message),
-                            _ => format!("API error ({}): {}", status, message),
-                        }
-                    }
+                    ServiceClientError::ApiError { status, message } => match *status {
+                        401 => "Authentication required. Check your API key.".to_string(),
+                        403 => "Access denied. Check your API key permissions.".to_string(),
+                        404 => "Service endpoint not found. The service may be an older version."
+                            .to_string(),
+                        500..=599 => format!("Service error ({}): {}", status, message),
+                        _ => format!("API error ({}): {}", status, message),
+                    },
                     ServiceClientError::Request(req_err) => {
                         if req_err.is_timeout() {
                             "Request timed out. The service may be overloaded.".to_string()
@@ -1516,8 +1508,7 @@ impl SensorWorker {
 
         match tokio::time::timeout(SERVICE_CONTROL_TIMEOUT, client.start_collector()).await {
             Ok(Ok(_)) => {
-                self.send_event(SensorEvent::ServiceCollectorStarted)
-                    .await;
+                self.send_event(SensorEvent::ServiceCollectorStarted).await;
                 // Refresh status to get updated state
                 self.handle_refresh_service_status().await;
             }
@@ -1555,8 +1546,7 @@ impl SensorWorker {
 
         match tokio::time::timeout(SERVICE_CONTROL_TIMEOUT, client.stop_collector()).await {
             Ok(Ok(_)) => {
-                self.send_event(SensorEvent::ServiceCollectorStopped)
-                    .await;
+                self.send_event(SensorEvent::ServiceCollectorStopped).await;
                 // Refresh status to get updated state
                 self.handle_refresh_service_status().await;
             }
@@ -1610,10 +1600,7 @@ impl SensorWorker {
 
     /// Handle installing aranet-service as a system service.
     async fn handle_install_system_service(&self, user_level: bool) {
-        info!(
-            "Installing system service (user_level={})",
-            user_level
-        );
+        info!("Installing system service (user_level={})", user_level);
 
         let result = tokio::task::spawn_blocking(move || {
             Self::run_service_command(&["service", "install"], user_level)
@@ -1643,10 +1630,7 @@ impl SensorWorker {
 
     /// Handle uninstalling aranet-service system service.
     async fn handle_uninstall_system_service(&self, user_level: bool) {
-        info!(
-            "Uninstalling system service (user_level={})",
-            user_level
-        );
+        info!("Uninstalling system service (user_level={})", user_level);
 
         let result = tokio::task::spawn_blocking(move || {
             Self::run_service_command(&["service", "uninstall"], user_level)
@@ -1655,8 +1639,7 @@ impl SensorWorker {
 
         match result {
             Ok(Ok(())) => {
-                self.send_event(SensorEvent::SystemServiceUninstalled)
-                    .await;
+                self.send_event(SensorEvent::SystemServiceUninstalled).await;
             }
             Ok(Err(e)) => {
                 self.send_event(SensorEvent::SystemServiceError {
@@ -1677,10 +1660,7 @@ impl SensorWorker {
 
     /// Handle starting aranet-service system service.
     async fn handle_start_system_service(&mut self, user_level: bool) {
-        info!(
-            "Starting system service (user_level={})",
-            user_level
-        );
+        info!("Starting system service (user_level={})", user_level);
 
         let result = tokio::task::spawn_blocking(move || {
             Self::run_service_command(&["service", "start"], user_level)
@@ -1712,10 +1692,7 @@ impl SensorWorker {
 
     /// Handle stopping aranet-service system service.
     async fn handle_stop_system_service(&mut self, user_level: bool) {
-        info!(
-            "Stopping system service (user_level={})",
-            user_level
-        );
+        info!("Stopping system service (user_level={})", user_level);
 
         let result = tokio::task::spawn_blocking(move || {
             Self::run_service_command(&["service", "stop"], user_level)
@@ -1747,15 +1724,10 @@ impl SensorWorker {
 
     /// Handle checking aranet-service system service status.
     async fn handle_check_system_service_status(&self, user_level: bool) {
-        info!(
-            "Checking system service status (user_level={})",
-            user_level
-        );
+        info!("Checking system service status (user_level={})", user_level);
 
-        let result = tokio::task::spawn_blocking(move || {
-            Self::check_service_status(user_level)
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || Self::check_service_status(user_level)).await;
 
         match result {
             Ok((installed, running)) => {
@@ -1839,10 +1811,7 @@ impl SensorWorker {
         ];
 
         #[cfg(target_os = "linux")]
-        let candidates = [
-            "/usr/local/bin/aranet-service",
-            "/usr/bin/aranet-service",
-        ];
+        let candidates = ["/usr/local/bin/aranet-service", "/usr/bin/aranet-service"];
 
         #[cfg(target_os = "windows")]
         let candidates: [&str; 0] = [];
@@ -1880,7 +1849,10 @@ impl SensorWorker {
             }
         }
 
-        Err("aranet-service executable not found. Install it with 'cargo install aranet-service'.".to_string())
+        Err(
+            "aranet-service executable not found. Install it with 'cargo install aranet-service'."
+                .to_string(),
+        )
     }
 
     /// Handle fetching the service configuration.
@@ -1983,7 +1955,10 @@ impl SensorWorker {
             return;
         };
 
-        match client.update_device(address, alias.clone(), Some(poll_interval)).await {
+        match client
+            .update_device(address, alias.clone(), Some(poll_interval))
+            .await
+        {
             Ok(device) => {
                 self.send_event(SensorEvent::ServiceDeviceUpdated {
                     device: ServiceMonitoredDevice {

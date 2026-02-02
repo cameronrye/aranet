@@ -279,7 +279,10 @@ impl SignalQuality {
 
     /// Check if the signal is strong enough for reliable operations.
     pub fn is_usable(&self) -> bool {
-        matches!(self, SignalQuality::Excellent | SignalQuality::Good | SignalQuality::Fair)
+        matches!(
+            self,
+            SignalQuality::Excellent | SignalQuality::Good | SignalQuality::Fair
+        )
     }
 }
 
@@ -619,12 +622,15 @@ impl Device {
     /// The timeout is controlled by [`ConnectionConfig::read_timeout`].
     pub async fn read_characteristic(&self, uuid: Uuid) -> Result<Vec<u8>> {
         let characteristic = self.find_characteristic(uuid).await?;
-        let data = timeout(self.config.read_timeout, self.peripheral.read(&characteristic))
-            .await
-            .map_err(|_| Error::Timeout {
-                operation: format!("read characteristic {}", uuid),
-                duration: self.config.read_timeout,
-            })??;
+        let data = timeout(
+            self.config.read_timeout,
+            self.peripheral.read(&characteristic),
+        )
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: format!("read characteristic {}", uuid),
+            duration: self.config.read_timeout,
+        })??;
         Ok(data)
     }
 

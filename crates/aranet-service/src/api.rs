@@ -156,9 +156,7 @@ pub struct PlatformInfo {
 ///
 /// Note: This endpoint acquires locks on store and device_stats.
 /// For high-frequency monitoring, prefer `/api/health`.
-async fn health_detailed(
-    State(state): State<Arc<AppState>>,
-) -> Json<DetailedHealthResponse> {
+async fn health_detailed(State(state): State<Arc<AppState>>) -> Json<DetailedHealthResponse> {
     // Check database health
     let database = {
         let store = state.store.lock().await;

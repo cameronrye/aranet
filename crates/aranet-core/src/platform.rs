@@ -538,7 +538,9 @@ impl AliasStore {
     /// If not found, returns the input string unchanged (it might already be an identifier).
     pub fn resolve(&self, alias_or_identifier: &str) -> String {
         if let Some(alias) = self.get(alias_or_identifier) {
-            alias.resolve().unwrap_or_else(|| alias_or_identifier.to_string())
+            alias
+                .resolve()
+                .unwrap_or_else(|| alias_or_identifier.to_string())
         } else {
             alias_or_identifier.to_string()
         }

@@ -417,7 +417,10 @@ impl HistoryOptions {
     }
 
     /// Get the effective read delay, optionally adjusted for signal quality.
-    pub fn effective_read_delay(&self, signal_quality: Option<crate::device::SignalQuality>) -> Duration {
+    pub fn effective_read_delay(
+        &self,
+        signal_quality: Option<crate::device::SignalQuality>,
+    ) -> Duration {
         if self.use_adaptive_delay {
             if let Some(quality) = signal_quality {
                 return quality.recommended_read_delay();
@@ -524,8 +527,11 @@ impl Device {
         let signal_quality = if options.use_adaptive_delay {
             match self.signal_quality().await {
                 Some(quality) => {
-                    info!("Signal quality: {:?} - using {} ms read delay",
-                        quality, quality.recommended_read_delay().as_millis());
+                    info!(
+                        "Signal quality: {:?} - using {} ms read delay",
+                        quality,
+                        quality.recommended_read_delay().as_millis()
+                    );
                     Some(quality)
                 }
                 None => {
@@ -548,18 +554,31 @@ impl Device {
                 // other Aranet devices and requires additional research/documentation.
                 Err(Error::InvalidData(
                     "History download for Aranet Radiation devices is not yet implemented. \
-                     Current readings are available via read_current().".to_string()
+                     Current readings are available via read_current()."
+                        .to_string(),
                 ))
             }
             Some(DeviceType::AranetRadon) => {
                 // For radon devices, download radon instead of CO2, and use Humidity2
-                self.download_radon_history_internal(&info, start_idx, end_idx, &options, effective_delay)
-                    .await
+                self.download_radon_history_internal(
+                    &info,
+                    start_idx,
+                    end_idx,
+                    &options,
+                    effective_delay,
+                )
+                .await
             }
             _ => {
                 // For Aranet4 and Aranet2, download CO2 (or 0 for Aranet2) and standard humidity
-                self.download_aranet4_history_internal(&info, start_idx, end_idx, &options, effective_delay)
-                    .await
+                self.download_aranet4_history_internal(
+                    &info,
+                    start_idx,
+                    end_idx,
+                    &options,
+                    effective_delay,
+                )
+                .await
             }
         }
     }
@@ -578,7 +597,11 @@ impl Device {
         // Create checkpoint if callback is set
         let device_id = self.address().to_string();
         let mut checkpoint = if options.checkpoint_callback.is_some() {
-            Some(HistoryCheckpoint::new(&device_id, info.total_readings, HistoryParam::Co2))
+            Some(HistoryCheckpoint::new(
+                &device_id,
+                info.total_readings,
+                HistoryParam::Co2,
+            ))
         } else {
             None
         };
@@ -723,7 +746,11 @@ impl Device {
         // Create checkpoint if callback is set
         let device_id = self.address().to_string();
         let mut checkpoint = if options.checkpoint_callback.is_some() {
-            Some(HistoryCheckpoint::new(&device_id, info.total_readings, HistoryParam::Radon))
+            Some(HistoryCheckpoint::new(
+                &device_id,
+                info.total_readings,
+                HistoryParam::Radon,
+            ))
         } else {
             None
         };
@@ -1075,7 +1102,10 @@ impl Device {
         // Set up notification handler
         self.subscribe_to_notifications(HISTORY_V1, move |data| {
             if let Err(e) = tx.try_send(data.to_vec()) {
-                warn!("V1 history notification channel full or closed, data may be lost: {}", e);
+                warn!(
+                    "V1 history notification channel full or closed, data may be lost: {}",
+                    e
+                );
             }
         })
         .await?;

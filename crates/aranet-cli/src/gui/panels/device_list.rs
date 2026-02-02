@@ -155,9 +155,7 @@ impl AranetApp {
                             )
                             .fill(bg)
                             .stroke(stroke)
-                            .corner_radius(egui::CornerRadius::same(
-                                self.theme.rounding.sm as u8,
-                            ));
+                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
                             if ui.add(btn).clicked() {
                                 self.device_type_filter = filter;
                             }
@@ -193,9 +191,7 @@ impl AranetApp {
                             )
                             .fill(bg)
                             .stroke(stroke)
-                            .corner_radius(egui::CornerRadius::same(
-                                self.theme.rounding.sm as u8,
-                            ));
+                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
                             if ui.add(btn).clicked() {
                                 self.connection_filter = filter;
                             }
@@ -228,14 +224,10 @@ impl AranetApp {
                         };
                         ui.add_enabled_ui(connect_enabled, |ui| {
                             let btn = egui::Button::new(
-                                RichText::new("Connect All")
-                                    .size(11.0)
-                                    .color(connect_text),
+                                RichText::new("Connect All").size(11.0).color(connect_text),
                             )
                             .fill(connect_bg)
-                            .corner_radius(egui::CornerRadius::same(
-                                self.theme.rounding.sm as u8,
-                            ));
+                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
                             if ui
                                 .add(btn)
                                 .on_hover_text(format!(
@@ -269,9 +261,7 @@ impl AranetApp {
                                     .color(disconnect_text),
                             )
                             .fill(disconnect_bg)
-                            .corner_radius(egui::CornerRadius::same(
-                                self.theme.rounding.sm as u8,
-                            ));
+                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
                             if ui
                                 .add(btn)
                                 .on_hover_text(format!(

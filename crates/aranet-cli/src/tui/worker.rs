@@ -24,16 +24,17 @@ use aranet_core::device::{ConnectionConfig, SignalQuality};
 use aranet_core::messages::{ErrorContext, ServiceDeviceStats};
 use aranet_core::service_client::ServiceClient;
 use aranet_core::settings::{DeviceSettings, MeasurementInterval};
-use aranet_core::{BluetoothRange, Device, RetryConfig, ScanOptions, scan::scan_with_options, with_retry};
+use aranet_core::{
+    BluetoothRange, Device, RetryConfig, ScanOptions, scan::scan_with_options, with_retry,
+};
 use aranet_store::Store;
 use aranet_types::{CurrentReading, DeviceType};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::messages::{CachedDevice, Command, SensorEvent};
-
 
 /// Background worker that handles BLE operations.
 ///
@@ -434,7 +435,14 @@ impl SensorWorker {
 
         match result {
             Ok((name, device_type, reading, settings, rssi, signal_quality)) => {
-                info!(device_id, ?name, ?device_type, ?rssi, ?signal_quality, "Device connected");
+                info!(
+                    device_id,
+                    ?name,
+                    ?device_type,
+                    ?rssi,
+                    ?signal_quality,
+                    "Device connected"
+                );
 
                 // Cache signal quality for adaptive behavior
                 if let Some(quality) = signal_quality {
@@ -457,7 +465,10 @@ impl SensorWorker {
 
                     // Warn about poor signal quality
                     if quality == SignalQuality::Poor {
-                        warn!(device_id, "Poor signal quality - connection may be unstable");
+                        warn!(
+                            device_id,
+                            "Poor signal quality - connection may be unstable"
+                        );
                     }
                 }
 
@@ -555,12 +566,21 @@ impl SensorWorker {
         info!(device_id, "Refreshing reading for device");
 
         // Get cached signal quality for adaptive retry configuration
-        let signal_quality = self.signal_quality_cache.read().await.get(device_id).copied();
+        let signal_quality = self
+            .signal_quality_cache
+            .read()
+            .await
+            .get(device_id)
+            .copied();
 
         // Use more aggressive retries for devices with known poor signal
         let retry_config = match signal_quality {
             Some(SignalQuality::Poor) | Some(SignalQuality::Fair) => {
-                debug!(device_id, ?signal_quality, "Using aggressive retry config for weak signal");
+                debug!(
+                    device_id,
+                    ?signal_quality,
+                    "Using aggressive retry config for weak signal"
+                );
                 RetryConfig::aggressive()
             }
             _ => RetryConfig::for_read(),
@@ -973,7 +993,10 @@ impl SensorWorker {
 
         // Validate connection is truly alive (especially important on macOS)
         if !device.validate_connection().await {
-            warn!(device_id, "Connection validation failed - device may be out of range");
+            warn!(
+                device_id,
+                "Connection validation failed - device may be out of range"
+            );
             let _ = device.disconnect().await;
             return Err(aranet_core::Error::NotConnected);
         }
@@ -1306,7 +1329,12 @@ impl SensorWorker {
 
         // Download history with start_index for incremental sync
         // Use adaptive read delay based on signal quality
-        let signal_quality = self.signal_quality_cache.read().await.get(device_id).copied();
+        let signal_quality = self
+            .signal_quality_cache
+            .read()
+            .await
+            .get(device_id)
+            .copied();
         let read_delay = signal_quality
             .map(|q| q.recommended_read_delay())
             .unwrap_or(Duration::from_millis(50));
@@ -1440,8 +1468,7 @@ impl SensorWorker {
                 );
 
                 // Update sync state for next incremental sync
-                if let Err(e) =
-                    store.update_sync_state(device_id, total_on_device, total_on_device)
+                if let Err(e) = store.update_sync_state(device_id, total_on_device, total_on_device)
                 {
                     warn!(device_id, error = %e, "Failed to update sync state");
                 }

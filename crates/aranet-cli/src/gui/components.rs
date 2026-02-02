@@ -117,13 +117,9 @@ pub fn section_header(ui: &mut Ui, theme: &Theme, title: &str) {
     ui.horizontal(|ui| {
         // Left accent bar
         let bar_height = theme.typography.subheading + 4.0;
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(3.0, bar_height), egui::Sense::hover());
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(1),
-            theme.accent,
-        );
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, bar_height), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(1), theme.accent);
         ui.add_space(theme.spacing.sm);
         ui.label(
             RichText::new(title)
@@ -175,7 +171,10 @@ pub fn co2_gauge(ui: &mut Ui, theme: &Theme, co2: u16) {
     let indicator_height = 20.0; // Space above bar for value indicator
     let label_height = 18.0;
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(available_width, indicator_height + bar_height + label_height),
+        egui::vec2(
+            available_width,
+            indicator_height + bar_height + label_height,
+        ),
         Sense::hover(),
     );
 
@@ -232,8 +231,14 @@ pub fn co2_gauge(ui: &mut Ui, theme: &Theme, co2: u16) {
     painter.add(egui::Shape::convex_polygon(
         vec![
             egui::pos2(indicator_x, triangle_y),
-            egui::pos2(indicator_x - triangle_size / 2.0, triangle_y - triangle_size),
-            egui::pos2(indicator_x + triangle_size / 2.0, triangle_y - triangle_size),
+            egui::pos2(
+                indicator_x - triangle_size / 2.0,
+                triangle_y - triangle_size,
+            ),
+            egui::pos2(
+                indicator_x + triangle_size / 2.0,
+                triangle_y - triangle_size,
+            ),
         ],
         fill_color,
         egui::Stroke::NONE,
