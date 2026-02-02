@@ -421,10 +421,10 @@ impl HistoryOptions {
         &self,
         signal_quality: Option<crate::device::SignalQuality>,
     ) -> Duration {
-        if self.use_adaptive_delay {
-            if let Some(quality) = signal_quality {
-                return quality.recommended_read_delay();
-            }
+        if self.use_adaptive_delay
+            && let Some(quality) = signal_quality
+        {
+            return quality.recommended_read_delay();
         }
         self.read_delay
     }

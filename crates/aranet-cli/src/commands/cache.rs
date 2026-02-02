@@ -12,6 +12,11 @@ use crate::format::{FormatOptions, format_history_csv, format_history_json, form
 
 /// Execute the cache command.
 pub fn cmd_cache(action: CacheAction, config: &Config) -> Result<()> {
+    // Handle info separately since it doesn't need the store
+    if matches!(action, CacheAction::Info) {
+        return show_info();
+    }
+
     let store = Store::open_default().context("Failed to open database")?;
 
     match action {
@@ -37,7 +42,7 @@ pub fn cmd_cache(action: CacheAction, config: &Config) -> Result<()> {
             since,
             until,
         } => export_history(&store, &device, format, output, since, until),
-        CacheAction::Info => show_info(),
+        CacheAction::Info => unreachable!("Handled above"),
         CacheAction::Import { format, input } => import_history(&store, format, input),
     }
 }

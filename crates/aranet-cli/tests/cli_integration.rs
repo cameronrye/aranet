@@ -154,7 +154,7 @@ fn test_config_show() {
     let output = run_aranet(&["config", "show"]);
 
     // May fail if no config exists, that's OK
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Should not crash

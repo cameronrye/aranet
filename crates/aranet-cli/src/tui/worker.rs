@@ -1775,10 +1775,10 @@ impl SensorWorker {
                                     debug!(device_id = %device_id_owned, "Background poll successful");
 
                                     // Save to store
-                                    if let Ok(store) = Store::open(&store_path) {
-                                        if let Err(e) = store.insert_reading(&device_id_owned, &reading) {
-                                            warn!(device_id = %device_id_owned, error = %e, "Failed to save background reading to store");
-                                        }
+                                    if let Ok(store) = Store::open(&store_path)
+                                        && let Err(e) = store.insert_reading(&device_id_owned, &reading)
+                                    {
+                                        warn!(device_id = %device_id_owned, error = %e, "Failed to save background reading to store");
                                     }
 
                                     // Send reading update

@@ -1357,17 +1357,17 @@ impl eframe::App for AranetApp {
         self.process_menu_events(ctx);
 
         // Load logo texture on first frame
-        if self.logo_texture.is_none() {
-            if let Ok(image) = image::load_from_memory(super::ICON_PNG) {
-                let image = image.into_rgba8();
-                let size = [image.width() as usize, image.height() as usize];
-                let pixels = image.into_flat_samples();
-                self.logo_texture = Some(ctx.load_texture(
-                    "logo",
-                    egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()),
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
+        if self.logo_texture.is_none()
+            && let Ok(image) = image::load_from_memory(super::ICON_PNG)
+        {
+            let image = image.into_rgba8();
+            let size = [image.width() as usize, image.height() as usize];
+            let pixels = image.into_flat_samples();
+            self.logo_texture = Some(ctx.load_texture(
+                "logo",
+                egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()),
+                egui::TextureOptions::LINEAR,
+            ));
         }
 
         // Handle screenshot capture in demo mode

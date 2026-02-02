@@ -47,11 +47,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         device_id: device.id.clone(),
                         reading,
                     };
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            info!("WebSocket client disconnected during initial snapshot");
-                            return;
-                        }
+                    if let Ok(json) = serde_json::to_string(&event)
+                        && sender.send(Message::Text(json.into())).await.is_err()
+                    {
+                        info!("WebSocket client disconnected during initial snapshot");
+                        return;
                     }
                 }
             }

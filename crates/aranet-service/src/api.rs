@@ -187,7 +187,7 @@ async fn health_detailed(State(state): State<Arc<AppState>>) -> Json<DetailedHea
             .iter()
             .filter(|s| {
                 // Consider healthy if last poll was within 3x poll interval
-                s.last_poll_at.map_or(false, |t| {
+                s.last_poll_at.is_some_and(|t| {
                     let age = (OffsetDateTime::now_utc() - t).whole_seconds();
                     age < (s.poll_interval as i64 * 3)
                 })

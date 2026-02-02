@@ -1195,18 +1195,18 @@ impl DeviceManager {
         // Check if we have a recent cached reading
         {
             let devices = self.devices.read().await;
-            if let Some(managed) = devices.get(identifier) {
-                if let Some(reading) = managed.last_reading {
-                    // Check if the reading has a captured_at timestamp
-                    if let Some(captured) = reading.captured_at {
-                        let age = time::OffsetDateTime::now_utc() - captured;
-                        if age
-                            < time::Duration::try_from(max_age)
-                                .unwrap_or(time::Duration::seconds(60))
-                        {
-                            debug!("Using cached passive reading for {}", identifier);
-                            return Ok(reading);
-                        }
+            if let Some(managed) = devices.get(identifier)
+                && let Some(reading) = managed.last_reading
+            {
+                // Check if the reading has a captured_at timestamp
+                if let Some(captured) = reading.captured_at {
+                    let age = time::OffsetDateTime::now_utc() - captured;
+                    if age
+                        < time::Duration::try_from(max_age)
+                            .unwrap_or(time::Duration::seconds(60))
+                    {
+                        debug!("Using cached passive reading for {}", identifier);
+                        return Ok(reading);
                     }
                 }
             }

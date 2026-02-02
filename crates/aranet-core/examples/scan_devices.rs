@@ -6,8 +6,6 @@
 //!
 //! Run with: `cargo run --example scan_devices`
 
-use std::time::Duration;
-
 use aranet_core::scan::{self, ScanOptions};
 
 #[tokio::main]

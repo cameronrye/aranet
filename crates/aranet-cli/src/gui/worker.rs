@@ -136,12 +136,12 @@ impl CircuitBreaker {
 
     /// Get the time until the circuit will try again.
     fn time_until_retry(&self) -> Option<Duration> {
-        if self.state == CircuitState::Open {
-            if let Some(opened_at) = self.opened_at {
-                let elapsed = opened_at.elapsed();
-                if elapsed < self.recovery_timeout {
-                    return Some(self.recovery_timeout - elapsed);
-                }
+        if self.state == CircuitState::Open
+            && let Some(opened_at) = self.opened_at
+        {
+            let elapsed = opened_at.elapsed();
+            if elapsed < self.recovery_timeout {
+                return Some(self.recovery_timeout - elapsed);
             }
         }
         None
@@ -1374,21 +1374,21 @@ impl SensorWorker {
         info!("Refreshing service status");
 
         // Check circuit breaker
-        if !self.service_circuit_breaker.should_allow() {
-            if let Some(retry_in) = self.service_circuit_breaker.time_until_retry() {
-                self.send_event(SensorEvent::ServiceStatusRefreshed {
-                    reachable: false,
-                    collector_running: false,
-                    uptime_seconds: None,
-                    devices: vec![],
-                })
-                .await;
-                debug!(
-                    "Circuit breaker open, skipping service call (retry in {:?})",
-                    retry_in
-                );
-                return;
-            }
+        if !self.service_circuit_breaker.should_allow()
+            && let Some(retry_in) = self.service_circuit_breaker.time_until_retry()
+        {
+            self.send_event(SensorEvent::ServiceStatusRefreshed {
+                reachable: false,
+                collector_running: false,
+                uptime_seconds: None,
+                devices: vec![],
+            })
+            .await;
+            debug!(
+                "Circuit breaker open, skipping service call (retry in {:?})",
+                retry_in
+            );
+            return;
         }
 
         let Some(ref client) = self.service_client else {
@@ -2136,10 +2136,10 @@ async fn refresh_single_device(
 
             if let Some(reading) = reading {
                 // Save to store
-                if let Ok(store) = Store::open(store_path) {
-                    if let Err(e) = store.insert_reading(device_id, &reading) {
-                        warn!(device_id, error = %e, "Failed to save reading to store");
-                    }
+                if let Ok(store) = Store::open(store_path)
+                    && let Err(e) = store.insert_reading(device_id, &reading)
+                {
+                    warn!(device_id, error = %e, "Failed to save reading to store");
                 }
 
                 let _ = event_tx

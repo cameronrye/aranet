@@ -117,16 +117,16 @@ pub async fn api_key_auth(
 
     // For WebSocket connections, also check query parameter
     // (browsers cannot set custom headers during WebSocket upgrade)
-    if provided_key.is_none() {
-        if let Some(query) = request.uri().query() {
-            provided_key = query.split('&').find_map(|param| {
-                let mut parts = param.splitn(2, '=');
-                match (parts.next(), parts.next()) {
-                    (Some("token"), Some(value)) => Some(value),
-                    _ => None,
-                }
-            });
-        }
+    if provided_key.is_none()
+        && let Some(query) = request.uri().query()
+    {
+        provided_key = query.split('&').find_map(|param| {
+            let mut parts = param.splitn(2, '=');
+            match (parts.next(), parts.next()) {
+                (Some("token"), Some(value)) => Some(value),
+                _ => None,
+            }
+        });
     }
 
     // Validate
