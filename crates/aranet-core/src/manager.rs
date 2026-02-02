@@ -1202,8 +1202,7 @@ impl DeviceManager {
                 if let Some(captured) = reading.captured_at {
                     let age = time::OffsetDateTime::now_utc() - captured;
                     if age
-                        < time::Duration::try_from(max_age)
-                            .unwrap_or(time::Duration::seconds(60))
+                        < time::Duration::try_from(max_age).unwrap_or(time::Duration::seconds(60))
                     {
                         debug!("Using cached passive reading for {}", identifier);
                         return Ok(reading);
