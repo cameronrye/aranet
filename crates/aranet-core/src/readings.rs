@@ -218,7 +218,7 @@ pub fn parse_aranet_radon_gatt(data: &[u8]) -> Result<CurrentReading> {
         co2: 0,
         temperature: temp_raw as f32 / 20.0,
         pressure: pressure_raw as f32 / 10.0,
-        humidity: (humidity_raw / 10).min(255) as u8, // Convert from 10ths to percent
+        humidity: (humidity_raw / 10).min(100) as u8, // Convert from 10ths to percent
         battery,
         status,
         interval,

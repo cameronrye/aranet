@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! # Aranet GUI
 //!
 //! A native desktop GUI application for monitoring Aranet environmental sensors.

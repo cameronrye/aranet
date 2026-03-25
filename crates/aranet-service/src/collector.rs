@@ -298,7 +298,9 @@ async fn collect_device(
                             device_id: device_id.clone(),
                             reading,
                         };
-                        let _ = state.readings_tx.send(event);
+                        if state.readings_tx.send(event).is_err() {
+                            debug!("No active WebSocket subscribers for reading broadcast");
+                        }
                     }
                     Err(e) => {
                         consecutive_failures += 1;
@@ -318,8 +320,13 @@ async fn collect_device(
                             );
                         } else if consecutive_failures == 4 {
                             error!(
-                                "Failed to poll {} after {} attempts, will continue trying silently",
+                                "Failed to poll {} after {} attempts, reducing log frequency",
                                 device_id, consecutive_failures
+                            );
+                        } else if consecutive_failures.is_multiple_of(100) {
+                            error!(
+                                "Failed to poll {} ({} consecutive failures): {}",
+                                device_id, consecutive_failures, e
                             );
                         }
                         // Continue trying - the device may come back online

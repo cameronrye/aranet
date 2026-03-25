@@ -267,6 +267,20 @@ pub struct SecurityConfig {
     /// Rate limit window in seconds.
     #[serde(default = "default_rate_limit_window")]
     pub rate_limit_window_secs: u64,
+    /// Maximum number of tracked IPs for rate limiting.
+    ///
+    /// When the number of tracked IPs exceeds this limit, the oldest entries
+    /// are evicted to prevent unbounded memory growth from many unique IPs.
+    #[serde(default = "default_rate_limit_max_entries")]
+    pub rate_limit_max_entries: usize,
+    /// Allowed CORS origins.
+    ///
+    /// By default, only localhost origins are allowed. Set to `["*"]` to allow
+    /// all origins (not recommended for production).
+    ///
+    /// Examples: `["http://localhost:3000", "http://127.0.0.1:8080"]`
+    #[serde(default = "default_cors_origins")]
+    pub cors_origins: Vec<String>,
 }
 
 fn default_rate_limit_requests() -> u32 {
@@ -275,6 +289,17 @@ fn default_rate_limit_requests() -> u32 {
 
 fn default_rate_limit_window() -> u64 {
     60
+}
+
+fn default_rate_limit_max_entries() -> usize {
+    10_000
+}
+
+fn default_cors_origins() -> Vec<String> {
+    vec![
+        "http://localhost".to_string(),
+        "http://127.0.0.1".to_string(),
+    ]
 }
 
 impl Default for SecurityConfig {
@@ -286,6 +311,8 @@ impl Default for SecurityConfig {
             rate_limit_enabled: true,
             rate_limit_requests: default_rate_limit_requests(),
             rate_limit_window_secs: default_rate_limit_window(),
+            rate_limit_max_entries: default_rate_limit_max_entries(),
+            cors_origins: default_cors_origins(),
         }
     }
 }
@@ -607,18 +634,13 @@ pub enum ConfigError {
 }
 
 /// A single validation error with context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{field}: {message}")]
 pub struct ValidationError {
     /// The field path (e.g., `server.bind` or `devices[0].address`).
     pub field: String,
     /// Description of the validation failure.
     pub message: String,
-}
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.field, self.message)
-    }
 }
 
 fn format_validation_errors(errors: &[ValidationError]) -> String {

@@ -532,7 +532,7 @@ impl CurrentReading {
             co2: 0,
             temperature: f32::from(temp_raw) / 20.0,
             pressure: f32::from(pressure_raw) / 10.0,
-            humidity: (humidity_raw / 10).min(255) as u8, // Convert from 10ths to percent
+            humidity: (humidity_raw / 10).min(100) as u8, // Convert from 10ths to percent
             battery,
             status,
             interval,

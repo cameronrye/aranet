@@ -127,6 +127,15 @@ fn migrate(conn: &Connection, old_version: i32) -> Result<()> {
     // Add future migrations here
     // if old_version < 2 { migrate_to_v2(conn)?; }
 
+    if old_version > SCHEMA_VERSION {
+        tracing::warn!(
+            "Database schema version {} is newer than supported version {}. \
+             This may cause compatibility issues.",
+            old_version,
+            SCHEMA_VERSION
+        );
+    }
+
     let _ = old_version; // Suppress unused warning
     set_schema_version(conn, SCHEMA_VERSION)?;
     Ok(())

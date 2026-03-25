@@ -18,7 +18,6 @@ pub async fn cmd_server(args: ServerArgs) -> Result<()> {
     use aranet_store::Store;
     use axum::Router;
     use std::sync::Arc;
-    use tower_http::cors::{Any, CorsLayer};
     use tower_http::trace::TraceLayer;
     use tracing::info;
 
@@ -66,12 +65,7 @@ pub async fn cmd_server(args: ServerArgs) -> Result<()> {
         .merge(aranet_service::api::router())
         .merge(aranet_service::ws::router())
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(aranet_service::middleware::cors_layer(&config.security))
         .with_state(state);
 
     // Parse bind address

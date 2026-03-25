@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Local data persistence for Aranet sensor readings.
 //!
 //! This crate provides SQLite-based storage for Aranet sensor data,

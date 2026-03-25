@@ -379,7 +379,7 @@ mod tests {
     fn test_co2_trend_rising() {
         let result = co2_trend(850, Some(800));
         assert!(result.is_some());
-        let (arrow, color) = result.unwrap();
+        let (arrow, color) = result.expect("co2_trend should return Some for rising trend");
         assert_eq!(arrow, "↑");
         assert_eq!(color, Color::Red);
     }
@@ -388,7 +388,7 @@ mod tests {
     fn test_co2_trend_falling() {
         let result = co2_trend(750, Some(800));
         assert!(result.is_some());
-        let (arrow, color) = result.unwrap();
+        let (arrow, color) = result.expect("co2_trend should return Some for falling trend");
         assert_eq!(arrow, "↓");
         assert_eq!(color, Color::Green);
     }
@@ -397,7 +397,7 @@ mod tests {
     fn test_co2_trend_stable() {
         let result = co2_trend(805, Some(800));
         assert!(result.is_some());
-        let (arrow, _) = result.unwrap();
+        let (arrow, _) = result.expect("co2_trend should return Some for stable trend");
         assert_eq!(arrow, "→");
     }
 

@@ -229,10 +229,15 @@ pub async fn connect_device_with_progress(
 /// This is part of the unified data architecture - all tools share the same database.
 fn save_device_to_store(device_id: &str, name: Option<&str>) {
     let store_path = aranet_store::default_db_path();
-    if let Ok(store) = aranet_store::Store::open(&store_path) {
-        // Insert or update the device in the store
-        if let Err(e) = store.upsert_device(device_id, name) {
-            tracing::warn!("Failed to save device to store: {}", e);
+    match aranet_store::Store::open(&store_path) {
+        Ok(store) => {
+            if let Err(e) = store.upsert_device(device_id, name) {
+                eprintln!("Warning: Failed to save device to database: {}", e);
+                tracing::warn!("Failed to save device to store: {}", e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to open store for device save: {}", e);
         }
     }
 }

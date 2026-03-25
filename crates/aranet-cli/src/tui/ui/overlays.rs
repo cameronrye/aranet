@@ -209,8 +209,8 @@ pub(super) fn draw_alert_history(frame: &mut Frame, app: &App) {
     } else {
         // Show most recent alerts first
         for record in app.alert_history.iter().rev().take(15) {
-            let format = time::format_description::parse("[month]-[day] [hour]:[minute]").unwrap();
-            let time_str = record.timestamp.format(&format).unwrap_or_default();
+            let format = time::macros::format_description!("[month]-[day] [hour]:[minute]");
+            let time_str = record.timestamp.format(format).unwrap_or_default();
 
             lines.push(Line::from(vec![
                 Span::styled(

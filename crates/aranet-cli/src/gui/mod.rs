@@ -125,7 +125,13 @@ pub fn run() -> Result<()> {
 
     // Spawn tokio runtime thread
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!("Failed to create tokio runtime: {}", e);
+                return;
+            }
+        };
         rt.block_on(async {
             let worker =
                 SensorWorker::with_service_url(command_rx, event_tx, store_path, &service_url);
@@ -293,7 +299,13 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
 
     // Spawn tokio runtime thread
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!("Failed to create tokio runtime: {}", e);
+                return;
+            }
+        };
         rt.block_on(async {
             let worker =
                 SensorWorker::with_service_url(command_rx, event_tx, store_path, &service_url);

@@ -48,18 +48,29 @@ impl DeviceGuard {
     /// Take ownership of the device, preventing automatic disconnect.
     ///
     /// After calling this, you are responsible for disconnecting the device.
+    /// This consumes the guard, so the device cannot be "already taken" —
+    /// the `Option` is only `None` during `Drop`.
     pub fn into_inner(mut self) -> Device {
-        self.device.take().expect("device already taken")
+        // SAFETY: `device` is always `Some` except inside `Drop`.
+        // Since `into_inner` takes `self` by value, Drop hasn't run yet.
+        self.device
+            .take()
+            .expect("DeviceGuard invariant violated: device is None outside of Drop")
     }
 
     /// Get a reference to the device.
-    pub fn device(&self) -> &Device {
-        self.device.as_ref().expect("device already taken")
+    fn device(&self) -> &Device {
+        // SAFETY: Same invariant as above — always `Some` outside of `Drop`.
+        self.device
+            .as_ref()
+            .expect("DeviceGuard invariant violated: device is None outside of Drop")
     }
 
     /// Get a mutable reference to the device.
-    pub fn device_mut(&mut self) -> &mut Device {
-        self.device.as_mut().expect("device already taken")
+    fn device_mut(&mut self) -> &mut Device {
+        self.device
+            .as_mut()
+            .expect("DeviceGuard invariant violated: device is None outside of Drop")
     }
 }
 

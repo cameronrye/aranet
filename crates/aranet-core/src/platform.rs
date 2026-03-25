@@ -466,55 +466,55 @@ impl AliasStore {
 
     /// Add or update an alias in the store.
     pub fn add(&self, alias: DeviceAlias) {
-        let mut aliases = self
-            .aliases
-            .write()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let mut aliases = self.aliases.write().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         aliases.insert(alias.alias.clone(), alias);
     }
 
     /// Get an alias by its user-friendly name.
     pub fn get(&self, alias_name: &str) -> Option<DeviceAlias> {
-        let aliases = self
-            .aliases
-            .read()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let aliases = self.aliases.read().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         aliases.get(alias_name).cloned()
     }
 
     /// Remove an alias by name.
     pub fn remove(&self, alias_name: &str) -> Option<DeviceAlias> {
-        let mut aliases = self
-            .aliases
-            .write()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let mut aliases = self.aliases.write().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         aliases.remove(alias_name)
     }
 
     /// Find an alias by any of its identifiers.
     pub fn find_by_identifier(&self, identifier: &str) -> Option<DeviceAlias> {
-        let aliases = self
-            .aliases
-            .read()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let aliases = self.aliases.read().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         aliases.values().find(|a| a.matches(identifier)).cloned()
     }
 
     /// Get all aliases.
     pub fn all(&self) -> Vec<DeviceAlias> {
-        let aliases = self
-            .aliases
-            .read()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let aliases = self.aliases.read().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         aliases.values().cloned().collect()
     }
 
     /// Get the number of aliases.
     pub fn len(&self) -> usize {
-        let aliases = self
-            .aliases
-            .read()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let aliases = self.aliases.read().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         aliases.len()
     }
 
@@ -525,10 +525,10 @@ impl AliasStore {
 
     /// Clear all aliases.
     pub fn clear(&self) {
-        let mut aliases = self
-            .aliases
-            .write()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let mut aliases = self.aliases.write().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         aliases.clear();
     }
 
@@ -548,10 +548,10 @@ impl AliasStore {
 
     /// Export all aliases to JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        let aliases = self
-            .aliases
-            .read()
-            .expect("alias store lock poisoned - a thread panicked while holding the lock");
+        let aliases = self.aliases.read().unwrap_or_else(|e| {
+            tracing::warn!("Alias store lock was poisoned, recovering");
+            e.into_inner()
+        });
         serde_json::to_string_pretty(&*aliases)
     }
 

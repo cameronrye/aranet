@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Background collector and HTTP REST API for Aranet sensors.
 //!
 //! This crate provides a service that:
@@ -53,6 +55,10 @@
 //!
 //! For WebSocket connections, browsers cannot set custom headers. Use the `token`
 //! query parameter instead: `ws://localhost:8080/api/ws?token=your-api-key`
+//!
+//! **Note**: Query parameters may be logged by proxies or appear in browser history.
+//! For sensitive deployments, consider using a short-lived token exchange endpoint
+//! rather than passing the API key directly in the query string.
 //!
 //! # Platform Setup
 //!

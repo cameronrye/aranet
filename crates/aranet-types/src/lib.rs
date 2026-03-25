@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Platform-agnostic types for Aranet environmental sensors.
 //!
 //! This crate provides shared types used across all aranet crates

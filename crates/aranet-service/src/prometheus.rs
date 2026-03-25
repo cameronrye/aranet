@@ -89,10 +89,13 @@ async fn run_prometheus_pusher(
     push_gateway: String,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("Failed to create HTTP client");
+    let client = match Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to create HTTP client for Prometheus pusher: {e}");
+            return;
+        }
+    };
 
     let push_interval = Duration::from_secs(config.push_interval);
     let mut interval = tokio::time::interval(push_interval);
@@ -297,7 +300,7 @@ async fn push_metrics(
         .body(metrics.to_string())
         .send()
         .await
-        .map_err(|e| PushError::Request(e.to_string()))?;
+        .map_err(PushError::Request)?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -322,7 +325,7 @@ fn escape_label_value(s: &str) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("Request failed: {0}")]
-    Request(String),
+    Request(#[from] reqwest::Error),
     #[error("Push gateway returned error {status}: {body}")]
     Response { status: u16, body: String },
 }

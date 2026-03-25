@@ -533,9 +533,11 @@ fn calculate_time_stats(times: &[u64]) -> (Option<u64>, Option<u64>, Option<u64>
     }
 
     let sum: u64 = times.iter().sum();
-    let avg = sum / times.len() as u64;
-    let min = *times.iter().min().unwrap();
-    let max = *times.iter().max().unwrap();
+    let len = times.len() as f64;
+    let avg = (sum as f64 / len).round() as u64;
+    // SAFETY: times is non-empty (checked above)
+    let min = *times.iter().min().expect("checked non-empty above");
+    let max = *times.iter().max().expect("checked non-empty above");
 
     (Some(avg), Some(min), Some(max))
 }

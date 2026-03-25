@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
-time = { version = "0.3", features = ["formatting", "parsing", "serde", "local-offset"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "local-offset", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }

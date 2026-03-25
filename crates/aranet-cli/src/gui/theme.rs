@@ -55,6 +55,9 @@ pub fn detect_system_theme() -> ThemeMode {
     // SAFETY: We're on the main thread (checked above), and the appearance object
     // is valid for the duration of this call. The name property returns a string
     // that describes the appearance.
+    // SAFETY: We're on the main thread (checked above via MainThreadMarker),
+    // and the appearance object is valid for the duration of this call.
+    #[allow(unsafe_code)]
     let name = unsafe { appearance.name() };
     let name_str = name.to_string();
 

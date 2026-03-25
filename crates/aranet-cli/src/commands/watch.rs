@@ -13,6 +13,7 @@ use aranet_core::advertisement::parse_advertisement_with_name;
 use aranet_core::scan::{ScanOptions, scan_with_options};
 use aranet_types::CurrentReading;
 use owo_colors::OwoColorize;
+use tracing::debug;
 
 use crate::cli::OutputFormat;
 use crate::format::{
@@ -69,8 +70,10 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
         // Check if we've reached the count limit
         if count > 0 && readings_taken >= count {
             eprintln!("Completed {} readings.", readings_taken);
-            if let Some(d) = current_device.take() {
-                d.disconnect().await.ok();
+            if let Some(d) = current_device.take()
+                && let Err(e) = d.disconnect().await
+            {
+                debug!("Failed to disconnect: {e}");
             }
             return Ok(());
         }
@@ -115,8 +118,13 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
             backoff_secs = MIN_BACKOFF_SECS;
         }
 
-        // At this point we're guaranteed to have a device
-        let device = current_device.as_ref().expect("device should be connected");
+        // At this point we should have a device from the connect logic above
+        let Some(device) = current_device.as_ref() else {
+            // Should not happen, but handle gracefully instead of panicking
+            eprintln!("Device unexpectedly unavailable. Reconnecting...");
+            current_device = None;
+            continue;
+        };
 
         // Print header with device info (after first successful connection)
         if !header_printed {
@@ -167,8 +175,10 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
             Err(e) => {
                 eprintln!("Read failed: {}. Will reconnect on next poll.", e);
                 // Mark connection as lost so we reconnect on next iteration
-                if let Some(d) = current_device.take() {
-                    d.disconnect().await.ok();
+                if let Some(d) = current_device.take()
+                    && let Err(e) = d.disconnect().await
+                {
+                    debug!("Failed to disconnect: {e}");
                 }
             }
         }
@@ -183,8 +193,8 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\nShutting down...");
                 // Clean up connection before exit
-                if let Some(d) = current_device.take() {
-                    d.disconnect().await.ok();
+                if let Some(d) = current_device.take() && let Err(e) = d.disconnect().await {
+                    debug!("Failed to disconnect: {e}");
                 }
                 return Ok(());
             }

@@ -756,7 +756,7 @@ mod tests {
         let cloned = cmd.clone();
         match cloned {
             Command::Connect { device_id } => assert_eq!(device_id, "test-device"),
-            _ => panic!("Expected Connect variant"),
+            other => panic!("Expected Connect variant, got {:?}", other),
         }
     }
 

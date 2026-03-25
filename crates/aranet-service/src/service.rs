@@ -22,7 +22,7 @@ pub enum ServiceError {
     NoServiceManager,
 
     #[error("Service manager error: {0}")]
-    Manager(String),
+    Manager(#[from] std::io::Error),
 
     #[error("Could not find aranet-service executable")]
     ExecutableNotFound,
@@ -151,7 +151,7 @@ pub fn install(level: Level) -> Result<(), ServiceError> {
                 delay_secs: Some(5),
             },
         })
-        .map_err(|e| ServiceError::Manager(e.to_string()))?;
+        .map_err(ServiceError::Manager)?;
 
     Ok(())
 }
@@ -163,7 +163,7 @@ pub fn uninstall(level: Level) -> Result<(), ServiceError> {
 
     manager
         .uninstall(ServiceUninstallCtx { label })
-        .map_err(|e| ServiceError::Manager(e.to_string()))?;
+        .map_err(ServiceError::Manager)?;
 
     Ok(())
 }
@@ -175,7 +175,7 @@ pub fn start(level: Level) -> Result<(), ServiceError> {
 
     manager
         .start(ServiceStartCtx { label })
-        .map_err(|e| ServiceError::Manager(e.to_string()))?;
+        .map_err(ServiceError::Manager)?;
 
     Ok(())
 }
@@ -187,7 +187,7 @@ pub fn stop(level: Level) -> Result<(), ServiceError> {
 
     manager
         .stop(ServiceStopCtx { label })
-        .map_err(|e| ServiceError::Manager(e.to_string()))?;
+        .map_err(ServiceError::Manager)?;
 
     Ok(())
 }
@@ -219,12 +219,23 @@ pub fn status(level: Level) -> Result<ServiceStatus, ServiceError> {
 }
 
 /// Check if the service API is reachable by attempting a TCP connection.
+///
+/// Uses the configured bind address from the service config, falling back
+/// to the default address if config cannot be loaded.
 fn is_service_reachable() -> bool {
-    use std::net::TcpStream;
+    use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
-    // Try to connect to the default service port
-    TcpStream::connect_timeout(&"127.0.0.1:8080".parse().unwrap(), Duration::from_secs(2)).is_ok()
+    let bind = aranet_service::Config::load_default()
+        .map(|c| c.server.bind)
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+
+    let addr: SocketAddr = match bind.parse() {
+        Ok(addr) => addr,
+        Err(_) => return false,
+    };
+
+    TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
 }
 
 /// Service status

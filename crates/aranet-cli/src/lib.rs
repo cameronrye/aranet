@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Command-line interface for Aranet environmental sensors.
 //!
 //! This crate provides a comprehensive CLI for interacting with Aranet devices

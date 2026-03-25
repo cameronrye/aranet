@@ -599,28 +599,20 @@ mod tests {
             assert_eq!(total, 3);
             assert_eq!(duration_secs, 5);
         } else {
-            panic!("Unexpected variant");
+            panic!("Expected ScanAttempt variant");
         }
     }
 
     #[test]
     fn test_find_progress_found() {
         let progress = FindProgress::Found { attempt: 1 };
-        if let FindProgress::Found { attempt } = progress {
-            assert_eq!(attempt, 1);
-        } else {
-            panic!("Unexpected variant");
-        }
+        assert!(matches!(progress, FindProgress::Found { attempt: 1 }));
     }
 
     #[test]
     fn test_find_progress_retry_needed() {
         let progress = FindProgress::RetryNeeded { attempt: 2 };
-        if let FindProgress::RetryNeeded { attempt } = progress {
-            assert_eq!(attempt, 2);
-        } else {
-            panic!("Unexpected variant");
-        }
+        assert!(matches!(progress, FindProgress::RetryNeeded { attempt: 2 }));
     }
 
     #[test]
@@ -632,25 +624,21 @@ mod tests {
         };
         let progress2 = progress1.clone();
 
-        if let (
-            FindProgress::ScanAttempt {
-                attempt: a1,
-                total: t1,
-                duration_secs: d1,
-            },
-            FindProgress::ScanAttempt {
-                attempt: a2,
-                total: t2,
-                duration_secs: d2,
-            },
-        ) = (progress1, progress2)
-        {
-            assert_eq!(a1, a2);
-            assert_eq!(t1, t2);
-            assert_eq!(d1, d2);
-        } else {
-            panic!("Clone should preserve variant");
-        }
+        assert!(matches!(
+            (&progress1, &progress2),
+            (
+                FindProgress::ScanAttempt {
+                    attempt: 1,
+                    total: 3,
+                    duration_secs: 4,
+                },
+                FindProgress::ScanAttempt {
+                    attempt: 1,
+                    total: 3,
+                    duration_secs: 4,
+                },
+            )
+        ));
     }
 
     // ==================== DiscoveredDevice Tests ====================

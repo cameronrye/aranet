@@ -297,11 +297,11 @@ impl Config {
                 Ok(content) => match toml::from_str(&content) {
                     Ok(config) => return config,
                     Err(e) => {
-                        eprintln!("Warning: Failed to parse config: {}", e);
+                        tracing::warn!("Failed to parse config file: {}", e);
                     }
                 },
                 Err(e) => {
-                    eprintln!("Warning: Failed to read config: {}", e);
+                    tracing::warn!("Failed to read config file: {}", e);
                 }
             }
         }

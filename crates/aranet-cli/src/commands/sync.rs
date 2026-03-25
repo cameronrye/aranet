@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use aranet_core::HistoryOptions;
 use aranet_store::Store;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::cli::{DeviceArgs, OutputFormat};
 use crate::config::Config;
@@ -65,7 +65,9 @@ pub async fn cmd_sync(args: SyncArgs, config: &Config) -> Result<()> {
         let start = store.calculate_sync_start(&device_address, total_on_device)?;
         if start > total_on_device {
             println!("Already up to date - no new readings to sync");
-            device.disconnect().await.ok();
+            if let Err(e) = device.disconnect().await {
+                debug!("Failed to disconnect after sync: {e}");
+            }
             return Ok(());
         }
         info!(
@@ -102,7 +104,9 @@ pub async fn cmd_sync(args: SyncArgs, config: &Config) -> Result<()> {
         .context("Failed to download history")?;
 
     pb.finish_with_message("Download complete");
-    device.disconnect().await.ok();
+    if let Err(e) = device.disconnect().await {
+        debug!("Failed to disconnect after sync: {e}");
+    }
 
     // Store history records
     let inserted = store.insert_history(&device_address, &history)?;
@@ -255,7 +259,9 @@ async fn sync_single_device(
     } else {
         let start = store.calculate_sync_start(device_address, total_on_device)?;
         if start > total_on_device {
-            device.disconnect().await.ok();
+            if let Err(e) = device.disconnect().await {
+                debug!("Failed to disconnect after sync: {e}");
+            }
             return Ok((0, 0)); // Already up to date
         }
         info!(
@@ -272,7 +278,9 @@ async fn sync_single_device(
         .await
         .context("Failed to download history")?;
 
-    device.disconnect().await.ok();
+    if let Err(e) = device.disconnect().await {
+        debug!("Failed to disconnect after sync: {e}");
+    }
 
     // Store history records
     let inserted = store.insert_history(device_address, &history)?;

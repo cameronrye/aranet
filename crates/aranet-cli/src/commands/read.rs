@@ -10,6 +10,7 @@ use aranet_core::advertisement::parse_advertisement_with_name;
 use aranet_core::scan::{ScanOptions, scan_with_options};
 use aranet_types::CurrentReading;
 use futures::future::join_all;
+use tracing::debug;
 
 use crate::cli::OutputFormat;
 use crate::format::{
@@ -34,6 +35,12 @@ pub async fn cmd_read(
     opts: &FormatOptions,
 ) -> Result<()> {
     if passive {
+        if devices.len() > 1 {
+            eprintln!(
+                "Warning: passive mode only supports one device, using '{}'",
+                devices[0]
+            );
+        }
         let device = devices.first().cloned();
         return cmd_read_passive(device, timeout, format, output, quiet, opts).await;
     }
@@ -75,7 +82,9 @@ async fn cmd_read_single(
         .await
         .context("Failed to read current values")?;
 
-    device.disconnect().await.ok();
+    if let Err(e) = device.disconnect().await {
+        debug!("Failed to disconnect after read: {e}");
+    }
 
     // Save reading to store (unified data architecture)
     crate::util::save_reading_to_store(&device_id, &reading);
@@ -182,7 +191,9 @@ async fn read_device(
         .context("Failed to read current values")
         .map_err(|e| (identifier.clone(), e))?;
 
-    device.disconnect().await.ok();
+    if let Err(e) = device.disconnect().await {
+        debug!("Failed to disconnect after read: {e}");
+    }
 
     // Save reading to store (unified data architecture)
     crate::util::save_reading_to_store(&device_id, &reading);

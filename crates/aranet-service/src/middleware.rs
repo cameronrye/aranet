@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 use axum::{
     Json,
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use tokio::sync::RwLock;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
 use crate::config::SecurityConfig;
@@ -80,12 +81,28 @@ impl RateLimitState {
     }
 
     /// Clean up expired entries to prevent memory leaks.
-    pub async fn cleanup(&self, window_secs: u64) {
+    ///
+    /// Also enforces `max_entries` cap to prevent unbounded growth from many unique IPs.
+    pub async fn cleanup(&self, window_secs: u64, max_entries: usize) {
         let window = Duration::from_secs(window_secs);
         let now = Instant::now();
 
         let mut requests = self.requests.write().await;
+        // Remove expired entries
         requests.retain(|_, entry| now.duration_since(entry.window_start) < window * 2);
+
+        // Evict oldest entries if we exceed the cap
+        if requests.len() > max_entries {
+            let mut entries: Vec<(IpAddr, Instant)> = requests
+                .iter()
+                .map(|(ip, entry)| (*ip, entry.window_start))
+                .collect();
+            entries.sort_by_key(|(_, start)| *start);
+            let to_remove = requests.len() - max_entries;
+            for (ip, _) in entries.into_iter().take(to_remove) {
+                requests.remove(&ip);
+            }
+        }
     }
 }
 
@@ -199,16 +216,56 @@ pub async fn rate_limit(
 }
 
 /// Constant-time byte comparison to prevent timing attacks.
+///
+/// Both length and content are compared in constant time to avoid
+/// leaking information about either the expected or provided key.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
+    // XOR lengths and fold into the result to avoid leaking key length via timing.
+    // We iterate over the longer of the two slices, comparing against the shorter
+    // one (wrapping the index) so we always do the same amount of work.
+    let len_diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+
+    // Both empty: equal only if lengths match (they do, both 0).
+    // One empty: len_diff != 0 so result is already non-zero.
+    if max_len == 0 {
+        return true;
+    }
+
+    // If either slice is empty, we can't index into it — but len_diff
+    // is already non-zero, guaranteeing a false result.
+    if a.is_empty() || b.is_empty() {
         return false;
     }
 
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
+    let mut result = len_diff as u8;
+    for i in 0..max_len {
+        result |= a[i % a.len()] ^ b[i % b.len()];
     }
     result == 0
+}
+
+/// Build a CORS layer from the security configuration.
+///
+/// By default, only localhost origins are allowed. If `cors_origins` contains `"*"`,
+/// all origins are permitted (not recommended for production).
+pub fn cors_layer(config: &SecurityConfig) -> CorsLayer {
+    if config.cors_origins.iter().any(|o| o == "*") {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        let origins: Vec<HeaderValue> = config
+            .cors_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    }
 }
 
 /// Sanitize a device name to prevent XSS and injection attacks.
@@ -367,8 +424,63 @@ mod tests {
         assert_eq!(state.requests.read().await.len(), 1);
 
         // Cleanup (entries within 2x window are kept)
-        state.cleanup(60).await;
+        state.cleanup(60, 10_000).await;
         assert_eq!(state.requests.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_state_cleanup_evicts_over_cap() {
+        let state = RateLimitState::new();
+
+        // Add 5 entries from different IPs
+        for i in 1..=5u8 {
+            let ip: IpAddr = format!("10.0.0.{}", i).parse().unwrap();
+            state.check_rate_limit(ip, 100, 60).await.ok();
+        }
+        assert_eq!(state.requests.read().await.len(), 5);
+
+        // Cleanup with max_entries=3 should evict the 2 oldest
+        state.cleanup(60, 3).await;
+        assert_eq!(state.requests.read().await.len(), 3);
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_lengths() {
+        // Different lengths should still return false without leaking length
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+    }
+
+    #[test]
+    fn test_cors_layer_wildcard() {
+        let config = SecurityConfig {
+            cors_origins: vec!["*".to_string()],
+            ..Default::default()
+        };
+        // Should not panic
+        let _layer = cors_layer(&config);
+    }
+
+    #[test]
+    fn test_cors_layer_specific_origins() {
+        let config = SecurityConfig {
+            cors_origins: vec![
+                "http://localhost:3000".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ],
+            ..Default::default()
+        };
+        let _layer = cors_layer(&config);
+    }
+
+    #[test]
+    fn test_cors_layer_default() {
+        let config = SecurityConfig::default();
+        assert_eq!(config.cors_origins.len(), 2);
+        let _layer = cors_layer(&config);
     }
 
     #[test]

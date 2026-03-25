@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! TUI for Aranet sensors.
 //!
 //! This crate provides a standalone binary wrapper around aranet-cli's TUI functionality.

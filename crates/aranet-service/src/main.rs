@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use axum::Router;
 use clap::{Parser, Subcommand};
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -198,11 +197,12 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
     {
         let rate_limit_state = Arc::clone(&rate_limit_state);
         let window_secs = config.security.rate_limit_window_secs;
+        let max_entries = config.security.rate_limit_max_entries;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 interval.tick().await;
-                rate_limit_state.cleanup(window_secs).await;
+                rate_limit_state.cleanup(window_secs, max_entries).await;
             }
         });
     }
@@ -246,12 +246,7 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
             middleware::rate_limit,
         ))
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(middleware::cors_layer(&config.security))
         .with_state(Arc::clone(&state));
 
     // Parse bind address
@@ -275,17 +270,24 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
 /// Wait for shutdown signal and perform cleanup.
 async fn shutdown_signal(mut collector: Option<Collector>, state: Arc<AppState>) {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to install Ctrl+C handler: {}", e);
+            // Fall through to pending so terminate handler can still work
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

@@ -45,10 +45,16 @@ use tracing::{debug, info, warn};
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord, Status};
 
 /// Safely convert a Unix timestamp to OffsetDateTime.
+///
 /// Returns UNIX_EPOCH if the timestamp is invalid (corrupted database data).
+/// Callers should be aware that UNIX_EPOCH indicates a corrupted value.
 fn timestamp_from_unix(ts: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(ts).unwrap_or_else(|_| {
-        warn!("Invalid timestamp {} in database, using UNIX_EPOCH", ts);
+        warn!(
+            "Corrupted timestamp {} in database, substituting UNIX_EPOCH. \
+             Consider running a database integrity check.",
+            ts
+        );
         OffsetDateTime::UNIX_EPOCH
     })
 }
@@ -193,6 +199,7 @@ impl Store {
     /// ```
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::initialize(&conn)?;
         Ok(Self { conn })
     }
@@ -399,29 +406,33 @@ impl Store {
 
     /// Delete a device and all associated data (readings, history, sync state).
     ///
+    /// All deletions are performed within a transaction to ensure atomicity.
     /// Returns true if the device was deleted, false if it didn't exist.
     pub fn delete_device(&self, device_id: &str) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+
         // Delete in order: history, readings, sync_state, device
-        // Foreign keys would handle this, but explicit is clearer
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM history WHERE device_id = ?1",
             rusqlite::params![device_id],
         )?;
 
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM readings WHERE device_id = ?1",
             rusqlite::params![device_id],
         )?;
 
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM sync_state WHERE device_id = ?1",
             rusqlite::params![device_id],
         )?;
 
-        let rows_deleted = self.conn.execute(
+        let rows_deleted = tx.execute(
             "DELETE FROM devices WHERE id = ?1",
             rusqlite::params![device_id],
         )?;
+
+        tx.commit()?;
 
         Ok(rows_deleted > 0)
     }
@@ -1333,6 +1344,9 @@ impl Store {
         let mut skipped = 0;
         let mut errors = Vec::new();
 
+        // Track devices we've already upserted to avoid N+1 queries
+        let mut upserted_devices = std::collections::HashSet::new();
+
         for (line_num, result) in reader.records().enumerate() {
             total += 1;
             let line = line_num + 2; // Account for header and 0-indexing
@@ -1496,8 +1510,10 @@ impl Store {
                 radiation_total: None,
             };
 
-            // Ensure device exists and insert record
-            self.upsert_device(device_id, None)?;
+            // Ensure device exists (only once per unique device_id)
+            if upserted_devices.insert(device_id.to_string()) {
+                self.upsert_device(device_id, None)?;
+            }
             let count = self.insert_history(device_id, &[history_record])?;
             imported += count;
             if count == 0 {
@@ -1526,12 +1542,17 @@ impl Store {
         let mut imported = 0;
         let mut skipped = 0;
 
+        // Track devices we've already upserted to avoid N+1 queries
+        let mut upserted_devices = std::collections::HashSet::new();
+
         for record in records {
             // Convert to HistoryRecord
             let history_record = record.to_history();
 
-            // Ensure device exists and insert record
-            self.upsert_device(&record.device_id, None)?;
+            // Ensure device exists (only once per unique device_id)
+            if upserted_devices.insert(record.device_id.clone()) {
+                self.upsert_device(&record.device_id, None)?;
+            }
             let count = self.insert_history(&record.device_id, &[history_record])?;
             imported += count;
             if count == 0 {

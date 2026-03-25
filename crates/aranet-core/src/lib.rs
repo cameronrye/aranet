@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Core BLE library for Aranet environmental sensors.
 //!
 //! This crate provides low-level Bluetooth Low Energy (BLE) communication

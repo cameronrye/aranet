@@ -36,7 +36,12 @@ pub fn ensure_agent() {
     // This prevents duplicate spawns while still allowing retry after failure
     // (which resets state back to IDLE).
     if AGENT_STATE
-        .compare_exchange(STATE_IDLE, STATE_STARTING, Ordering::SeqCst, Ordering::SeqCst)
+        .compare_exchange(
+            STATE_IDLE,
+            STATE_STARTING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
         .is_err()
     {
         return;

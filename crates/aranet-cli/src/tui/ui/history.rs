@@ -153,8 +153,8 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     // Show last sync time
     if let Some(sync_time) = device.last_sync {
-        let format = time::format_description::parse("[hour]:[minute]:[second]").unwrap();
-        let sync_str = sync_time.format(&format).unwrap_or_default();
+        let format = time::macros::format_description!("[hour]:[minute]:[second]");
+        let sync_str = sync_time.format(format).unwrap_or_default();
         let age = (time::OffsetDateTime::now_utc() - sync_time).whole_minutes();
         let age_str = if age < 1 {
             "just now".to_string()

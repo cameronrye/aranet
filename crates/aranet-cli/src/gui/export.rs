@@ -22,9 +22,9 @@ pub fn generate_export_path(
 ) -> (PathBuf, String) {
     // Generate filename with timestamp
     let timestamp = time::OffsetDateTime::now_utc()
-        .format(
-            &time::format_description::parse("[year][month][day]_[hour][minute][second]").unwrap(),
-        )
+        .format(time::macros::format_description!(
+            "[year][month][day]_[hour][minute][second]"
+        ))
         .unwrap_or_else(|_| "export".to_string());
     let safe_device_name = device_name
         .chars()

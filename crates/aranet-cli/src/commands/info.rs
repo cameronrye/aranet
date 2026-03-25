@@ -28,7 +28,9 @@ pub async fn cmd_info(
         .await
         .context("Failed to read device info")?;
 
-    device.disconnect().await.ok();
+    if let Err(e) = device.disconnect().await {
+        tracing::debug!("Failed to disconnect after info: {e}");
+    }
 
     let content = match format {
         OutputFormat::Json => opts.as_json(&info)?,

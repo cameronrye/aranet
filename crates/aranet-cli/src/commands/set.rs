@@ -111,6 +111,8 @@ pub async fn cmd_set(
         }
     }
 
-    device.disconnect().await.ok();
+    if let Err(e) = device.disconnect().await {
+        tracing::debug!("Failed to disconnect after set: {e}");
+    }
     Ok(())
 }

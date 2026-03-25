@@ -1271,19 +1271,18 @@ async fn get_all_readings(
 }
 
 /// Application error type.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
     Conflict(String),
-    Store(aranet_store::Error),
+    #[error(transparent)]
+    Store(#[from] aranet_store::Error),
+    #[error("{0}")]
     Internal(String),
-}
-
-impl From<aranet_store::Error> for AppError {
-    fn from(e: aranet_store::Error) -> Self {
-        AppError::Store(e)
-    }
 }
 
 impl IntoResponse for AppError {

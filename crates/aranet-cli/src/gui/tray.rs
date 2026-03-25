@@ -564,6 +564,7 @@ pub fn show_dock_icon() {
         if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &icon_data) {
             // SAFETY: We have a MainThreadMarker proving we're on the main thread,
             // and the icon is a valid NSImage created from our embedded PNG data.
+            #[allow(unsafe_code)]
             unsafe {
                 app.setApplicationIconImage(Some(&icon));
             }
