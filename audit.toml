@@ -32,6 +32,11 @@ ignore = [
     # rustls-pemfile is unmaintained - used by rumqttc for MQTT TLS support.
     # The functionality still works and is a transitive dependency.
     "RUSTSEC-2025-0134",  # rustls-pemfile
+
+    # rustls-webpki 0.102.x CRL matching bug - pinned by rumqttc's dependency
+    # on rustls 0.22.x. Cannot upgrade without rumqttc updating to rustls 0.23+.
+    # Only affects CRL distribution point matching, not general TLS security.
+    "RUSTSEC-2026-0049",  # rustls-webpki (via rumqttc -> rustls 0.22)
 ]
 
 # Informational warnings about unmaintained crates - these are acceptable
