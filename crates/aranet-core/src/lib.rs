@@ -66,6 +66,8 @@
 //! ```
 
 pub mod advertisement;
+#[cfg(target_os = "linux")]
+pub mod bluez_agent;
 pub mod commands;
 pub mod device;
 pub mod diagnostics;

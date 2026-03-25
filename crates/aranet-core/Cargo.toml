@@ -27,6 +27,11 @@ tokio-util.workspace = true
 reqwest = { workspace = true, optional = true }
 serde_json.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = "0.9"
+dbus-tokio = "0.7"
+dbus-crossroads = "0.5"
+
 [features]
 default = []
 service-client = ["dep:reqwest"]

@@ -140,6 +140,12 @@ impl ScanOptions {
 pub async fn get_adapter() -> Result<Adapter> {
     use crate::error::DeviceNotFoundReason;
 
+    // On Linux, register a BlueZ agent to handle authentication during service
+    // discovery. Without this, BlueZ hangs when it encounters characteristics
+    // that require authentication (e.g., Battery Level on Aranet devices).
+    #[cfg(target_os = "linux")]
+    crate::bluez_agent::ensure_agent();
+
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;
 
