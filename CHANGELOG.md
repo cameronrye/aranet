@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-03-25
+
+### Added
+
+- **BlueZ Agent** - Register a BlueZ agent on Linux to prevent BLE hangs during service discovery
+
+### Fixed
+
+- Fix BLE connection hang on Linux caused by unhandled BlueZ pairing/authorization requests
+- Update vulnerable dependencies: `bytes` 1.11.1, `quinn-proto` 0.11.14, `rustls-webpki` 0.103.10, `time` 0.3.47
+- Ignore unpatchable `rustls-webpki` 0.102.x advisory (pinned by `rumqttc`)
+
 ## [0.1.12] - 2026-02-01
 
 ### Added

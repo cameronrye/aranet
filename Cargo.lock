@@ -264,7 +264,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "aranet-cli"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "aranet-core",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "aranet-types",
  "async-trait",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-gui"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "aranet-cli",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-service"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "aranet-core",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-store"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "aranet-types",
  "csv",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-tui"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "aranet-cli",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-types"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "bytes",
  "proptest",
