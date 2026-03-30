@@ -79,14 +79,35 @@ jobs:
             fi
           done
 
-      - name: List generated screenshots
-        run: ls -la assets/screenshots/
+      - name: Validate generated screenshots
+        run: |
+          failed=0
+          for gif in assets/screenshots/*.gif; do
+            size=$(stat -f%z "$gif" 2>/dev/null || stat -c%s "$gif" 2>/dev/null)
+            echo "$gif: ${size} bytes"
+            if [ "$size" -lt 30000 ]; then
+              echo "::warning::$gif looks too small (${size} bytes) — VHS recording may have failed"
+              failed=1
+            fi
+          done
+          ls -la assets/screenshots/
+          if [ "$failed" -eq 1 ]; then
+            echo "::warning::Some screenshots may be broken. Skipping commit."
+            echo "SCREENSHOTS_VALID=false" >> "$GITHUB_ENV"
+          else
+            echo "SCREENSHOTS_VALID=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Sync to website
+        if: env.SCREENSHOTS_VALID == 'true'
+        run: cp assets/screenshots/* website/public/screenshots/
 
       - name: Commit screenshots
+        if: env.SCREENSHOTS_VALID == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add assets/screenshots/
+          git add assets/screenshots/ website/public/screenshots/
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
