@@ -234,6 +234,7 @@ async fn generate_metrics(state: &AppState) -> String {
         let mut radiation_rate_lines = Vec::new();
         let mut radiation_total_lines = Vec::new();
 
+        let now = OffsetDateTime::now_utc();
         for (device, reading) in &device_readings {
             let device_name = device.name.as_deref().unwrap_or(&device.id);
             let labels = format!(
@@ -269,10 +270,11 @@ async fn generate_metrics(state: &AppState) -> String {
                 "aranet_battery_percent{{{}}} {}\n",
                 labels, reading.battery
             ));
-            if reading.age > 0 {
+            let age_seconds = (now - reading.captured_at).whole_seconds();
+            if age_seconds > 0 {
                 reading_age_lines.push(format!(
                     "aranet_reading_age_seconds{{{}}} {}\n",
-                    labels, reading.age
+                    labels, age_seconds
                 ));
             }
             if let Some(radon) = reading.radon {
