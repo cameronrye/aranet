@@ -290,10 +290,11 @@ mod tests {
 
     #[test]
     fn test_build_install_args_preserves_runtime_options() {
+        let db_path = env::temp_dir().join("aranet-test.db");
         let options = aranet_service::RunOptions {
             config: Some(PathBuf::from("config/server.toml")),
             bind: Some("0.0.0.0:9090".to_string()),
-            database: Some(PathBuf::from("/tmp/aranet.db")),
+            database: Some(db_path.clone()),
             no_collector: true,
         };
 
@@ -309,7 +310,7 @@ mod tests {
                 OsString::from("--bind"),
                 OsString::from("0.0.0.0:9090"),
                 OsString::from("--database"),
-                OsString::from("/tmp/aranet.db"),
+                db_path.into_os_string(),
                 OsString::from("--no-collector"),
             ]
         );
