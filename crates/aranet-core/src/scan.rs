@@ -7,8 +7,47 @@ use std::time::Duration;
 
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+
+/// Cached BLE manager — avoids creating a new D-Bus connection on every call.
+///
+/// Using `RwLock<Option<Manager>>` instead of `OnceCell` so the manager can
+/// be re-created if the underlying D-Bus connection dies (e.g., dbus-daemon
+/// restart, adapter reset).
+static MANAGER: RwLock<Option<Manager>> = RwLock::const_new(None);
+
+/// Get or create the shared BLE manager.
+async fn shared_manager() -> Result<Manager> {
+    // Fast path: read lock to return existing manager.
+    {
+        let guard = MANAGER.read().await;
+        if let Some(m) = guard.as_ref() {
+            return Ok(m.clone());
+        }
+    }
+    // Slow path: create a new manager under write lock.
+    let mut guard = MANAGER.write().await;
+    // Double-check after acquiring write lock.
+    if let Some(m) = guard.as_ref() {
+        return Ok(m.clone());
+    }
+    let m = Manager::new().await?;
+    *guard = Some(m.clone());
+    Ok(m)
+}
+
+/// Reset the cached manager, forcing the next call to create a fresh one.
+///
+/// Call this when the D-Bus connection appears to be dead (e.g., adapter
+/// enumeration fails with a connection error).
+async fn reset_manager() {
+    let mut guard = MANAGER.write().await;
+    if guard.take().is_some() {
+        warn!("BLE manager reset — next operation will create a new D-Bus connection");
+    }
+}
 
 use crate::error::{Error, Result};
 use crate::util::{create_identifier, format_peripheral_id};
@@ -146,8 +185,16 @@ pub async fn get_adapter() -> Result<Adapter> {
     #[cfg(target_os = "linux")]
     crate::bluez_agent::ensure_agent();
 
-    let manager = Manager::new().await?;
-    let adapters = manager.adapters().await?;
+    let manager = shared_manager().await?;
+    let adapters = match manager.adapters().await {
+        Ok(a) => a,
+        Err(e) => {
+            // The D-Bus connection may have died — reset the cached manager
+            // so the next call creates a fresh connection.
+            reset_manager().await;
+            return Err(e.into());
+        }
+    };
 
     adapters
         .into_iter()
@@ -381,34 +428,40 @@ pub async fn find_device_with_options(
     find_device_with_progress(identifier, options, None).await
 }
 
-/// Find a specific device with progress callback for UI feedback.
+/// Find a specific device using a pre-existing adapter.
 ///
-/// The progress callback is called with updates about the search progress,
-/// including cache hits, scan attempts, and retry information.
-pub async fn find_device_with_progress(
+/// This avoids creating a new btleplug `Manager` (and D-Bus connection) on
+/// every call.  The caller is responsible for keeping the `Adapter` alive.
+pub async fn find_device_with_adapter(
+    adapter: &Adapter,
+    identifier: &str,
+    options: ScanOptions,
+) -> Result<Peripheral> {
+    find_device_with_adapter_progress(adapter, identifier, options, None).await
+}
+
+/// Find a specific device using a pre-existing adapter, with progress callback.
+pub async fn find_device_with_adapter_progress(
+    adapter: &Adapter,
     identifier: &str,
     options: ScanOptions,
     progress: Option<ProgressCallback>,
-) -> Result<(Adapter, Peripheral)> {
-    let adapter = get_adapter().await?;
+) -> Result<Peripheral> {
     let identifier_lower = identifier.to_lowercase();
 
     info!("Looking for device: {}", identifier);
 
-    // First, check if device is already known (cached from previous scans)
-    if let Some(peripheral) = find_peripheral_by_identifier(&adapter, &identifier_lower).await? {
+    if let Some(peripheral) = find_peripheral_by_identifier(adapter, &identifier_lower).await? {
         info!("Found device in cache (no scan needed)");
         if let Some(ref cb) = progress {
             cb(FindProgress::CacheHit);
         }
-        return Ok((adapter, peripheral));
+        return Ok(peripheral);
     }
 
-    // Retry with multiple scan attempts for better reliability
-    // BLE advertisements can be missed due to timing, so we try multiple times
     let max_attempts: u32 = 3;
     let base_duration = options.duration.as_millis() as u64 / 2;
-    let base_duration = Duration::from_millis(base_duration.max(2000)); // At least 2 seconds
+    let base_duration = Duration::from_millis(base_duration.max(2000));
 
     for attempt in 1..=max_attempts {
         let scan_duration = base_duration * attempt;
@@ -427,19 +480,16 @@ pub async fn find_device_with_progress(
             });
         }
 
-        // Start scanning
         adapter.start_scan(ScanFilter::default()).await?;
         sleep(scan_duration).await;
         adapter.stop_scan().await?;
 
-        // Check if we found the device
-        if let Some(peripheral) = find_peripheral_by_identifier(&adapter, &identifier_lower).await?
-        {
+        if let Some(peripheral) = find_peripheral_by_identifier(adapter, &identifier_lower).await? {
             info!("Found device on attempt {}", attempt);
             if let Some(ref cb) = progress {
                 cb(FindProgress::Found { attempt });
             }
-            return Ok((adapter, peripheral));
+            return Ok(peripheral);
         }
 
         if attempt < max_attempts {
@@ -455,6 +505,21 @@ pub async fn find_device_with_progress(
         max_attempts, identifier
     );
     Err(Error::device_not_found(identifier))
+}
+
+/// Find a specific device with progress callback for UI feedback.
+///
+/// The progress callback is called with updates about the search progress,
+/// including cache hits, scan attempts, and retry information.
+pub async fn find_device_with_progress(
+    identifier: &str,
+    options: ScanOptions,
+    progress: Option<ProgressCallback>,
+) -> Result<(Adapter, Peripheral)> {
+    let adapter = get_adapter().await?;
+    let peripheral =
+        find_device_with_adapter_progress(&adapter, identifier, options, progress).await?;
+    Ok((adapter, peripheral))
 }
 
 /// Search through known peripherals to find one matching the identifier.

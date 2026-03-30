@@ -1,0 +1,34 @@
+# Aranet Service — standalone Docker Compose (BLE-enabled host)
+#
+# This is the minimal single-service setup for hosts with Bluetooth.
+# For the full monitoring stack (Prometheus + Grafana), use:
+#   docker compose -f docker/docker-compose.yml up -d
+
+services:
+  aranet-service:
+    build: .
+    container_name: aranet-service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist database
+      - aranet-data:/data
+      # Mount config
+      - ./server.toml:/app/server.toml:ro
+      # D-Bus access for BLE
+      - /var/run/dbus:/var/run/dbus
+    # Required for BLE access
+    privileged: true
+    network_mode: host
+    environment:
+      - RUST_LOG=aranet_service=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  aranet-data:

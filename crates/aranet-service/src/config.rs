@@ -4,6 +4,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Push a validation error onto `$errors` with the given field and message.
+macro_rules! validate {
+    ($errors:expr, $field:expr, $msg:expr) => {
+        $errors.push(ValidationError {
+            field: $field.to_string(),
+            message: $msg.to_string(),
+        })
+    };
+    ($errors:expr, $field:expr, $($arg:tt)+) => {
+        $errors.push(ValidationError {
+            field: $field.to_string(),
+            message: format!($($arg)+),
+        })
+    };
+}
+
 /// Server configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -24,6 +40,15 @@ pub struct Config {
     /// MQTT publisher settings.
     #[serde(default)]
     pub mqtt: MqttConfig,
+    /// Desktop notification settings.
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+    /// Webhook notification settings.
+    #[serde(default)]
+    pub webhooks: WebhookConfig,
+    /// InfluxDB export settings.
+    #[serde(default)]
+    pub influxdb: InfluxDbConfig,
 }
 
 impl Config {
@@ -64,7 +89,17 @@ impl Config {
         std::fs::write(path.as_ref(), content).map_err(|e| ConfigError::Write {
             path: path.as_ref().to_path_buf(),
             source: e,
-        })
+        })?;
+
+        // Restrict permissions to owner-only since config may contain API keys
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(path.as_ref(), perms);
+        }
+
+        Ok(())
     }
 
     /// Validate the configuration and return any errors.
@@ -105,10 +140,12 @@ impl Config {
             // Check for duplicate addresses
             let addr_lower = device.address.to_lowercase();
             if !seen_addresses.insert(addr_lower.clone()) {
-                errors.push(ValidationError {
-                    field: format!("{}.address", prefix),
-                    message: format!("duplicate device address '{}'", device.address),
-                });
+                validate!(
+                    errors,
+                    format!("{}.address", prefix),
+                    "duplicate device address '{}'",
+                    device.address
+                );
             }
         }
 
@@ -117,6 +154,12 @@ impl Config {
 
         // Validate MQTT config
         errors.extend(self.mqtt.validate());
+
+        // Validate webhook config
+        errors.extend(self.webhooks.validate());
+
+        // Validate InfluxDB config
+        errors.extend(self.influxdb.validate());
 
         if errors.is_empty() {
             Ok(())
@@ -174,43 +217,50 @@ impl ServerConfig {
         let mut errors = Vec::new();
 
         if self.bind.is_empty() {
-            errors.push(ValidationError {
-                field: "server.bind".to_string(),
-                message: "bind address cannot be empty".to_string(),
-            });
+            validate!(errors, "server.bind", "bind address cannot be empty");
         } else {
             // Check for valid host:port format
             let parts: Vec<&str> = self.bind.rsplitn(2, ':').collect();
             if parts.len() != 2 {
-                errors.push(ValidationError {
-                    field: "server.bind".to_string(),
-                    message: format!(
-                        "invalid bind address '{}': expected format 'host:port'",
-                        self.bind
-                    ),
-                });
+                validate!(
+                    errors,
+                    "server.bind",
+                    "invalid bind address '{}': expected format 'host:port'",
+                    self.bind
+                );
             } else {
                 // Validate port
                 let port_str = parts[0];
                 match port_str.parse::<u16>() {
                     Ok(0) => {
-                        errors.push(ValidationError {
-                            field: "server.bind".to_string(),
-                            message: "port cannot be 0".to_string(),
-                        });
+                        validate!(errors, "server.bind", "port cannot be 0");
                     }
                     Err(_) => {
-                        errors.push(ValidationError {
-                            field: "server.bind".to_string(),
-                            message: format!(
-                                "invalid port '{}': must be a number 1-65535",
-                                port_str
-                            ),
-                        });
+                        validate!(
+                            errors,
+                            "server.bind",
+                            "invalid port '{}': must be a number 1-65535",
+                            port_str
+                        );
                     }
                     Ok(_) => {} // Valid port
                 }
             }
+        }
+
+        if self.broadcast_buffer == 0 {
+            validate!(
+                errors,
+                "server.broadcast_buffer",
+                "broadcast buffer must be greater than 0"
+            );
+        } else if self.broadcast_buffer > 10_000 {
+            validate!(
+                errors,
+                "server.broadcast_buffer",
+                "broadcast buffer {} exceeds maximum of 10000",
+                self.broadcast_buffer
+            );
         }
 
         errors
@@ -239,10 +289,7 @@ impl StorageConfig {
         let mut errors = Vec::new();
 
         if self.path.as_os_str().is_empty() {
-            errors.push(ValidationError {
-                field: "storage.path".to_string(),
-                message: "database path cannot be empty".to_string(),
-            });
+            validate!(errors, "storage.path", "database path cannot be empty");
         }
 
         errors
@@ -325,16 +372,18 @@ impl SecurityConfig {
         if self.api_key_enabled {
             match &self.api_key {
                 None => {
-                    errors.push(ValidationError {
-                        field: "security.api_key".to_string(),
-                        message: "API key must be set when authentication is enabled".to_string(),
-                    });
+                    validate!(
+                        errors,
+                        "security.api_key",
+                        "API key must be set when authentication is enabled"
+                    );
                 }
                 Some(key) if key.len() < 32 => {
-                    errors.push(ValidationError {
-                        field: "security.api_key".to_string(),
-                        message: "API key must be at least 32 characters for security".to_string(),
-                    });
+                    validate!(
+                        errors,
+                        "security.api_key",
+                        "API key must be at least 32 characters for security"
+                    );
                 }
                 _ => {}
             }
@@ -342,16 +391,18 @@ impl SecurityConfig {
 
         if self.rate_limit_enabled {
             if self.rate_limit_requests == 0 {
-                errors.push(ValidationError {
-                    field: "security.rate_limit_requests".to_string(),
-                    message: "rate limit requests must be greater than 0".to_string(),
-                });
+                validate!(
+                    errors,
+                    "security.rate_limit_requests",
+                    "rate limit requests must be greater than 0"
+                );
             }
             if self.rate_limit_window_secs < 1 {
-                errors.push(ValidationError {
-                    field: "security.rate_limit_window_secs".to_string(),
-                    message: "rate limit window must be at least 1 second".to_string(),
-                });
+                validate!(
+                    errors,
+                    "security.rate_limit_window_secs",
+                    "rate limit window must be at least 1 second"
+                );
             }
         }
 
@@ -395,20 +446,20 @@ impl PrometheusConfig {
         if let Some(url) = &self.push_gateway
             && url.is_empty()
         {
-            errors.push(ValidationError {
-                field: "prometheus.push_gateway".to_string(),
-                message: "push gateway URL cannot be empty (use null/omit instead)".to_string(),
-            });
+            validate!(
+                errors,
+                "prometheus.push_gateway",
+                "push gateway URL cannot be empty (use null/omit instead)"
+            );
         }
 
         if self.push_interval < 10 {
-            errors.push(ValidationError {
-                field: "prometheus.push_interval".to_string(),
-                message: format!(
-                    "push interval {} is too short (minimum 10 seconds)",
-                    self.push_interval
-                ),
-            });
+            validate!(
+                errors,
+                "prometheus.push_interval",
+                "push interval {} is too short (minimum 10 seconds)",
+                self.push_interval
+            );
         }
 
         errors
@@ -442,6 +493,14 @@ pub struct MqttConfig {
     /// Keep-alive interval in seconds.
     #[serde(default = "default_keep_alive")]
     pub keep_alive: u64,
+    /// Enable Home Assistant MQTT auto-discovery.
+    /// When enabled, discovery messages are published to the HA discovery topic
+    /// so devices appear automatically in Home Assistant.
+    #[serde(default)]
+    pub homeassistant: bool,
+    /// Home Assistant discovery topic prefix.
+    #[serde(default = "default_ha_discovery_prefix")]
+    pub ha_discovery_prefix: String,
 }
 
 fn default_topic_prefix() -> String {
@@ -460,6 +519,10 @@ fn default_keep_alive() -> u64 {
     60
 }
 
+fn default_ha_discovery_prefix() -> String {
+    "homeassistant".to_string()
+}
+
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
@@ -472,6 +535,8 @@ impl Default for MqttConfig {
             username: None,
             password: None,
             keep_alive: default_keep_alive(),
+            homeassistant: false,
+            ha_discovery_prefix: default_ha_discovery_prefix(),
         }
     }
 }
@@ -483,49 +548,44 @@ impl MqttConfig {
 
         if self.enabled {
             if self.broker.is_empty() {
-                errors.push(ValidationError {
-                    field: "mqtt.broker".to_string(),
-                    message: "broker URL cannot be empty when MQTT is enabled".to_string(),
-                });
+                validate!(
+                    errors,
+                    "mqtt.broker",
+                    "broker URL cannot be empty when MQTT is enabled"
+                );
             } else if !self.broker.starts_with("mqtt://") && !self.broker.starts_with("mqtts://") {
-                errors.push(ValidationError {
-                    field: "mqtt.broker".to_string(),
-                    message: format!(
-                        "invalid broker URL '{}': must start with mqtt:// or mqtts://",
-                        self.broker
-                    ),
-                });
+                validate!(
+                    errors,
+                    "mqtt.broker",
+                    "invalid broker URL '{}': must start with mqtt:// or mqtts://",
+                    self.broker
+                );
             }
 
             if self.topic_prefix.is_empty() {
-                errors.push(ValidationError {
-                    field: "mqtt.topic_prefix".to_string(),
-                    message: "topic prefix cannot be empty".to_string(),
-                });
+                validate!(errors, "mqtt.topic_prefix", "topic prefix cannot be empty");
             }
 
             if self.client_id.is_empty() {
-                errors.push(ValidationError {
-                    field: "mqtt.client_id".to_string(),
-                    message: "client ID cannot be empty".to_string(),
-                });
+                validate!(errors, "mqtt.client_id", "client ID cannot be empty");
             }
 
             if self.qos > 2 {
-                errors.push(ValidationError {
-                    field: "mqtt.qos".to_string(),
-                    message: format!("invalid QoS level {}: must be 0, 1, or 2", self.qos),
-                });
+                validate!(
+                    errors,
+                    "mqtt.qos",
+                    "invalid QoS level {}: must be 0, 1, or 2",
+                    self.qos
+                );
             }
 
             if self.keep_alive < 5 {
-                errors.push(ValidationError {
-                    field: "mqtt.keep_alive".to_string(),
-                    message: format!(
-                        "keep-alive interval {} is too short (minimum 5 seconds)",
-                        self.keep_alive
-                    ),
-                });
+                validate!(
+                    errors,
+                    "mqtt.keep_alive",
+                    "keep-alive interval {} is too short (minimum 5 seconds)",
+                    self.keep_alive
+                );
             }
         }
 
@@ -562,47 +622,290 @@ impl DeviceConfig {
 
         // Address validation
         if self.address.is_empty() {
-            errors.push(ValidationError {
-                field: format!("{}.address", prefix),
-                message: "device address cannot be empty".to_string(),
-            });
+            validate!(
+                errors,
+                format!("{}.address", prefix),
+                "device address cannot be empty"
+            );
         } else if self.address.len() < 3 {
-            errors.push(ValidationError {
-                field: format!("{}.address", prefix),
-                message: format!(
-                    "device address '{}' is too short (minimum 3 characters)",
-                    self.address
-                ),
-            });
+            validate!(
+                errors,
+                format!("{}.address", prefix),
+                "device address '{}' is too short (minimum 3 characters)",
+                self.address
+            );
         }
 
         // Alias validation (if provided)
         if let Some(alias) = &self.alias
             && alias.is_empty()
         {
-            errors.push(ValidationError {
-                field: format!("{}.alias", prefix),
-                message: "alias cannot be empty string (use null/omit instead)".to_string(),
-            });
+            validate!(
+                errors,
+                format!("{}.alias", prefix),
+                "alias cannot be empty string (use null/omit instead)"
+            );
         }
 
         // Poll interval validation
         if self.poll_interval < MIN_POLL_INTERVAL {
-            errors.push(ValidationError {
-                field: format!("{}.poll_interval", prefix),
-                message: format!(
-                    "poll interval {} is too short (minimum {} seconds)",
-                    self.poll_interval, MIN_POLL_INTERVAL
-                ),
-            });
+            validate!(
+                errors,
+                format!("{}.poll_interval", prefix),
+                "poll interval {} is too short (minimum {} seconds)",
+                self.poll_interval,
+                MIN_POLL_INTERVAL
+            );
         } else if self.poll_interval > MAX_POLL_INTERVAL {
-            errors.push(ValidationError {
-                field: format!("{}.poll_interval", prefix),
-                message: format!(
-                    "poll interval {} is too long (maximum {} seconds / 1 hour)",
-                    self.poll_interval, MAX_POLL_INTERVAL
-                ),
-            });
+            validate!(
+                errors,
+                format!("{}.poll_interval", prefix),
+                "poll interval {} is too long (maximum {} seconds / 1 hour)",
+                self.poll_interval,
+                MAX_POLL_INTERVAL
+            );
+        }
+
+        errors
+    }
+}
+
+/// Desktop notification settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfig {
+    /// Whether desktop notifications are enabled.
+    pub enabled: bool,
+    /// CO2 threshold in ppm (notify when exceeded).
+    #[serde(default = "default_co2_threshold")]
+    pub co2_threshold: u16,
+    /// Radon threshold in Bq/m³ (notify when exceeded).
+    #[serde(default = "default_radon_threshold")]
+    pub radon_threshold: u32,
+    /// Minimum interval between notifications per device (in seconds).
+    #[serde(default = "default_notification_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+fn default_co2_threshold() -> u16 {
+    1000
+}
+
+fn default_radon_threshold() -> u32 {
+    300
+}
+
+fn default_notification_cooldown() -> u64 {
+    300
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            co2_threshold: default_co2_threshold(),
+            radon_threshold: default_radon_threshold(),
+            cooldown_secs: default_notification_cooldown(),
+        }
+    }
+}
+
+/// Webhook notification configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookConfig {
+    /// Whether webhook notifications are enabled.
+    pub enabled: bool,
+    /// CO2 threshold in ppm (triggers "co2_high" event).
+    #[serde(default = "default_co2_threshold")]
+    pub co2_threshold: u16,
+    /// Radon threshold in Bq/m³ (triggers "radon_high" event).
+    #[serde(default = "default_radon_threshold")]
+    pub radon_threshold: u32,
+    /// Battery threshold in % (triggers "battery_low" event when at or below).
+    #[serde(default = "default_battery_threshold")]
+    pub battery_threshold: u8,
+    /// Minimum interval between alerts per device per event type (in seconds).
+    #[serde(default = "default_webhook_cooldown")]
+    pub cooldown_secs: u64,
+    /// Webhook endpoints to notify.
+    #[serde(default)]
+    pub endpoints: Vec<WebhookEndpoint>,
+}
+
+fn default_battery_threshold() -> u8 {
+    10
+}
+
+fn default_webhook_cooldown() -> u64 {
+    300
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            co2_threshold: default_co2_threshold(),
+            radon_threshold: default_radon_threshold(),
+            battery_threshold: default_battery_threshold(),
+            cooldown_secs: default_webhook_cooldown(),
+            endpoints: Vec::new(),
+        }
+    }
+}
+
+impl WebhookConfig {
+    /// Validate webhook configuration.
+    pub fn validate(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+
+        if self.enabled && self.endpoints.is_empty() {
+            validate!(
+                errors,
+                "webhooks.endpoints",
+                "at least one endpoint must be configured when webhooks are enabled"
+            );
+        }
+
+        for (i, endpoint) in self.endpoints.iter().enumerate() {
+            let prefix = format!("webhooks.endpoints[{}]", i);
+            if endpoint.url.is_empty() {
+                validate!(errors, format!("{}.url", prefix), "URL cannot be empty");
+            } else if !endpoint.url.starts_with("http://") && !endpoint.url.starts_with("https://")
+            {
+                validate!(
+                    errors,
+                    format!("{}.url", prefix),
+                    "URL must start with http:// or https://"
+                );
+            }
+            if endpoint.events.is_empty() {
+                validate!(
+                    errors,
+                    format!("{}.events", prefix),
+                    "at least one event type must be specified"
+                );
+            }
+            for event in &endpoint.events {
+                if !["co2_high", "radon_high", "battery_low"].contains(&event.as_str()) {
+                    validate!(
+                        errors,
+                        format!("{}.events", prefix),
+                        "unknown event type '{}' (valid: co2_high, radon_high, battery_low)",
+                        event
+                    );
+                }
+            }
+        }
+
+        if self.cooldown_secs < 10 {
+            validate!(
+                errors,
+                "webhooks.cooldown_secs",
+                "cooldown {} is too short (minimum 10 seconds)",
+                self.cooldown_secs
+            );
+        }
+
+        errors
+    }
+}
+
+/// A webhook endpoint configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookEndpoint {
+    /// The URL to POST alerts to.
+    pub url: String,
+    /// Event types to send to this endpoint.
+    /// Valid values: "co2_high", "radon_high", "battery_low"
+    pub events: Vec<String>,
+    /// Optional HTTP headers to include in requests (e.g., authorization tokens).
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// InfluxDB export configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InfluxDbConfig {
+    /// Whether InfluxDB export is enabled.
+    pub enabled: bool,
+    /// InfluxDB server URL (e.g., "http://localhost:8086").
+    pub url: String,
+    /// InfluxDB API token for authentication.
+    pub token: Option<String>,
+    /// Organization name (InfluxDB 2.x).
+    pub org: String,
+    /// Bucket name (InfluxDB 2.x) or database name (1.x).
+    pub bucket: String,
+    /// Measurement name for sensor readings.
+    #[serde(default = "default_influxdb_measurement")]
+    pub measurement: String,
+    /// Write precision.
+    #[serde(default = "default_influxdb_precision")]
+    pub precision: String,
+}
+
+fn default_influxdb_measurement() -> String {
+    "aranet".to_string()
+}
+
+fn default_influxdb_precision() -> String {
+    "s".to_string()
+}
+
+impl Default for InfluxDbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: "http://localhost:8086".to_string(),
+            token: None,
+            org: String::new(),
+            bucket: "aranet".to_string(),
+            measurement: default_influxdb_measurement(),
+            precision: default_influxdb_precision(),
+        }
+    }
+}
+
+impl InfluxDbConfig {
+    /// Validate InfluxDB configuration.
+    pub fn validate(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+
+        if self.enabled {
+            if self.url.trim().is_empty() {
+                validate!(
+                    errors,
+                    "influxdb.url",
+                    "URL cannot be empty when InfluxDB export is enabled"
+                );
+            }
+            if self.org.trim().is_empty() {
+                validate!(
+                    errors,
+                    "influxdb.org",
+                    "organization cannot be empty when InfluxDB export is enabled"
+                );
+            }
+            if self.bucket.trim().is_empty() {
+                validate!(errors, "influxdb.bucket", "bucket name cannot be empty");
+            }
+            if self.measurement.trim().is_empty() {
+                validate!(
+                    errors,
+                    "influxdb.measurement",
+                    "measurement name cannot be empty"
+                );
+            }
+            if !["s", "ms", "us", "ns"].contains(&self.precision.as_str()) {
+                validate!(
+                    errors,
+                    "influxdb.precision",
+                    "invalid precision '{}' (valid: s, ms, us, ns)",
+                    self.precision
+                );
+            }
         }
 
         errors
@@ -674,6 +977,7 @@ mod tests {
     fn test_server_config_default() {
         let config = ServerConfig::default();
         assert_eq!(config.bind, "127.0.0.1:8080");
+        assert_eq!(config.broadcast_buffer, DEFAULT_BROADCAST_BUFFER);
     }
 
     #[test]
@@ -861,6 +1165,15 @@ mod tests {
         let errors = bad_port.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("must be a number"));
+
+        // Invalid: zero broadcast buffer
+        let zero_buffer = ServerConfig {
+            broadcast_buffer: 0,
+            ..Default::default()
+        };
+        let errors = zero_buffer.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].field.contains("broadcast_buffer"));
     }
 
     #[test]
@@ -1215,6 +1528,29 @@ mod tests {
         assert_eq!(config.username, Some("user".to_string()));
         assert_eq!(config.password, Some("secret".to_string()));
         assert_eq!(config.keep_alive, 30);
+    }
+
+    #[test]
+    fn test_influxdb_config_requires_org_when_enabled() {
+        let config = InfluxDbConfig {
+            enabled: true,
+            org: "   ".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate();
+        assert!(errors.iter().any(
+            |e| e.field == "influxdb.org" && e.message.contains("organization cannot be empty")
+        ));
+    }
+
+    #[test]
+    fn test_influxdb_config_validates_when_enabled_with_org() {
+        let config = InfluxDbConfig {
+            enabled: true,
+            org: "aranet".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_empty());
     }
 
     #[test]

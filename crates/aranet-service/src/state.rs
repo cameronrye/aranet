@@ -30,9 +30,8 @@ use std::time::Duration;
 
 use aranet_store::Store;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
-use tokio::task::JoinSet;
-use tracing::warn;
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config::{Config, default_config_path};
 
@@ -40,14 +39,26 @@ use crate::config::{Config, default_config_path};
 pub struct AppState {
     /// The data store (wrapped in Mutex for thread-safe access).
     pub store: Mutex<Store>,
+    /// File-backed database path for opening parallel read connections.
+    ///
+    /// In-memory stores leave this as `None` and fall back to the shared mutex.
+    store_path: Option<PathBuf>,
     /// Configuration (RwLock for runtime updates).
     pub config: RwLock<Config>,
     /// Path to the configuration file (for saving changes).
     pub config_path: PathBuf,
     /// Broadcast channel for real-time reading updates.
     pub readings_tx: broadcast::Sender<ReadingEvent>,
+    /// Semaphore to serialize BLE adapter access (only one device at a time).
+    pub ble_semaphore: Semaphore,
     /// Collector control state.
     pub collector: CollectorState,
+    /// Total number of broadcast messages dropped due to slow subscribers.
+    pub ws_messages_dropped: AtomicU64,
+    /// Global application shutdown signal for background integrations.
+    shutdown_tx: watch::Sender<bool>,
+    /// Receiver side of the application shutdown signal.
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl AppState {
@@ -63,12 +74,19 @@ impl AppState {
     pub fn with_config_path(store: Store, config: Config, config_path: PathBuf) -> Arc<Self> {
         let buffer_size = config.server.broadcast_buffer;
         let (readings_tx, _) = broadcast::channel(buffer_size);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let store_path = store.database_path().map(PathBuf::from);
         Arc::new(Self {
             store: Mutex::new(store),
+            store_path,
             config: RwLock::new(config),
             config_path,
             readings_tx,
+            ble_semaphore: Semaphore::new(1),
             collector: CollectorState::new(),
+            ws_messages_dropped: AtomicU64::new(0),
+            shutdown_tx,
+            shutdown_rx,
         })
     }
 
@@ -80,24 +98,50 @@ impl AppState {
         config.save(&self.config_path)
     }
 
-    /// Save the configuration to disk, logging any errors.
+    /// Execute a read-only store operation.
     ///
-    /// This is a convenience method for fire-and-forget saves.
-    pub async fn save_config_or_log(&self) {
-        if let Err(e) = self.save_config().await {
-            warn!("Failed to save configuration: {}", e);
+    /// File-backed stores open a separate connection per call so concurrent API reads
+    /// do not block on the shared write mutex. In-memory stores fall back to the shared
+    /// store because they cannot be reopened.
+    pub async fn with_store_read<T, F>(&self, f: F) -> aranet_store::Result<T>
+    where
+        F: FnOnce(&Store) -> aranet_store::Result<T>,
+    {
+        if let Some(path) = &self.store_path {
+            let store = Store::open(path)?;
+            f(&store)
+        } else {
+            let store = self.store.lock().await;
+            f(&store)
         }
+    }
+
+    /// Execute a write-capable store operation through the shared connection.
+    pub async fn with_store_write<T, F>(&self, f: F) -> aranet_store::Result<T>
+    where
+        F: FnOnce(&Store) -> aranet_store::Result<T>,
+    {
+        let store = self.store.lock().await;
+        f(&store)
     }
 
     /// Signal that the device configuration has changed.
     ///
-    /// This saves the config to disk and signals the collector to reload
-    /// if it is currently running.
+    /// Reload notifications are sent even when the collector is temporarily
+    /// idle so a no-device startup or an empty-device config can recover
+    /// once devices are added again.
     pub async fn on_devices_changed(&self) {
-        self.save_config_or_log().await;
-        if self.collector.is_running() {
-            self.collector.signal_reload();
-        }
+        self.collector.signal_reload();
+    }
+
+    /// Subscribe to the application shutdown signal.
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
+    /// Signal all long-lived background integrations to stop.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 }
 
@@ -122,6 +166,8 @@ pub struct CollectorState {
     /// This allows both the initial collector start and the reload watcher
     /// to track spawned tasks, ensuring proper cleanup on stop.
     pub device_tasks: Mutex<JoinSet<()>>,
+    /// Handle for the reload watcher task.
+    pub reload_watcher: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl CollectorState {
@@ -138,6 +184,7 @@ impl CollectorState {
             reload_rx,
             device_stats: RwLock::new(Vec::new()),
             device_tasks: Mutex::new(JoinSet::new()),
+            reload_watcher: Mutex::new(None),
         }
     }
 
@@ -146,12 +193,31 @@ impl CollectorState {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Atomically try to transition from not-running to running.
+    /// Returns `true` if the transition succeeded (was not running, now is).
+    /// Returns `false` if already running.
+    pub fn try_start(&self) -> bool {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
+            self.started_at.store(now, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Mark the collector as started.
     pub fn set_running(&self, running: bool) {
         self.running.store(running, Ordering::SeqCst);
         if running {
             let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
             self.started_at.store(now, Ordering::SeqCst);
+        } else {
+            self.started_at.store(0, Ordering::SeqCst);
         }
     }
 
@@ -174,6 +240,7 @@ impl CollectorState {
     pub fn signal_stop(&self) {
         let _ = self.stop_tx.send(true);
         self.running.store(false, Ordering::SeqCst);
+        self.started_at.store(0, Ordering::SeqCst);
     }
 
     /// Reset the stop signal (for restarting).
@@ -225,6 +292,34 @@ impl CollectorState {
         let mut tasks = self.device_tasks.lock().await;
         tasks.spawn(future);
     }
+
+    /// Replace the reload watcher task with a new handle.
+    pub async fn set_reload_watcher(&self, handle: JoinHandle<()>) {
+        let mut watcher = self.reload_watcher.lock().await;
+        if let Some(existing) = watcher.replace(handle) {
+            existing.abort();
+        }
+    }
+
+    /// Wait for the reload watcher to exit, aborting it on timeout.
+    pub async fn wait_for_reload_watcher(&self, timeout: Duration) -> bool {
+        let mut handle = {
+            let mut watcher = self.reload_watcher.lock().await;
+            watcher.take()
+        };
+
+        let Some(handle) = handle.as_mut() else {
+            return true;
+        };
+
+        match tokio::time::timeout(timeout, &mut *handle).await {
+            Ok(_) => true,
+            Err(_) => {
+                handle.abort();
+                false
+            }
+        }
+    }
 }
 
 impl Default for CollectorState {
@@ -250,6 +345,8 @@ pub struct DeviceCollectionStats {
     pub last_error_at: Option<OffsetDateTime>,
     /// Last error message.
     pub last_error: Option<String>,
+    /// Duration of the last poll in milliseconds.
+    pub last_poll_duration_ms: Option<u64>,
     /// Total successful polls.
     pub success_count: u64,
     /// Total failed polls.
@@ -286,6 +383,9 @@ mod tests {
             radon: None,
             radiation_rate: None,
             radiation_total: None,
+            radon_avg_24h: None,
+            radon_avg_7d: None,
+            radon_avg_30d: None,
             captured_at: time::OffsetDateTime::now_utc(),
         }
     }
@@ -320,8 +420,10 @@ mod tests {
         let config = Config::default();
         let state = AppState::new(store, config);
 
-        let store = state.store.lock().await;
-        let devices = store.list_devices().unwrap();
+        let devices = state
+            .with_store_read(|store| store.list_devices())
+            .await
+            .unwrap();
         assert!(devices.is_empty());
     }
 
@@ -434,7 +536,7 @@ mod tests {
 
         collector.set_running(false);
         assert!(!collector.is_running());
-        // Note: started_at is not reset when set_running(false)
+        assert!(collector.started_at().is_none());
     }
 
     #[tokio::test]
@@ -451,6 +553,7 @@ mod tests {
                 last_poll_at: None,
                 last_error_at: None,
                 last_error: None,
+                last_poll_duration_ms: None,
                 success_count: 0,
                 failure_count: 0,
                 polling: false,
@@ -472,6 +575,7 @@ mod tests {
             last_poll_at: Some(time::OffsetDateTime::now_utc()),
             last_error_at: None,
             last_error: None,
+            last_poll_duration_ms: None,
             success_count: 42,
             failure_count: 3,
             polling: true,
@@ -496,6 +600,7 @@ mod tests {
             last_poll_at: None,
             last_error_at: Some(time::OffsetDateTime::now_utc()),
             last_error: Some("Connection timeout".to_string()),
+            last_poll_duration_ms: None,
             success_count: 10,
             failure_count: 5,
             polling: false,
@@ -514,6 +619,7 @@ mod tests {
             last_poll_at: Some(time::OffsetDateTime::now_utc()),
             last_error_at: None,
             last_error: None,
+            last_poll_duration_ms: None,
             success_count: 100,
             failure_count: 2,
             polling: true,
@@ -537,6 +643,7 @@ mod tests {
             last_poll_at: None,
             last_error_at: None,
             last_error: None,
+            last_poll_duration_ms: None,
             success_count: 5,
             failure_count: 1,
             polling: false,
@@ -609,18 +716,17 @@ mod tests {
         let config = Config::default();
         let state = AppState::new(store, config);
 
-        // Insert a device via store
-        {
-            let store = state.store.lock().await;
-            store.upsert_device("test-device", Some("Test")).unwrap();
-        }
+        state
+            .with_store_write(|store| store.upsert_device("test-device", Some("Test")).map(|_| ()))
+            .await
+            .unwrap();
 
-        // Query the device
-        {
-            let store = state.store.lock().await;
-            let device = store.get_device("test-device").unwrap().unwrap();
-            assert_eq!(device.name, Some("Test".to_string()));
-        }
+        let device = state
+            .with_store_read(|store| store.get_device("test-device"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(device.name, Some("Test".to_string()));
     }
 
     #[test]

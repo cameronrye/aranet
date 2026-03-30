@@ -17,34 +17,12 @@ mod overlays;
 mod service;
 mod settings;
 
-use chrono::Local;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::app::{App, Tab, Theme};
 use colors::co2_color;
 use theme::BORDER_TYPE;
-
-/// Get signal strength bars based on RSSI value.
-pub(crate) fn rssi_display(rssi: i16) -> (&'static str, Color) {
-    // Typical RSSI ranges:
-    // -30 to -50: Excellent (4 bars)
-    // -50 to -60: Good (3 bars)
-    // -60 to -70: Fair (2 bars)
-    // -70 to -80: Weak (1 bar)
-    // Below -80: Very weak (0 bars)
-    if rssi >= -50 {
-        ("▂▄▆█", Color::Green)
-    } else if rssi >= -60 {
-        ("▂▄▆░", Color::Green)
-    } else if rssi >= -70 {
-        ("▂▄░░", Color::Yellow)
-    } else if rssi >= -80 {
-        ("▂░░░", Color::Red)
-    } else {
-        ("░░░░", Color::DarkGray)
-    }
-}
 
 /// Draw the complete TUI interface.
 ///
@@ -141,17 +119,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// Draw the header bar with app title, quick stats, and indicators.
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.app_theme();
+    let width = area.width;
 
-    let mut spans = vec![
-        Span::styled(
-            " Aranet Monitor ",
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("v0.3.0 ", Style::default().fg(theme.text_muted)),
-        Span::styled("• rye.dev ", Style::default().fg(theme.text_muted)),
-    ];
+    let mut spans = vec![Span::styled(
+        " Aranet ",
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    )];
+
+    if width >= 32 {
+        spans.push(Span::styled(
+            format!("v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
 
     // Connected count
     let connected = app.connected_count();
@@ -161,56 +143,58 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         theme.success
     };
-    spans.push(Span::styled(
-        format!(" *{}/{} ", connected, total),
-        Style::default().fg(conn_color),
-    ));
+    if width >= 22 {
+        spans.push(Span::styled(
+            format!(" {}/{} online ", connected, total),
+            Style::default().fg(conn_color),
+        ));
+    }
 
     // Average CO2 if available
-    if let Some(avg_co2) = app.average_co2() {
-        let co2_color = co2_color(avg_co2);
+    if width >= 40
+        && let Some(avg_co2) = app.average_co2()
+    {
+        let co2_color = co2_color(&theme, avg_co2);
         spans.push(Span::styled(
-            format!(" CO2:{} ", avg_co2),
+            format!(" CO2 {} ", avg_co2),
             Style::default().fg(co2_color),
         ));
     }
 
     // Alert count
     let alert_count = app.alerts.len();
-    if alert_count > 0 {
+    if width >= 50 && alert_count > 0 {
         spans.push(Span::styled(
-            format!(" !{} ", alert_count),
+            format!(" Alerts {} ", alert_count),
             Style::default()
                 .fg(theme.danger)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
-    // Sticky indicator
-    if app.sticky_alerts {
-        spans.push(Span::styled(" STICKY ", Style::default().fg(theme.warning)));
-    }
-
-    // Bell indicator
-    if app.bell_enabled {
-        spans.push(Span::styled(" BELL ", Style::default().fg(theme.warning)));
-    }
-
-    // Error indicator
-    if app.last_error.is_some() && !app.show_error_details {
-        spans.push(Span::styled(" ERR ", Style::default().fg(theme.danger)));
-    }
-
     // Theme indicator
-    if matches!(app.theme, Theme::Light) {
-        spans.push(Span::styled(" LIGHT ", Style::default().fg(theme.warning)));
-    } else {
-        spans.push(Span::styled(" DARK ", Style::default().fg(theme.info)));
+    if width >= 62 {
+        let (theme_label, theme_color) = if matches!(app.theme, Theme::Light) {
+            (" Light ", theme.warning)
+        } else {
+            (" Dark ", theme.info)
+        };
+        spans.push(Span::styled(theme_label, Style::default().fg(theme_color)));
     }
 
-    // Smart Home indicator
-    if app.smart_home_enabled {
-        spans.push(Span::styled(" HOME ", Style::default().fg(theme.success)));
+    if width >= 76 {
+        if app.sticky_alerts {
+            spans.push(Span::styled(" Sticky ", Style::default().fg(theme.warning)));
+        }
+        if app.bell_enabled {
+            spans.push(Span::styled(" Bell ", Style::default().fg(theme.warning)));
+        }
+        if app.last_error.is_some() && !app.show_error_details {
+            spans.push(Span::styled(" Error ", Style::default().fg(theme.danger)));
+        }
+        if app.smart_home_enabled {
+            spans.push(Span::styled(" Home ", Style::default().fg(theme.success)));
+        }
     }
 
     let header = Paragraph::new(Line::from(spans)).style(theme.header_style());
@@ -271,7 +255,13 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 /// Draw the status bar with context-sensitive help.
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.app_theme();
-    let time_str = Local::now().format("%H:%M:%S").to_string();
+    let width = area.width;
+    let time_str = {
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        now.format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap_or_default())
+            .unwrap_or_default()
+    };
 
     // Build left content with context-sensitive hints
     let left_spans = if app.scanning {
@@ -306,6 +296,29 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         // Context-sensitive hints with styled keys
         let hints = context_hints(app);
+        let hints: Vec<_> = if width < 46 {
+            let mut compact = vec![hints[0]];
+            if hints.len() > 2 {
+                compact.push(hints[1]);
+            }
+            if let Some(last) = hints.last().copied()
+                && compact.last().copied() != Some(last)
+            {
+                compact.push(last);
+            }
+            compact
+        } else if width < 72 {
+            let mut compact = vec![hints[0]];
+            compact.extend(hints.iter().skip(1).take(2).copied());
+            if let Some(last) = hints.last().copied()
+                && compact.last().copied() != Some(last)
+            {
+                compact.push(last);
+            }
+            compact
+        } else {
+            hints
+        };
         let mut spans = vec![Span::raw(" ")];
         for (i, (key, desc)) in hints.iter().enumerate() {
             if i > 0 {

@@ -57,7 +57,7 @@ fn parse_aranet4_reading(data: &[u8]) -> Result<CurrentReading, Error> {
 | 6 | Battery (%) | u8 | none |
 | 7-8 | Temperature | u16LE | ÷ 20.0 → °C |
 | 9-10 | Humidity | u16LE | ÷ 10.0 → % |
-| 11 | Status Flags | u8 | bits[0:1]=humidity, bits[2:3]=temp |
+| 11 | Status Flags | u8 | bits[0:1]=humidity, bits[2:3]=temp (primary status indicator) |
 
 ## AranetRn+ (Radon) Readings
 
@@ -143,8 +143,3 @@ Bytes: 61:PP:SS:SS
 PP = Parameter (see table above)
 SS:SS = Start index (u16LE)
 ```
-
----
-
-Made with ❤️ by [Cameron Rye](https://rye.dev/)
-

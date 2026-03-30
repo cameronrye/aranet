@@ -8,6 +8,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Disconnect from a device, logging any errors at debug level.
+async fn disconnect_quietly(device: &aranet_core::Device) {
+    if let Err(e) = device.disconnect().await {
+        tracing::debug!("Failed to disconnect device: {e}");
+    }
+}
+
 use aranet_core::messages::{
     CachedDevice, Command, ErrorContext, SensorEvent, ServiceDeviceStats, ServiceMonitoredDevice,
     SignalQuality,
@@ -174,7 +181,7 @@ impl SensorWorker {
         event_tx: mpsc::Sender<SensorEvent>,
         store_path: PathBuf,
     ) -> Self {
-        Self::with_service_url(command_rx, event_tx, store_path, DEFAULT_SERVICE_URL)
+        Self::with_service_config(command_rx, event_tx, store_path, DEFAULT_SERVICE_URL, None)
     }
 
     /// Create a new sensor worker with a custom service URL.
@@ -184,21 +191,33 @@ impl SensorWorker {
         store_path: PathBuf,
         service_url: &str,
     ) -> Self {
+        Self::with_service_config(command_rx, event_tx, store_path, service_url, None)
+    }
+
+    /// Create a new sensor worker with custom service authentication settings.
+    pub fn with_service_config(
+        command_rx: mpsc::Receiver<Command>,
+        event_tx: mpsc::Sender<SensorEvent>,
+        store_path: PathBuf,
+        service_url: &str,
+        service_api_key: Option<String>,
+    ) -> Self {
         // Try to create service client, logging any errors
-        let service_client = match ServiceClient::new(service_url) {
-            Ok(client) => {
-                info!(url = service_url, "Service client initialized");
-                Some(client)
-            }
-            Err(e) => {
-                warn!(
-                    url = service_url,
-                    error = %e,
-                    "Failed to initialize service client - service features will be unavailable"
-                );
-                None
-            }
-        };
+        let service_client =
+            match ServiceClient::new_with_api_key(service_url, service_api_key.clone()) {
+                Ok(client) => {
+                    info!(url = service_url, "Service client initialized");
+                    Some(client)
+                }
+                Err(e) => {
+                    warn!(
+                        url = service_url,
+                        error = %e,
+                        "Failed to initialize service client - service features will be unavailable"
+                    );
+                    None
+                }
+            };
 
         Self {
             command_rx,
@@ -403,23 +422,7 @@ impl SensorWorker {
         let mut cached_devices = Vec::new();
         for stored in stored_devices {
             let reading = match store.get_latest_reading(&stored.id) {
-                Ok(Some(stored_reading)) => Some(CurrentReading {
-                    co2: stored_reading.co2,
-                    temperature: stored_reading.temperature,
-                    pressure: stored_reading.pressure,
-                    humidity: stored_reading.humidity,
-                    battery: stored_reading.battery,
-                    status: stored_reading.status,
-                    interval: 0,
-                    age: 0,
-                    captured_at: Some(stored_reading.captured_at),
-                    radon: stored_reading.radon,
-                    radiation_rate: stored_reading.radiation_rate,
-                    radiation_total: stored_reading.radiation_total,
-                    radon_avg_24h: None,
-                    radon_avg_7d: None,
-                    radon_avg_30d: None,
-                }),
+                Ok(Some(stored_reading)) => Some(stored_reading.to_reading()),
                 Ok(None) => None,
                 Err(e) => {
                     warn!("Failed to get latest reading for {}: {}", stored.id, e);
@@ -470,19 +473,8 @@ impl SensorWorker {
 
         match store.query_history(&query) {
             Ok(stored_records) => {
-                let records: Vec<aranet_types::HistoryRecord> = stored_records
-                    .into_iter()
-                    .map(|r| aranet_types::HistoryRecord {
-                        timestamp: r.timestamp,
-                        co2: r.co2,
-                        temperature: r.temperature,
-                        pressure: r.pressure,
-                        humidity: r.humidity,
-                        radon: r.radon,
-                        radiation_rate: r.radiation_rate,
-                        radiation_total: r.radiation_total,
-                    })
-                    .collect();
+                let records: Vec<aranet_types::HistoryRecord> =
+                    stored_records.into_iter().map(|r| r.to_history()).collect();
 
                 info!(
                     device_id,
@@ -819,7 +811,7 @@ impl SensorWorker {
             Err(e) => {
                 let context = ErrorContext::from_error(&e);
                 error!(device_id, error = %e, "Failed to get history info");
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 self.send_event(SensorEvent::HistorySyncError {
                     device_id: device_id.to_string(),
                     error: context.message.clone(),
@@ -835,7 +827,7 @@ impl SensorWorker {
         // Calculate start index for incremental sync
         let start_index = {
             let Some(store) = self.get_store() else {
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 return;
             };
 
@@ -851,7 +843,7 @@ impl SensorWorker {
         // Check if already up to date
         if start_index > total_on_device {
             info!(device_id, "Already up to date, no new readings to sync");
-            let _ = device.disconnect().await;
+            disconnect_quietly(&device).await;
             self.send_event(SensorEvent::HistorySynced {
                 device_id: device_id.to_string(),
                 count: 0,
@@ -912,7 +904,7 @@ impl SensorWorker {
             result = timeout(HISTORY_DOWNLOAD_TIMEOUT, device.download_history_with_options(history_options)) => result,
             _ = cancel_token.cancelled() => {
                 info!(device_id, "History sync cancelled by user");
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 self.send_event(SensorEvent::OperationCancelled {
                     operation: format!("History sync for {}", device_id),
                 }).await;
@@ -925,7 +917,7 @@ impl SensorWorker {
             Ok(Err(e)) => {
                 let context = ErrorContext::from_error(&e);
                 error!(device_id, error = %e, "Failed to download history");
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 self.send_event(SensorEvent::HistorySyncError {
                     device_id: device_id.to_string(),
                     error: context.message.clone(),
@@ -942,7 +934,7 @@ impl SensorWorker {
                     ),
                     "Large history downloads can take time. Try again or sync in smaller batches.",
                 );
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 self.send_event(SensorEvent::HistorySyncError {
                     device_id: device_id.to_string(),
                     error: context.message.clone(),
@@ -961,9 +953,7 @@ impl SensorWorker {
         );
 
         // Disconnect from device
-        if let Err(e) = device.disconnect().await {
-            warn!(device_id, error = %e, "Failed to disconnect after history sync");
-        }
+        disconnect_quietly(&device).await;
 
         // Insert history to store (with deduplication)
         {
@@ -1068,9 +1058,7 @@ impl SensorWorker {
             }
         };
 
-        if let Err(e) = device.disconnect().await {
-            warn!(device_id, error = %e, "Failed to disconnect");
-        }
+        disconnect_quietly(&device).await;
 
         Ok((name, device_type, reading, settings, rssi))
     }
@@ -1117,12 +1105,7 @@ impl SensorWorker {
 
         if let Err(e) = device.set_interval(interval).await {
             warn!("Failed to set interval: {}", e);
-            if let Err(disconnect_err) = device.disconnect().await {
-                warn!(
-                    "Failed to disconnect after interval error: {}",
-                    disconnect_err
-                );
-            }
+            disconnect_quietly(&device).await;
             let context = aranet_core::messages::ErrorContext::from_error(&e);
             self.send_event(SensorEvent::IntervalError {
                 device_id: device_id.to_string(),
@@ -1133,9 +1116,7 @@ impl SensorWorker {
             return;
         }
 
-        if let Err(e) = device.disconnect().await {
-            warn!("Failed to disconnect after setting interval: {}", e);
-        }
+        disconnect_quietly(&device).await;
 
         info!("Measurement interval set successfully for {}", device_id);
         self.send_event(SensorEvent::IntervalChanged {
@@ -1175,9 +1156,7 @@ impl SensorWorker {
 
         if let Err(e) = device.set_bluetooth_range(range).await {
             warn!("Failed to set Bluetooth range: {}", e);
-            if let Err(disconnect_err) = device.disconnect().await {
-                warn!("Failed to disconnect after range error: {}", disconnect_err);
-            }
+            disconnect_quietly(&device).await;
             let context = aranet_core::messages::ErrorContext::from_error(&e);
             self.send_event(SensorEvent::BluetoothRangeError {
                 device_id: device_id.to_string(),
@@ -1188,9 +1167,7 @@ impl SensorWorker {
             return;
         }
 
-        if let Err(e) = device.disconnect().await {
-            warn!("Failed to disconnect after setting Bluetooth range: {}", e);
-        }
+        disconnect_quietly(&device).await;
 
         info!("Bluetooth range set successfully for {}", device_id);
         self.send_event(SensorEvent::BluetoothRangeChanged {
@@ -1221,12 +1198,7 @@ impl SensorWorker {
 
         if let Err(e) = device.set_smart_home(enabled).await {
             warn!("Failed to set Smart Home: {}", e);
-            if let Err(disconnect_err) = device.disconnect().await {
-                warn!(
-                    "Failed to disconnect after Smart Home error: {}",
-                    disconnect_err
-                );
-            }
+            disconnect_quietly(&device).await;
             let context = aranet_core::messages::ErrorContext::from_error(&e);
             self.send_event(SensorEvent::SmartHomeError {
                 device_id: device_id.to_string(),
@@ -1237,9 +1209,7 @@ impl SensorWorker {
             return;
         }
 
-        if let Err(e) = device.disconnect().await {
-            warn!("Failed to disconnect after setting Smart Home: {}", e);
-        }
+        disconnect_quietly(&device).await;
 
         info!("Smart Home set successfully for {}", device_id);
         self.send_event(SensorEvent::SmartHomeChanged {
@@ -1450,6 +1420,7 @@ impl SensorWorker {
                     ServiceClientError::ApiError { status, message } => match *status {
                         401 => "Authentication required. Check your API key.".to_string(),
                         403 => "Access denied. Check your API key permissions.".to_string(),
+                        409 => message.clone(),
                         404 => "Service endpoint not found. The service may be an older version."
                             .to_string(),
                         500..=599 => format!("Service error ({}): {}", status, message),
@@ -1582,6 +1553,7 @@ impl SensorWorker {
             ServiceClientError::ApiError { status, message } => match *status {
                 401 => "Authentication required. Check your API key.".to_string(),
                 403 => "Access denied. Check your API key permissions.".to_string(),
+                409 => message.clone(),
                 404 => "Endpoint not found. The service may be an older version.".to_string(),
                 500..=599 => format!("Service error ({}): {}", status, message),
                 _ => format!("API error ({}): {}", status, message),
@@ -1850,7 +1822,7 @@ impl SensorWorker {
         }
 
         Err(
-            "aranet-service executable not found. Install it with 'cargo install aranet-service'."
+            "aranet-service executable not found. Install it with 'cargo install aranet-service --features full'."
                 .to_string(),
         )
     }
@@ -2233,9 +2205,7 @@ async fn connect_and_read_standalone(
             }
         };
 
-        if let Err(e) = device.disconnect().await {
-            warn!(device_id, error = %e, "Failed to disconnect");
-        }
+        disconnect_quietly(&device).await;
 
         Ok((name, device_type, reading, settings, rssi))
     })
@@ -2267,5 +2237,68 @@ async fn background_polling_task(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_store_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "aranet-gui-worker-{label}-{}-{unique}.db",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn circuit_breaker_opens_and_recovers_after_timeout() {
+        let mut breaker = CircuitBreaker::new();
+
+        breaker.record_failure();
+        breaker.record_failure();
+        assert!(!breaker.is_open());
+
+        breaker.record_failure();
+        assert!(breaker.is_open());
+        assert!(breaker.time_until_retry().is_some());
+        assert!(!breaker.should_allow());
+
+        breaker.opened_at = Some(std::time::Instant::now() - breaker.recovery_timeout);
+        assert!(breaker.should_allow());
+        assert_eq!(breaker.state, CircuitState::HalfOpen);
+
+        breaker.record_success();
+        assert!(!breaker.is_open());
+        assert!(breaker.time_until_retry().is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_operation_resets_token_and_emits_event() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut worker = SensorWorker::new(command_rx, event_tx, test_store_path("cancel"));
+        let original_token = worker.cancel_token.clone();
+
+        worker.handle_cancel_operation().await;
+
+        assert!(original_token.is_cancelled());
+        assert!(!worker.cancel_token.is_cancelled());
+
+        let event = event_rx.recv().await.unwrap();
+        match event {
+            SensorEvent::OperationCancelled { operation } => {
+                assert_eq!(operation, "Current operation");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        drop(command_tx);
     }
 }

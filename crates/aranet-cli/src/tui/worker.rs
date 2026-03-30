@@ -20,6 +20,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Disconnect from a device, logging any errors at debug level.
+async fn disconnect_quietly(device: &aranet_core::Device) {
+    if let Err(e) = device.disconnect().await {
+        tracing::debug!("Failed to disconnect device: {e}");
+    }
+}
+
 use aranet_core::device::{ConnectionConfig, SignalQuality};
 use aranet_core::messages::{ErrorContext, ServiceDeviceStats};
 use aranet_core::service_client::ServiceClient;
@@ -82,8 +89,19 @@ impl SensorWorker {
         event_tx: mpsc::Sender<SensorEvent>,
         store_path: PathBuf,
     ) -> Self {
+        Self::with_service_config(command_rx, event_tx, store_path, DEFAULT_SERVICE_URL, None)
+    }
+
+    /// Create a new sensor worker with custom service authentication settings.
+    pub fn with_service_config(
+        command_rx: mpsc::Receiver<Command>,
+        event_tx: mpsc::Sender<SensorEvent>,
+        store_path: PathBuf,
+        service_url: &str,
+        service_api_key: Option<String>,
+    ) -> Self {
         // Try to create service client with default URL
-        let service_client = ServiceClient::new(DEFAULT_SERVICE_URL).ok();
+        let service_client = ServiceClient::new_with_api_key(service_url, service_api_key).ok();
 
         // Use platform-optimized connection configuration
         let connection_config = ConnectionConfig::for_current_platform();
@@ -265,23 +283,7 @@ impl SensorWorker {
         let mut cached_devices = Vec::new();
         for stored in stored_devices {
             let reading = match store.get_latest_reading(&stored.id) {
-                Ok(Some(stored_reading)) => Some(CurrentReading {
-                    co2: stored_reading.co2,
-                    temperature: stored_reading.temperature,
-                    pressure: stored_reading.pressure,
-                    humidity: stored_reading.humidity,
-                    battery: stored_reading.battery,
-                    status: stored_reading.status,
-                    interval: 0, // Not stored
-                    age: 0,      // Will be calculated below
-                    captured_at: Some(stored_reading.captured_at),
-                    radon: stored_reading.radon,
-                    radiation_rate: stored_reading.radiation_rate,
-                    radiation_total: stored_reading.radiation_total,
-                    radon_avg_24h: None,
-                    radon_avg_7d: None,
-                    radon_avg_30d: None,
-                }),
+                Ok(Some(stored_reading)) => Some(stored_reading.to_reading()),
                 Ok(None) => None,
                 Err(e) => {
                     debug!("Failed to get latest reading for {}: {}", stored.id, e);
@@ -777,7 +779,7 @@ impl SensorWorker {
         .await
         {
             error!(device_id, error = %e, "Failed to set interval");
-            let _ = device.disconnect().await;
+            disconnect_quietly(&device).await;
             let context = ErrorContext::from_error(&e);
             let _ = self
                 .event_tx
@@ -791,9 +793,7 @@ impl SensorWorker {
         }
 
         // Disconnect from device
-        if let Err(e) = device.disconnect().await {
-            warn!(device_id, error = %e, "Failed to disconnect after setting interval");
-        }
+        disconnect_quietly(&device).await;
 
         info!(
             device_id,
@@ -861,7 +861,7 @@ impl SensorWorker {
         .await
         {
             error!(device_id, error = %e, "Failed to set Bluetooth range");
-            let _ = device.disconnect().await;
+            disconnect_quietly(&device).await;
             let context = ErrorContext::from_error(&e);
             let _ = self
                 .event_tx
@@ -875,9 +875,7 @@ impl SensorWorker {
         }
 
         // Disconnect from device
-        if let Err(e) = device.disconnect().await {
-            warn!(device_id, error = %e, "Failed to disconnect after setting Bluetooth range");
-        }
+        disconnect_quietly(&device).await;
 
         info!(device_id, range_name, "Bluetooth range set successfully");
 
@@ -935,7 +933,7 @@ impl SensorWorker {
         .await
         {
             error!(device_id, error = %e, "Failed to set Smart Home");
-            let _ = device.disconnect().await;
+            disconnect_quietly(&device).await;
             let context = ErrorContext::from_error(&e);
             let _ = self
                 .event_tx
@@ -949,9 +947,7 @@ impl SensorWorker {
         }
 
         // Disconnect from device
-        if let Err(e) = device.disconnect().await {
-            warn!(device_id, error = %e, "Failed to disconnect after setting Smart Home");
-        }
+        disconnect_quietly(&device).await;
 
         info!(device_id, mode, "Smart Home set successfully");
 
@@ -997,7 +993,7 @@ impl SensorWorker {
                 device_id,
                 "Connection validation failed - device may be out of range"
             );
-            let _ = device.disconnect().await;
+            disconnect_quietly(&device).await;
             return Err(aranet_core::Error::NotConnected);
         }
         debug!(device_id, "Connection validated successfully");
@@ -1047,34 +1043,9 @@ impl SensorWorker {
         };
 
         // Disconnect from the device
-        if let Err(e) = device.disconnect().await {
-            warn!(device_id, error = %e, "Failed to disconnect from device");
-        }
+        disconnect_quietly(&device).await;
 
         Ok((name, device_type, reading, settings, rssi, signal_quality))
-    }
-
-    /// Connect to a device and read its current values (legacy method).
-    ///
-    /// Returns the device name, type, current reading, settings, and RSSI if successful.
-    /// The device is disconnected after reading.
-    #[allow(dead_code)]
-    async fn connect_and_read(
-        &self,
-        device_id: &str,
-    ) -> Result<
-        (
-            Option<String>,
-            Option<DeviceType>,
-            Option<CurrentReading>,
-            Option<DeviceSettings>,
-            Option<i16>,
-        ),
-        aranet_core::Error,
-    > {
-        let (name, device_type, reading, settings, rssi, _signal_quality) =
-            Self::connect_and_read_with_config(device_id, self.connection_config.clone()).await?;
-        Ok((name, device_type, reading, settings, rssi))
     }
 
     /// Save a reading to the store.
@@ -1152,20 +1123,8 @@ impl SensorWorker {
 
         match store.query_history(&query) {
             Ok(stored_records) => {
-                // Convert StoredHistoryRecord to HistoryRecord
-                let records: Vec<aranet_types::HistoryRecord> = stored_records
-                    .into_iter()
-                    .map(|r| aranet_types::HistoryRecord {
-                        timestamp: r.timestamp,
-                        co2: r.co2,
-                        temperature: r.temperature,
-                        pressure: r.pressure,
-                        humidity: r.humidity,
-                        radon: r.radon,
-                        radiation_rate: r.radiation_rate,
-                        radiation_total: r.radiation_total,
-                    })
-                    .collect();
+                let records: Vec<aranet_types::HistoryRecord> =
+                    stored_records.into_iter().map(|r| r.to_history()).collect();
 
                 info!(
                     device_id,
@@ -1244,7 +1203,7 @@ impl SensorWorker {
         // Validate connection
         if !device.validate_connection().await {
             warn!(device_id, "Connection validation failed for history sync");
-            let _ = device.disconnect().await;
+            disconnect_quietly(&device).await;
             let context = ErrorContext::transient(
                 "Connection validation failed",
                 "Device connected but is not responding. Try moving closer.",
@@ -1265,7 +1224,7 @@ impl SensorWorker {
             Ok(info) => info,
             Err(e) => {
                 error!(device_id, error = %e, "Failed to get history info");
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
@@ -1293,7 +1252,7 @@ impl SensorWorker {
         // Check if already up to date
         if start_index > total_on_device {
             info!(device_id, "Already up to date, no new readings to sync");
-            let _ = device.disconnect().await;
+            disconnect_quietly(&device).await;
             let _ = self
                 .event_tx
                 .send(SensorEvent::HistorySynced {
@@ -1403,7 +1362,7 @@ impl SensorWorker {
             _ = cancel_token.cancelled() => {
                 progress_task.abort();
                 info!(device_id, "History sync cancelled by user");
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 let _ = self
                     .event_tx
                     .send(SensorEvent::OperationCancelled {
@@ -1422,7 +1381,7 @@ impl SensorWorker {
             Err(e) => {
                 progress_task.abort();
                 error!(device_id, error = %e, "Failed to download history");
-                let _ = device.disconnect().await;
+                disconnect_quietly(&device).await;
                 let context = ErrorContext::from_error(&e);
                 let _ = self
                     .event_tx
@@ -1454,7 +1413,7 @@ impl SensorWorker {
             .await;
 
         // Disconnect from device
-        let _ = device.disconnect().await;
+        disconnect_quietly(&device).await;
 
         // Insert history to store (with deduplication)
         // Only update sync state if insert succeeds to avoid data loss on next sync
@@ -1536,22 +1495,8 @@ impl SensorWorker {
                     })
                     .await;
             }
-            Err(e) => {
-                // Check if it's a connection error (service not running)
-                let (reachable, error_msg) = match &e {
-                    aranet_core::service_client::ServiceClientError::NotReachable { .. } => {
-                        (false, "Service not reachable".to_string())
-                    }
-                    _ => (false, e.to_string()),
-                };
-
-                if reachable {
-                    let _ = self
-                        .event_tx
-                        .send(SensorEvent::ServiceStatusError { error: error_msg })
-                        .await;
-                } else {
-                    // Send status with reachable=false
+            Err(e) => match &e {
+                aranet_core::service_client::ServiceClientError::NotReachable { .. } => {
                     let _ = self
                         .event_tx
                         .send(SensorEvent::ServiceStatusRefreshed {
@@ -1562,7 +1507,15 @@ impl SensorWorker {
                         })
                         .await;
                 }
-            }
+                _ => {
+                    let _ = self
+                        .event_tx
+                        .send(SensorEvent::ServiceStatusError {
+                            error: Self::format_service_error(&e),
+                        })
+                        .await;
+                }
+            },
         }
     }
 
@@ -1593,7 +1546,7 @@ impl SensorWorker {
                 let _ = self
                     .event_tx
                     .send(SensorEvent::ServiceCollectorError {
-                        error: e.to_string(),
+                        error: Self::format_service_error(&e),
                     })
                     .await;
             }
@@ -1627,9 +1580,42 @@ impl SensorWorker {
                 let _ = self
                     .event_tx
                     .send(SensorEvent::ServiceCollectorError {
-                        error: e.to_string(),
+                        error: Self::format_service_error(&e),
                     })
                     .await;
+            }
+        }
+    }
+
+    fn format_service_error(e: &aranet_core::service_client::ServiceClientError) -> String {
+        use aranet_core::service_client::ServiceClientError;
+
+        match e {
+            ServiceClientError::NotReachable { url, .. } => {
+                format!(
+                    "Service not reachable at {}. Run 'aranet-service run' to start it.",
+                    url
+                )
+            }
+            ServiceClientError::InvalidUrl(url) => {
+                format!("Invalid service URL: '{}'. Check your configuration.", url)
+            }
+            ServiceClientError::ApiError { status, message } => match *status {
+                401 => "Authentication required. Check your API key.".to_string(),
+                403 => "Access denied. Check your API key permissions.".to_string(),
+                404 => "Endpoint not found. The service may be an older version.".to_string(),
+                409 => message.clone(),
+                500..=599 => format!("Service error ({}): {}", status, message),
+                _ => format!("API error ({}): {}", status, message),
+            },
+            ServiceClientError::Request(req_err) => {
+                if req_err.is_timeout() {
+                    "Request timed out. The service may be overloaded.".to_string()
+                } else if req_err.is_connect() {
+                    "Connection failed. The service may not be running.".to_string()
+                } else {
+                    format!("Request failed: {}", req_err)
+                }
             }
         }
     }
@@ -1912,5 +1898,70 @@ impl SensorWorker {
         } else {
             warn!(device_id, "No active background polling found for device");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_store_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "aranet-tui-worker-{label}-{}-{unique}.db",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_operation_resets_token_and_emits_event() {
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut worker = SensorWorker::new(command_rx, event_tx, test_store_path("cancel"));
+        let original_token = worker.cancel_token.clone();
+
+        worker.handle_cancel_operation().await;
+
+        assert!(original_token.is_cancelled());
+        assert!(!worker.cancel_token.is_cancelled());
+
+        let event = event_rx.recv().await.unwrap();
+        match event {
+            SensorEvent::OperationCancelled { operation } => {
+                assert_eq!(operation, "Current operation");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_stop_background_polling_removes_cancel_sender() {
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let worker = SensorWorker::new(command_rx, event_tx, test_store_path("polling"));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let device_id = "aranet-test";
+
+        worker
+            .background_polling
+            .write()
+            .await
+            .insert(device_id.to_string(), cancel_tx);
+
+        worker.handle_stop_background_polling(device_id).await;
+
+        assert!(
+            !worker
+                .background_polling
+                .read()
+                .await
+                .contains_key(device_id)
+        );
+        assert!(*cancel_rx.borrow());
     }
 }

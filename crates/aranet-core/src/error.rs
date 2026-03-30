@@ -162,6 +162,10 @@ pub enum Error {
         service_count: usize,
     },
 
+    /// Operation not supported for this device type.
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
+
     /// Failed to parse data received from device.
     #[error("Invalid data: {0}")]
     InvalidData(String),

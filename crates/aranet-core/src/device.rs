@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use btleplug::api::{Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::{Adapter, Peripheral};
 use tokio::sync::RwLock;
@@ -167,10 +166,10 @@ impl ConnectionConfig {
     /// thick walls, or long distances.
     pub fn challenging_environment() -> Self {
         Self {
-            connection_timeout: Duration::from_secs(25),
-            read_timeout: Duration::from_secs(15),
+            connection_timeout: Duration::from_secs(90),
+            read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(15),
-            discovery_timeout: Duration::from_secs(15),
+            discovery_timeout: Duration::from_secs(30),
             validation_timeout: Duration::from_secs(5),
         }
     }
@@ -349,6 +348,40 @@ impl Device {
         Self::from_peripheral_with_config(adapter, peripheral, config).await
     }
 
+    /// Connect to a device using an existing BLE adapter.
+    ///
+    /// This avoids creating a new btleplug `Manager` (and D-Bus connection) on
+    /// every call.  Prefer this over [`connect_with_config`](Self::connect_with_config)
+    /// in long-running services that poll devices repeatedly.
+    #[tracing::instrument(level = "info", skip_all, fields(identifier = %identifier))]
+    pub async fn connect_with_adapter(
+        adapter: Adapter,
+        identifier: &str,
+        config: ConnectionConfig,
+    ) -> Result<Self> {
+        let options = ScanOptions {
+            duration: config.connection_timeout,
+            filter_aranet_only: false,
+            use_service_filter: false,
+        };
+
+        let peripheral = match crate::scan::find_device_with_adapter(
+            &adapter,
+            identifier,
+            ScanOptions::default(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Fast scan failed ({e}), retrying with extended options");
+                crate::scan::find_device_with_adapter(&adapter, identifier, options).await?
+            }
+        };
+
+        Self::from_peripheral_with_config(adapter, peripheral, config).await
+    }
+
     /// Create a Device from an already-discovered peripheral.
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn from_peripheral(adapter: Adapter, peripheral: Peripheral) -> Result<Self> {
@@ -392,7 +425,33 @@ impl Device {
                 duration: config.discovery_timeout,
             })??;
 
-        let services = peripheral.services();
+        let mut services = peripheral.services();
+
+        // If service discovery returned nothing, BlueZ may have stale state
+        // from a previous failed connection (e.g., auth failure during GATT
+        // discovery). Disconnect, wait, and retry once with a clean connection.
+        if services.is_empty() {
+            warn!("Service discovery returned 0 services — retrying with fresh connection");
+            let _ = peripheral.disconnect().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            timeout(config.connection_timeout, peripheral.connect())
+                .await
+                .map_err(|_| Error::Timeout {
+                    operation: "reconnect to device".to_string(),
+                    duration: config.connection_timeout,
+                })??;
+
+            timeout(config.discovery_timeout, peripheral.discover_services())
+                .await
+                .map_err(|_| Error::Timeout {
+                    operation: "rediscover services".to_string(),
+                    duration: config.discovery_timeout,
+                })??;
+
+            services = peripheral.services();
+        }
+
         debug!("Found {} services", services.len());
 
         // Build characteristics cache for O(1) lookups
@@ -439,9 +498,15 @@ impl Device {
     /// Check if the device is connected (queries BLE stack state).
     ///
     /// Note: This only checks the BLE stack's connection state, which may be stale,
-    /// especially on macOS. For a more reliable check, use [`validate_connection`].
+    /// especially on macOS. For a more reliable check, use [`Self::validate_connection`].
     pub async fn is_connected(&self) -> bool {
-        self.peripheral.is_connected().await.unwrap_or(false)
+        match self.peripheral.is_connected().await {
+            Ok(connected) => connected,
+            Err(e) => {
+                warn!("Failed to query connection state: {e}");
+                false
+            }
+        }
     }
 
     /// Validate the connection by performing a lightweight read operation.
@@ -465,7 +530,7 @@ impl Device {
 
     /// Check if the connection is alive by performing a lightweight keepalive check.
     ///
-    /// This is an alias for [`validate_connection`] that better describes
+    /// This is an alias for [`Self::validate_connection`] that better describes
     /// the intent when used for connection health monitoring.
     ///
     /// # Example
@@ -700,33 +765,41 @@ impl Device {
     /// - Aranet2, Radon, Radiation use `f0cd3003`
     #[tracing::instrument(level = "debug", skip(self), fields(device_name = ?self.name, device_type = ?self.device_type))]
     pub async fn read_current(&self) -> Result<CurrentReading> {
-        // Try primary characteristic first (Aranet4)
-        let data = match self.read_characteristic(CURRENT_READINGS_DETAIL).await {
-            Ok(data) => data,
-            Err(Error::CharacteristicNotFound { .. }) => {
-                // Try alternative characteristic (Aranet2/Radon/Radiation)
-                debug!("Primary reading characteristic not found, trying alternative");
+        // Use the correct characteristic directly when device type is known,
+        // otherwise probe primary then fall back to alternative.
+        let data = match self.device_type {
+            Some(DeviceType::Aranet4) => self.read_characteristic(CURRENT_READINGS_DETAIL).await?,
+            Some(DeviceType::Aranet2 | DeviceType::AranetRadon | DeviceType::AranetRadiation) => {
                 self.read_characteristic(CURRENT_READINGS_DETAIL_ALT)
                     .await?
             }
-            Err(e) => return Err(e),
+            None | Some(_) => {
+                // Unknown type: try primary first, fall back to alternative
+                match self.read_characteristic(CURRENT_READINGS_DETAIL).await {
+                    Ok(data) => data,
+                    Err(Error::CharacteristicNotFound { .. }) => {
+                        debug!("Primary reading characteristic not found, trying alternative");
+                        self.read_characteristic(CURRENT_READINGS_DETAIL_ALT)
+                            .await?
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
 
-        // Parse based on device type
-        match self.device_type {
-            Some(DeviceType::Aranet4) | None => {
-                // Default to Aranet4 parsing
-                Ok(CurrentReading::from_bytes(&data)?)
+        // Parse based on device type.
+        let device_type = match self.device_type {
+            Some(dt) => dt,
+            None => {
+                warn!(
+                    "Device type unknown for {}; defaulting to Aranet4 — \
+                     readings may be incorrect if this is a different model",
+                    self.name().unwrap_or("unknown")
+                );
+                DeviceType::Aranet4
             }
-            Some(DeviceType::Aranet2) => crate::readings::parse_aranet2_reading(&data),
-            Some(DeviceType::AranetRadon) => crate::readings::parse_aranet_radon_gatt(&data),
-            Some(DeviceType::AranetRadiation) => {
-                // Use dedicated radiation parser that extracts dose rate, total dose, and duration
-                crate::readings::parse_aranet_radiation_gatt(&data).map(|ext| ext.reading)
-            }
-            // Handle future device types - default to Aranet4 parsing
-            Some(_) => Ok(CurrentReading::from_bytes(&data)?),
-        }
+        };
+        crate::readings::parse_reading_for_device(&data, device_type)
     }
 
     /// Read the battery level (0-100).
@@ -794,7 +867,7 @@ impl Device {
 
     /// Read essential device information only.
     ///
-    /// This is a faster alternative to [`read_device_info`] that only reads
+    /// This is a faster alternative to [`Self::read_device_info`] that only reads
     /// the most critical characteristics: name, serial number, and firmware version.
     /// Use this for faster startup when full device info isn't needed immediately.
     #[tracing::instrument(level = "debug", skip(self))]
@@ -937,7 +1010,6 @@ impl Drop for Device {
     }
 }
 
-#[async_trait]
 impl AranetDevice for Device {
     // --- Connection Management ---
 

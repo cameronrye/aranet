@@ -29,7 +29,7 @@ This crate provides SQLite-based storage for Aranet sensor data, enabling offlin
 
 ```toml
 [dependencies]
-aranet-store = "0.1"
+aranet-store = "0.2"
 ```
 
 ## Usage

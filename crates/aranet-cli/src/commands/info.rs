@@ -23,14 +23,12 @@ pub async fn cmd_info(
     let show_progress = !quiet && matches!(format, OutputFormat::Text);
     let device = connect_device_with_progress(&identifier, timeout, show_progress).await?;
 
-    let info = device
+    let info_result = device
         .read_device_info()
         .await
-        .context("Failed to read device info")?;
-
-    if let Err(e) = device.disconnect().await {
-        tracing::debug!("Failed to disconnect after info: {e}");
-    }
+        .context("Failed to read device info");
+    crate::util::disconnect_device(&device).await;
+    let info = info_result?;
 
     let content = match format {
         OutputFormat::Json => opts.as_json(&info)?,

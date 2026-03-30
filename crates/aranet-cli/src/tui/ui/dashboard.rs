@@ -8,8 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline};
 
 use aranet_types::DeviceType;
 
-use super::colors::{battery_color, co2_color, radon_color};
-use super::rssi_display;
+use super::colors::{battery_color, co2_color, radon_color, signal_strength_display};
 use super::theme::{AppTheme, BORDER_TYPE};
 use super::widgets::{
     co2_trend, convert_radon_for_device, format_radon_for_device, format_temp_for_device,
@@ -53,10 +52,421 @@ fn reading_card(
         )
 }
 
+/// Format a reading age as a human-readable string.
+fn format_age(age: u16) -> String {
+    if age < 60 {
+        format!("{}s ago", age)
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else {
+        format!("{}h ago", age / 3600)
+    }
+}
+
+/// Render the battery and age cards into the given areas.
+fn render_battery_and_age(
+    frame: &mut Frame,
+    battery_area: Rect,
+    age_area: Rect,
+    reading: &aranet_types::CurrentReading,
+    theme: &AppTheme,
+) {
+    let color = battery_color(theme, reading.battery);
+    let card = reading_card(
+        "Battery",
+        &format!("{}%", reading.battery),
+        color,
+        None,
+        theme,
+    );
+    frame.render_widget(card, battery_area);
+
+    let age_str = format_age(reading.age);
+    let is_stale = reading.age > reading.interval * 2;
+    let age_color = if is_stale {
+        theme.danger
+    } else {
+        theme.text_muted
+    };
+    let card = reading_card("Age", &age_str, age_color, None, theme);
+    frame.render_widget(card, age_area);
+}
+
+/// Render reading cards for an Aranet4 (CO2) device.
+fn render_aranet4_readings(
+    frame: &mut Frame,
+    row_areas: [Rect; 3],
+    reading: &aranet_types::CurrentReading,
+    device: &crate::tui::app::DeviceState,
+    theme: &AppTheme,
+) {
+    let settings = device.settings.as_ref();
+
+    // Row 1: CO2 + Temperature
+    let row1_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[0]);
+
+    let color = co2_color(theme, reading.co2);
+    let trend = co2_trend(
+        theme,
+        reading.co2,
+        device.previous_reading.as_ref().map(|r| r.co2),
+    );
+    let card = reading_card("CO2", &format!("{} ppm", reading.co2), color, trend, theme);
+    frame.render_widget(card, row1_cols[0]);
+
+    let temp_display = format_temp_for_device(reading.temperature, settings);
+    let card = reading_card(
+        "Temperature",
+        &temp_display,
+        theme.sensor_temperature,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row1_cols[1]);
+
+    // Row 2: Humidity + Pressure
+    let row2_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[1]);
+
+    let card = reading_card(
+        "Humidity",
+        &format!("{}%", reading.humidity),
+        theme.sensor_humidity,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row2_cols[0]);
+
+    if reading.pressure > 0.0 {
+        let card = reading_card(
+            "Pressure",
+            &format!("{:.0} hPa", reading.pressure),
+            theme.sensor_pressure,
+            None,
+            theme,
+        );
+        frame.render_widget(card, row2_cols[1]);
+    }
+
+    // Row 3: Battery + Age
+    let row3_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[2]);
+
+    render_battery_and_age(frame, row3_cols[0], row3_cols[1], reading, theme);
+}
+
+/// Render reading cards for an Aranet2 (temperature/humidity) device.
+fn render_aranet2_readings(
+    frame: &mut Frame,
+    row_areas: [Rect; 3],
+    reading: &aranet_types::CurrentReading,
+    device: &crate::tui::app::DeviceState,
+    theme: &AppTheme,
+) {
+    let settings = device.settings.as_ref();
+
+    // Row 1: Temperature + Humidity
+    let row1_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[0]);
+
+    let temp_display = format_temp_for_device(reading.temperature, settings);
+    let card = reading_card(
+        "Temperature",
+        &temp_display,
+        theme.sensor_temperature,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row1_cols[0]);
+
+    let card = reading_card(
+        "Humidity",
+        &format!("{}%", reading.humidity),
+        theme.sensor_humidity,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row1_cols[1]);
+
+    // Row 2: Battery + Age
+    let row2_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[1]);
+
+    render_battery_and_age(frame, row2_cols[0], row2_cols[1], reading, theme);
+
+    // Row 3: empty for Aranet2
+}
+
+/// Render reading cards for an AranetRadon device.
+fn render_aranet_radon_readings(
+    frame: &mut Frame,
+    row_areas: [Rect; 3],
+    reading: &aranet_types::CurrentReading,
+    device: &crate::tui::app::DeviceState,
+    theme: &AppTheme,
+) {
+    let settings = device.settings.as_ref();
+
+    // Row 1: Radon + Temperature
+    let row1_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[0]);
+
+    if let Some(radon) = reading.radon {
+        let color = radon_color(theme, radon);
+        let radon_display = format_radon_for_device(radon, settings);
+        let card = reading_card("Radon", &radon_display, color, None, theme);
+        frame.render_widget(card, row1_cols[0]);
+    }
+
+    let temp_display = format_temp_for_device(reading.temperature, settings);
+    let card = reading_card(
+        "Temperature",
+        &temp_display,
+        theme.sensor_temperature,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row1_cols[1]);
+
+    // Row 2: Humidity + Pressure
+    let row2_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[1]);
+
+    let card = reading_card(
+        "Humidity",
+        &format!("{}%", reading.humidity),
+        theme.sensor_humidity,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row2_cols[0]);
+
+    if reading.pressure > 0.0 {
+        let card = reading_card(
+            "Pressure",
+            &format!("{:.0} hPa", reading.pressure),
+            theme.sensor_pressure,
+            None,
+            theme,
+        );
+        frame.render_widget(card, row2_cols[1]);
+    }
+
+    // Row 3: Battery + Age
+    let row3_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[2]);
+
+    render_battery_and_age(frame, row3_cols[0], row3_cols[1], reading, theme);
+}
+
+/// Render reading cards for an AranetRadiation device.
+fn render_aranet_radiation_readings(
+    frame: &mut Frame,
+    row_areas: [Rect; 3],
+    reading: &aranet_types::CurrentReading,
+    device: &crate::tui::app::DeviceState,
+    theme: &AppTheme,
+) {
+    let settings = device.settings.as_ref();
+
+    // Row 1: Radiation + Temperature
+    let row1_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[0]);
+
+    if let Some(rate) = reading.radiation_rate {
+        let card = reading_card(
+            "Radiation",
+            &format!("{:.2} uSv/h", rate),
+            theme.sensor_radiation,
+            None,
+            theme,
+        );
+        frame.render_widget(card, row1_cols[0]);
+    }
+
+    let temp_display = format_temp_for_device(reading.temperature, settings);
+    let card = reading_card(
+        "Temperature",
+        &temp_display,
+        theme.sensor_temperature,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row1_cols[1]);
+
+    // Row 2: Humidity + Pressure
+    let row2_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[1]);
+
+    let card = reading_card(
+        "Humidity",
+        &format!("{}%", reading.humidity),
+        theme.sensor_humidity,
+        None,
+        theme,
+    );
+    frame.render_widget(card, row2_cols[0]);
+
+    if reading.pressure > 0.0 {
+        let card = reading_card(
+            "Pressure",
+            &format!("{:.0} hPa", reading.pressure),
+            theme.sensor_pressure,
+            None,
+            theme,
+        );
+        frame.render_widget(card, row2_cols[1]);
+    }
+
+    // Row 3: Battery + Age
+    let row3_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_areas[2]);
+
+    render_battery_and_age(frame, row3_cols[0], row3_cols[1], reading, theme);
+}
+
+/// Render the sparkline for device history data.
+fn render_sparkline(
+    frame: &mut Frame,
+    area: Rect,
+    device: &crate::tui::app::DeviceState,
+    reading: &aranet_types::CurrentReading,
+    theme: &AppTheme,
+) {
+    let history_data = sparkline_data(&device.history, device.device_type);
+    if history_data.is_empty() {
+        return;
+    }
+
+    let sparkline_color = match device.device_type {
+        Some(DeviceType::AranetRadon) => {
+            if let Some(last_radon) = device.history.last().and_then(|r| r.radon) {
+                radon_color(theme, last_radon)
+            } else {
+                theme.series_radon
+            }
+        }
+        Some(DeviceType::AranetRadiation) => theme.series_radiation,
+        _ => {
+            if reading.co2 > 0 {
+                co2_color(theme, reading.co2)
+            } else {
+                theme.series_co2
+            }
+        }
+    };
+
+    let sparkline_width = area.width as usize;
+    let resampled_data = resample_sparkline_data(&history_data, sparkline_width);
+    let sparkline = Sparkline::default()
+        .data(&resampled_data)
+        .style(Style::default().fg(sparkline_color));
+    frame.render_widget(sparkline, area);
+}
+
+/// Render radon averages line for radon devices.
+fn render_radon_averages(
+    frame: &mut Frame,
+    area: Rect,
+    device: &crate::tui::app::DeviceState,
+    theme: &AppTheme,
+) {
+    let settings = device.settings.as_ref();
+    let (day_avg, week_avg) = calculate_radon_averages(&device.history);
+    let radon_unit = radon_unit_for_device(settings);
+
+    let mut avg_spans = vec![Span::styled(
+        "  Averages  ",
+        Style::default().fg(theme.text_muted),
+    )];
+
+    if let Some(avg) = day_avg {
+        let avg_display = convert_radon_for_device(avg, settings);
+        avg_spans.push(Span::styled("24h: ", Style::default().fg(theme.text_muted)));
+        avg_spans.push(Span::styled(
+            format!("{:.1}", avg_display),
+            Style::default().fg(radon_color(theme, avg)),
+        ));
+        avg_spans.push(Span::raw("  "));
+    }
+
+    if let Some(avg) = week_avg {
+        let avg_display = convert_radon_for_device(avg, settings);
+        avg_spans.push(Span::styled("7d: ", Style::default().fg(theme.text_muted)));
+        avg_spans.push(Span::styled(
+            format!("{:.1}", avg_display),
+            Style::default().fg(radon_color(theme, avg)),
+        ));
+    }
+
+    avg_spans.push(Span::styled(
+        format!(" {}", radon_unit),
+        Style::default().fg(theme.text_muted),
+    ));
+
+    let avg_line = Line::from(avg_spans);
+    let avg_para = Paragraph::new(avg_line);
+    frame.render_widget(avg_para, area);
+}
+
+/// Render session statistics line for CO2-tracking devices.
+fn render_session_stats(
+    frame: &mut Frame,
+    area: Rect,
+    device: &crate::tui::app::DeviceState,
+    theme: &AppTheme,
+) {
+    let stats = &device.session_stats;
+    let stats_line = Line::from(vec![
+        Span::styled("  Stats  ", Style::default().fg(theme.text_muted)),
+        Span::styled("Min: ", Style::default().fg(theme.text_muted)),
+        Span::styled(
+            format!("{}", stats.co2_min.unwrap_or(0)),
+            Style::default().fg(theme.success),
+        ),
+        Span::styled("  Max: ", Style::default().fg(theme.text_muted)),
+        Span::styled(
+            format!("{}", stats.co2_max.unwrap_or(0)),
+            Style::default().fg(theme.danger),
+        ),
+        Span::styled("  Avg: ", Style::default().fg(theme.text_muted)),
+        Span::styled(
+            format!("{}", stats.co2_avg().unwrap_or(0)),
+            Style::default().fg(theme.warning),
+        ),
+        Span::styled(" ppm", Style::default().fg(theme.text_muted)),
+    ]);
+    let stats_para = Paragraph::new(stats_line);
+    frame.render_widget(stats_para, area);
+}
+
 /// Draw the device list panel.
 pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.app_theme();
-    let filtered = app.filtered_devices();
+    let filtered = app.filtered_device_indices();
     let filter_label = if app.device_filter != DeviceFilter::All {
         format!(" [{}]", app.device_filter.label())
     } else {
@@ -66,8 +476,8 @@ pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
 
     let items: Vec<ListItem> = filtered
         .iter()
-        .enumerate()
-        .map(|(i, device)| {
+        .map(|device_index| {
+            let device = &app.devices[*device_index];
             let name = device.display_name().chars().take(18).collect::<String>();
 
             let (status_icon, icon_color) = match &device.status {
@@ -77,7 +487,7 @@ pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
                 ConnectionStatus::Disconnected => ("o", theme.text_muted),
             };
 
-            let is_selected = i == app.selected_device;
+            let is_selected = *device_index == app.selected_device;
             let prefix = if is_selected { "> " } else { "  " };
 
             let name_style = if is_selected {
@@ -98,7 +508,7 @@ pub(super) fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
             // Add RSSI indicator for connected devices
             if matches!(device.status, ConnectionStatus::Connected) {
                 if let Some(rssi) = device.rssi {
-                    let (bars, color) = rssi_display(rssi);
+                    let (bars, color) = signal_strength_display(&theme, rssi);
                     spans.push(Span::styled(
                         format!(" {}", bars),
                         Style::default().fg(color),
@@ -307,254 +717,36 @@ pub(super) fn draw_readings_panel(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(Alignment::Center);
     frame.render_widget(header, readings_layout[1]);
 
-    // Row 1: Primary reading (CO2/Radon/Radiation) + Temperature
-    let row1_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(readings_layout[2]);
-
-    // Get device settings for unit formatting
-    let settings = device.settings.as_ref();
-
-    // Primary reading card based on device type
-    if let Some(radon) = reading.radon {
-        // Radon device - use device's radon unit setting
-        let color = radon_color(radon);
-        let radon_display = format_radon_for_device(radon, settings);
-        let card = reading_card("Radon", &radon_display, color, None, &theme);
-        frame.render_widget(card, row1_cols[0]);
-    } else if let Some(rate) = reading.radiation_rate {
-        // Radiation device
-        let card = reading_card(
-            "Radiation",
-            &format!("{:.2} uSv/h", rate),
-            Color::Magenta,
-            None,
-            &theme,
-        );
-        frame.render_widget(card, row1_cols[0]);
-    } else if reading.co2 > 0 {
-        // Aranet4 - CO2
-        let color = co2_color(reading.co2);
-        let trend = co2_trend(reading.co2, device.previous_reading.as_ref().map(|r| r.co2));
-        let card = reading_card("CO2", &format!("{} ppm", reading.co2), color, trend, &theme);
-        frame.render_widget(card, row1_cols[0]);
-    } else {
-        // Aranet2 - Temperature is primary (show in first position)
-        let temp_display = format_temp_for_device(reading.temperature, settings);
-        let card = reading_card("Temperature", &temp_display, theme.warning, None, &theme);
-        frame.render_widget(card, row1_cols[0]);
-    }
-
-    // Temperature card (only if not Aranet2, since it's already shown as primary)
-    if reading.co2 > 0 || reading.radon.is_some() || reading.radiation_rate.is_some() {
-        let temp_display = format_temp_for_device(reading.temperature, settings);
-        let card = reading_card("Temperature", &temp_display, theme.warning, None, &theme);
-        frame.render_widget(card, row1_cols[1]);
-    } else {
-        // For Aranet2, show humidity in the second slot of row 1
-        let card = reading_card(
-            "Humidity",
-            &format!("{}%", reading.humidity),
-            theme.info,
-            None,
-            &theme,
-        );
-        frame.render_widget(card, row1_cols[1]);
-    }
-
-    // Row 2: Humidity + Pressure
-    let row2_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(readings_layout[3]);
-
-    // Humidity card (skip if Aranet2 since it's already shown)
-    if reading.co2 > 0 || reading.radon.is_some() || reading.radiation_rate.is_some() {
-        let card = reading_card(
-            "Humidity",
-            &format!("{}%", reading.humidity),
-            theme.info,
-            None,
-            &theme,
-        );
-        frame.render_widget(card, row2_cols[0]);
-    } else {
-        // For Aranet2, show battery in row 2 left slot
-        let color = battery_color(reading.battery);
-        let card = reading_card(
-            "Battery",
-            &format!("{}%", reading.battery),
-            color,
-            None,
-            &theme,
-        );
-        frame.render_widget(card, row2_cols[0]);
-    }
-
-    // Pressure card (if available)
-    if reading.pressure > 0.0 {
-        let card = reading_card(
-            "Pressure",
-            &format!("{:.0} hPa", reading.pressure),
-            theme.text_primary,
-            None,
-            &theme,
-        );
-        frame.render_widget(card, row2_cols[1]);
-    } else if reading.co2 == 0 && reading.radon.is_none() && reading.radiation_rate.is_none() {
-        // For Aranet2 without pressure, show age in row 2 right slot
-        let age_str = if reading.age < 60 {
-            format!("{}s ago", reading.age)
-        } else if reading.age < 3600 {
-            format!("{}m ago", reading.age / 60)
-        } else {
-            format!("{}h ago", reading.age / 3600)
-        };
-        let is_stale = reading.age > reading.interval * 2;
-        let age_color = if is_stale {
-            theme.danger
-        } else {
-            theme.text_muted
-        };
-        let card = reading_card("Age", &age_str, age_color, None, &theme);
-        frame.render_widget(card, row2_cols[1]);
-    }
-
-    // Row 3: Battery + Age
-    let row3_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(readings_layout[4]);
-
-    // Battery card (skip if Aranet2 since it's already shown)
-    if reading.co2 > 0 || reading.radon.is_some() || reading.radiation_rate.is_some() {
-        let color = battery_color(reading.battery);
-        let card = reading_card(
-            "Battery",
-            &format!("{}%", reading.battery),
-            color,
-            None,
-            &theme,
-        );
-        frame.render_widget(card, row3_cols[0]);
-
-        // Age card
-        let age_str = if reading.age < 60 {
-            format!("{}s ago", reading.age)
-        } else if reading.age < 3600 {
-            format!("{}m ago", reading.age / 60)
-        } else {
-            format!("{}h ago", reading.age / 3600)
-        };
-        let is_stale = reading.age > reading.interval * 2;
-        let age_color = if is_stale {
-            theme.danger
-        } else {
-            theme.text_muted
-        };
-        let card = reading_card("Age", &age_str, age_color, None, &theme);
-        frame.render_widget(card, row3_cols[1]);
-    }
-
-    // Sparkline for history (CO2 for Aranet4, radon for AranetRadon)
-    if has_history {
-        let history_data = sparkline_data(&device.history, device.device_type);
-        if !history_data.is_empty() {
-            // Determine sparkline color based on device type and current reading
-            let sparkline_color = match device.device_type {
-                Some(DeviceType::AranetRadon) => {
-                    // Use radon value from reading (stored in co2 field for current reading)
-                    // or get from history if available
-                    if let Some(last_radon) = device.history.last().and_then(|r| r.radon) {
-                        radon_color(last_radon)
-                    } else {
-                        theme.info // Default for radon
-                    }
-                }
-                Some(DeviceType::AranetRadiation) => Color::Magenta,
-                _ => {
-                    // CO2-based coloring for Aranet4
-                    if reading.co2 > 0 {
-                        co2_color(reading.co2)
-                    } else {
-                        theme.text_primary
-                    }
-                }
-            };
-
-            // Resample data to fill the entire width
-            let sparkline_width = readings_layout[5].width as usize;
-            let resampled_data = resample_sparkline_data(&history_data, sparkline_width);
-            let sparkline = Sparkline::default()
-                .data(&resampled_data)
-                .style(Style::default().fg(sparkline_color));
-            frame.render_widget(sparkline, readings_layout[5]);
+    // Dispatch reading cards to device-type-specific helpers
+    let row_areas = [readings_layout[2], readings_layout[3], readings_layout[4]];
+    match device.device_type {
+        Some(DeviceType::AranetRadon) => {
+            render_aranet_radon_readings(frame, row_areas, reading, device, &theme);
         }
+        Some(DeviceType::AranetRadiation) => {
+            render_aranet_radiation_readings(frame, row_areas, reading, device, &theme);
+        }
+        Some(DeviceType::Aranet2) => {
+            render_aranet2_readings(frame, row_areas, reading, device, &theme);
+        }
+        _ => {
+            // Aranet4 or unknown device type - use CO2 layout
+            render_aranet4_readings(frame, row_areas, reading, device, &theme);
+        }
+    }
+
+    // Sparkline for history
+    if has_history {
+        render_sparkline(frame, readings_layout[5], device, reading, &theme);
     }
 
     // Radon averages (for radon devices with history)
     if matches!(device.device_type, Some(DeviceType::AranetRadon)) && !device.history.is_empty() {
-        let (day_avg, week_avg) = calculate_radon_averages(&device.history);
-        let radon_unit = radon_unit_for_device(settings);
-
-        let mut avg_spans = vec![Span::styled(
-            "  Averages  ",
-            Style::default().fg(theme.text_muted),
-        )];
-
-        if let Some(avg) = day_avg {
-            let avg_display = convert_radon_for_device(avg, settings);
-            avg_spans.push(Span::styled("24h: ", Style::default().fg(theme.text_muted)));
-            avg_spans.push(Span::styled(
-                format!("{:.1}", avg_display),
-                Style::default().fg(radon_color(avg)),
-            ));
-            avg_spans.push(Span::raw("  "));
-        }
-
-        if let Some(avg) = week_avg {
-            let avg_display = convert_radon_for_device(avg, settings);
-            avg_spans.push(Span::styled("7d: ", Style::default().fg(theme.text_muted)));
-            avg_spans.push(Span::styled(
-                format!("{:.1}", avg_display),
-                Style::default().fg(radon_color(avg)),
-            ));
-        }
-
-        avg_spans.push(Span::styled(
-            format!(" {}", radon_unit),
-            Style::default().fg(theme.text_muted),
-        ));
-
-        let avg_line = Line::from(avg_spans);
-        let avg_para = Paragraph::new(avg_line);
-        frame.render_widget(avg_para, readings_layout[6]);
+        render_radon_averages(frame, readings_layout[6], device, &theme);
     }
 
     // Session statistics (if available)
     if device.session_stats.co2_count > 0 {
-        let stats = &device.session_stats;
-        let stats_line = Line::from(vec![
-            Span::styled("  Stats  ", Style::default().fg(theme.text_muted)),
-            Span::styled("Min: ", Style::default().fg(theme.text_muted)),
-            Span::styled(
-                format!("{}", stats.co2_min.unwrap_or(0)),
-                Style::default().fg(theme.success),
-            ),
-            Span::styled("  Max: ", Style::default().fg(theme.text_muted)),
-            Span::styled(
-                format!("{}", stats.co2_max.unwrap_or(0)),
-                Style::default().fg(theme.danger),
-            ),
-            Span::styled("  Avg: ", Style::default().fg(theme.text_muted)),
-            Span::styled(
-                format!("{}", stats.co2_avg().unwrap_or(0)),
-                Style::default().fg(theme.warning),
-            ),
-            Span::styled(" ppm", Style::default().fg(theme.text_muted)),
-        ]);
-        let stats_para = Paragraph::new(stats_line);
-        frame.render_widget(stats_para, readings_layout[7]);
+        render_session_stats(frame, readings_layout[7], device, &theme);
     }
 }

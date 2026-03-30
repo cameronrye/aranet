@@ -179,16 +179,17 @@ pub async fn cmd_history(args: HistoryArgs<'_>) -> Result<()> {
     };
 
     let device_id = device.address().to_string();
-    let history = device
+    let history_result = device
         .download_history_with_options(history_options)
         .await
-        .context("Failed to download history")?;
+        .context("Failed to download history");
+
+    crate::util::disconnect_device(&device).await;
+    let history = history_result?;
 
     if let Some(pb) = pb {
         pb.finish_with_message("Download complete");
     }
-
-    device.disconnect().await.ok();
 
     // Save history to store (unified data architecture)
     crate::util::save_history_to_store(&device_id, &history);

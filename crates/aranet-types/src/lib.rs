@@ -172,7 +172,7 @@ mod tests {
     fn test_parse_current_reading_max_values() {
         let bytes: [u8; 13] = [
             0xFF, 0xFF, // CO2 = 65535
-            0xFF, 0xFF, // temp_raw = 65535
+            0xFF, 0xFF, // temp_raw = -1 as i16 (-0.05°C signed)
             0xFF, 0xFF, // pressure_raw = 65535
             0xFF, // humidity = 255
             0xFF, // battery = 255
@@ -183,7 +183,7 @@ mod tests {
 
         let reading = CurrentReading::from_bytes(&bytes).unwrap();
         assert_eq!(reading.co2, 65535);
-        assert!((reading.temperature - 3276.75).abs() < 0.01); // 65535/20
+        assert!((reading.temperature - (-0.05)).abs() < 0.01); // -1 as i16 / 20
         assert!((reading.pressure - 6553.5).abs() < 0.1); // 65535/10
         assert_eq!(reading.humidity, 255);
         assert_eq!(reading.battery, 255);
@@ -752,12 +752,54 @@ mod tests {
             DeviceType::from_name("aranetrn+ 12345"),
             Some(DeviceType::AranetRadon)
         );
+
+        // Should match Aranet Radiation by ☢ symbol (real device name format)
+        assert_eq!(
+            DeviceType::from_name("Aranet\u{2622} 30ED1"),
+            Some(DeviceType::AranetRadiation)
+        );
+        assert_eq!(
+            DeviceType::from_name("Aranet Radiation"),
+            Some(DeviceType::AranetRadiation)
+        );
+    }
+
+    #[test]
+    fn test_device_type_has_co2() {
+        assert!(DeviceType::Aranet4.has_co2());
+        assert!(!DeviceType::Aranet2.has_co2());
+        assert!(!DeviceType::AranetRadon.has_co2());
+        assert!(!DeviceType::AranetRadiation.has_co2());
+    }
+
+    #[test]
+    fn test_device_type_has_temperature() {
+        assert!(DeviceType::Aranet4.has_temperature());
+        assert!(DeviceType::Aranet2.has_temperature());
+        assert!(DeviceType::AranetRadon.has_temperature());
+        assert!(!DeviceType::AranetRadiation.has_temperature());
+    }
+
+    #[test]
+    fn test_device_type_has_humidity() {
+        assert!(DeviceType::Aranet4.has_humidity());
+        assert!(DeviceType::Aranet2.has_humidity());
+        assert!(DeviceType::AranetRadon.has_humidity());
+        assert!(!DeviceType::AranetRadiation.has_humidity());
+    }
+
+    #[test]
+    fn test_device_type_has_pressure() {
+        assert!(DeviceType::Aranet4.has_pressure());
+        assert!(!DeviceType::Aranet2.has_pressure());
+        assert!(DeviceType::AranetRadon.has_pressure());
+        assert!(!DeviceType::AranetRadiation.has_pressure());
     }
 
     #[test]
     fn test_byte_size_constants() {
         assert_eq!(MIN_CURRENT_READING_BYTES, 13);
-        assert_eq!(types::MIN_ARANET2_READING_BYTES, 7);
+        assert_eq!(types::MIN_ARANET2_READING_BYTES, 12);
         assert_eq!(types::MIN_RADON_READING_BYTES, 15);
         assert_eq!(types::MIN_RADON_GATT_READING_BYTES, 18);
         assert_eq!(types::MIN_RADIATION_READING_BYTES, 28);
@@ -765,13 +807,15 @@ mod tests {
 
     #[test]
     fn test_from_bytes_aranet2() {
-        // 7 bytes: temp(2), humidity(1), battery(1), status(1), interval(2)
+        // 12 bytes GATT format: header(2), interval(2), age(2), battery(1), temp(2), humidity(2), status_flags(1)
         let data = [
-            0x90, 0x01, // temp = 400 -> 20.0°C
-            0x32, // humidity = 50
-            0x55, // battery = 85
-            0x01, // status = Green
+            0x02, 0x00, // header
             0x2C, 0x01, // interval = 300
+            0x3C, 0x00, // age = 60
+            0x55, // battery = 85
+            0x90, 0x01, // temp = 400 -> 20.0°C
+            0xF4, 0x01, // humidity = 500 -> 50%
+            0x04, // status flags: bits[2:3] = 01 = Green
         ];
 
         let reading = CurrentReading::from_bytes_aranet2(&data).unwrap();
@@ -781,12 +825,13 @@ mod tests {
         assert_eq!(reading.battery, 85);
         assert_eq!(reading.status, Status::Green);
         assert_eq!(reading.interval, 300);
+        assert_eq!(reading.age, 60);
         assert_eq!(reading.pressure, 0.0); // Aranet2 has no pressure
     }
 
     #[test]
     fn test_from_bytes_aranet2_insufficient() {
-        let data = [0u8; 6]; // Too short
+        let data = [0u8; 11]; // Too short (need 12)
         let result = CurrentReading::from_bytes_aranet2(&data);
         assert!(result.is_err());
     }
@@ -798,7 +843,7 @@ mod tests {
         let result = CurrentReading::from_bytes_for_device(&aranet4_data, DeviceType::Aranet4);
         assert!(result.is_ok());
 
-        let aranet2_data = [0u8; 7];
+        let aranet2_data = [0u8; 12];
         let result = CurrentReading::from_bytes_for_device(&aranet2_data, DeviceType::Aranet2);
         assert!(result.is_ok());
     }
@@ -997,29 +1042,33 @@ mod proptests {
             prop_assert_eq!(reading.age, age);
         }
 
-        /// Valid 7-byte input should always parse successfully for Aranet2.
+        /// Valid 12-byte GATT input should always parse successfully for Aranet2.
         #[test]
         fn parse_valid_aranet2_bytes(
             temp_raw in 0u16..2000u16,
-            humidity in 0u8..100u8,
+            humidity_raw in 0u16..1000u16,
             battery in 0u8..100u8,
-            status_byte in 0u8..4u8,
+            status_flags in 0u8..16u8,
             interval in 60u16..3600u16,
+            age in 0u16..3600u16,
         ) {
-            let mut data = [0u8; 7];
-            data[0..2].copy_from_slice(&temp_raw.to_le_bytes());
-            data[2] = humidity;
-            data[3] = battery;
-            data[4] = status_byte;
-            data[5..7].copy_from_slice(&interval.to_le_bytes());
+            let mut data = [0u8; 12];
+            data[0..2].copy_from_slice(&0x0002u16.to_le_bytes()); // header
+            data[2..4].copy_from_slice(&interval.to_le_bytes());
+            data[4..6].copy_from_slice(&age.to_le_bytes());
+            data[6] = battery;
+            data[7..9].copy_from_slice(&temp_raw.to_le_bytes());
+            data[9..11].copy_from_slice(&humidity_raw.to_le_bytes());
+            data[11] = status_flags;
 
             let result = CurrentReading::from_bytes_aranet2(&data);
             prop_assert!(result.is_ok());
 
             let reading = result.unwrap();
-            prop_assert_eq!(reading.humidity, humidity);
+            prop_assert_eq!(reading.humidity, (humidity_raw / 10) as u8);
             prop_assert_eq!(reading.battery, battery);
             prop_assert_eq!(reading.interval, interval);
+            prop_assert_eq!(reading.age, age);
         }
 
         /// JSON serialization roundtrip should preserve all values.

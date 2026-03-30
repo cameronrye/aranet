@@ -19,7 +19,7 @@ impl AranetApp {
         // Collapsed sidebar - just show a thin expand button
         if self.sidebar_collapsed {
             egui::SidePanel::left("devices_collapsed")
-                .exact_width(40.0)
+                .exact_width(44.0)
                 .resizable(false)
                 .frame(
                     egui::Frame::new()
@@ -77,7 +77,7 @@ impl AranetApp {
 
         // Full sidebar
         egui::SidePanel::left("devices")
-            .exact_width(280.0)
+            .exact_width(300.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -128,7 +128,7 @@ impl AranetApp {
                 if !self.devices.is_empty() {
                     // Type filter row
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().item_spacing.x = self.theme.spacing.xs;
                         for filter in [
                             DeviceTypeFilter::All,
                             DeviceTypeFilter::Aranet4,
@@ -137,26 +137,15 @@ impl AranetApp {
                             DeviceTypeFilter::Aranet2,
                         ] {
                             let is_selected = self.device_type_filter == filter;
-                            let (bg, text_color, stroke) = if is_selected {
-                                (
-                                    self.theme.accent,
-                                    self.theme.text_on_accent,
-                                    egui::Stroke::new(1.0, self.theme.accent),
-                                )
-                            } else {
-                                (
-                                    self.theme.bg_card,
-                                    self.theme.text_secondary,
-                                    egui::Stroke::new(1.0, self.theme.border_subtle),
-                                )
-                            };
-                            let btn = egui::Button::new(
-                                RichText::new(filter.label()).size(11.0).color(text_color),
+                            if components::toggle_chip(
+                                ui,
+                                &self.theme,
+                                filter.label(),
+                                is_selected,
+                                self.theme.accent,
                             )
-                            .fill(bg)
-                            .stroke(stroke)
-                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
-                            if ui.add(btn).clicked() {
+                            .clicked()
+                            {
                                 self.device_type_filter = filter;
                             }
                         }
@@ -166,33 +155,22 @@ impl AranetApp {
 
                     // Connection status filter row
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().item_spacing.x = self.theme.spacing.xs;
                         for filter in [
                             ConnectionFilter::All,
                             ConnectionFilter::Connected,
                             ConnectionFilter::Disconnected,
                         ] {
                             let is_selected = self.connection_filter == filter;
-                            let (bg, text_color, stroke) = if is_selected {
-                                (
-                                    self.theme.info,
-                                    self.theme.text_on_accent,
-                                    egui::Stroke::new(1.0, self.theme.info),
-                                )
-                            } else {
-                                (
-                                    self.theme.bg_card,
-                                    self.theme.text_secondary,
-                                    egui::Stroke::new(1.0, self.theme.border_subtle),
-                                )
-                            };
-                            let btn = egui::Button::new(
-                                RichText::new(filter.label()).size(11.0).color(text_color),
+                            if components::toggle_chip(
+                                ui,
+                                &self.theme,
+                                filter.label(),
+                                is_selected,
+                                self.theme.info,
                             )
-                            .fill(bg)
-                            .stroke(stroke)
-                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
-                            if ui.add(btn).clicked() {
+                            .clicked()
+                            {
                                 self.connection_filter = filter;
                             }
                         }
@@ -213,28 +191,28 @@ impl AranetApp {
                         .count();
 
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().item_spacing.x = self.theme.spacing.xs;
 
                         // Connect All button
                         let connect_enabled = disconnected_count > 0;
-                        let (connect_bg, connect_text) = if connect_enabled {
-                            (self.theme.bg_card, self.theme.text_secondary)
+                        let connect_style = if connect_enabled {
+                            self.theme.button_secondary()
                         } else {
-                            (self.theme.bg_disabled, self.theme.text_disabled)
+                            self.theme.button_disabled()
                         };
                         ui.add_enabled_ui(connect_enabled, |ui| {
-                            let btn = egui::Button::new(
-                                RichText::new("Connect All").size(11.0).color(connect_text),
+                            if components::themed_button(
+                                ui,
+                                &self.theme,
+                                "Connect All",
+                                connect_style,
+                                self.theme.typography.caption,
                             )
-                            .fill(connect_bg)
-                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
-                            if ui
-                                .add(btn)
-                                .on_hover_text(format!(
-                                    "Connect to all {} disconnected devices",
-                                    disconnected_count
-                                ))
-                                .clicked()
+                            .on_hover_text(format!(
+                                "Connect to all {} disconnected devices",
+                                disconnected_count
+                            ))
+                            .clicked()
                             {
                                 self.status = "Connecting to all devices...".to_string();
                                 for device in &self.devices {
@@ -249,26 +227,24 @@ impl AranetApp {
 
                         // Disconnect All button
                         let disconnect_enabled = connected_count > 0;
-                        let (disconnect_bg, disconnect_text) = if disconnect_enabled {
-                            (self.theme.bg_card, self.theme.text_secondary)
+                        let disconnect_style = if disconnect_enabled {
+                            self.theme.button_secondary()
                         } else {
-                            (self.theme.bg_disabled, self.theme.text_disabled)
+                            self.theme.button_disabled()
                         };
                         ui.add_enabled_ui(disconnect_enabled, |ui| {
-                            let btn = egui::Button::new(
-                                RichText::new("Disconnect All")
-                                    .size(11.0)
-                                    .color(disconnect_text),
+                            if components::themed_button(
+                                ui,
+                                &self.theme,
+                                "Disconnect All",
+                                disconnect_style,
+                                self.theme.typography.caption,
                             )
-                            .fill(disconnect_bg)
-                            .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
-                            if ui
-                                .add(btn)
-                                .on_hover_text(format!(
-                                    "Disconnect from all {} connected devices",
-                                    connected_count
-                                ))
-                                .clicked()
+                            .on_hover_text(format!(
+                                "Disconnect from all {} connected devices",
+                                connected_count
+                            ))
+                            .clicked()
                             {
                                 self.status = "Disconnecting from all devices...".to_string();
                                 for device in &self.devices {

@@ -42,6 +42,12 @@ pub fn cmd_cache(action: CacheAction, config: &Config) -> Result<()> {
             since,
             until,
         } => export_history(&store, &device, format, output, since, until),
+        CacheAction::Prune {
+            older_than,
+            history_only,
+            force,
+            vacuum,
+        } => prune_data(&store, &older_than, history_only, force, vacuum),
         CacheAction::Info => unreachable!("Handled above"),
         CacheAction::Import { format, input } => import_history(&store, format, input),
     }
@@ -155,7 +161,8 @@ fn query_history(
         .with_bq(bq)
         .with_inhg(inhg);
 
-    let formatted = match output.format {
+    let format = output.format.unwrap_or(crate::cli::OutputFormat::Text);
+    let formatted = match format {
         crate::cli::OutputFormat::Json => format_history_json(&history, &opts)?,
         crate::cli::OutputFormat::Csv => format_history_csv(&history, &opts),
         crate::cli::OutputFormat::Text => format_history_text(&history, &opts),
@@ -373,6 +380,80 @@ fn import_history(
                 println!("  ... and {} more errors", result.errors.len() - 10);
             }
         }
+    }
+
+    Ok(())
+}
+
+fn parse_duration(s: &str) -> Result<time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("Duration cannot be empty");
+    }
+
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let num: i64 = num_str
+        .parse()
+        .with_context(|| format!("Invalid number in duration: {}", s))?;
+
+    match unit {
+        "h" => Ok(time::Duration::hours(num)),
+        "d" => Ok(time::Duration::days(num)),
+        "w" => Ok(time::Duration::weeks(num)),
+        "m" => Ok(time::Duration::days(num * 30)),
+        "y" => Ok(time::Duration::days(num * 365)),
+        _ => anyhow::bail!(
+            "Unknown duration unit '{}'. Use h (hours), d (days), w (weeks), m (months), y (years)",
+            unit
+        ),
+    }
+}
+
+fn prune_data(
+    store: &Store,
+    older_than: &str,
+    history_only: bool,
+    force: bool,
+    vacuum: bool,
+) -> Result<()> {
+    let duration = parse_duration(older_than)?;
+    let cutoff = OffsetDateTime::now_utc() - duration;
+
+    let cutoff_str = cutoff.format(&time::format_description::well_known::Rfc3339)?;
+
+    if !force {
+        println!(
+            "This will delete all {} records before {}",
+            if history_only {
+                "history"
+            } else {
+                "history and reading"
+            },
+            cutoff_str
+        );
+        print!("Continue? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let history_deleted = store.prune_history(cutoff)?;
+    println!("Deleted {} history records", history_deleted);
+
+    if !history_only {
+        let readings_deleted = store.prune_readings(cutoff)?;
+        println!("Deleted {} readings", readings_deleted);
+    }
+
+    if vacuum {
+        println!("Running VACUUM to reclaim disk space...");
+        store.vacuum()?;
+        println!("Done.");
     }
 
     Ok(())

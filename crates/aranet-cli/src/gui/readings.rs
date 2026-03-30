@@ -134,7 +134,7 @@ fn render_co2_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, co2: 
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
         .shadow(theme.subtle_shadow())
         .show(ui, |ui| {
-            ui.set_min_width(ui.available_width().min(320.0));
+            ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
@@ -245,7 +245,7 @@ fn render_radon_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, rad
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
         .shadow(theme.subtle_shadow())
         .show(ui, |ui| {
-            ui.set_min_width(ui.available_width().min(320.0));
+            ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
@@ -400,7 +400,7 @@ fn render_radiation_card(ui: &mut egui::Ui, theme: &Theme, rate: f32, total: Opt
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
         .shadow(theme.subtle_shadow())
         .show(ui, |ui| {
-            ui.set_min_width(ui.available_width().min(320.0));
+            ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {

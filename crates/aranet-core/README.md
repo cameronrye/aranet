@@ -44,7 +44,7 @@ This crate provides low-level Bluetooth Low Energy (BLE) communication with Aran
 
 ```toml
 [dependencies]
-aranet-core = "0.1"
+aranet-core = "0.2"
 ```
 
 ## Usage

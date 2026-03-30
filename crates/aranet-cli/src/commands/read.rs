@@ -5,19 +5,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use aranet_core::advertisement::parse_advertisement_with_name;
-use aranet_core::scan::{ScanOptions, scan_with_options};
-use aranet_types::CurrentReading;
-use futures::future::join_all;
-use tracing::debug;
-
 use crate::cli::OutputFormat;
 use crate::format::{
     FormatOptions, format_multi_reading_csv, format_multi_reading_json, format_multi_reading_text,
     format_reading_csv, format_reading_json, format_reading_text, format_reading_text_with_name,
 };
 use crate::util::{require_device_interactive, write_output};
+use anyhow::{Context, Result, bail};
+use aranet_core::advertisement::parse_advertisement_with_name;
+use aranet_core::scan::{ScanOptions, scan_with_options};
+use aranet_types::CurrentReading;
+use futures::future::join_all;
 
 /// Result of reading from a device
 pub struct DeviceReading {
@@ -36,9 +34,10 @@ pub async fn cmd_read(
 ) -> Result<()> {
     if passive {
         if devices.len() > 1 {
-            eprintln!(
-                "Warning: passive mode only supports one device, using '{}'",
-                devices[0]
+            bail!(
+                "Passive mode only supports one device, but {} were specified. \
+                 Use a single device address or omit --passive.",
+                devices.len()
             );
         }
         let device = devices.first().cloned();
@@ -77,14 +76,12 @@ async fn cmd_read_single(
         crate::util::connect_device_with_progress(identifier, timeout, show_progress).await?;
     let device_id = device.address().to_string();
     let device_name = device.name().map(|s| s.to_string());
-    let reading = device
+    let reading_result = device
         .read_current()
         .await
-        .context("Failed to read current values")?;
-
-    if let Err(e) = device.disconnect().await {
-        debug!("Failed to disconnect after read: {e}");
-    }
+        .context("Failed to read current values");
+    crate::util::disconnect_device(&device).await;
+    let reading = reading_result?;
 
     // Save reading to store (unified data architecture)
     crate::util::save_reading_to_store(&device_id, &reading);
@@ -185,15 +182,13 @@ async fn read_device(
         .map_err(|e| (identifier.clone(), e))?;
 
     let device_id = device.address().to_string();
-    let reading = device
+    let reading_result = device
         .read_current()
         .await
         .context("Failed to read current values")
-        .map_err(|e| (identifier.clone(), e))?;
-
-    if let Err(e) = device.disconnect().await {
-        debug!("Failed to disconnect after read: {e}");
-    }
+        .map_err(|e| (identifier.clone(), e));
+    crate::util::disconnect_device(&device).await;
+    let reading = reading_result?;
 
     // Save reading to store (unified data architecture)
     crate::util::save_reading_to_store(&device_id, &reading);

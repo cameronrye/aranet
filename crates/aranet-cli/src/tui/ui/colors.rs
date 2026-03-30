@@ -20,6 +20,7 @@ use aranet_types::Status;
 use ratatui::style::Color;
 
 use super::super::app::ConnectionStatus;
+use super::theme::AppTheme;
 
 /// Returns a color based on CO2 concentration level.
 ///
@@ -35,13 +36,8 @@ use super::super::app::ConnectionStatus;
 /// - Orange (RGB 255,165,0): 1001-1500 ppm (elevated)
 /// - Red: 1501+ ppm (high)
 #[must_use]
-pub fn co2_color(ppm: u16) -> Color {
-    match ppm {
-        0..=800 => Color::Green,
-        801..=1000 => Color::Yellow,
-        1001..=1500 => Color::Rgb(255, 165, 0),
-        _ => Color::Red,
-    }
+pub fn co2_color(theme: &AppTheme, ppm: u16) -> Color {
+    theme.co2_level_color(ppm)
 }
 
 /// Returns a color based on radon concentration level.
@@ -57,13 +53,8 @@ pub fn co2_color(ppm: u16) -> Color {
 ///
 /// Note: EPA action level is 4 pCi/L ≈ 148 Bq/m³
 #[must_use]
-pub fn radon_color(bq_m3: u32) -> Color {
-    match bq_m3 {
-        0..=100 => Color::Green,
-        101..=150 => Color::Yellow,
-        151..=300 => Color::Rgb(255, 165, 0),
-        _ => Color::Red,
-    }
+pub fn radon_color(theme: &AppTheme, bq_m3: u32) -> Color {
+    theme.radon_level_color(bq_m3)
 }
 
 /// Returns a color based on the sensor status indicator.
@@ -82,15 +73,8 @@ pub fn radon_color(bq_m3: u32) -> Color {
 // Kept for future use: displaying sensor status indicators in the TUI
 #[allow(dead_code)]
 #[must_use]
-pub fn status_color(status: &Status) -> Color {
-    match status {
-        Status::Green => Color::Green,
-        Status::Yellow => Color::Yellow,
-        Status::Red => Color::Red,
-        Status::Error => Color::DarkGray,
-        // Handle future non_exhaustive variants
-        _ => Color::DarkGray,
-    }
+pub fn status_color(theme: &AppTheme, status: &Status) -> Color {
+    theme.sensor_status_color(status)
 }
 
 /// Returns a color based on battery percentage.
@@ -106,12 +90,8 @@ pub fn status_color(status: &Status) -> Color {
 /// - Yellow: 21-50% (moderate)
 /// - Green: 51-100% (good)
 #[must_use]
-pub fn battery_color(percent: u8) -> Color {
-    match percent {
-        0..=20 => Color::Red,
-        21..=50 => Color::Yellow,
-        _ => Color::Green,
-    }
+pub fn battery_color(theme: &AppTheme, percent: u8) -> Color {
+    theme.battery_level_color(percent)
 }
 
 /// Returns a color based on the connection status.
@@ -130,13 +110,14 @@ pub fn battery_color(percent: u8) -> Color {
 // Kept for future use: displaying connection status in the TUI header/footer
 #[allow(dead_code)]
 #[must_use]
-pub fn connection_status_color(status: &ConnectionStatus) -> Color {
-    match status {
-        ConnectionStatus::Disconnected => Color::DarkGray,
-        ConnectionStatus::Connecting => Color::Yellow,
-        ConnectionStatus::Connected => Color::Green,
-        ConnectionStatus::Error(_) => Color::Red,
-    }
+pub fn connection_status_color(theme: &AppTheme, status: &ConnectionStatus) -> Color {
+    theme.connection_color(status)
+}
+
+/// Returns signal bars and color based on RSSI value.
+#[must_use]
+pub fn signal_strength_display(theme: &AppTheme, rssi: i16) -> (&'static str, Color) {
+    theme.signal_strength_display(rssi)
 }
 
 #[cfg(test)]
@@ -145,95 +126,106 @@ mod tests {
 
     #[test]
     fn test_co2_color_good() {
-        assert_eq!(co2_color(0), Color::Green);
-        assert_eq!(co2_color(400), Color::Green);
-        assert_eq!(co2_color(800), Color::Green);
+        let theme = AppTheme::dark();
+        assert_eq!(co2_color(&theme, 0), theme.success);
+        assert_eq!(co2_color(&theme, 400), theme.success);
+        assert_eq!(co2_color(&theme, 800), theme.success);
     }
 
     #[test]
     fn test_co2_color_moderate() {
-        assert_eq!(co2_color(801), Color::Yellow);
-        assert_eq!(co2_color(900), Color::Yellow);
-        assert_eq!(co2_color(1000), Color::Yellow);
+        let theme = AppTheme::dark();
+        assert_eq!(co2_color(&theme, 801), theme.warning);
+        assert_eq!(co2_color(&theme, 900), theme.warning);
+        assert_eq!(co2_color(&theme, 1000), theme.warning);
     }
 
     #[test]
     fn test_co2_color_elevated() {
-        assert_eq!(co2_color(1001), Color::Rgb(255, 165, 0));
-        assert_eq!(co2_color(1250), Color::Rgb(255, 165, 0));
-        assert_eq!(co2_color(1500), Color::Rgb(255, 165, 0));
+        let theme = AppTheme::dark();
+        assert_eq!(co2_color(&theme, 1001), theme.caution);
+        assert_eq!(co2_color(&theme, 1250), theme.caution);
+        assert_eq!(co2_color(&theme, 1500), theme.caution);
     }
 
     #[test]
     fn test_co2_color_high() {
-        assert_eq!(co2_color(1501), Color::Red);
-        assert_eq!(co2_color(2000), Color::Red);
-        assert_eq!(co2_color(5000), Color::Red);
+        let theme = AppTheme::dark();
+        assert_eq!(co2_color(&theme, 1501), theme.danger);
+        assert_eq!(co2_color(&theme, 2000), theme.danger);
+        assert_eq!(co2_color(&theme, 5000), theme.danger);
     }
 
     #[test]
     fn test_battery_color() {
-        assert_eq!(battery_color(0), Color::Red);
-        assert_eq!(battery_color(20), Color::Red);
-        assert_eq!(battery_color(21), Color::Yellow);
-        assert_eq!(battery_color(50), Color::Yellow);
-        assert_eq!(battery_color(51), Color::Green);
-        assert_eq!(battery_color(100), Color::Green);
+        let theme = AppTheme::dark();
+        assert_eq!(battery_color(&theme, 0), theme.danger);
+        assert_eq!(battery_color(&theme, 20), theme.danger);
+        assert_eq!(battery_color(&theme, 21), theme.warning);
+        assert_eq!(battery_color(&theme, 50), theme.warning);
+        assert_eq!(battery_color(&theme, 51), theme.success);
+        assert_eq!(battery_color(&theme, 100), theme.success);
     }
 
     #[test]
     fn test_status_color() {
-        assert_eq!(status_color(&Status::Green), Color::Green);
-        assert_eq!(status_color(&Status::Yellow), Color::Yellow);
-        assert_eq!(status_color(&Status::Red), Color::Red);
-        assert_eq!(status_color(&Status::Error), Color::DarkGray);
+        let theme = AppTheme::dark();
+        assert_eq!(status_color(&theme, &Status::Green), theme.success);
+        assert_eq!(status_color(&theme, &Status::Yellow), theme.warning);
+        assert_eq!(status_color(&theme, &Status::Red), theme.danger);
+        assert_eq!(status_color(&theme, &Status::Error), theme.signal_offline);
     }
 
     #[test]
     fn test_connection_status_color() {
+        let theme = AppTheme::dark();
         assert_eq!(
-            connection_status_color(&ConnectionStatus::Disconnected),
-            Color::DarkGray
+            connection_status_color(&theme, &ConnectionStatus::Disconnected),
+            theme.signal_offline
         );
         assert_eq!(
-            connection_status_color(&ConnectionStatus::Connecting),
-            Color::Yellow
+            connection_status_color(&theme, &ConnectionStatus::Connecting),
+            theme.warning
         );
         assert_eq!(
-            connection_status_color(&ConnectionStatus::Connected),
-            Color::Green
+            connection_status_color(&theme, &ConnectionStatus::Connected),
+            theme.success
         );
         assert_eq!(
-            connection_status_color(&ConnectionStatus::Error("test".to_string())),
-            Color::Red
+            connection_status_color(&theme, &ConnectionStatus::Error("test".to_string())),
+            theme.danger
         );
     }
 
     #[test]
     fn test_radon_color_good() {
-        assert_eq!(radon_color(0), Color::Green);
-        assert_eq!(radon_color(50), Color::Green);
-        assert_eq!(radon_color(100), Color::Green);
+        let theme = AppTheme::dark();
+        assert_eq!(radon_color(&theme, 0), theme.success);
+        assert_eq!(radon_color(&theme, 50), theme.success);
+        assert_eq!(radon_color(&theme, 100), theme.success);
     }
 
     #[test]
     fn test_radon_color_moderate() {
-        assert_eq!(radon_color(101), Color::Yellow);
-        assert_eq!(radon_color(125), Color::Yellow);
-        assert_eq!(radon_color(150), Color::Yellow);
+        let theme = AppTheme::dark();
+        assert_eq!(radon_color(&theme, 101), theme.warning);
+        assert_eq!(radon_color(&theme, 125), theme.warning);
+        assert_eq!(radon_color(&theme, 150), theme.warning);
     }
 
     #[test]
     fn test_radon_color_elevated() {
-        assert_eq!(radon_color(151), Color::Rgb(255, 165, 0));
-        assert_eq!(radon_color(200), Color::Rgb(255, 165, 0));
-        assert_eq!(radon_color(300), Color::Rgb(255, 165, 0));
+        let theme = AppTheme::dark();
+        assert_eq!(radon_color(&theme, 151), theme.caution);
+        assert_eq!(radon_color(&theme, 200), theme.caution);
+        assert_eq!(radon_color(&theme, 300), theme.caution);
     }
 
     #[test]
     fn test_radon_color_high() {
-        assert_eq!(radon_color(301), Color::Red);
-        assert_eq!(radon_color(500), Color::Red);
-        assert_eq!(radon_color(1000), Color::Red);
+        let theme = AppTheme::dark();
+        assert_eq!(radon_color(&theme, 301), theme.danger);
+        assert_eq!(radon_color(&theme, 500), theme.danger);
+        assert_eq!(radon_color(&theme, 1000), theme.danger);
     }
 }

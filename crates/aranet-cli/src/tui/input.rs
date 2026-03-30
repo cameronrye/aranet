@@ -233,83 +233,9 @@ pub fn handle_mouse(event: MouseEvent) -> Action {
     }
 }
 
-/// Apply an action to the application state.
-///
-/// This function handles both UI-only actions (which modify app state directly)
-/// and command actions (which return a command to be sent to the background worker).
-///
-/// # Arguments
-///
-/// * `app` - Mutable reference to the application state
-/// * `action` - The action to apply
-/// * `_command_tx` - Channel for sending commands (used for reference, actual sending done by caller)
-///
-/// # Returns
-///
-/// `Some(Command)` if an async command should be sent to the background worker,
-/// `None` if the action was handled entirely within the UI.
-pub fn apply_action(
-    app: &mut App,
-    action: Action,
-    _command_tx: &mpsc::Sender<Command>,
-) -> Option<Command> {
+/// Handle navigation actions: tab switching, scrolling, item selection, mouse clicks.
+fn apply_navigation_action(app: &mut App, action: Action) -> Option<Command> {
     match action {
-        Action::Quit => {
-            app.should_quit = true;
-            None
-        }
-        Action::Scan => Some(Command::Scan {
-            duration: Duration::from_secs(5),
-        }),
-        Action::Refresh => {
-            if app.active_tab == Tab::Service {
-                // In Service tab, refresh service status
-                Some(Command::RefreshServiceStatus)
-            } else {
-                // In other tabs, refresh sensor readings
-                Some(Command::RefreshAll)
-            }
-        }
-        Action::Connect => app.selected_device().map(|device| Command::Connect {
-            device_id: device.id.clone(),
-        }),
-        Action::ConnectAll => {
-            // Connect to all disconnected devices one by one
-            // Find first disconnected device and connect
-            let first_disconnected = app
-                .devices
-                .iter()
-                .find(|d| matches!(d.status, ConnectionStatus::Disconnected))
-                .map(|d| d.id.clone());
-            let count = app
-                .devices
-                .iter()
-                .filter(|d| matches!(d.status, ConnectionStatus::Disconnected))
-                .count();
-
-            if let Some(device_id) = first_disconnected {
-                app.push_status_message(format!("Connecting... ({} remaining)", count));
-                return Some(Command::Connect { device_id });
-            } else {
-                app.push_status_message("All devices already connected".to_string());
-            }
-            None
-        }
-        Action::Disconnect => {
-            if let Some(device) = app.selected_device()
-                && matches!(device.status, ConnectionStatus::Connected)
-            {
-                let action = PendingAction::Disconnect {
-                    device_id: device.id.clone(),
-                    device_name: device.name.clone().unwrap_or_else(|| device.id.clone()),
-                };
-                app.request_confirmation(action);
-            }
-            None
-        }
-        Action::SyncHistory => app.selected_device().map(|device| Command::SyncHistory {
-            device_id: device.id.clone(),
-        }),
         Action::SelectNext => {
             if app.active_tab == Tab::Settings {
                 app.select_next_setting();
@@ -344,39 +270,6 @@ pub fn apply_action(
             };
             None
         }
-        Action::ToggleHelp => {
-            app.show_help = !app.show_help;
-            None
-        }
-        Action::ToggleLogging => {
-            app.toggle_logging();
-            None
-        }
-        Action::ToggleBell => {
-            app.bell_enabled = !app.bell_enabled;
-            app.push_status_message(format!(
-                "Bell notifications {}",
-                if app.bell_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ));
-            None
-        }
-        Action::DismissAlert => {
-            // Close help overlay if open
-            if app.show_help {
-                app.show_help = false;
-            // Close error popup if open
-            } else if app.show_error_details {
-                app.show_error_details = false;
-            } else if let Some(device) = app.selected_device() {
-                let device_id = device.id.clone();
-                app.dismiss_alert(&device_id);
-            }
-            None
-        }
         Action::ScrollUp => {
             if app.active_tab == Tab::History {
                 app.scroll_history_up();
@@ -395,6 +288,141 @@ pub fn apply_action(
             }
             None
         }
+        Action::MouseClick { x, y } => {
+            // Tab bar is at y=1-3, clicking on a tab switches to it
+            if (1..=3).contains(&y) {
+                // Simple tab detection based on x position
+                if x < 15 {
+                    app.active_tab = Tab::Dashboard;
+                } else if x < 30 {
+                    app.active_tab = Tab::History;
+                } else if x < 45 {
+                    app.active_tab = Tab::Settings;
+                } else if x < 60 {
+                    app.active_tab = Tab::Service;
+                }
+            }
+            // Device list is in the left sidebar (x < ~25, y > 4)
+            else if x < 25 && y > 4 {
+                let device_row = (y as usize).saturating_sub(5);
+                app.select_filtered_row(device_row);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Handle device actions: connect, disconnect, scan, refresh, sync, confirm/cancel.
+fn apply_device_action(app: &mut App, action: Action) -> Option<Command> {
+    match action {
+        Action::Scan => Some(Command::Scan {
+            duration: Duration::from_secs(5),
+        }),
+        Action::Refresh => {
+            if app.active_tab == Tab::Service {
+                Some(Command::RefreshServiceStatus)
+            } else {
+                Some(Command::RefreshAll)
+            }
+        }
+        Action::Connect => app.selected_device().map(|device| Command::Connect {
+            device_id: device.id.clone(),
+        }),
+        Action::ConnectAll => {
+            let first_disconnected = app
+                .devices
+                .iter()
+                .find(|d| matches!(d.status, ConnectionStatus::Disconnected))
+                .map(|d| d.id.clone());
+            let count = app
+                .devices
+                .iter()
+                .filter(|d| matches!(d.status, ConnectionStatus::Disconnected))
+                .count();
+
+            if let Some(device_id) = first_disconnected {
+                app.push_status_message(format!("Connecting... ({} remaining)", count));
+                return Some(Command::Connect { device_id });
+            } else {
+                app.push_status_message("All devices already connected".to_string());
+            }
+            None
+        }
+        Action::Disconnect => {
+            if let Some(device) = app.selected_device()
+                && matches!(device.status, ConnectionStatus::Connected)
+            {
+                let action = PendingAction::Disconnect {
+                    device_id: device.id.clone(),
+                    device_name: device.name.clone().unwrap_or_else(|| device.id.clone()),
+                };
+                app.request_confirmation(action);
+            }
+            None
+        }
+        Action::SyncHistory => app.selected_device().map(|device| Command::SyncHistory {
+            device_id: device.id.clone(),
+        }),
+        Action::Confirm => {
+            if app.pending_confirmation.is_some() {
+                return app.confirm_action();
+            }
+            None
+        }
+        Action::Cancel => {
+            if app.pending_confirmation.is_some() {
+                app.cancel_confirmation();
+            }
+            None
+        }
+        Action::EditAlias => {
+            app.start_alias_edit();
+            None
+        }
+        Action::TextInput(c) => {
+            if app.editing_alias {
+                app.alias_input_char(c);
+            }
+            None
+        }
+        Action::TextBackspace => {
+            if app.editing_alias {
+                app.alias_input_backspace();
+            }
+            None
+        }
+        Action::TextSubmit => {
+            if app.editing_alias {
+                app.save_alias();
+            }
+            None
+        }
+        Action::TextCancel => {
+            if app.editing_alias {
+                app.cancel_alias_edit();
+            }
+            None
+        }
+        Action::ExportHistory => {
+            if let Some(path) = app.export_history() {
+                app.push_status_message(format!("Exported to {}", path));
+            } else {
+                app.push_status_message("No history to export".to_string());
+            }
+            None
+        }
+        Action::CycleDeviceFilter => {
+            app.cycle_device_filter();
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Handle settings actions: threshold adjustments, interval changes, service control.
+fn apply_settings_action(app: &mut App, action: Action) -> Option<Command> {
+    match action {
         Action::IncreaseThreshold => {
             if app.active_tab == Tab::Settings {
                 match app.selected_setting {
@@ -425,7 +453,6 @@ pub fn apply_action(
         }
         Action::ChangeSetting => {
             if app.active_tab == Tab::Service {
-                // In Service tab, Enter toggles collector start/stop
                 if let Some(ref status) = app.service_status {
                     if status.reachable {
                         if status.collector_running {
@@ -443,7 +470,6 @@ pub fn apply_action(
                 }
                 None
             } else if app.active_tab == Tab::Settings && app.selected_setting == 0 {
-                // Interval setting
                 if let Some((device_id, new_interval)) = app.cycle_interval() {
                     return Some(Command::SetInterval {
                         device_id,
@@ -455,12 +481,20 @@ pub fn apply_action(
                 None
             }
         }
-        Action::ExportHistory => {
-            if let Some(path) = app.export_history() {
-                app.push_status_message(format!("Exported to {}", path));
-            } else {
-                app.push_status_message("No history to export".to_string());
-            }
+        Action::ToggleLogging => {
+            app.toggle_logging();
+            None
+        }
+        Action::ToggleBell => {
+            app.bell_enabled = !app.bell_enabled;
+            app.push_status_message(format!(
+                "Bell notifications {}",
+                if app.bell_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ));
             None
         }
         Action::ToggleAlertHistory => {
@@ -471,8 +505,42 @@ pub fn apply_action(
             app.toggle_sticky_alerts();
             None
         }
-        Action::CycleDeviceFilter => {
-            app.cycle_device_filter();
+        Action::ToggleBleRange => {
+            app.toggle_ble_range();
+            None
+        }
+        Action::ToggleSmartHome => {
+            app.toggle_smart_home();
+            None
+        }
+        Action::ToggleDoNotDisturb => {
+            app.toggle_do_not_disturb();
+            None
+        }
+        Action::ToggleExportFormat => {
+            app.toggle_export_format();
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Handle view/display actions: theme, help, sidebar, chart, comparison, errors.
+fn apply_view_action(app: &mut App, action: Action) -> Option<Command> {
+    match action {
+        Action::ToggleHelp => {
+            app.show_help = !app.show_help;
+            None
+        }
+        Action::DismissAlert => {
+            if app.show_help {
+                app.show_help = false;
+            } else if app.show_error_details {
+                app.show_error_details = false;
+            } else if let Some(device) = app.selected_device() {
+                let device_id = device.id.clone();
+                app.dismiss_alert(&device_id);
+            }
             None
         }
         Action::ToggleSidebar => {
@@ -492,71 +560,8 @@ pub fn apply_action(
             app.push_status_message(format!("Sidebar width: {}", app.sidebar_width));
             None
         }
-        Action::MouseClick { x, y } => {
-            // Tab bar is at y=1-3, clicking on a tab switches to it
-            if (1..=3).contains(&y) {
-                // Simple tab detection based on x position
-                if x < 15 {
-                    app.active_tab = Tab::Dashboard;
-                } else if x < 30 {
-                    app.active_tab = Tab::History;
-                } else if x < 45 {
-                    app.active_tab = Tab::Settings;
-                } else if x < 60 {
-                    app.active_tab = Tab::Service;
-                }
-            }
-            // Device list is in the left sidebar (x < ~25, y > 4)
-            else if x < 25 && y > 4 {
-                let device_row = (y as usize).saturating_sub(5);
-                if device_row < app.devices.len() {
-                    app.selected_device = device_row;
-                }
-            }
-            None
-        }
-        Action::Confirm => {
-            if app.pending_confirmation.is_some() {
-                return app.confirm_action();
-            }
-            None
-        }
-        Action::Cancel => {
-            if app.pending_confirmation.is_some() {
-                app.cancel_confirmation();
-            }
-            None
-        }
         Action::ToggleChart => {
             app.toggle_fullscreen_chart();
-            None
-        }
-        Action::EditAlias => {
-            app.start_alias_edit();
-            None
-        }
-        Action::TextInput(c) => {
-            if app.editing_alias {
-                app.alias_input_char(c);
-            }
-            None
-        }
-        Action::TextBackspace => {
-            if app.editing_alias {
-                app.alias_input_backspace();
-            }
-            None
-        }
-        Action::TextSubmit => {
-            if app.editing_alias {
-                app.save_alias();
-            }
-            None
-        }
-        Action::TextCancel => {
-            if app.editing_alias {
-                app.cancel_alias_edit();
-            }
             None
         }
         Action::ToggleComparison => {
@@ -604,22 +609,91 @@ pub fn apply_action(
             app.push_status_message(format!("Humidity on chart: {}", status));
             None
         }
-        Action::ToggleBleRange => {
-            app.toggle_ble_range();
-            None
-        }
-        Action::ToggleSmartHome => {
-            app.toggle_smart_home();
-            None
-        }
-        Action::ToggleDoNotDisturb => {
-            app.toggle_do_not_disturb();
-            None
-        }
-        Action::ToggleExportFormat => {
-            app.toggle_export_format();
+        _ => None,
+    }
+}
+
+/// Apply an action to the application state.
+///
+/// This function handles both UI-only actions (which modify app state directly)
+/// and command actions (which return a command to be sent to the background worker).
+/// Actions are dispatched to focused handler functions by category:
+/// navigation, device, settings, and view actions.
+///
+/// # Arguments
+///
+/// * `app` - Mutable reference to the application state
+/// * `action` - The action to apply
+/// * `_command_tx` - Channel for sending commands (used for reference, actual sending done by caller)
+///
+/// # Returns
+///
+/// `Some(Command)` if an async command should be sent to the background worker,
+/// `None` if the action was handled entirely within the UI.
+pub fn apply_action(
+    app: &mut App,
+    action: Action,
+    _command_tx: &mpsc::Sender<Command>,
+) -> Option<Command> {
+    match action {
+        Action::Quit => {
+            app.should_quit = true;
             None
         }
         Action::None => None,
+
+        // Navigation: tab switching, scrolling, item selection, mouse clicks
+        Action::SelectNext
+        | Action::SelectPrevious
+        | Action::NextTab
+        | Action::PreviousTab
+        | Action::ScrollUp
+        | Action::ScrollDown
+        | Action::SetHistoryFilter(_)
+        | Action::MouseClick { .. } => apply_navigation_action(app, action),
+
+        // Device: scan, connect, disconnect, sync, confirm/cancel, alias, export, filter
+        Action::Scan
+        | Action::Refresh
+        | Action::Connect
+        | Action::ConnectAll
+        | Action::Disconnect
+        | Action::SyncHistory
+        | Action::Confirm
+        | Action::Cancel
+        | Action::EditAlias
+        | Action::TextInput(_)
+        | Action::TextBackspace
+        | Action::TextSubmit
+        | Action::TextCancel
+        | Action::ExportHistory
+        | Action::CycleDeviceFilter => apply_device_action(app, action),
+
+        // Settings: thresholds, intervals, toggles for logging/bell/alerts/BLE/smart home
+        Action::IncreaseThreshold
+        | Action::DecreaseThreshold
+        | Action::ChangeSetting
+        | Action::ToggleLogging
+        | Action::ToggleBell
+        | Action::ToggleAlertHistory
+        | Action::ToggleStickyAlerts
+        | Action::ToggleBleRange
+        | Action::ToggleSmartHome
+        | Action::ToggleDoNotDisturb
+        | Action::ToggleExportFormat => apply_settings_action(app, action),
+
+        // View: theme, help, sidebar, chart, comparison, error details
+        Action::ToggleHelp
+        | Action::DismissAlert
+        | Action::ToggleSidebar
+        | Action::ToggleSidebarWidth
+        | Action::ToggleChart
+        | Action::ToggleComparison
+        | Action::NextComparisonDevice
+        | Action::PrevComparisonDevice
+        | Action::ShowErrorDetails
+        | Action::ToggleTheme
+        | Action::ToggleChartTemp
+        | Action::ToggleChartHumidity => apply_view_action(app, action),
     }
 }

@@ -38,6 +38,35 @@ retain = true
 # username = "aranet"
 # password = "secret"
 
+[webhooks]
+# Enable webhook notifications when thresholds are exceeded
+enabled = false
+# co2_threshold = 1000        # ppm (triggers "co2_high")
+# radon_threshold = 300       # Bq/m³ (triggers "radon_high")
+# battery_threshold = 10      # % (triggers "battery_low")
+# cooldown_secs = 300         # seconds between repeat alerts per device
+
+# [[webhooks.endpoints]]
+# url = "https://hooks.slack.com/services/T00/B00/xxx"
+# events = ["co2_high", "radon_high", "battery_low"]
+# headers = { "Authorization" = "Bearer token" }
+
+[influxdb]
+# Enable InfluxDB v2 export
+enabled = false
+# InfluxDB server URL
+# url = "http://influxdb:8086"
+# API token for authentication
+# token = "your-influxdb-token"
+# Organization name
+# org = "my-org"
+# Bucket for storing measurements
+# bucket = "aranet"
+# Measurement name
+# measurement = "aranet"
+# Write precision: s, ms, us, or ns
+# precision = "s"
+
 # Devices to monitor
 # Note: Bluetooth is not available in Docker by default.
 # For BLE access, you need to:

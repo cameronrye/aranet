@@ -23,7 +23,7 @@
 //! # }
 //! ```
 
-use reqwest::Client;
+use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -32,6 +32,7 @@ use time::OffsetDateTime;
 pub struct ServiceClient {
     client: Client,
     base_url: String,
+    api_key: Option<String>,
 }
 
 /// Error type for service client operations.
@@ -60,6 +61,8 @@ pub enum ServiceClientError {
 
 /// Result type for service client operations.
 pub type Result<T> = std::result::Result<T, ServiceClientError>;
+
+const REJECTED_ACTION_STATUS: u16 = 409;
 
 // ==========================================================================
 // Response Types
@@ -171,37 +174,41 @@ impl ServiceClient {
     ///
     /// * `base_url` - The base URL of the aranet-service (e.g., "http://localhost:8080")
     pub fn new(base_url: &str) -> Result<Self> {
-        // Normalize URL (remove trailing slash)
-        let base_url = base_url.trim_end_matches('/').to_string();
-
-        // Validate URL format
-        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(ServiceClientError::InvalidUrl(format!(
-                "URL must start with http:// or https://, got: {}",
-                base_url
-            )));
-        }
-
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(ServiceClientError::Request)?;
 
-        Ok(Self { client, base_url })
+        Self::with_client_and_api_key(base_url, client, None)
+    }
+
+    /// Create a new service client with an optional API key.
+    pub fn new_with_api_key(base_url: &str, api_key: Option<String>) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(ServiceClientError::Request)?;
+
+        Self::with_client_and_api_key(base_url, client, api_key)
     }
 
     /// Create a client with a custom reqwest Client.
     pub fn with_client(base_url: &str, client: Client) -> Result<Self> {
-        let base_url = base_url.trim_end_matches('/').to_string();
+        Self::with_client_and_api_key(base_url, client, None)
+    }
 
-        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(ServiceClientError::InvalidUrl(format!(
-                "URL must start with http:// or https://, got: {}",
-                base_url
-            )));
-        }
-
-        Ok(Self { client, base_url })
+    /// Create a client with a custom reqwest Client and optional API key.
+    pub fn with_client_and_api_key(
+        base_url: &str,
+        client: Client,
+        api_key: Option<String>,
+    ) -> Result<Self> {
+        let base_url = normalize_base_url(base_url)?;
+        Ok(Self {
+            client,
+            base_url,
+            api_key: sanitize_api_key(api_key),
+        })
     }
 
     /// Get the base URL.
@@ -229,13 +236,15 @@ impl ServiceClient {
     /// Start the collector.
     pub async fn start_collector(&self) -> Result<CollectorActionResponse> {
         let url = format!("{}/api/collector/start", self.base_url);
-        self.post_empty(&url).await
+        let response = self.post_empty(&url).await?;
+        ensure_successful_action(response)
     }
 
     /// Stop the collector.
     pub async fn stop_collector(&self) -> Result<CollectorActionResponse> {
         let url = format!("{}/api/collector/stop", self.base_url);
-        self.post_empty(&url).await
+        let response = self.post_empty(&url).await?;
+        ensure_successful_action(response)
     }
 
     /// Get current configuration.
@@ -257,11 +266,19 @@ impl ServiceClient {
         alias: Option<String>,
         poll_interval: Option<u64>,
     ) -> Result<DeviceConfig> {
+        self.update_device_with_alias_change(device_id, alias.map(Some), poll_interval)
+            .await
+    }
+
+    /// Update a device configuration, distinguishing unchanged and cleared aliases.
+    pub async fn update_device_with_alias_change(
+        &self,
+        device_id: &str,
+        alias: Option<Option<String>>,
+        poll_interval: Option<u64>,
+    ) -> Result<DeviceConfig> {
         let url = format!("{}/api/config/devices/{}", self.base_url, device_id);
-        let body = serde_json::json!({
-            "alias": alias,
-            "poll_interval": poll_interval,
-        });
+        let body = build_update_device_body(alias, poll_interval);
         self.put_json(&url, &body).await
     }
 
@@ -275,30 +292,32 @@ impl ServiceClient {
     // Internal HTTP helpers
     // ======================================================================
 
+    fn request(&self, method: Method, url: &str) -> RequestBuilder {
+        let mut request = self.client.request(method, url);
+        if let Some(api_key) = &self.api_key {
+            request = request.header("X-API-Key", api_key);
+        }
+        request
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let response =
-            self.client
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| ServiceClientError::NotReachable {
-                    url: url.to_string(),
-                    source: e,
-                })?;
+        let response = self.request(Method::GET, url).send().await.map_err(|e| {
+            ServiceClientError::NotReachable {
+                url: url.to_string(),
+                source: e,
+            }
+        })?;
 
         self.handle_response(response).await
     }
 
     async fn post_empty<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let response =
-            self.client
-                .post(url)
-                .send()
-                .await
-                .map_err(|e| ServiceClientError::NotReachable {
-                    url: url.to_string(),
-                    source: e,
-                })?;
+        let response = self.request(Method::POST, url).send().await.map_err(|e| {
+            ServiceClientError::NotReachable {
+                url: url.to_string(),
+                source: e,
+            }
+        })?;
 
         self.handle_response(response).await
     }
@@ -308,12 +327,15 @@ impl ServiceClient {
         url: &str,
         body: &B,
     ) -> Result<T> {
-        let response = self.client.post(url).json(body).send().await.map_err(|e| {
-            ServiceClientError::NotReachable {
+        let response = self
+            .request(Method::POST, url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ServiceClientError::NotReachable {
                 url: url.to_string(),
                 source: e,
-            }
-        })?;
+            })?;
 
         self.handle_response(response).await
     }
@@ -323,26 +345,28 @@ impl ServiceClient {
         url: &str,
         body: &B,
     ) -> Result<T> {
-        let response = self.client.put(url).json(body).send().await.map_err(|e| {
-            ServiceClientError::NotReachable {
+        let response = self
+            .request(Method::PUT, url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ServiceClientError::NotReachable {
                 url: url.to_string(),
                 source: e,
-            }
-        })?;
+            })?;
 
         self.handle_response(response).await
     }
 
     async fn delete(&self, url: &str) -> Result<()> {
-        let response =
-            self.client
-                .delete(url)
-                .send()
-                .await
-                .map_err(|e| ServiceClientError::NotReachable {
-                    url: url.to_string(),
-                    source: e,
-                })?;
+        let response = self
+            .request(Method::DELETE, url)
+            .send()
+            .await
+            .map_err(|e| ServiceClientError::NotReachable {
+                url: url.to_string(),
+                source: e,
+            })?;
 
         let status = response.status();
         if status.is_success() {
@@ -385,6 +409,56 @@ impl ServiceClient {
     }
 }
 
+fn normalize_base_url(base_url: &str) -> Result<String> {
+    let base_url = base_url.trim_end_matches('/').to_string();
+
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(ServiceClientError::InvalidUrl(format!(
+            "URL must start with http:// or https://, got: {}",
+            base_url
+        )));
+    }
+
+    Ok(base_url)
+}
+
+fn sanitize_api_key(api_key: Option<String>) -> Option<String> {
+    api_key
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
+
+fn build_update_device_body(
+    alias: Option<Option<String>>,
+    poll_interval: Option<u64>,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+
+    if let Some(alias) = alias {
+        body.insert("alias".to_string(), serde_json::Value::from(alias));
+    }
+
+    if let Some(poll_interval) = poll_interval {
+        body.insert(
+            "poll_interval".to_string(),
+            serde_json::Value::from(poll_interval),
+        );
+    }
+
+    serde_json::Value::Object(body)
+}
+
+fn ensure_successful_action(response: CollectorActionResponse) -> Result<CollectorActionResponse> {
+    if response.success {
+        Ok(response)
+    } else {
+        Err(ServiceClientError::ApiError {
+            status: REJECTED_ACTION_STATUS,
+            message: response.message,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +470,7 @@ mod tests {
 
         let client = client.unwrap();
         assert_eq!(client.base_url(), "http://localhost:8080");
+        assert!(client.api_key.is_none());
     }
 
     #[test]
@@ -412,9 +487,66 @@ mod tests {
     }
 
     #[test]
+    fn test_client_sanitizes_api_key() {
+        let client = ServiceClient::new_with_api_key(
+            "http://localhost:8080",
+            Some("  test-api-key  ".to_string()),
+        )
+        .unwrap();
+        assert_eq!(client.api_key.as_deref(), Some("test-api-key"));
+
+        let client =
+            ServiceClient::new_with_api_key("http://localhost:8080", Some("   ".to_string()))
+                .unwrap();
+        assert!(client.api_key.is_none());
+    }
+
+    #[test]
+    fn test_update_device_body_omits_unchanged_alias() {
+        let body = build_update_device_body(None, Some(300));
+        assert_eq!(body, serde_json::json!({ "poll_interval": 300 }));
+    }
+
+    #[test]
+    fn test_update_device_body_can_clear_alias() {
+        let body = build_update_device_body(Some(None), None);
+        assert_eq!(body, serde_json::json!({ "alias": null }));
+    }
+
+    #[test]
     fn test_device_config_default_poll_interval() {
         let json = r#"{"address": "test"}"#;
         let config: DeviceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.poll_interval, 60);
+    }
+
+    #[test]
+    fn test_successful_collector_action_passes_through() {
+        let response = CollectorActionResponse {
+            success: true,
+            message: "Collector started".to_string(),
+            running: true,
+        };
+
+        let result = ensure_successful_action(response).unwrap();
+        assert!(result.running);
+        assert_eq!(result.message, "Collector started");
+    }
+
+    #[test]
+    fn test_rejected_collector_action_returns_conflict_error() {
+        let response = CollectorActionResponse {
+            success: false,
+            message: "No devices configured".to_string(),
+            running: false,
+        };
+
+        let result = ensure_successful_action(response);
+
+        assert!(matches!(
+            result,
+            Err(ServiceClientError::ApiError { status, message })
+                if status == REJECTED_ACTION_STATUS && message == "No devices configured"
+        ));
     }
 }

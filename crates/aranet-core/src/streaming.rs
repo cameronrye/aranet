@@ -68,7 +68,7 @@ impl Default for StreamOptions {
             poll_interval: Duration::from_secs(1),
             buffer_size: 16,
             include_errors: false,
-            max_consecutive_failures: None,
+            max_consecutive_failures: Some(10),
         }
     }
 }
@@ -176,7 +176,16 @@ impl ReadingStream {
     ///
     /// If `max_consecutive_failures` is set, the stream will automatically
     /// close after that many consecutive read failures.
+    ///
+    /// Invalid options (zero buffer size, zero poll interval) are replaced
+    /// with defaults and a warning is logged.
     pub fn new(device: Arc<Device>, options: StreamOptions) -> Self {
+        let options = if let Err(e) = options.validate() {
+            warn!("Invalid stream options ({e}), using defaults");
+            StreamOptions::default()
+        } else {
+            options
+        };
         let (tx, rx) = mpsc::channel(options.buffer_size);
         let cancel_token = CancellationToken::new();
         let task_token = cancel_token.clone();

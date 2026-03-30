@@ -27,14 +27,12 @@ pub async fn cmd_status(
 
     let device_id = device.address().to_string();
     let name = device.name().map(|s| s.to_string());
-    let reading = device
+    let reading_result = device
         .read_current()
         .await
-        .context("Failed to read current values")?;
-
-    if let Err(e) = device.disconnect().await {
-        tracing::debug!("Failed to disconnect after status: {e}");
-    }
+        .context("Failed to read current values");
+    crate::util::disconnect_device(&device).await;
+    let reading = reading_result?;
 
     // Save reading to store (unified data architecture)
     crate::util::save_reading_to_store(&device_id, &reading);

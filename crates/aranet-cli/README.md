@@ -23,6 +23,8 @@ A fast, scriptable CLI for reading sensor data, downloading history, and configu
 cargo install aranet-cli
 ```
 
+This installs the `aranet` executable.
+
 Or build from source:
 
 ```bash
@@ -57,6 +59,9 @@ aranet history --device <DEVICE_ADDRESS> --count 100 --format csv --output histo
 
 # Filter by date range
 aranet history --device <DEVICE_ADDRESS> --since 2026-01-15 --until 2026-01-16
+
+# Read from local cache instead of connecting to device
+aranet history --device <DEVICE_ADDRESS> --cache
 ```
 
 ### Read from multiple devices
@@ -118,6 +123,12 @@ aranet read -d living-room
 aranet alias remove living-room
 ```
 
+### Show usage examples
+
+```bash
+aranet examples
+```
+
 ### Diagnose BLE issues
 
 ```bash
@@ -146,8 +157,40 @@ aranet cache stats
 # Query cached history
 aranet cache history --device <DEVICE_ADDRESS> --count 100
 
+# Show aggregate statistics (min/max/avg) for cached history
+aranet cache aggregate --device <DEVICE_ADDRESS>
+aranet cache aggregate --device <DEVICE_ADDRESS> --since 2026-01-15 --format json
+
+# Export cached history to file
+aranet cache export --device <DEVICE_ADDRESS> --format csv --output history.csv
+aranet cache export --device <DEVICE_ADDRESS> --format json --since 2026-03-01
+
+# Import history from a file
+aranet cache import --format csv --input history.csv
+aranet cache import --format json --input history.json
+
+# Delete old data from the cache
+aranet cache prune --older-than 90d
+aranet cache prune --older-than 6m --history-only --vacuum
+
 # Show database info
 aranet cache info
+```
+
+### Generate summary reports
+
+```bash
+# Summarize the last 24 hours for a specific device
+aranet report --device <DEVICE_ADDRESS>
+
+# Use aliases and JSON output
+aranet report --device living-room --period weekly --format json
+
+# Generate JSON for all cached devices
+aranet report --all --format json
+
+# Use the configured or remembered device
+aranet report --format json
 ```
 
 ### Pressure units
@@ -221,7 +264,7 @@ aranet read --device <DEVICE> --style minimal
 aranet history --device <DEVICE> --style plain
 
 # Set via environment variable
-export ARANET_STYLE=minimal
+export ARANET_STYLE=minimal  # Options: rich, minimal, plain
 ```
 
 ### Color-Coded Values

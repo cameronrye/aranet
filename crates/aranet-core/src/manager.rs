@@ -507,15 +507,19 @@ impl DeviceManager {
                 return Ok(());
             }
 
-            // Try to atomically set the connecting flag to prevent race conditions
-            // If another task is already connecting, return early
+            // Try to atomically set the connecting flag to prevent race conditions.
+            // If another task is already connecting, return Ok(()) immediately.
+            //
+            // NOTE: The caller should verify `is_connected()` afterward if the
+            // connection must be established before proceeding, since this early
+            // return does not wait for the in-flight connection attempt to finish.
             if managed
                 .connecting
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
                 debug!(
-                    "Another task is already connecting to device {}",
+                    "Another task is already connecting to device {}, returning early",
                     identifier
                 );
                 return Ok(());

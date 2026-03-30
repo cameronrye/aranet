@@ -64,47 +64,12 @@ pub fn connecting_spinner(device: &str) -> ProgressBar {
     pb
 }
 
-/// Create a spinner for generic operations.
-#[allow(dead_code)]
-pub fn operation_spinner(message: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(spinner_style());
-    pb.set_message(message.to_string());
-    pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
-    pb
-}
-
 /// Create a progress bar for download operations.
 pub fn download_progress_bar() -> ProgressBar {
     let pb = ProgressBar::new(100);
     pb.set_style(progress_bar_style());
     pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
     pb
-}
-
-/// Print a message while suspending a spinner to prevent visual glitches.
-/// If no spinner is provided, just prints normally.
-#[allow(dead_code)]
-pub fn print_suspended(spinner: Option<&ProgressBar>, message: &str) {
-    if let Some(pb) = spinner {
-        pb.suspend(|| {
-            eprintln!("{}", message);
-        });
-    } else {
-        eprintln!("{}", message);
-    }
-}
-
-/// Print a message to stdout while suspending a spinner.
-#[allow(dead_code)]
-pub fn print_suspended_stdout(spinner: Option<&ProgressBar>, message: &str) {
-    if let Some(pb) = spinner {
-        pb.suspend(|| {
-            println!("{}", message);
-        });
-    } else {
-        println!("{}", message);
-    }
 }
 
 // ============================================================================

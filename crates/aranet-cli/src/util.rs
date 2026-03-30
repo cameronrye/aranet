@@ -1,5 +1,6 @@
 //! Utility functions for CLI operations.
 
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,22 +14,44 @@ use indicatif::ProgressBar;
 use crate::config::update_last_device;
 use crate::style;
 
-/// Get device identifier, with helpful error message.
-/// Used for non-interactive contexts (e.g., scripts, piped input).
-#[allow(dead_code)]
-pub fn require_device(device: Option<String>) -> Result<String> {
-    device.ok_or_else(|| {
-        anyhow::anyhow!(
-            "No device specified.\n\n\
-             How to fix:\n  \
-             1. Run 'aranet scan' to discover nearby devices\n  \
-             2. Use --device <ADDRESS> with the device address\n  \
-             3. Set ARANET_DEVICE environment variable\n  \
-             4. Set a default with 'aranet config set device <ADDRESS>'\n  \
-             5. Omit --device for interactive selection (if TTY)\n\n\
-             Example: aranet read --device AA:BB:CC:DD:EE:FF"
-        )
-    })
+/// Disconnect from a device, logging any errors at debug level.
+pub async fn disconnect_device(device: &aranet_core::Device) {
+    if let Err(e) = device.disconnect().await {
+        tracing::debug!("Failed to disconnect device: {e}");
+    }
+}
+
+/// Build a user-friendly device error with suggestions and timestamp.
+fn device_error(operation: &str, identifier: &str, cause: impl std::fmt::Display) -> anyhow::Error {
+    let timestamp = aranet_cli::local_now_fmt("[year]-[month]-[day] [hour]:[minute]:[second]");
+    let base_msg = format!("Failed to {} device: {}", operation, identifier);
+    let suggestion = format!(
+        "\n\nPossible causes:\n  \
+        - Bluetooth may be disabled -- check system settings\n  \
+        - Device may be out of range -- try moving closer\n  \
+        - Device may be connected to another host\n  \
+        - Device address may be incorrect -- run 'aranet scan' to verify\n\n\
+        Tip: Run 'aranet doctor' to diagnose Bluetooth issues\n\
+        Time: {}",
+        timestamp
+    );
+    anyhow::anyhow!("{}\n\nCause: {}{}", base_msg, cause, suggestion)
+}
+
+/// Open the store database, printing a warning to stderr on failure.
+fn open_store() -> Option<aranet_store::Store> {
+    let store_path = aranet_store::default_db_path();
+    match aranet_store::Store::open(&store_path) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!("Failed to open store: {}", e);
+            eprintln!(
+                "Warning: could not open local database at {}. Readings will not be cached.",
+                store_path.display()
+            );
+            None
+        }
+    }
 }
 
 /// Get device identifier, scanning and prompting interactively if none specified.
@@ -97,13 +120,6 @@ pub async fn require_device_interactive(device: Option<String>) -> Result<String
         .context("Failed to get user selection")?;
 
     Ok(devices[selection].identifier.clone())
-}
-
-/// Connect to a device with timeout and improved error messages.
-/// Shows progress feedback for connection attempts.
-#[allow(dead_code)]
-pub async fn connect_device(identifier: &str, timeout: Duration) -> Result<Device> {
-    connect_device_with_progress(identifier, timeout, true).await
 }
 
 /// Connect to a device with optional progress display.
@@ -175,38 +191,11 @@ pub async fn connect_device_with_progress(
     }
 
     // Now create Device from peripheral
-    let (adapter, peripheral) = result.map_err(|e| {
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let base_msg = format!("Failed to find device: {}", identifier);
-        let suggestion = format!(
-            "\n\nPossible causes:\n  \
-            - Bluetooth may be disabled -- check system settings\n  \
-            - Device may be out of range -- try moving closer\n  \
-            - Device may be connected to another host\n  \
-            - Device address may be incorrect -- run 'aranet scan' to verify\n\n\
-            Tip: Run 'aranet doctor' to diagnose Bluetooth issues\n\
-            Time: {}",
-            timestamp
-        );
-        anyhow::anyhow!("{}\n\nCause: {}{}", base_msg, e, suggestion)
-    })?;
+    let (adapter, peripheral) = result.map_err(|e| device_error("find", identifier, e))?;
 
     let device = Device::from_peripheral(adapter, peripheral)
         .await
-        .map_err(|e| {
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-            let base_msg = format!("Failed to connect to device: {}", identifier);
-            let suggestion = format!(
-                "\n\nPossible causes:\n  \
-                - Device may have gone out of range\n  \
-                - Device may be connected to another host\n  \
-                - Bluetooth connection was interrupted\n\n\
-                Tip: Run 'aranet doctor' to diagnose Bluetooth issues\n\
-                Time: {}",
-                timestamp
-            );
-            anyhow::anyhow!("{}\n\nCause: {}{}", base_msg, e, suggestion)
-        })?;
+        .map_err(|e| device_error("connect to", identifier, e))?;
 
     // Finish spinner
     if let Some(sp) = spinner {
@@ -225,60 +214,55 @@ pub async fn connect_device_with_progress(
 }
 
 /// Save a device connection to the store database.
-///
-/// This is part of the unified data architecture - all tools share the same database.
 fn save_device_to_store(device_id: &str, name: Option<&str>) {
-    let store_path = aranet_store::default_db_path();
-    match aranet_store::Store::open(&store_path) {
-        Ok(store) => {
-            if let Err(e) = store.upsert_device(device_id, name) {
-                eprintln!("Warning: Failed to save device to database: {}", e);
-                tracing::warn!("Failed to save device to store: {}", e);
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to open store for device save: {}", e);
-        }
+    if let Some(store) = open_store()
+        && let Err(e) = store.upsert_device(device_id, name)
+    {
+        tracing::warn!("Failed to save device to store: {}", e);
+        eprintln!("Warning: could not save device to local database: {e}");
     }
 }
 
 /// Save a reading to the store database.
-///
-/// This is part of the unified data architecture - all tools share the same database.
 pub fn save_reading_to_store(device_id: &str, reading: &aranet_types::CurrentReading) {
-    let store_path = aranet_store::default_db_path();
-    if let Ok(store) = aranet_store::Store::open(&store_path)
+    if let Some(store) = open_store()
         && let Err(e) = store.insert_reading(device_id, reading)
     {
         tracing::warn!("Failed to save reading to store: {}", e);
+        eprintln!("Warning: could not save reading to local database: {e}");
     }
 }
 
-/// Save history records to the store database.
-///
-/// This is part of the unified data architecture - all tools share the same database.
-/// Returns the number of records inserted.
+/// Save history records to the store database. Returns the number of records inserted.
 pub fn save_history_to_store(device_id: &str, records: &[aranet_types::HistoryRecord]) -> usize {
-    let store_path = aranet_store::default_db_path();
-    if let Ok(store) = aranet_store::Store::open(&store_path) {
-        match store.insert_history(device_id, records) {
-            Ok(count) => count,
-            Err(e) => {
-                tracing::warn!("Failed to save history to store: {}", e);
-                0
-            }
+    let Some(store) = open_store() else {
+        return 0;
+    };
+    match store.insert_history(device_id, records) {
+        Ok(count) => count,
+        Err(e) => {
+            tracing::warn!("Failed to save history to store: {}", e);
+            eprintln!("Warning: could not save history to local database: {e}");
+            0
         }
-    } else {
-        0
     }
 }
 
-/// Write output to file or stdout
-pub fn write_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
+fn write_output_inner(output: Option<&PathBuf>, content: &str, append: bool) -> Result<()> {
     match output {
         Some(path) => {
-            std::fs::write(path, content)
-                .with_context(|| format!("Failed to write to {}", path.display()))?;
+            if append {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .with_context(|| format!("Failed to open {} for append", path.display()))?;
+                file.write_all(content.as_bytes())
+                    .with_context(|| format!("Failed to write to {}", path.display()))?;
+            } else {
+                std::fs::write(path, content)
+                    .with_context(|| format!("Failed to write to {}", path.display()))?;
+            }
         }
         None => {
             print!("{}", content);
@@ -288,23 +272,42 @@ pub fn write_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write output to file or stdout, replacing any existing file contents.
+pub fn write_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
+    write_output_inner(output, content, false)
+}
+
+/// Append output to a file or stdout.
+pub fn append_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
+    write_output_inner(output, content, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_require_device_with_some() {
-        let result = require_device(Some("AA:BB:CC:DD:EE:FF".to_string()));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "AA:BB:CC:DD:EE:FF");
+    fn test_write_output_replaces_existing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("output.txt");
+
+        write_output(Some(&path), "first").unwrap();
+        write_output(Some(&path), "second").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "second");
     }
 
     #[test]
-    fn test_require_device_with_none() {
-        let result = require_device(None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("No device specified"));
-        assert!(err.contains("ARANET_DEVICE"));
+    fn test_append_output_preserves_existing_file_contents() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("output.txt");
+
+        write_output(Some(&path), "header\n").unwrap();
+        append_output(Some(&path), "row1\n").unwrap();
+        append_output(Some(&path), "row2\n").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "header\nrow1\nrow2\n");
     }
 }

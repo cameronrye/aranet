@@ -8,6 +8,8 @@ use ratatui::prelude::*;
 use aranet_core::settings::{DeviceSettings, RadonUnit, TemperatureUnit};
 use aranet_types::HistoryRecord;
 
+use super::theme::AppTheme;
+
 /// Convert Celsius to Fahrenheit.
 #[inline]
 fn celsius_to_fahrenheit(celsius: f32) -> f32 {
@@ -178,20 +180,29 @@ pub fn resample_sparkline_data(data: &[u64], target_width: usize) -> Vec<u64> {
 
 /// Calculate trend indicator based on current and previous values.
 /// Returns (arrow character, color) tuple.
-pub fn trend_indicator(current: i32, previous: i32, threshold: i32) -> (&'static str, Color) {
+pub fn trend_indicator(
+    theme: &AppTheme,
+    current: i32,
+    previous: i32,
+    threshold: i32,
+) -> (&'static str, Color) {
     let diff = current - previous;
     if diff > threshold {
-        ("↑", Color::Red) // Rising (bad for CO2)
+        ("↑", theme.trend_color(diff, threshold))
     } else if diff < -threshold {
-        ("↓", Color::Green) // Falling (good for CO2)
+        ("↓", theme.trend_color(diff, threshold))
     } else {
-        ("→", Color::DarkGray) // Stable
+        ("→", theme.trend_color(diff, threshold))
     }
 }
 
 /// Calculate trend for CO2 readings.
-pub fn co2_trend(current: u16, previous: Option<u16>) -> Option<(&'static str, Color)> {
-    previous.map(|prev| trend_indicator(current as i32, prev as i32, 20))
+pub fn co2_trend(
+    theme: &AppTheme,
+    current: u16,
+    previous: Option<u16>,
+) -> Option<(&'static str, Color)> {
+    previous.map(|prev| trend_indicator(theme, current as i32, prev as i32, 20))
 }
 
 #[cfg(test)]
@@ -346,23 +357,26 @@ mod tests {
 
     #[test]
     fn test_trend_indicator_rising() {
-        let (arrow, color) = trend_indicator(500, 400, 20);
+        let theme = AppTheme::dark();
+        let (arrow, color) = trend_indicator(&theme, 500, 400, 20);
         assert_eq!(arrow, "↑");
-        assert_eq!(color, Color::Red);
+        assert_eq!(color, theme.trend_rising);
     }
 
     #[test]
     fn test_trend_indicator_falling() {
-        let (arrow, color) = trend_indicator(400, 500, 20);
+        let theme = AppTheme::dark();
+        let (arrow, color) = trend_indicator(&theme, 400, 500, 20);
         assert_eq!(arrow, "↓");
-        assert_eq!(color, Color::Green);
+        assert_eq!(color, theme.trend_falling);
     }
 
     #[test]
     fn test_trend_indicator_stable() {
-        let (arrow, color) = trend_indicator(500, 505, 20);
+        let theme = AppTheme::dark();
+        let (arrow, color) = trend_indicator(&theme, 500, 505, 20);
         assert_eq!(arrow, "→");
-        assert_eq!(color, Color::DarkGray);
+        assert_eq!(color, theme.trend_stable);
     }
 
     // ========================================================================
@@ -371,31 +385,35 @@ mod tests {
 
     #[test]
     fn test_co2_trend_no_previous() {
-        let result = co2_trend(800, None);
+        let theme = AppTheme::dark();
+        let result = co2_trend(&theme, 800, None);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_co2_trend_rising() {
-        let result = co2_trend(850, Some(800));
+        let theme = AppTheme::dark();
+        let result = co2_trend(&theme, 850, Some(800));
         assert!(result.is_some());
         let (arrow, color) = result.expect("co2_trend should return Some for rising trend");
         assert_eq!(arrow, "↑");
-        assert_eq!(color, Color::Red);
+        assert_eq!(color, theme.trend_rising);
     }
 
     #[test]
     fn test_co2_trend_falling() {
-        let result = co2_trend(750, Some(800));
+        let theme = AppTheme::dark();
+        let result = co2_trend(&theme, 750, Some(800));
         assert!(result.is_some());
         let (arrow, color) = result.expect("co2_trend should return Some for falling trend");
         assert_eq!(arrow, "↓");
-        assert_eq!(color, Color::Green);
+        assert_eq!(color, theme.trend_falling);
     }
 
     #[test]
     fn test_co2_trend_stable() {
-        let result = co2_trend(805, Some(800));
+        let theme = AppTheme::dark();
+        let result = co2_trend(&theme, 805, Some(800));
         assert!(result.is_some());
         let (arrow, _) = result.expect("co2_trend should return Some for stable trend");
         assert_eq!(arrow, "→");

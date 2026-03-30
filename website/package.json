@@ -1,7 +1,7 @@
 {
   "name": "aranet-website",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Documentation and demo site for the Aranet Rust ecosystem",
   "scripts": {
     "dev": "astro dev",

@@ -11,6 +11,11 @@ use bytes::Buf;
 use crate::error::{Error, Result};
 use aranet_types::{CurrentReading, DeviceType, Status};
 
+/// Convert an `aranet_types::ParseError` into our crate's `Error`.
+fn from_parse_error(e: aranet_types::ParseError) -> Error {
+    Error::InvalidData(e.to_string())
+}
+
 /// Extended reading that includes all available sensor data.
 ///
 /// This struct wraps `CurrentReading` and adds fields that don't fit
@@ -41,46 +46,11 @@ pub fn parse_aranet4_reading(data: &[u8]) -> Result<CurrentReading> {
     CurrentReading::from_bytes(data).map_err(|e| Error::InvalidData(e.to_string()))
 }
 
-/// Parse Aranet2 current readings (temperature and humidity only).
+/// Parse Aranet2 current readings from GATT characteristic (f0cd3003).
 ///
-/// Format (7 bytes):
-/// - bytes 0-1: Temperature (u16 LE, /20 for °C)
-/// - byte 2: Humidity (u8)
-/// - byte 3: Battery (u8)
-/// - byte 4: Status (u8)
-/// - bytes 5-6: Interval (u16 LE, seconds)
+/// Delegates to [`CurrentReading::from_bytes_aranet2`].
 pub fn parse_aranet2_reading(data: &[u8]) -> Result<CurrentReading> {
-    if data.len() < 7 {
-        return Err(Error::InvalidData(format!(
-            "Aranet2 reading requires 7 bytes, got {}",
-            data.len()
-        )));
-    }
-
-    let mut buf = data;
-    let temp_raw = buf.get_u16_le();
-    let humidity = buf.get_u8();
-    let battery = buf.get_u8();
-    let status = Status::from(buf.get_u8());
-    let interval = buf.get_u16_le();
-
-    Ok(CurrentReading {
-        co2: 0, // Aranet2 doesn't have CO2
-        temperature: temp_raw as f32 / 20.0,
-        pressure: 0.0, // Aranet2 doesn't have pressure
-        humidity,
-        battery,
-        status,
-        interval,
-        age: 0,
-        captured_at: None,
-        radon: None,
-        radiation_rate: None,
-        radiation_total: None,
-        radon_avg_24h: None,
-        radon_avg_7d: None,
-        radon_avg_30d: None,
-    })
+    CurrentReading::from_bytes_aranet2(data).map_err(from_parse_error)
 }
 
 /// Parse Aranet Radon readings from advertisement data.
@@ -98,7 +68,7 @@ pub fn parse_aranet_radon_reading(data: &[u8]) -> Result<ExtendedReading> {
 
     // Standard fields
     let co2 = buf.get_u16_le();
-    let temp_raw = buf.get_u16_le();
+    let temp_raw = buf.get_i16_le();
     let pressure_raw = buf.get_u16_le();
     let humidity = buf.get_u8();
     let battery = buf.get_u8();
@@ -135,166 +105,22 @@ pub fn parse_aranet_radon_reading(data: &[u8]) -> Result<ExtendedReading> {
 
 /// Parse Aranet Radon readings from GATT characteristic (f0cd3003 or f0cd1504).
 ///
-/// Format (47 bytes):
-/// - Bytes 0-1: Device type marker (0x0003 for radon)
-/// - Bytes 2-3: Interval (LE16, seconds)
-/// - Bytes 4-5: Seconds since update (LE16)
-/// - Byte 6: Battery (0-100%)
-/// - Bytes 7-8: Temperature (LE16, raw / 20 = °C)
-/// - Bytes 9-10: Pressure (LE16, raw / 10 = hPa)
-/// - Bytes 11-12: Humidity (LE16, raw / 10 = %)
-/// - Bytes 13-16: Radon concentration (LE32, Bq/m³)
-/// - Byte 17: Status/color
-/// - Bytes 18-21: 24h average time (LE32)
-/// - Bytes 22-25: 24h average value (LE32, Bq/m³)
-/// - Bytes 26-29: 7d average time (LE32)
-/// - Bytes 30-33: 7d average value (LE32, Bq/m³)
-/// - Bytes 34-37: 30d average time (LE32)
-/// - Bytes 38-41: 30d average value (LE32, Bq/m³)
-///
-/// Note: If an average value >= 0xff000000, it indicates the average
-/// is still being calculated (in progress) and is not yet available.
+/// Delegates to [`CurrentReading::from_bytes_radon`].
 pub fn parse_aranet_radon_gatt(data: &[u8]) -> Result<CurrentReading> {
-    if data.len() < 18 {
-        return Err(Error::InvalidData(format!(
-            "Aranet Radon GATT reading requires at least 18 bytes, got {}",
-            data.len()
-        )));
-    }
-
-    let mut buf = data;
-
-    // Parse header
-    let _device_type = buf.get_u16_le(); // 0x0003 for radon
-    let interval = buf.get_u16_le();
-    let age = buf.get_u16_le();
-    let battery = buf.get_u8();
-
-    // Parse sensor values
-    let temp_raw = buf.get_u16_le();
-    let pressure_raw = buf.get_u16_le();
-    let humidity_raw = buf.get_u16_le();
-    let radon = buf.get_u32_le();
-    let status = if buf.has_remaining() {
-        Status::from(buf.get_u8())
-    } else {
-        Status::Green
-    };
-
-    // Parse optional working averages (extended format, 47 bytes)
-    // Each average is a pair: (time: u32, value: u32)
-    // If value >= 0xff000000, the average is still being calculated
-    let (radon_avg_24h, radon_avg_7d, radon_avg_30d) = if buf.remaining() >= 24 {
-        let _time_24h = buf.get_u32_le();
-        let avg_24h_raw = buf.get_u32_le();
-        let _time_7d = buf.get_u32_le();
-        let avg_7d_raw = buf.get_u32_le();
-        let _time_30d = buf.get_u32_le();
-        let avg_30d_raw = buf.get_u32_le();
-
-        // Values >= 0xff000000 indicate "in progress" (not yet available)
-        let avg_24h = if avg_24h_raw >= 0xff00_0000 {
-            None
-        } else {
-            Some(avg_24h_raw)
-        };
-        let avg_7d = if avg_7d_raw >= 0xff00_0000 {
-            None
-        } else {
-            Some(avg_7d_raw)
-        };
-        let avg_30d = if avg_30d_raw >= 0xff00_0000 {
-            None
-        } else {
-            Some(avg_30d_raw)
-        };
-
-        (avg_24h, avg_7d, avg_30d)
-    } else {
-        (None, None, None)
-    };
-
-    Ok(CurrentReading {
-        co2: 0,
-        temperature: temp_raw as f32 / 20.0,
-        pressure: pressure_raw as f32 / 10.0,
-        humidity: (humidity_raw / 10).min(100) as u8, // Convert from 10ths to percent
-        battery,
-        status,
-        interval,
-        age,
-        captured_at: None,
-        radon: Some(radon),
-        radiation_rate: None,
-        radiation_total: None,
-        radon_avg_24h,
-        radon_avg_7d,
-        radon_avg_30d,
-    })
+    CurrentReading::from_bytes_radon(data).map_err(from_parse_error)
 }
 
 /// Parse Aranet Radiation readings from GATT characteristic.
 ///
-/// Format (28 bytes):
-/// - bytes 0-1: Unknown
-/// - bytes 2-3: Interval (LE16, seconds)
-/// - bytes 4-5: Age (LE16, seconds)
-/// - byte 6: Battery
-/// - bytes 7-10: Dose rate (LE32, nSv/h)
-/// - bytes 11-18: Total dose (LE64, nSv)
-/// - bytes 19-26: Duration (LE64, seconds)
-/// - byte 27: Status
+/// Delegates to [`CurrentReading::from_bytes_radiation`] for the core reading,
+/// then extracts the measurement duration from bytes 19-26 (which `CurrentReading`
+/// does not store).
 pub fn parse_aranet_radiation_gatt(data: &[u8]) -> Result<ExtendedReading> {
-    if data.len() < 28 {
-        return Err(Error::InvalidData(format!(
-            "Aranet Radiation GATT reading requires at least 28 bytes, got {}",
-            data.len()
-        )));
-    }
+    let reading = CurrentReading::from_bytes_radiation(data).map_err(from_parse_error)?;
 
-    let mut buf = data;
-
-    // Skip 2 unknown bytes
-    buf.advance(2);
-
-    let interval = buf.get_u16_le();
-    let age = buf.get_u16_le();
-    let battery = buf.get_u8();
-
-    // Dose rate in nSv/h, convert to µSv/h
-    let dose_rate_nsv = buf.get_u32_le();
-    let dose_rate_usv = dose_rate_nsv as f32 / 1000.0;
-
-    // Total dose in nSv, convert to mSv
-    let total_dose_nsv = buf.get_u64_le();
-    let total_dose_msv = total_dose_nsv as f64 / 1_000_000.0;
-
-    // Duration in seconds
-    let duration = buf.get_u64_le();
-
-    let status = if buf.has_remaining() {
-        Status::from(buf.get_u8())
-    } else {
-        Status::Green
-    };
-
-    let reading = CurrentReading {
-        co2: 0,
-        temperature: 0.0,
-        pressure: 0.0,
-        humidity: 0,
-        battery,
-        status,
-        interval,
-        age,
-        captured_at: None,
-        radon: None,
-        radiation_rate: Some(dose_rate_usv),
-        radiation_total: Some(total_dose_msv),
-        radon_avg_24h: None,
-        radon_avg_7d: None,
-        radon_avg_30d: None,
-    };
+    // Extract radiation duration from bytes 19-26 (u64 LE, seconds).
+    // from_bytes_radiation already validated length >= 28.
+    let duration = (&data[19..27]).get_u64_le();
 
     Ok(ExtendedReading {
         reading,
@@ -302,40 +128,19 @@ pub fn parse_aranet_radiation_gatt(data: &[u8]) -> Result<ExtendedReading> {
     })
 }
 
-/// Parse a reading based on device type.
+/// Parse a reading based on device type (GATT format).
+///
+/// Delegates to [`CurrentReading::from_bytes_for_device`].
 pub fn parse_reading_for_device(data: &[u8], device_type: DeviceType) -> Result<CurrentReading> {
-    match device_type {
-        DeviceType::Aranet4 => parse_aranet4_reading(data),
-        DeviceType::Aranet2 => parse_aranet2_reading(data),
-        DeviceType::AranetRadon => parse_aranet_radon_reading(data).map(|ext| ext.reading),
-        DeviceType::AranetRadiation => parse_aranet_radiation_gatt(data).map(|ext| ext.reading),
-        // Handle future device types - default to Aranet4 parsing
-        _ => parse_aranet4_reading(data),
-    }
+    CurrentReading::from_bytes_for_device(data, device_type).map_err(from_parse_error)
 }
 
-/// Parse an extended reading based on device type.
+/// Parse an extended reading based on device type (GATT format).
 pub fn parse_extended_reading(data: &[u8], device_type: DeviceType) -> Result<ExtendedReading> {
     match device_type {
-        DeviceType::Aranet4 => {
-            let reading = parse_aranet4_reading(data)?;
-            Ok(ExtendedReading {
-                reading,
-                radiation_duration: None,
-            })
-        }
-        DeviceType::Aranet2 => {
-            let reading = parse_aranet2_reading(data)?;
-            Ok(ExtendedReading {
-                reading,
-                radiation_duration: None,
-            })
-        }
-        DeviceType::AranetRadon => parse_aranet_radon_reading(data),
         DeviceType::AranetRadiation => parse_aranet_radiation_gatt(data),
-        // Handle future device types - default to Aranet4 parsing
         _ => {
-            let reading = parse_aranet4_reading(data)?;
+            let reading = parse_reading_for_device(data, device_type)?;
             Ok(ExtendedReading {
                 reading,
                 radiation_duration: None,
@@ -348,21 +153,25 @@ pub fn parse_extended_reading(data: &[u8], device_type: DeviceType) -> Result<Ex
 mod tests {
     use super::*;
 
-    // --- Aranet2 parsing tests ---
+    // --- Aranet2 GATT parsing tests ---
 
     #[test]
     fn test_parse_aranet2_reading() {
+        // GATT format: header, interval, age, battery, temp, humidity, status_flags
         // Temperature: 450 raw (22.5°C)
-        // Humidity: 55
+        // Humidity: 550 raw (55.0%)
         // Battery: 90
-        // Status: Green (1)
+        // Status flags: 0x04 = bits[2:3]=01 = Green (temperature status)
         // Interval: 300 (5 min)
-        let data: [u8; 7] = [
-            0xC2, 0x01, // temp = 450
-            55,   // humidity
-            90,   // battery
-            1,    // status = Green
+        // Age: 120 (2 min)
+        let data: [u8; 12] = [
+            0x02, 0x00, // header (device type marker)
             0x2C, 0x01, // interval = 300
+            0x78, 0x00, // age = 120
+            90,   // battery
+            0xC2, 0x01, // temp = 450 (22.5°C)
+            0x26, 0x02, // humidity = 550 (55.0%)
+            0x04, // status flags: bits[2:3] = 01 = Green
         ];
 
         let reading = parse_aranet2_reading(&data).unwrap();
@@ -372,26 +181,32 @@ mod tests {
         assert_eq!(reading.battery, 90);
         assert_eq!(reading.status, Status::Green);
         assert_eq!(reading.interval, 300);
+        assert_eq!(reading.age, 120);
     }
 
     #[test]
     fn test_parse_aranet2_reading_all_status_values() {
-        // Test different status values
-        for (status_byte, expected_status) in [
-            (0, Status::Error),
-            (1, Status::Green),
-            (2, Status::Yellow),
-            (3, Status::Red),
-            (4, Status::Error), // Unknown maps to Error
+        // Status flags: bits[2:3] = temperature status
+        // 0b0000_00XX where XX is in bits[2:3]
+        for (status_flags, expected_status) in [
+            (0x00, Status::Error),  // bits[2:3] = 00
+            (0x04, Status::Green),  // bits[2:3] = 01
+            (0x08, Status::Yellow), // bits[2:3] = 10
+            (0x0C, Status::Red),    // bits[2:3] = 11
         ] {
-            let data: [u8; 7] = [
+            let data: [u8; 12] = [
+                0x02,
+                0x00, // header
+                0x2C,
+                0x01, // interval = 300
+                0x78,
+                0x00, // age = 120
+                90,   // battery
                 0xC2,
                 0x01, // temp = 450
-                55,
-                90,
-                status_byte,
-                0x2C,
-                0x01,
+                0x26,
+                0x02, // humidity = 550
+                status_flags,
             ];
 
             let reading = parse_aranet2_reading(&data).unwrap();
@@ -401,26 +216,20 @@ mod tests {
 
     #[test]
     fn test_parse_aranet2_reading_insufficient_bytes() {
-        let data: [u8; 5] = [0xC2, 0x01, 55, 90, 1]; // Only 5 bytes, need 7
+        let data: [u8; 8] = [0x02, 0x00, 0x2C, 0x01, 0x78, 0x00, 90, 0xC2];
 
         let result = parse_aranet2_reading(&data);
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("requires 7 bytes"));
-        assert!(err.to_string().contains("got 5"));
+        assert!(err.to_string().contains("expected 12"));
+        assert!(err.to_string().contains("got 8"));
     }
 
     #[test]
     fn test_parse_aranet2_reading_edge_values() {
-        // Test with edge case values
-        let data: [u8; 7] = [
-            0x00, 0x00, // temp = 0 (0°C)
-            0,    // humidity = 0
-            0,    // battery = 0
-            0,    // status = Error
-            0x00, 0x00, // interval = 0
-        ];
+        // Test with all-zero values
+        let data: [u8; 12] = [0; 12];
 
         let reading = parse_aranet2_reading(&data).unwrap();
         assert_eq!(reading.co2, 0);
@@ -429,24 +238,27 @@ mod tests {
         assert_eq!(reading.battery, 0);
         assert_eq!(reading.status, Status::Error);
         assert_eq!(reading.interval, 0);
+        assert_eq!(reading.age, 0);
     }
 
     #[test]
     fn test_parse_aranet2_reading_max_values() {
-        let data: [u8; 7] = [
-            0xFF, 0xFF, // temp = 65535
-            255,  // humidity = 255 (invalid but possible)
-            100,  // battery = 100
-            3,    // status = Red
+        let data: [u8; 12] = [
+            0xFF, 0xFF, // header
             0xFF, 0xFF, // interval = 65535
+            0xFF, 0xFF, // age = 65535
+            100,  // battery = 100
+            0xFF, 0xFF, // temp = -1 as i16 (-0.05°C with signed parsing)
+            0xFF, 0xFF, // humidity = 65535 (6553 / 10 = 6553 → 6553 as u8 wraps)
+            0x0C, // status flags: bits[2:3] = 11 = Red
         ];
 
         let reading = parse_aranet2_reading(&data).unwrap();
-        assert!((reading.temperature - 3276.75).abs() < 0.01); // 65535/20
-        assert_eq!(reading.humidity, 255);
+        assert!((reading.temperature - (-0.05)).abs() < 0.01); // -1 as i16 / 20
         assert_eq!(reading.battery, 100);
         assert_eq!(reading.status, Status::Red);
         assert_eq!(reading.interval, 65535);
+        assert_eq!(reading.age, 65535);
     }
 
     // --- Aranet4 parsing tests ---
@@ -607,12 +419,7 @@ mod tests {
 
         let result = parse_aranet_radon_gatt(&data);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("at least 18 bytes")
-        );
+        assert!(result.unwrap_err().to_string().contains("expected 18"));
     }
 
     #[test]
@@ -650,7 +457,15 @@ mod tests {
 
     #[test]
     fn test_parse_reading_for_device_aranet2() {
-        let data: [u8; 7] = [0xC2, 0x01, 55, 90, 1, 0x2C, 0x01];
+        let data: [u8; 12] = [
+            0x02, 0x00, // header
+            0x2C, 0x01, // interval = 300
+            0x78, 0x00, // age = 120
+            90,   // battery
+            0xC2, 0x01, // temp = 450 (22.5°C)
+            0x26, 0x02, // humidity = 550 (55.0%)
+            0x04, // status flags
+        ];
 
         let reading = parse_reading_for_device(&data, DeviceType::Aranet2).unwrap();
         assert_eq!(reading.co2, 0); // Aranet2 doesn't have CO2
@@ -816,7 +631,7 @@ mod tests {
         let result = parse_aranet_radiation_gatt(&data);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("28 bytes"));
+        assert!(err.to_string().contains("expected 28"));
     }
 
     #[test]
@@ -945,29 +760,34 @@ mod proptests {
             prop_assert_eq!(reading.age, age);
         }
 
-        /// Valid Aranet2 readings should parse correctly.
+        /// Valid Aranet2 GATT readings should parse correctly.
         #[test]
         fn aranet2_valid_bytes_parse_correctly(
             temp_raw in 0u16..2000u16,
-            humidity in 0u8..100u8,
+            humidity_raw in 0u16..1000u16,
             battery in 0u8..100u8,
-            status_byte in 0u8..4u8,
+            status_flags in 0u8..16u8,
             interval in 60u16..3600u16,
+            age in 0u16..3600u16,
         ) {
-            let mut data = [0u8; 7];
-            data[0..2].copy_from_slice(&temp_raw.to_le_bytes());
-            data[2] = humidity;
-            data[3] = battery;
-            data[4] = status_byte;
-            data[5..7].copy_from_slice(&interval.to_le_bytes());
+            let mut data = [0u8; 12];
+            data[0..2].copy_from_slice(&0x0002u16.to_le_bytes()); // header
+            data[2..4].copy_from_slice(&interval.to_le_bytes());
+            data[4..6].copy_from_slice(&age.to_le_bytes());
+            data[6] = battery;
+            data[7..9].copy_from_slice(&temp_raw.to_le_bytes());
+            data[9..11].copy_from_slice(&humidity_raw.to_le_bytes());
+            data[11] = status_flags;
 
             let result = parse_aranet2_reading(&data);
             prop_assert!(result.is_ok());
 
             let reading = result.unwrap();
             prop_assert_eq!(reading.co2, 0); // Aranet2 has no CO2
-            prop_assert_eq!(reading.humidity, humidity);
+            prop_assert_eq!(reading.humidity, (humidity_raw / 10) as u8);
             prop_assert_eq!(reading.battery, battery);
+            prop_assert_eq!(reading.interval, interval);
+            prop_assert_eq!(reading.age, age);
         }
     }
 }

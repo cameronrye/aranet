@@ -10,13 +10,13 @@
 //! | Aranet4 | Full | CO₂, temperature, pressure, humidity |
 //! | Aranet2 | Full | Temperature, humidity |
 //! | AranetRn+ (Radon) | Full | Radon, temperature, pressure, humidity |
-//! | Aranet Radiation | Not supported | Returns error - protocol undocumented |
+//! | Aranet Radiation | Not supported | BLE protocol undocumented by manufacturer |
 //!
-//! **Note:** Aranet Radiation devices do not support history download. Attempting
-//! to download history from an Aranet Radiation device will return an error.
+//! **Note:** Aranet Radiation devices do not support history download because
+//! the BLE protocol for historical radiation data is not publicly documented
+//! by SAF Tehnika. Attempting to download history will return [`Error::Unsupported`].
 //! Use [`Device::read_current()`](crate::device::Device::read_current) for
-//! current radiation readings. The `radiation_rate` and `radiation_total` fields
-//! in [`HistoryRecord`] are reserved for future implementation.
+//! current radiation readings.
 //!
 //! # Index Convention
 //!
@@ -170,6 +170,14 @@ impl From<HistoryParamCheckpoint> for HistoryParam {
             HistoryParamCheckpoint::Radon => HistoryParam::Radon,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct U16HistoryStep {
+    param: HistoryParam,
+    step: usize,
+    total_steps: usize,
+    next_param: Option<HistoryParamCheckpoint>,
 }
 
 /// Partially downloaded history data for checkpoint resume.
@@ -523,6 +531,17 @@ impl Device {
         let start_idx = options.start_index.unwrap_or(1);
         let end_idx = options.end_index.unwrap_or(info.total_readings);
 
+        if start_idx > end_idx {
+            return Err(Error::InvalidConfig(format!(
+                "start_index ({start_idx}) must be <= end_index ({end_idx})"
+            )));
+        }
+        if start_idx == 0 {
+            return Err(Error::InvalidConfig(
+                "start_index must be >= 1 (indices are 1-based)".into(),
+            ));
+        }
+
         // Get signal quality for adaptive delay if enabled
         let signal_quality = if options.use_adaptive_delay {
             match self.signal_quality().await {
@@ -549,12 +568,13 @@ impl Device {
         // Dispatch based on device type
         match self.device_type() {
             Some(DeviceType::AranetRadiation) => {
-                // Aranet Radiation history download is not yet implemented.
-                // The device protocol for historical radiation data is different from
-                // other Aranet devices and requires additional research/documentation.
-                Err(Error::InvalidData(
-                    "History download for Aranet Radiation devices is not yet implemented. \
-                     Current readings are available via read_current()."
+                // Aranet Radiation history download is not supported.
+                // The BLE protocol for historical radiation data differs from other
+                // Aranet devices and is not publicly documented by SAF Tehnika.
+                Err(Error::Unsupported(
+                    "History download is not available for Aranet Radiation devices. \
+                     The radiation history protocol is not documented. \
+                     Use read_current() for current radiation readings."
                         .to_string(),
                 ))
             }
@@ -569,8 +589,19 @@ impl Device {
                 )
                 .await
             }
+            Some(DeviceType::Aranet2) => {
+                // For Aranet2, download temperature and humidity only
+                self.download_aranet2_history_internal(
+                    &info,
+                    start_idx,
+                    end_idx,
+                    &options,
+                    effective_delay,
+                )
+                .await
+            }
             _ => {
-                // For Aranet4 and Aranet2, download CO2 (or 0 for Aranet2) and standard humidity
+                // For Aranet4 (and unknown devices), download CO2, temp, pressure, humidity
                 self.download_aranet4_history_internal(
                     &info,
                     start_idx,
@@ -583,6 +614,53 @@ impl Device {
         }
     }
 
+    /// Download a u16 parameter with progress reporting and checkpoint updates.
+    ///
+    /// This is the common pattern shared by all parameter downloads except radon (u32).
+    /// Returns the downloaded values.
+    async fn download_u16_param_with_checkpoint(
+        &self,
+        step_info: U16HistoryStep,
+        start_idx: u16,
+        end_idx: u16,
+        effective_delay: Duration,
+        options: &HistoryOptions,
+        checkpoint: &mut Option<HistoryCheckpoint>,
+    ) -> Result<Vec<u16>> {
+        let total_values = (end_idx - start_idx + 1) as usize;
+        let mut progress = HistoryProgress::new(
+            step_info.param,
+            step_info.step,
+            step_info.total_steps,
+            total_values,
+        );
+        options.report_progress(&progress);
+
+        let values = self
+            .download_param_history_with_progress(
+                step_info.param,
+                start_idx,
+                end_idx,
+                effective_delay,
+                |downloaded| {
+                    progress.update(downloaded);
+                    options.report_progress(&progress);
+                },
+            )
+            .await?;
+
+        if let Some(cp) = checkpoint {
+            cp.complete_param(step_info.param, values.clone());
+            if let Some(next) = step_info.next_param {
+                cp.current_param = next;
+                cp.resume_index = start_idx;
+            }
+            options.report_checkpoint(cp);
+        }
+
+        Ok(values)
+    }
+
     /// Download history for Aranet4 devices (CO2, temp, pressure, humidity).
     async fn download_aranet4_history_internal(
         &self,
@@ -592,9 +670,10 @@ impl Device {
         options: &HistoryOptions,
         effective_delay: Duration,
     ) -> Result<Vec<HistoryRecord>> {
-        let total_values = (end_idx - start_idx + 1) as usize;
+        if start_idx > end_idx {
+            return Ok(Vec::new());
+        }
 
-        // Create checkpoint if callback is set
         let device_id = self.address().to_string();
         let mut checkpoint = if options.checkpoint_callback.is_some() {
             Some(HistoryCheckpoint::new(
@@ -606,129 +685,143 @@ impl Device {
             None
         };
 
-        // Download each parameter type with progress reporting
-        let mut progress = HistoryProgress::new(HistoryParam::Co2, 1, 4, total_values);
-        options.report_progress(&progress);
-
         let co2_values = self
-            .download_param_history_with_progress(
-                HistoryParam::Co2,
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Co2,
+                    step: 1,
+                    total_steps: 4,
+                    next_param: Some(HistoryParamCheckpoint::Temperature),
+                },
                 start_idx,
                 end_idx,
                 effective_delay,
-                |downloaded| {
-                    progress.update(downloaded);
-                    options.report_progress(&progress);
-                },
+                options,
+                &mut checkpoint,
             )
             .await?;
-
-        // Update checkpoint after CO2
-        if let Some(ref mut cp) = checkpoint {
-            cp.complete_param(HistoryParam::Co2, co2_values.clone());
-            cp.current_param = HistoryParamCheckpoint::Temperature;
-            cp.resume_index = start_idx;
-            options.report_checkpoint(cp);
-        }
-
-        progress = HistoryProgress::new(HistoryParam::Temperature, 2, 4, total_values);
-        options.report_progress(&progress);
 
         let temp_values = self
-            .download_param_history_with_progress(
-                HistoryParam::Temperature,
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Temperature,
+                    step: 2,
+                    total_steps: 4,
+                    next_param: Some(HistoryParamCheckpoint::Pressure),
+                },
                 start_idx,
                 end_idx,
                 effective_delay,
-                |downloaded| {
-                    progress.update(downloaded);
-                    options.report_progress(&progress);
-                },
+                options,
+                &mut checkpoint,
             )
             .await?;
-
-        // Update checkpoint after Temperature
-        if let Some(ref mut cp) = checkpoint {
-            cp.complete_param(HistoryParam::Temperature, temp_values.clone());
-            cp.current_param = HistoryParamCheckpoint::Pressure;
-            cp.resume_index = start_idx;
-            options.report_checkpoint(cp);
-        }
-
-        progress = HistoryProgress::new(HistoryParam::Pressure, 3, 4, total_values);
-        options.report_progress(&progress);
 
         let pressure_values = self
-            .download_param_history_with_progress(
-                HistoryParam::Pressure,
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Pressure,
+                    step: 3,
+                    total_steps: 4,
+                    next_param: Some(HistoryParamCheckpoint::Humidity),
+                },
                 start_idx,
                 end_idx,
                 effective_delay,
-                |downloaded| {
-                    progress.update(downloaded);
-                    options.report_progress(&progress);
-                },
+                options,
+                &mut checkpoint,
             )
             .await?;
-
-        // Update checkpoint after Pressure
-        if let Some(ref mut cp) = checkpoint {
-            cp.complete_param(HistoryParam::Pressure, pressure_values.clone());
-            cp.current_param = HistoryParamCheckpoint::Humidity;
-            cp.resume_index = start_idx;
-            options.report_checkpoint(cp);
-        }
-
-        progress = HistoryProgress::new(HistoryParam::Humidity, 4, 4, total_values);
-        options.report_progress(&progress);
 
         let humidity_values = self
-            .download_param_history_with_progress(
-                HistoryParam::Humidity,
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Humidity,
+                    step: 4,
+                    total_steps: 4,
+                    next_param: None,
+                },
                 start_idx,
                 end_idx,
                 effective_delay,
-                |downloaded| {
-                    progress.update(downloaded);
-                    options.report_progress(&progress);
-                },
+                options,
+                &mut checkpoint,
             )
             .await?;
 
-        // Update checkpoint after Humidity (download complete)
-        if let Some(ref mut cp) = checkpoint {
-            cp.complete_param(HistoryParam::Humidity, humidity_values.clone());
-            options.report_checkpoint(cp);
-        }
-
-        // Calculate timestamps for each record
-        let now = OffsetDateTime::now_utc();
-        let latest_reading_time = now - time::Duration::seconds(info.seconds_since_update as i64);
-
-        // Build history records by combining all parameters
-        let mut records = Vec::new();
-        let count = co2_values.len();
-
-        for i in 0..count {
-            // Calculate timestamp: most recent reading is at the end
-            let readings_ago = (count - 1 - i) as i64;
-            let timestamp = latest_reading_time
-                - time::Duration::seconds(readings_ago * info.interval_seconds as i64);
-
-            let record = HistoryRecord {
-                timestamp,
-                co2: co2_values.get(i).copied().unwrap_or(0),
-                temperature: raw_to_temperature(temp_values.get(i).copied().unwrap_or(0)),
-                pressure: raw_to_pressure(pressure_values.get(i).copied().unwrap_or(0)),
-                humidity: humidity_values.get(i).copied().unwrap_or(0) as u8,
-                radon: None,
-                radiation_rate: None,
-                radiation_total: None,
-            };
-            records.push(record);
-        }
+        let records = build_history_records(
+            info,
+            &co2_values,
+            &temp_values,
+            &pressure_values,
+            &humidity_values,
+            &[],
+        );
 
         info!("Downloaded {} history records", records.len());
+        Ok(records)
+    }
+
+    /// Download history for Aranet2 devices (temperature, humidity only).
+    async fn download_aranet2_history_internal(
+        &self,
+        info: &HistoryInfo,
+        start_idx: u16,
+        end_idx: u16,
+        options: &HistoryOptions,
+        effective_delay: Duration,
+    ) -> Result<Vec<HistoryRecord>> {
+        if start_idx > end_idx {
+            return Ok(Vec::new());
+        }
+
+        let device_id = self.address().to_string();
+        let mut checkpoint = if options.checkpoint_callback.is_some() {
+            Some(HistoryCheckpoint::new(
+                &device_id,
+                info.total_readings,
+                HistoryParam::Temperature,
+            ))
+        } else {
+            None
+        };
+
+        let temp_values = self
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Temperature,
+                    step: 1,
+                    total_steps: 2,
+                    next_param: Some(HistoryParamCheckpoint::Humidity2),
+                },
+                start_idx,
+                end_idx,
+                effective_delay,
+                options,
+                &mut checkpoint,
+            )
+            .await?;
+
+        let humidity_values = self
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Humidity2,
+                    step: 2,
+                    total_steps: 2,
+                    next_param: None,
+                },
+                start_idx,
+                end_idx,
+                effective_delay,
+                options,
+                &mut checkpoint,
+            )
+            .await?;
+
+        // Build records with no CO2, no pressure, no radon
+        let records = build_history_records(info, &[], &temp_values, &[], &humidity_values, &[]);
+
+        info!("Downloaded {} Aranet2 history records", records.len());
         Ok(records)
     }
 
@@ -741,9 +834,11 @@ impl Device {
         options: &HistoryOptions,
         effective_delay: Duration,
     ) -> Result<Vec<HistoryRecord>> {
+        if start_idx > end_idx {
+            return Ok(Vec::new());
+        }
         let total_values = (end_idx - start_idx + 1) as usize;
 
-        // Create checkpoint if callback is set
         let device_id = self.address().to_string();
         let mut checkpoint = if options.checkpoint_callback.is_some() {
             Some(HistoryCheckpoint::new(
@@ -755,7 +850,7 @@ impl Device {
             None
         };
 
-        // Download radon values (4 bytes each)
+        // Download radon values (4 bytes each, uses u32 variant)
         let mut progress = HistoryProgress::new(HistoryParam::Radon, 1, 4, total_values);
         options.report_progress(&progress);
 
@@ -772,7 +867,6 @@ impl Device {
             )
             .await?;
 
-        // Update checkpoint after Radon
         if let Some(ref mut cp) = checkpoint {
             cp.complete_radon_param(radon_values.clone());
             cp.current_param = HistoryParamCheckpoint::Temperature;
@@ -780,105 +874,62 @@ impl Device {
             options.report_checkpoint(cp);
         }
 
-        progress = HistoryProgress::new(HistoryParam::Temperature, 2, 4, total_values);
-        options.report_progress(&progress);
-
         let temp_values = self
-            .download_param_history_with_progress(
-                HistoryParam::Temperature,
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Temperature,
+                    step: 2,
+                    total_steps: 4,
+                    next_param: Some(HistoryParamCheckpoint::Pressure),
+                },
                 start_idx,
                 end_idx,
                 effective_delay,
-                |downloaded| {
-                    progress.update(downloaded);
-                    options.report_progress(&progress);
-                },
+                options,
+                &mut checkpoint,
             )
             .await?;
-
-        // Update checkpoint after Temperature
-        if let Some(ref mut cp) = checkpoint {
-            cp.complete_param(HistoryParam::Temperature, temp_values.clone());
-            cp.current_param = HistoryParamCheckpoint::Pressure;
-            options.report_checkpoint(cp);
-        }
-
-        progress = HistoryProgress::new(HistoryParam::Pressure, 3, 4, total_values);
-        options.report_progress(&progress);
 
         let pressure_values = self
-            .download_param_history_with_progress(
-                HistoryParam::Pressure,
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Pressure,
+                    step: 3,
+                    total_steps: 4,
+                    next_param: Some(HistoryParamCheckpoint::Humidity2),
+                },
                 start_idx,
                 end_idx,
                 effective_delay,
-                |downloaded| {
-                    progress.update(downloaded);
-                    options.report_progress(&progress);
-                },
+                options,
+                &mut checkpoint,
             )
             .await?;
-
-        // Update checkpoint after Pressure
-        if let Some(ref mut cp) = checkpoint {
-            cp.complete_param(HistoryParam::Pressure, pressure_values.clone());
-            cp.current_param = HistoryParamCheckpoint::Humidity2;
-            options.report_checkpoint(cp);
-        }
-
-        // Radon devices use Humidity2 (different encoding, 2 bytes, divide by 10)
-        progress = HistoryProgress::new(HistoryParam::Humidity2, 4, 4, total_values);
-        options.report_progress(&progress);
 
         let humidity_values = self
-            .download_param_history_with_progress(
-                HistoryParam::Humidity2,
+            .download_u16_param_with_checkpoint(
+                U16HistoryStep {
+                    param: HistoryParam::Humidity2,
+                    step: 4,
+                    total_steps: 4,
+                    next_param: None,
+                },
                 start_idx,
                 end_idx,
                 effective_delay,
-                |downloaded| {
-                    progress.update(downloaded);
-                    options.report_progress(&progress);
-                },
+                options,
+                &mut checkpoint,
             )
             .await?;
 
-        // Update checkpoint after Humidity2 (download complete)
-        if let Some(ref mut cp) = checkpoint {
-            cp.complete_param(HistoryParam::Humidity2, humidity_values.clone());
-            options.report_checkpoint(cp);
-        }
-
-        // Calculate timestamps for each record
-        let now = OffsetDateTime::now_utc();
-        let latest_reading_time = now - time::Duration::seconds(info.seconds_since_update as i64);
-
-        // Build history records by combining all parameters
-        let mut records = Vec::new();
-        let count = radon_values.len();
-
-        for i in 0..count {
-            // Calculate timestamp: most recent reading is at the end
-            let readings_ago = (count - 1 - i) as i64;
-            let timestamp = latest_reading_time
-                - time::Duration::seconds(readings_ago * info.interval_seconds as i64);
-
-            // Humidity2 is stored as tenths of a percent
-            let humidity_raw = humidity_values.get(i).copied().unwrap_or(0);
-            let humidity = (humidity_raw / 10).min(100) as u8;
-
-            let record = HistoryRecord {
-                timestamp,
-                co2: 0, // Not applicable for radon devices
-                temperature: raw_to_temperature(temp_values.get(i).copied().unwrap_or(0)),
-                pressure: raw_to_pressure(pressure_values.get(i).copied().unwrap_or(0)),
-                humidity,
-                radon: Some(radon_values.get(i).copied().unwrap_or(0)),
-                radiation_rate: None,
-                radiation_total: None,
-            };
-            records.push(record);
-        }
+        let records = build_history_records(
+            info,
+            &[],
+            &temp_values,
+            &pressure_values,
+            &humidity_values,
+            &radon_values,
+        );
 
         info!("Downloaded {} radon history records", records.len());
         Ok(records)
@@ -912,6 +963,8 @@ impl Device {
 
         let mut values: BTreeMap<u16, T> = BTreeMap::new();
         let mut current_idx = start_idx;
+        let mut consecutive_wrong_param = 0u32;
+        const MAX_WRONG_PARAM_RETRIES: u32 = 5;
 
         while current_idx <= end_idx {
             // Send V2 history request using command constant
@@ -946,11 +999,20 @@ impl Device {
 
             let resp_param = response[0];
             if resp_param != param as u8 {
-                warn!("Unexpected parameter in response: {}", resp_param);
+                consecutive_wrong_param += 1;
+                warn!(
+                    "Unexpected parameter in response: {} (retry {}/{})",
+                    resp_param, consecutive_wrong_param, MAX_WRONG_PARAM_RETRIES
+                );
+                if consecutive_wrong_param >= MAX_WRONG_PARAM_RETRIES {
+                    warn!("Too many wrong parameter responses, aborting download");
+                    break;
+                }
                 // Wait and retry - device may not have processed command yet
                 sleep(read_delay).await;
                 continue;
             }
+            consecutive_wrong_param = 0;
 
             // Parse header
             let resp_start = u16::from_le_bytes([response[7], response[8]]);
@@ -1217,6 +1279,21 @@ impl Device {
         let mut records = Vec::new();
         let count = co2_values.len();
 
+        // Warn if parameter arrays have mismatched lengths (partial download)
+        if temp_values.len() != count
+            || pressure_values.len() != count
+            || humidity_values.len() != count
+        {
+            warn!(
+                "V1 history arrays have mismatched lengths: co2={}, temp={}, pressure={}, humidity={} — \
+                 records with missing values will use defaults",
+                count,
+                temp_values.len(),
+                pressure_values.len(),
+                humidity_values.len()
+            );
+        }
+
         for i in 0..count {
             let readings_ago = (count - 1 - i) as i64;
             let timestamp = latest_reading_time
@@ -1238,6 +1315,84 @@ impl Device {
         info!("V1 download complete: {} records", records.len());
         Ok(records)
     }
+}
+
+/// Build history records from downloaded parameter arrays.
+///
+/// For Aranet4: pass co2_values and empty radon_values.
+/// For AranetRn+: pass empty co2_values and radon_values.
+/// Humidity is converted differently based on whether radon_values is populated
+/// (radon devices use Humidity2 encoding: tenths of a percent).
+fn build_history_records(
+    info: &HistoryInfo,
+    co2_values: &[u16],
+    temp_values: &[u16],
+    pressure_values: &[u16],
+    humidity_values: &[u16],
+    radon_values: &[u32],
+) -> Vec<HistoryRecord> {
+    let is_radon = !radon_values.is_empty();
+    let is_aranet2 = co2_values.is_empty() && radon_values.is_empty();
+    let count = if is_radon {
+        radon_values.len()
+    } else if is_aranet2 {
+        temp_values.len()
+    } else {
+        co2_values.len()
+    };
+
+    // Warn if parameter arrays have mismatched lengths (partial download)
+    let expected = count;
+    if temp_values.len() != expected
+        || pressure_values.len() != expected
+        || humidity_values.len() != expected
+    {
+        warn!(
+            "History arrays have mismatched lengths: primary={expected}, temp={}, pressure={}, humidity={} — \
+             records with missing values will use defaults",
+            temp_values.len(),
+            pressure_values.len(),
+            humidity_values.len()
+        );
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let latest_reading_time = now - time::Duration::seconds(info.seconds_since_update as i64);
+
+    (0..count)
+        .map(|i| {
+            let readings_ago = (count - 1 - i) as i64;
+            let timestamp = latest_reading_time
+                - time::Duration::seconds(readings_ago * info.interval_seconds as i64);
+
+            let humidity = if is_radon || is_aranet2 {
+                // Humidity2 is stored as tenths of a percent
+                let raw = humidity_values.get(i).copied().unwrap_or(0);
+                (raw / 10).min(100) as u8
+            } else {
+                humidity_values.get(i).copied().unwrap_or(0) as u8
+            };
+
+            HistoryRecord {
+                timestamp,
+                co2: if is_radon {
+                    0
+                } else {
+                    co2_values.get(i).copied().unwrap_or(0)
+                },
+                temperature: raw_to_temperature(temp_values.get(i).copied().unwrap_or(0)),
+                pressure: raw_to_pressure(pressure_values.get(i).copied().unwrap_or(0)),
+                humidity,
+                radon: if is_radon {
+                    Some(radon_values.get(i).copied().unwrap_or(0))
+                } else {
+                    None
+                },
+                radiation_rate: None,
+                radiation_total: None,
+            }
+        })
+        .collect()
 }
 
 /// Convert raw temperature value to Celsius.

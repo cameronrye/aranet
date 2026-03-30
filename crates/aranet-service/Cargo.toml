@@ -1,6 +1,6 @@
 [package]
 name = "aranet-service"
-version = "0.1.13"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,14 +20,15 @@ dist = false
 
 [features]
 default = []
-prometheus = ["dep:reqwest"]
+prometheus = []
 mqtt = ["dep:rumqttc"]
-full = ["prometheus", "mqtt"]
+notifications = ["dep:notify-rust"]
+full = ["prometheus", "mqtt", "notifications"]
 
 [dependencies]
-aranet-core = { version = "0.1.13", path = "../aranet-core" }
-aranet-store = { version = "0.1.13", path = "../aranet-store" }
-aranet-types = { version = "0.1.13", path = "../aranet-types" }
+aranet-core = { version = "0.2.0", path = "../aranet-core" }
+aranet-store = { version = "0.2.0", path = "../aranet-store" }
+aranet-types = { version = "0.2.0", path = "../aranet-types" }
 
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
@@ -62,10 +63,20 @@ dirs = "6"
 service-manager = "0.10.0"
 
 # MQTT support (optional)
-rumqttc = { version = "0.24", optional = true }
+rumqttc = { version = "0.25.1", optional = true, default-features = false, features = ["use-native-tls"] }
 
-# Prometheus push gateway (optional)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# HTTP client for webhooks, InfluxDB, and Prometheus push gateway
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Desktop notifications (optional)
+notify-rust = { version = "4", optional = true }
+
+# Constant-time comparison for API key authentication
+subtle = "2"
+
+# mDNS service discovery
+mdns-sd = "0.11"
+hostname = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
@@ -73,4 +84,3 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1.0"
-

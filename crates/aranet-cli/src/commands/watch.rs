@@ -7,14 +7,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
-use aranet_core::Device;
-use aranet_core::advertisement::parse_advertisement_with_name;
-use aranet_core::scan::{ScanOptions, scan_with_options};
-use aranet_types::CurrentReading;
-use owo_colors::OwoColorize;
-use tracing::debug;
-
 use crate::cli::OutputFormat;
 use crate::format::{
     FormatOptions, bq_to_pci, format_reading_json, format_reading_json_with_device,
@@ -22,7 +14,13 @@ use crate::format::{
     format_watch_csv_line_with_device, format_watch_line_with_device,
 };
 use crate::style;
-use crate::util::{require_device_interactive, write_output};
+use crate::util::{append_output, require_device_interactive};
+use anyhow::Result;
+use aranet_core::Device;
+use aranet_core::advertisement::parse_advertisement_with_name;
+use aranet_core::scan::{ScanOptions, scan_with_options};
+use aranet_types::CurrentReading;
+use owo_colors::OwoColorize;
 
 /// Minimum backoff delay for reconnection attempts
 const MIN_BACKOFF_SECS: u64 = 2;
@@ -70,10 +68,8 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
         // Check if we've reached the count limit
         if count > 0 && readings_taken >= count {
             eprintln!("Completed {} readings.", readings_taken);
-            if let Some(d) = current_device.take()
-                && let Err(e) = d.disconnect().await
-            {
-                debug!("Failed to disconnect: {e}");
+            if let Some(ref d) = current_device.take() {
+                crate::util::disconnect_device(d).await;
             }
             return Ok(());
         }
@@ -169,16 +165,14 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
                         format_watch_line_with_trend(&reading, previous_reading.as_ref(), opts)
                     }
                 };
-                write_output(output, &content)?;
+                append_output(output, &content)?;
                 previous_reading = Some(reading);
             }
             Err(e) => {
                 eprintln!("Read failed: {}. Will reconnect on next poll.", e);
                 // Mark connection as lost so we reconnect on next iteration
-                if let Some(d) = current_device.take()
-                    && let Err(e) = d.disconnect().await
-                {
-                    debug!("Failed to disconnect: {e}");
+                if let Some(ref d) = current_device.take() {
+                    crate::util::disconnect_device(d).await;
                 }
             }
         }
@@ -193,8 +187,8 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\nShutting down...");
                 // Clean up connection before exit
-                if let Some(d) = current_device.take() && let Err(e) = d.disconnect().await {
-                    debug!("Failed to disconnect: {e}");
+                if let Some(ref d) = current_device.take() {
+                    crate::util::disconnect_device(d).await;
                 }
                 return Ok(());
             }
@@ -328,7 +322,7 @@ async fn cmd_watch_passive(
                                             opts,
                                         ),
                                     };
-                                    write_output(output, &content)?;
+                                    append_output(output, &content)?;
                                 }
                                 Err(e) => {
                                     eprintln!(
@@ -369,9 +363,7 @@ fn format_watch_line_with_trend(
     previous: Option<&CurrentReading>,
     opts: &FormatOptions,
 ) -> String {
-    use chrono::Local;
-
-    let timestamp = Local::now().format("%H:%M:%S").to_string();
+    let timestamp = aranet_cli::local_now_fmt("[hour]:[minute]:[second]");
 
     // Get trend indicators if we have a previous reading
     // Use "~" for first reading to indicate "no change data yet" rather than "-" which could be confused with "decreasing"

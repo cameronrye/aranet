@@ -36,7 +36,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
@@ -75,10 +75,10 @@ impl MqttPublisher {
         info!("Starting MQTT publisher to {}", mqtt_config.broker);
 
         let state = Arc::clone(&self.state);
-        let stop_rx = self.state.collector.subscribe_stop();
+        let shutdown_rx = self.state.subscribe_shutdown();
 
         tokio::spawn(async move {
-            run_mqtt_publisher(state, mqtt_config, stop_rx).await;
+            run_mqtt_publisher(state, mqtt_config, shutdown_rx).await;
         });
     }
 }
@@ -87,7 +87,7 @@ impl MqttPublisher {
 async fn run_mqtt_publisher(
     state: Arc<AppState>,
     config: MqttConfig,
-    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     // Parse broker URL
     let (host, port, use_tls) = match parse_broker_url(&config.broker) {
@@ -111,7 +111,7 @@ async fn run_mqtt_publisher(
     if use_tls {
         // For TLS, we use the native-tls transport
         // Note: This requires the broker to have a valid certificate
-        mqtt_options.set_transport(rumqttc::Transport::tls_with_default_config());
+        mqtt_options.set_transport(Transport::tls_with_config(TlsConfiguration::Native));
     }
 
     let qos = match config.qos {
@@ -125,18 +125,29 @@ async fn run_mqtt_publisher(
 
     // Subscribe to readings broadcast
     let mut readings_rx = state.readings_tx.subscribe();
+    let mut reload_rx = state.collector.subscribe_reload();
 
     info!(
         "MQTT publisher connected to {} with prefix '{}'",
         config.broker, config.topic_prefix
     );
 
-    // Spawn event loop handler
-    tokio::spawn(async move {
+    // Spawn event loop handler (keep handle so we can abort on shutdown)
+    let eventloop_handle = tokio::spawn(async move {
+        let mut consecutive_errors: u32 = 0;
+        let max_backoff = Duration::from_secs(300); // Cap at 5 minutes
         loop {
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(ack))) => {
-                    info!("MQTT connected: {:?}", ack);
+                    if consecutive_errors > 0 {
+                        info!(
+                            "MQTT reconnected after {} errors: {:?}",
+                            consecutive_errors, ack
+                        );
+                    } else {
+                        info!("MQTT connected: {:?}", ack);
+                    }
+                    consecutive_errors = 0;
                 }
                 Ok(Event::Incoming(Packet::PingResp)) => {
                     debug!("MQTT ping response received");
@@ -146,12 +157,36 @@ async fn run_mqtt_publisher(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    warn!("MQTT connection error: {}. Reconnecting...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let backoff = Duration::from_secs(5)
+                        .saturating_mul(2u32.saturating_pow(consecutive_errors.min(6)))
+                        .min(max_backoff);
+                    if consecutive_errors <= 3 {
+                        warn!(
+                            "MQTT connection error: {}. Reconnecting in {:?}...",
+                            e, backoff
+                        );
+                    } else if consecutive_errors.is_multiple_of(50) {
+                        error!(
+                            "MQTT connection error ({} consecutive): {}. Reconnecting in {:?}...",
+                            consecutive_errors, e, backoff
+                        );
+                    }
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
     });
+
+    // Publish Home Assistant discovery messages if enabled
+    if config.homeassistant {
+        // Small delay to ensure MQTT connection is established
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let devices = configured_devices(&state).await;
+        if let Err(e) = publish_ha_discovery(&client, &config, &devices, qos).await {
+            warn!("Failed to publish HA discovery: {}", e);
+        }
+    }
 
     // Main publishing loop
     loop {
@@ -159,7 +194,7 @@ async fn run_mqtt_publisher(
             result = readings_rx.recv() => {
                 match result {
                     Ok(event) => {
-                        if let Err(e) = publish_reading(&client, &config, &event, qos).await {
+                        if let Err(e) = publish_reading(&client, &config, &state, &event, qos).await {
                             warn!("Failed to publish reading: {}", e);
                         }
                     }
@@ -172,8 +207,16 @@ async fn run_mqtt_publisher(
                     }
                 }
             }
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
+            result = reload_rx.changed() => {
+                if result.is_ok() && config.homeassistant {
+                    let devices = configured_devices(&state).await;
+                    if let Err(e) = publish_ha_discovery(&client, &config, &devices, qos).await {
+                        warn!("Failed to refresh HA discovery after config reload: {}", e);
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
                     info!("MQTT publisher received stop signal");
                     break;
                 }
@@ -181,10 +224,11 @@ async fn run_mqtt_publisher(
         }
     }
 
-    // Disconnect gracefully
+    // Disconnect gracefully and abort the event loop task
     if let Err(e) = client.disconnect().await {
         debug!("Error disconnecting MQTT client: {}", e);
     }
+    eventloop_handle.abort();
 
     info!("MQTT publisher stopped");
 }
@@ -193,10 +237,16 @@ async fn run_mqtt_publisher(
 async fn publish_reading(
     client: &AsyncClient,
     config: &MqttConfig,
+    state: &AppState,
     event: &ReadingEvent,
     qos: QoS,
 ) -> Result<(), rumqttc::ClientError> {
-    let device_name = sanitize_topic_segment(&event.device_id);
+    let device_name = sanitize_topic_segment(
+        configured_device_name(state, &event.device_id)
+            .await
+            .as_deref()
+            .unwrap_or(&event.device_id),
+    );
     let prefix = &config.topic_prefix;
     let retain = config.retain;
 
@@ -207,49 +257,60 @@ async fn publish_reading(
         .publish(&json_topic, qos, retain, json_payload.as_bytes())
         .await?;
 
-    // Publish individual metrics
+    // Publish individual metrics, filtered by device capabilities.
+    // When device type can be determined from the name, use capability checks.
+    // When it cannot (e.g. MAC address), fall back to data-driven detection
+    // to avoid suppressing valid readings.
     let reading = &event.reading;
+    let device_type = aranet_types::DeviceType::from_name(&event.device_id);
+    let has_co2 = device_type.map_or(reading.co2 > 0, |dt| dt.has_co2());
+    let has_temp = device_type.map_or(reading.temperature != 0.0 || reading.humidity > 0, |dt| {
+        dt.has_temperature()
+    });
+    let has_pressure = device_type.map_or(reading.pressure > 0.0, |dt| dt.has_pressure());
 
-    // CO2
-    let co2_topic = format!("{}/{}/co2", prefix, device_name);
-    client
-        .publish(&co2_topic, qos, retain, reading.co2.to_string().as_bytes())
-        .await?;
+    if has_co2 {
+        let co2_topic = format!("{}/{}/co2", prefix, device_name);
+        client
+            .publish(&co2_topic, qos, retain, reading.co2.to_string().as_bytes())
+            .await?;
+    }
 
-    // Temperature
-    let temp_topic = format!("{}/{}/temperature", prefix, device_name);
-    client
-        .publish(
-            &temp_topic,
-            qos,
-            retain,
-            format!("{:.2}", reading.temperature).as_bytes(),
-        )
-        .await?;
+    if has_temp {
+        let temp_topic = format!("{}/{}/temperature", prefix, device_name);
+        client
+            .publish(
+                &temp_topic,
+                qos,
+                retain,
+                format!("{:.2}", reading.temperature).as_bytes(),
+            )
+            .await?;
 
-    // Humidity
-    let humidity_topic = format!("{}/{}/humidity", prefix, device_name);
-    client
-        .publish(
-            &humidity_topic,
-            qos,
-            retain,
-            reading.humidity.to_string().as_bytes(),
-        )
-        .await?;
+        let humidity_topic = format!("{}/{}/humidity", prefix, device_name);
+        client
+            .publish(
+                &humidity_topic,
+                qos,
+                retain,
+                reading.humidity.to_string().as_bytes(),
+            )
+            .await?;
+    }
 
-    // Pressure
-    let pressure_topic = format!("{}/{}/pressure", prefix, device_name);
-    client
-        .publish(
-            &pressure_topic,
-            qos,
-            retain,
-            format!("{:.2}", reading.pressure).as_bytes(),
-        )
-        .await?;
+    if has_pressure {
+        let pressure_topic = format!("{}/{}/pressure", prefix, device_name);
+        client
+            .publish(
+                &pressure_topic,
+                qos,
+                retain,
+                format!("{:.2}", reading.pressure).as_bytes(),
+            )
+            .await?;
+    }
 
-    // Battery
+    // Battery (all devices have this)
     let battery_topic = format!("{}/{}/battery", prefix, device_name);
     client
         .publish(
@@ -281,6 +342,26 @@ async fn publish_reading(
             .await?;
     }
 
+    // Radon averages (if available)
+    if let Some(avg) = reading.radon_avg_24h {
+        let topic = format!("{}/{}/radon_avg_24h", prefix, device_name);
+        client
+            .publish(&topic, qos, retain, avg.to_string().as_bytes())
+            .await?;
+    }
+    if let Some(avg) = reading.radon_avg_7d {
+        let topic = format!("{}/{}/radon_avg_7d", prefix, device_name);
+        client
+            .publish(&topic, qos, retain, avg.to_string().as_bytes())
+            .await?;
+    }
+    if let Some(avg) = reading.radon_avg_30d {
+        let topic = format!("{}/{}/radon_avg_30d", prefix, device_name);
+        client
+            .publish(&topic, qos, retain, avg.to_string().as_bytes())
+            .await?;
+    }
+
     // Radiation rate (if available)
     if let Some(rate) = reading.radiation_rate {
         let rate_topic = format!("{}/{}/radiation_rate", prefix, device_name);
@@ -306,6 +387,149 @@ async fn publish_reading(
         "Published reading for {} to MQTT (CO2={})",
         event.device_id, reading.co2
     );
+
+    Ok(())
+}
+
+async fn configured_devices(state: &AppState) -> Vec<crate::config::DeviceConfig> {
+    let config = state.config.read().await;
+    config.devices.clone()
+}
+
+async fn configured_device_name(state: &AppState, device_id: &str) -> Option<String> {
+    let config = state.config.read().await;
+    config
+        .devices
+        .iter()
+        .find(|device| device.address == device_id)
+        .map(|device| {
+            device
+                .alias
+                .clone()
+                .unwrap_or_else(|| device.address.clone())
+        })
+}
+
+/// Publish Home Assistant MQTT auto-discovery messages for all configured devices.
+async fn publish_ha_discovery(
+    client: &AsyncClient,
+    config: &MqttConfig,
+    devices: &[crate::config::DeviceConfig],
+    qos: QoS,
+) -> Result<(), rumqttc::ClientError> {
+    let prefix = &config.ha_discovery_prefix;
+    let topic_prefix = &config.topic_prefix;
+
+    for device in devices {
+        let device_name =
+            sanitize_topic_segment(device.alias.as_deref().unwrap_or(&device.address));
+        let display_name = device.alias.as_deref().unwrap_or(&device.address);
+
+        // Determine device type from name/address
+        let device_type = aranet_types::DeviceType::from_name(&device.address).or_else(|| {
+            device
+                .alias
+                .as_deref()
+                .and_then(aranet_types::DeviceType::from_name)
+        });
+
+        let has_co2 = device_type.is_none_or(|dt| dt.has_co2());
+        let has_temp = device_type.is_none_or(|dt| dt.has_temperature());
+        let has_pressure = device_type.is_none_or(|dt| dt.has_pressure());
+
+        let device_json = serde_json::json!({
+            "identifiers": [format!("aranet_{}", device_name)],
+            "name": display_name,
+            "manufacturer": "SAF Tehnika",
+            "model": device_type.map(|dt| dt.to_string()).unwrap_or_else(|| "Aranet".to_string()),
+        });
+
+        // Helper to build a single sensor discovery message
+        let publish_sensor = |metric: &str,
+                              name_suffix: &str,
+                              unit: &str,
+                              device_class: Option<&str>,
+                              state_class: Option<&str>| {
+            let unique_id = format!("aranet_{}_{}", device_name, metric);
+            let sensor_name = format!("{} {}", display_name, name_suffix);
+            let state_topic = format!("{}/{}/{}", topic_prefix, device_name, metric);
+            let config_topic = format!("{}/sensor/{}_{}/config", prefix, device_name, metric);
+
+            let mut payload = serde_json::json!({
+                "name": sensor_name,
+                "unique_id": unique_id,
+                "state_topic": state_topic,
+                "unit_of_measurement": unit,
+                "device": device_json,
+            });
+
+            if let Some(dc) = device_class {
+                payload["device_class"] = serde_json::json!(dc);
+            }
+            if let Some(sc) = state_class {
+                payload["state_class"] = serde_json::json!(sc);
+            }
+
+            (config_topic, payload.to_string())
+        };
+
+        // Define sensors to register
+        let mut sensors = vec![];
+
+        if has_co2 {
+            sensors.push(publish_sensor(
+                "co2",
+                "CO\u{2082}",
+                "ppm",
+                Some("carbon_dioxide"),
+                Some("measurement"),
+            ));
+        }
+
+        if has_temp {
+            sensors.push(publish_sensor(
+                "temperature",
+                "Temperature",
+                "\u{00b0}C",
+                Some("temperature"),
+                Some("measurement"),
+            ));
+            sensors.push(publish_sensor(
+                "humidity",
+                "Humidity",
+                "%",
+                Some("humidity"),
+                Some("measurement"),
+            ));
+        }
+
+        if has_pressure {
+            sensors.push(publish_sensor(
+                "pressure",
+                "Pressure",
+                "hPa",
+                Some("atmospheric_pressure"),
+                Some("measurement"),
+            ));
+        }
+
+        sensors.push(publish_sensor(
+            "battery",
+            "Battery",
+            "%",
+            Some("battery"),
+            Some("measurement"),
+        ));
+
+        // Publish all discovery messages
+        for (config_topic, payload) in sensors {
+            client
+                .publish(&config_topic, qos, true, payload.as_bytes())
+                .await?;
+        }
+
+        info!("Published HA discovery for device: {}", display_name);
+    }
 
     Ok(())
 }

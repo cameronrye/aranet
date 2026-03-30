@@ -307,13 +307,13 @@ async fn test_mock_device_history_download() {
     assert_eq!(downloaded.len(), 10);
     assert_eq!(downloaded[0].co2, 800);
 
-    // Download with options (partial range)
-    let options = HistoryOptions::default().start_index(2).end_index(5);
+    // Download with options (partial range, 1-based inclusive)
+    let options = HistoryOptions::default().start_index(3).end_index(5);
     let partial = device
         .download_history_with_options(options)
         .await
         .expect("Partial download should succeed");
-    assert_eq!(partial.len(), 3); // indices 2, 3, 4
+    assert_eq!(partial.len(), 3); // 1-based indices 3, 4, 5
 }
 
 /// Test transient failure handling (simulates retry scenarios)
@@ -531,42 +531,33 @@ async fn test_multi_device_concurrent_reads() {
 /// Test device trait polymorphism with multiple device types
 #[tokio::test]
 async fn test_polymorphic_device_collection() {
-    // Create a collection of devices with different types (auto_connect=true by default in builder)
-    let devices: Vec<Box<dyn AranetDevice + Send + Sync>> = vec![
-        Box::new(
-            MockDeviceBuilder::new()
-                .name("Aranet4 Test")
-                .device_type(DeviceType::Aranet4)
-                .build(),
-        ),
-        Box::new(
-            MockDeviceBuilder::new()
-                .name("Radon Test")
-                .device_type(DeviceType::AranetRadon)
-                .build(),
-        ),
-        Box::new(
-            MockDeviceBuilder::new()
-                .name("Aranet2 Test")
-                .device_type(DeviceType::Aranet2)
-                .build(),
-        ),
-    ];
-
-    // Read from all devices through trait interface
-    for device in &devices {
+    // Test device trait with static dispatch for each device type
+    async fn check_device(device: &impl AranetDevice, expected_type: DeviceType) {
         let reading = device.read_current().await;
         assert!(
             reading.is_ok(),
             "Failed to read from {}",
             device.name().unwrap_or("unknown")
         );
+        assert_eq!(device.device_type(), Some(expected_type));
     }
 
-    // Verify device types
-    assert_eq!(devices[0].device_type(), Some(DeviceType::Aranet4));
-    assert_eq!(devices[1].device_type(), Some(DeviceType::AranetRadon));
-    assert_eq!(devices[2].device_type(), Some(DeviceType::Aranet2));
+    let d1 = MockDeviceBuilder::new()
+        .name("Aranet4 Test")
+        .device_type(DeviceType::Aranet4)
+        .build();
+    let d2 = MockDeviceBuilder::new()
+        .name("Radon Test")
+        .device_type(DeviceType::AranetRadon)
+        .build();
+    let d3 = MockDeviceBuilder::new()
+        .name("Aranet2 Test")
+        .device_type(DeviceType::Aranet2)
+        .build();
+
+    check_device(&d1, DeviceType::Aranet4).await;
+    check_device(&d2, DeviceType::AranetRadon).await;
+    check_device(&d3, DeviceType::Aranet2).await;
 }
 
 // =============================================================================

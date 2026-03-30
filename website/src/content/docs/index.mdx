@@ -116,7 +116,7 @@ import { Card, CardGrid, Badge, Tabs, TabItem, Aside } from '@astrojs/starlight/
     Subscribe to live sensor updates with auto-reconnection and configurable backoff strategies.
   </Card>
   <Card title="Comprehensive Tooling" icon="setting">
-    CLI for quick readings, TUI dashboard for monitoring, GUI app for desktop, and background service with REST API.
+    CLI for quick readings, sync/report workflows, TUI monitoring, GUI desktop use, and a background service with REST API, dashboard, MQTT, and webhooks.
   </Card>
 </CardGrid>
 
@@ -161,6 +161,14 @@ cargo install aranet-cli
 aranet --version
 ```
   </TabItem>
+  <TabItem label="Docker">
+```bash
+# Run aranet-service in a container
+docker compose up -d
+
+# Dashboard: http://localhost:8080/dashboard
+```
+  </TabItem>
   <TabItem label="Source">
 ```bash
 # Build from source
@@ -192,7 +200,7 @@ aranet scan
   <TabItem label="Read">
 ```bash
 # Read current sensor values
-aranet read AA:BB:CC:DD:EE:FF
+aranet read --device AA:BB:CC:DD:EE:FF
 
 # Output:
 # CO₂: 847 ppm (Green)
@@ -204,26 +212,26 @@ aranet read AA:BB:CC:DD:EE:FF
   <TabItem label="History">
 ```bash
 # Download measurement history
-aranet history AA:BB:CC:DD:EE:FF --output history.csv
+aranet history --device AA:BB:CC:DD:EE:FF --output history.csv
 
 # Filter by date range
-aranet history AA:BB:CC:DD:EE:FF --since 2026-01-15
+aranet history --device AA:BB:CC:DD:EE:FF --since 2026-01-15
 
 # Export as JSON
-aranet history AA:BB:CC:DD:EE:FF --format json
+aranet history --device AA:BB:CC:DD:EE:FF --format json
 ```
   </TabItem>
-  <TabItem label="Multi-Device">
+  <TabItem label="Cache & Report">
 ```bash
 # Setup device aliases for easy access
 aranet alias set living-room AA:BB:CC:DD:EE:FF
 aranet alias set bedroom 11:22:33:44:55:66
 
-# Read from multiple devices
-aranet read -d living-room -d bedroom
+# Sync every known device into the local cache
+aranet sync --all
 
-# Watch all aliased devices
-aranet watch --all
+# Generate a weekly summary from cached data
+aranet report --all --period weekly
 ```
   </TabItem>
 </Tabs>
@@ -305,7 +313,7 @@ import architectureSvg from '../../assets/architecture.svg';
     Terminal dashboard with sparklines, alerts, vim keys, multi-device monitoring.
   </Card>
   <Card title="aranet-service" icon="setting">
-    Background daemon with REST API, Prometheus metrics, MQTT publishing, WebSocket streaming.
+    Background daemon with REST API, web dashboard, Prometheus metrics, MQTT publishing, webhooks, InfluxDB export, mDNS discovery, and WebSocket streaming.
   </Card>
   <Card title="aranet-gui" icon="approve-check">
     Native desktop application with real-time monitoring, charts, and multi-device support.
@@ -318,4 +326,3 @@ import architectureSvg from '../../assets/architecture.svg';
   <p>Made with ❤️ by <a href="https://rye.dev/">Cameron Rye</a></p>
   <p class="disclaimer">This project is not affiliated with, endorsed by, or sponsored by Aranet or SAF Tehnika JSC. Aranet is a trademark of SAF Tehnika JSC.</p>
 </div>
-

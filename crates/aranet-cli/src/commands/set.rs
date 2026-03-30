@@ -76,7 +76,7 @@ pub async fn cmd_set(
     // Use connect_device_with_progress which has its own spinner
     let device = connect_device_with_progress(&identifier, timeout, !quiet).await?;
 
-    match setting {
+    let update_result = match setting {
         DeviceSetting::Interval { minutes } => {
             // Validation already done by clap parser
             let interval = MeasurementInterval::from_minutes(minutes).ok_or_else(|| {
@@ -89,6 +89,7 @@ pub async fn cmd_set(
             if !quiet {
                 println!("Measurement interval set to {} minute(s)", minutes);
             }
+            Ok(())
         }
         DeviceSetting::Range { range } => {
             let bt_range = match range {
@@ -99,6 +100,7 @@ pub async fn cmd_set(
             if !quiet {
                 println!("Bluetooth range set to {:?}", bt_range);
             }
+            Ok(())
         }
         DeviceSetting::SmartHome { enabled } => {
             device.set_smart_home(enabled).await?;
@@ -108,11 +110,9 @@ pub async fn cmd_set(
                     if enabled { "enabled" } else { "disabled" }
                 );
             }
+            Ok(())
         }
-    }
-
-    if let Err(e) = device.disconnect().await {
-        tracing::debug!("Failed to disconnect after set: {e}");
-    }
-    Ok(())
+    };
+    crate::util::disconnect_device(&device).await;
+    update_result
 }

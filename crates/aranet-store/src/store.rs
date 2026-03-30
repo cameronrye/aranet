@@ -36,7 +36,7 @@
 //! - **macOS**: `~/Library/Application Support/aranet/data.db`
 //! - **Windows**: `C:\Users\<user>\AppData\Local\aranet\data.db`
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension};
 use time::OffsetDateTime;
@@ -46,17 +46,40 @@ use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord, Status
 
 /// Safely convert a Unix timestamp to OffsetDateTime.
 ///
-/// Returns UNIX_EPOCH if the timestamp is invalid (corrupted database data).
-/// Callers should be aware that UNIX_EPOCH indicates a corrupted value.
+/// Returns UNIX_EPOCH as a sentinel for clearly invalid timestamps (zero,
+/// negative, or out of range). Downstream code can check for epoch
+/// timestamps to detect corrupt rows. A warning is always logged for
+/// invalid values to aid in database integrity diagnosis.
 fn timestamp_from_unix(ts: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(ts).unwrap_or_else(|_| {
-        warn!(
-            "Corrupted timestamp {} in database, substituting UNIX_EPOCH. \
-             Consider running a database integrity check.",
-            ts
-        );
-        OffsetDateTime::UNIX_EPOCH
-    })
+    match OffsetDateTime::from_unix_timestamp(ts) {
+        Ok(dt) if ts > 0 => dt,
+        Ok(_) => {
+            warn!(
+                "Unexpected zero/negative timestamp {ts} in database, \
+                 returning epoch sentinel. Run 'aranet cache check' to inspect database integrity."
+            );
+            OffsetDateTime::UNIX_EPOCH
+        }
+        Err(_) => {
+            warn!(
+                "Corrupted timestamp {ts} in database (out of representable range), \
+                 returning epoch sentinel. Run 'aranet cache check' to inspect database integrity."
+            );
+            OffsetDateTime::UNIX_EPOCH
+        }
+    }
+}
+
+/// Convert an `i64` from the database to a `u32` radon value, logging a
+/// warning if the value is negative instead of silently dropping it.
+fn radon_from_i64(v: i64, context: &str) -> Option<u32> {
+    match u32::try_from(v) {
+        Ok(val) => Some(val),
+        Err(_) => {
+            warn!("Invalid radon value {v} in {context} (expected non-negative u32)");
+            None
+        }
+    }
 }
 
 use crate::error::{Error, Result};
@@ -115,6 +138,7 @@ use crate::schema;
 /// ```
 pub struct Store {
     conn: Connection,
+    path: Option<PathBuf>,
 }
 
 impl Store {
@@ -138,17 +162,15 @@ impl Store {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
-        // Create parent directories if needed
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
+        // Create parent directories if needed (create_dir_all is idempotent)
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::CreateDirectory {
                 path: parent.to_path_buf(),
                 source: e,
             })?;
         }
 
-        info!("Opening database at {}", path.display());
+        debug!("Opening database at {}", path.display());
         let conn = Connection::open(path)?;
 
         // Enable foreign keys and WAL mode for better performance
@@ -161,7 +183,10 @@ impl Store {
         // Initialize schema
         schema::initialize(&conn)?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        })
     }
 
     /// Open the database at the platform-specific default location.
@@ -201,7 +226,14 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::initialize(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: None })
+    }
+
+    /// Return the database path for file-backed stores.
+    ///
+    /// In-memory stores return `None`.
+    pub fn database_path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     // === Device operations ===
@@ -436,6 +468,36 @@ impl Store {
 
         Ok(rows_deleted > 0)
     }
+
+    /// Delete history records older than the given timestamp.
+    ///
+    /// Returns the number of records deleted.
+    pub fn prune_history(&self, older_than: OffsetDateTime) -> Result<u64> {
+        let ts = older_than.unix_timestamp();
+        let deleted = self.conn.execute(
+            "DELETE FROM history WHERE timestamp < ?1",
+            rusqlite::params![ts],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    /// Delete readings older than the given timestamp.
+    ///
+    /// Returns the number of records deleted.
+    pub fn prune_readings(&self, older_than: OffsetDateTime) -> Result<u64> {
+        let ts = older_than.unix_timestamp();
+        let deleted = self.conn.execute(
+            "DELETE FROM readings WHERE captured_at < ?1",
+            rusqlite::params![ts],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    /// Reclaim unused disk space after deletions.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
+    }
 }
 
 fn parse_device_type(s: &str) -> Option<DeviceType> {
@@ -454,7 +516,10 @@ fn parse_status(s: &str) -> Status {
         "Yellow" => Status::Yellow,
         "Red" => Status::Red,
         "Error" => Status::Error,
-        _ => Status::Green,
+        _ => {
+            tracing::warn!("Unknown status value '{}', defaulting to Error", s);
+            Status::Error
+        }
     }
 }
 
@@ -505,8 +570,9 @@ impl Store {
 
         self.conn.execute(
             "INSERT INTO readings (device_id, captured_at, co2, temperature, pressure,
-             humidity, battery, status, radon, radiation_rate, radiation_total)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             humidity, battery, status, radon, radiation_rate, radiation_total,
+             radon_avg_24h, radon_avg_7d, radon_avg_30d)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 device_id,
                 captured_at,
@@ -519,6 +585,9 @@ impl Store {
                 reading.radon,
                 reading.radiation_rate,
                 reading.radiation_total,
+                reading.radon_avg_24h,
+                reading.radon_avg_7d,
+                reading.radon_avg_30d,
             ],
         )?;
 
@@ -570,15 +639,35 @@ impl Store {
                     id: row.get(0)?,
                     device_id: row.get(1)?,
                     captured_at: timestamp_from_unix(row.get(2)?),
-                    co2: row.get::<_, i64>(3)? as u16,
+                    co2: u16::try_from(row.get::<_, i64>(3)?).unwrap_or_else(|e| {
+                        warn!("Invalid co2 value in database: {e}");
+                        0
+                    }),
                     temperature: row.get(4)?,
                     pressure: row.get(5)?,
-                    humidity: row.get::<_, i64>(6)? as u8,
-                    battery: row.get::<_, i64>(7)? as u8,
+                    humidity: u8::try_from(row.get::<_, i64>(6)?).unwrap_or_else(|e| {
+                        warn!("Invalid humidity value in database: {e}");
+                        0
+                    }),
+                    battery: u8::try_from(row.get::<_, i64>(7)?).unwrap_or_else(|e| {
+                        warn!("Invalid battery value in database: {e}");
+                        0
+                    }),
                     status: parse_status(&row.get::<_, String>(8)?),
-                    radon: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                    radon: row
+                        .get::<_, Option<i64>>(9)?
+                        .and_then(|v| radon_from_i64(v, "readings")),
                     radiation_rate: row.get(10)?,
                     radiation_total: row.get(11)?,
+                    radon_avg_24h: row
+                        .get::<_, Option<i64>>(12)?
+                        .and_then(|v| radon_from_i64(v, "readings")),
+                    radon_avg_7d: row
+                        .get::<_, Option<i64>>(13)?
+                        .and_then(|v| radon_from_i64(v, "readings")),
+                    radon_avg_30d: row
+                        .get::<_, Option<i64>>(14)?
+                        .and_then(|v| radon_from_i64(v, "readings")),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -614,6 +703,74 @@ impl Store {
         let query = ReadingQuery::new().device(device_id).limit(1);
         let mut readings = self.query_readings(&query)?;
         Ok(readings.pop())
+    }
+
+    /// List each device together with its latest stored reading.
+    ///
+    /// Devices without readings are omitted. Results are ordered by device
+    /// `last_seen` descending to match [`Store::list_devices`].
+    pub fn list_latest_readings(&self) -> Result<Vec<(StoredDevice, StoredReading)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                d.id, d.name, d.device_type, d.serial, d.firmware, d.hardware, d.first_seen, d.last_seen,
+                r.id, r.device_id, r.captured_at, r.co2, r.temperature, r.pressure, r.humidity, r.battery,
+                r.status, r.radon, r.radiation_rate, r.radiation_total, r.radon_avg_24h, r.radon_avg_7d, r.radon_avg_30d
+             FROM devices d
+             JOIN readings r ON r.id = (
+                SELECT latest.id
+                FROM readings latest
+                WHERE latest.device_id = d.id
+                ORDER BY latest.captured_at DESC, latest.id DESC
+                LIMIT 1
+             )
+             ORDER BY d.last_seen DESC",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let device = StoredDevice {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    device_type: row
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|s| parse_device_type(&s)),
+                    serial: row.get(3)?,
+                    firmware: row.get(4)?,
+                    hardware: row.get(5)?,
+                    first_seen: timestamp_from_unix(row.get(6)?),
+                    last_seen: timestamp_from_unix(row.get(7)?),
+                };
+                let reading = StoredReading {
+                    id: row.get(8)?,
+                    device_id: row.get(9)?,
+                    captured_at: timestamp_from_unix(row.get(10)?),
+                    co2: u16::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                    temperature: row.get(12)?,
+                    pressure: row.get(13)?,
+                    humidity: u8::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
+                    battery: u8::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
+                    status: parse_status(&row.get::<_, String>(16)?),
+                    radon: row
+                        .get::<_, Option<i64>>(17)?
+                        .and_then(|v| radon_from_i64(v, "latest_readings")),
+                    radiation_rate: row.get(18)?,
+                    radiation_total: row.get(19)?,
+                    radon_avg_24h: row
+                        .get::<_, Option<i64>>(20)?
+                        .and_then(|v| radon_from_i64(v, "latest_readings")),
+                    radon_avg_7d: row
+                        .get::<_, Option<i64>>(21)?
+                        .and_then(|v| radon_from_i64(v, "latest_readings")),
+                    radon_avg_30d: row
+                        .get::<_, Option<i64>>(22)?
+                        .and_then(|v| radon_from_i64(v, "latest_readings")),
+                };
+
+                Ok((device, reading))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(rows)
     }
 
     /// Count total readings, optionally filtered by device.
@@ -700,11 +857,12 @@ impl Store {
         // Ensure device exists
         self.upsert_device(device_id, None)?;
 
+        let tx = self.conn.unchecked_transaction()?;
         let synced_at = OffsetDateTime::now_utc().unix_timestamp();
         let mut inserted = 0;
 
         for record in records {
-            let result = self.conn.execute(
+            let result = tx.execute(
                 "INSERT OR IGNORE INTO history (device_id, timestamp, synced_at, co2,
                  temperature, pressure, humidity, radon, radiation_rate, radiation_total)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -724,10 +882,20 @@ impl Store {
             inserted += result;
         }
 
-        info!(
-            "Inserted {} new history records for {}",
-            inserted, device_id
-        );
+        tx.commit()?;
+
+        let skipped = records.len() - inserted;
+        if skipped > 0 {
+            info!(
+                "Inserted {} new history records for {} ({} duplicates skipped)",
+                inserted, device_id, skipped
+            );
+        } else {
+            info!(
+                "Inserted {} new history records for {}",
+                inserted, device_id
+            );
+        }
         Ok(inserted)
     }
 
@@ -759,47 +927,8 @@ impl Store {
     /// # Ok::<(), aranet_store::Error>(())
     /// ```
     pub fn query_history(&self, query: &HistoryQuery) -> Result<Vec<StoredHistoryRecord>> {
-        let mut conditions = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if let Some(ref device_id) = query.device_id {
-            conditions.push("device_id = ?");
-            params.push(Box::new(device_id.clone()));
-        }
-
-        if let Some(since) = query.since {
-            conditions.push("timestamp >= ?");
-            params.push(Box::new(since.unix_timestamp()));
-        }
-
-        if let Some(until) = query.until {
-            conditions.push("timestamp <= ?");
-            params.push(Box::new(until.unix_timestamp()));
-        }
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-
-        let order = if query.newest_first { "DESC" } else { "ASC" };
-
-        let mut sql = format!(
-            "SELECT id, device_id, timestamp, synced_at, co2, temperature, pressure,
-             humidity, radon, radiation_rate, radiation_total
-             FROM history {} ORDER BY timestamp {}",
-            where_clause, order
-        );
-
-        if let Some(limit) = query.limit {
-            sql.push_str(&format!(" LIMIT {}", limit));
-        }
-
-        if let Some(offset) = query.offset {
-            sql.push_str(&format!(" OFFSET {}", offset));
-        }
-
+        let sql = query.build_sql();
+        let (_, params) = query.build_where();
         let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -810,11 +939,19 @@ impl Store {
                     device_id: row.get(1)?,
                     timestamp: timestamp_from_unix(row.get(2)?),
                     synced_at: timestamp_from_unix(row.get(3)?),
-                    co2: row.get::<_, i64>(4)? as u16,
+                    co2: u16::try_from(row.get::<_, i64>(4)?).unwrap_or_else(|e| {
+                        warn!("Invalid co2 value in history: {e}");
+                        0
+                    }),
                     temperature: row.get(5)?,
                     pressure: row.get(6)?,
-                    humidity: row.get::<_, i64>(7)? as u8,
-                    radon: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+                    humidity: u8::try_from(row.get::<_, i64>(7)?).unwrap_or_else(|e| {
+                        warn!("Invalid humidity value in history: {e}");
+                        0
+                    }),
+                    radon: row
+                        .get::<_, Option<i64>>(8)?
+                        .and_then(|v| radon_from_i64(v, "history")),
                     radiation_rate: row.get(9)?,
                     radiation_total: row.get(10)?,
                 })
@@ -899,8 +1036,12 @@ impl Store {
             .query_row([device_id], |row| {
                 Ok(SyncState {
                     device_id: row.get(0)?,
-                    last_history_index: row.get::<_, Option<i64>>(1)?.map(|v| v as u16),
-                    total_readings: row.get::<_, Option<i64>>(2)?.map(|v| v as u16),
+                    last_history_index: row
+                        .get::<_, Option<i64>>(1)?
+                        .and_then(|v| u16::try_from(v).ok()),
+                    total_readings: row
+                        .get::<_, Option<i64>>(2)?
+                        .and_then(|v| u16::try_from(v).ok()),
                     last_sync_at: row.get::<_, Option<i64>>(3)?.map(timestamp_from_unix),
                 })
             })
@@ -1007,7 +1148,7 @@ impl Store {
 
                             // Recent sync and no indication of wrap-around
                             debug!("No new readings for {}", device_id);
-                            Ok(current_total + 1)
+                            Ok(current_total.saturating_add(1))
                         }
                         None => {
                             // Sync state exists but no history records - cache was likely cleared
@@ -1027,7 +1168,10 @@ impl Store {
             }
             Some(s) if s.last_history_index.is_some() => {
                 // We have previous state, calculate new records
-                let last_index = s.last_history_index.unwrap();
+                let last_index = match s.last_history_index {
+                    Some(idx) => idx,
+                    None => unreachable!("guarded by is_some() in match arm"),
+                };
                 let prev_total = s.total_readings.unwrap_or(0);
 
                 // Check if device was reset (current_total < prev_total)
@@ -1061,7 +1205,7 @@ impl Store {
                     );
                     Ok(start)
                 } else {
-                    Ok(current_total + 1)
+                    Ok(current_total.saturating_add(1))
                 }
             }
             _ => {
@@ -1266,33 +1410,96 @@ impl Store {
     /// # Ok::<(), aranet_store::Error>(())
     /// ```
     pub fn export_history_csv(&self, query: &HistoryQuery) -> Result<String> {
-        let records = self.query_history(query)?;
-        let mut output = String::new();
+        let sql = query.build_sql_with_select(
+            "SELECT timestamp, device_id, co2, temperature, pressure, humidity, radon, \
+             radiation_rate, radiation_total FROM history",
+        );
+        let (_, params) = query.build_where();
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut wtr = csv::Writer::from_writer(Vec::new());
 
         // Header
-        output.push_str("timestamp,device_id,co2,temperature,pressure,humidity,radon\n");
+        wtr.write_record([
+            "timestamp",
+            "device_id",
+            "co2",
+            "temperature",
+            "pressure",
+            "humidity",
+            "radon",
+            "radiation_rate",
+            "radiation_total",
+        ])
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok((
+                timestamp_from_unix(row.get(0)?),
+                row.get::<_, String>(1)?,
+                u16::try_from(row.get::<_, i64>(2)?).unwrap_or_else(|e| {
+                    warn!("Invalid co2 value in export row: {e}");
+                    0
+                }),
+                row.get::<_, f32>(3)?,
+                row.get::<_, f32>(4)?,
+                u8::try_from(row.get::<_, i64>(5)?).unwrap_or_else(|e| {
+                    warn!("Invalid humidity value in export row: {e}");
+                    0
+                }),
+                row.get::<_, Option<i64>>(6)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                row.get::<_, Option<f64>>(7)?,
+                row.get::<_, Option<f64>>(8)?,
+            ))
+        })?;
 
         // Data rows
-        for record in records {
-            let timestamp = record
-                .timestamp
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default();
-            let radon = record.radon.map(|r| r.to_string()).unwrap_or_default();
-
-            output.push_str(&format!(
-                "{},{},{},{:.1},{:.2},{},{}\n",
+        for row in rows {
+            let (
                 timestamp,
-                record.device_id,
-                record.co2,
-                record.temperature,
-                record.pressure,
-                record.humidity,
-                radon
-            ));
+                device_id,
+                co2,
+                temperature,
+                pressure,
+                humidity,
+                radon,
+                radiation_rate,
+                radiation_total,
+            ) = row?;
+            let timestamp = match timestamp.format(&time::format_description::well_known::Rfc3339) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    warn!("Skipping CSV row with unformattable timestamp: {e}");
+                    continue;
+                }
+            };
+            let radon = radon.map(|r| r.to_string()).unwrap_or_default();
+            let radiation_rate = radiation_rate
+                .map(|r| format!("{:.4}", r))
+                .unwrap_or_default();
+            let radiation_total = radiation_total
+                .map(|r| format!("{:.4}", r))
+                .unwrap_or_default();
+
+            wtr.write_record(&[
+                timestamp,
+                device_id,
+                co2.to_string(),
+                format!("{:.1}", temperature),
+                format!("{:.2}", pressure),
+                humidity.to_string(),
+                radon,
+                radiation_rate,
+                radiation_total,
+            ])
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         }
 
-        Ok(output)
+        let bytes = wtr
+            .into_inner()
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        String::from_utf8(bytes).map_err(|e| Error::Io(std::io::Error::other(e)))
     }
 
     /// Export history records to JSON format.
@@ -1317,9 +1524,56 @@ impl Store {
     /// # Ok::<(), aranet_store::Error>(())
     /// ```
     pub fn export_history_json(&self, query: &HistoryQuery) -> Result<String> {
-        let records = self.query_history(query)?;
-        let json = serde_json::to_string_pretty(&records)
-            .map_err(|e| Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        let sql = query.build_sql();
+        let (_, params) = query.build_where();
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok(StoredHistoryRecord {
+                id: row.get(0)?,
+                device_id: row.get(1)?,
+                timestamp: timestamp_from_unix(row.get(2)?),
+                synced_at: timestamp_from_unix(row.get(3)?),
+                co2: u16::try_from(row.get::<_, i64>(4)?).unwrap_or_else(|e| {
+                    warn!("Invalid co2 value in JSON export: {e}");
+                    0
+                }),
+                temperature: row.get(5)?,
+                pressure: row.get(6)?,
+                humidity: u8::try_from(row.get::<_, i64>(7)?).unwrap_or_else(|e| {
+                    warn!("Invalid humidity value in JSON export: {e}");
+                    0
+                }),
+                radon: row
+                    .get::<_, Option<i64>>(8)?
+                    .and_then(|v| radon_from_i64(v, "json_export")),
+                radiation_rate: row.get(9)?,
+                radiation_total: row.get(10)?,
+            })
+        })?;
+
+        let mut json = String::from("[");
+        let mut first = true;
+
+        for row in rows {
+            let record = row?;
+            let record_json = serde_json::to_string_pretty(&record)?;
+            if first {
+                json.push('\n');
+                first = false;
+            } else {
+                json.push_str(",\n");
+            }
+
+            for line in record_json.lines() {
+                json.push_str("  ");
+                json.push_str(line);
+                json.push('\n');
+            }
+        }
+
+        json.push(']');
+
         Ok(json)
     }
 
@@ -1343,9 +1597,8 @@ impl Store {
         let mut imported = 0;
         let mut skipped = 0;
         let mut errors = Vec::new();
-
-        // Track devices we've already upserted to avoid N+1 queries
-        let mut upserted_devices = std::collections::HashSet::new();
+        let mut device_records: std::collections::HashMap<String, Vec<HistoryRecord>> =
+            std::collections::HashMap::new();
 
         for (line_num, result) in reader.records().enumerate() {
             total += 1;
@@ -1376,6 +1629,12 @@ impl Store {
                 continue;
             }
 
+            if timestamp_str.is_empty() {
+                errors.push(format!("Line {}: missing timestamp", line));
+                skipped += 1;
+                continue;
+            }
+
             // Parse timestamp
             let timestamp = match OffsetDateTime::parse(
                 timestamp_str,
@@ -1393,8 +1652,10 @@ impl Store {
             };
 
             // Parse numeric fields with defaults and validation
-            let co2: u16 = match co2_str.parse::<u16>() {
-                Ok(v) if v <= 10000 => v, // CO2 sensor max is typically 10000 ppm
+            // Parse as u32 first so values > u16::MAX (65535) produce a clear
+            // "exceeds maximum" message instead of a generic parse error.
+            let co2: u16 = match co2_str.parse::<u32>() {
+                Ok(v) if v <= 10000 => v as u16, // CO2 sensor max is typically 10000 ppm
                 Ok(v) => {
                     errors.push(format!(
                         "Line {}: CO2 value {} exceeds maximum of 10000 ppm",
@@ -1510,15 +1771,18 @@ impl Store {
                 radiation_total: None,
             };
 
-            // Ensure device exists (only once per unique device_id)
-            if upserted_devices.insert(device_id.to_string()) {
-                self.upsert_device(device_id, None)?;
-            }
-            let count = self.insert_history(device_id, &[history_record])?;
+            device_records
+                .entry(device_id.to_string())
+                .or_default()
+                .push(history_record);
+        }
+
+        for (device_id, records) in device_records {
+            self.upsert_device(&device_id, None)?;
+            let total_records = records.len();
+            let count = self.insert_history(&device_id, &records)?;
             imported += count;
-            if count == 0 {
-                skipped += 1; // Duplicate record
-            }
+            skipped += total_records.saturating_sub(count);
         }
 
         Ok(ImportResult {
@@ -1535,29 +1799,28 @@ impl Store {
     ///
     /// Returns the number of records imported (deduplicated by device_id + timestamp).
     pub fn import_history_json(&self, json_data: &str) -> Result<ImportResult> {
-        let records: Vec<StoredHistoryRecord> = serde_json::from_str(json_data)
-            .map_err(|e| Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        let records: Vec<StoredHistoryRecord> = serde_json::from_str(json_data)?;
 
         let total = records.len();
         let mut imported = 0;
         let mut skipped = 0;
-
-        // Track devices we've already upserted to avoid N+1 queries
-        let mut upserted_devices = std::collections::HashSet::new();
+        let mut device_records: std::collections::HashMap<String, Vec<HistoryRecord>> =
+            std::collections::HashMap::new();
 
         for record in records {
-            // Convert to HistoryRecord
-            let history_record = record.to_history();
+            let device_id = record.device_id.clone();
+            device_records
+                .entry(device_id)
+                .or_default()
+                .push(record.to_history());
+        }
 
-            // Ensure device exists (only once per unique device_id)
-            if upserted_devices.insert(record.device_id.clone()) {
-                self.upsert_device(&record.device_id, None)?;
-            }
-            let count = self.insert_history(&record.device_id, &[history_record])?;
+        for (device_id, records) in device_records {
+            self.upsert_device(&device_id, None)?;
+            let total_records = records.len();
+            let count = self.insert_history(&device_id, &records)?;
             imported += count;
-            if count == 0 {
-                skipped += 1; // Duplicate record
-            }
+            skipped += total_records.saturating_sub(count);
         }
 
         Ok(ImportResult {
@@ -1658,6 +1921,39 @@ mod tests {
 
         let latest = store.get_latest_reading("test-device").unwrap().unwrap();
         assert_eq!(latest.co2, 900);
+    }
+
+    #[test]
+    fn test_list_latest_readings_returns_one_row_per_device() {
+        let store = Store::open_in_memory().unwrap();
+
+        let mut alpha_old = create_test_reading();
+        alpha_old.co2 = 700;
+        alpha_old.captured_at = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+        store.insert_reading("alpha", &alpha_old).unwrap();
+
+        let mut alpha_new = create_test_reading();
+        alpha_new.co2 = 900;
+        alpha_new.captured_at = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2));
+        store.insert_reading("alpha", &alpha_new).unwrap();
+
+        let mut beta = create_test_reading();
+        beta.co2 = 500;
+        beta.captured_at = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(3));
+        store.insert_reading("beta", &beta).unwrap();
+
+        store.upsert_device("gamma", Some("No Reading")).unwrap();
+
+        let latest = store.list_latest_readings().unwrap();
+
+        assert_eq!(latest.len(), 2);
+        let latest_by_device: std::collections::HashMap<_, _> = latest
+            .into_iter()
+            .map(|(device, reading)| (device.id, reading.co2))
+            .collect();
+        assert_eq!(latest_by_device.get("alpha"), Some(&900));
+        assert_eq!(latest_by_device.get("beta"), Some(&500));
+        assert!(!latest_by_device.contains_key("gamma"));
     }
 
     #[test]
@@ -2188,7 +2484,7 @@ invalid-timestamp,test-device,800,22.5,1013.25,45,
         let query = HistoryQuery::new();
         let csv = store.export_history_csv(&query).unwrap();
 
-        assert!(csv.starts_with("timestamp,device_id,co2,temperature,pressure,humidity,radon\n"));
+        assert!(csv.starts_with("timestamp,device_id,co2,temperature,pressure,humidity,radon,radiation_rate,radiation_total\n"));
         // Only header, no data
         assert_eq!(csv.lines().count(), 1);
     }

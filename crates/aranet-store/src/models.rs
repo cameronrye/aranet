@@ -96,21 +96,19 @@ pub struct StoredReading {
     pub radiation_rate: Option<f32>,
     /// Total radiation dose in mSv for radiation devices.
     pub radiation_total: Option<f64>,
+    /// 24-hour average radon concentration in Bq/m³ (radon devices only).
+    pub radon_avg_24h: Option<u32>,
+    /// 7-day average radon concentration in Bq/m³ (radon devices only).
+    pub radon_avg_7d: Option<u32>,
+    /// 30-day average radon concentration in Bq/m³ (radon devices only).
+    pub radon_avg_30d: Option<u32>,
 }
 
 impl StoredReading {
-    /// Create a `StoredReading` from an `aranet_types::CurrentReading`.
-    ///
-    /// The database `id` is set to 0 and will be assigned by SQLite on insert.
-    /// If `captured_at` is `None` in the source reading, the current time is used.
-    ///
-    /// # Arguments
-    ///
-    /// * `device_id` - The device identifier this reading came from
-    /// * `reading` - The source reading from `aranet-types`
-    pub fn from_reading(device_id: &str, reading: &CurrentReading) -> Self {
+    /// Create a `StoredReading` from an `aranet_types::CurrentReading` with an explicit row ID.
+    pub fn from_reading_with_id(device_id: &str, reading: &CurrentReading, id: i64) -> Self {
         Self {
-            id: 0, // Will be set by database
+            id,
             device_id: device_id.to_string(),
             captured_at: reading.captured_at.unwrap_or_else(OffsetDateTime::now_utc),
             co2: reading.co2,
@@ -122,14 +120,29 @@ impl StoredReading {
             radon: reading.radon,
             radiation_rate: reading.radiation_rate,
             radiation_total: reading.radiation_total,
+            radon_avg_24h: reading.radon_avg_24h,
+            radon_avg_7d: reading.radon_avg_7d,
+            radon_avg_30d: reading.radon_avg_30d,
         }
+    }
+
+    /// Create a `StoredReading` from an `aranet_types::CurrentReading`.
+    ///
+    /// The database `id` is set to 0 and will be assigned by SQLite on insert.
+    /// If `captured_at` is `None` in the source reading, the current time is used.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_id` - The device identifier this reading came from
+    /// * `reading` - The source reading from `aranet-types`
+    pub fn from_reading(device_id: &str, reading: &CurrentReading) -> Self {
+        Self::from_reading_with_id(device_id, reading, 0)
     }
 
     /// Convert back to an `aranet_types::CurrentReading`.
     ///
     /// Note: Some fields are not preserved in storage:
     /// - `interval` and `age` are set to 0
-    /// - `radon_avg_*` fields are set to `None`
     ///
     /// Use this when you need to pass stored data to functions expecting `CurrentReading`.
     pub fn to_reading(&self) -> CurrentReading {
@@ -146,9 +159,9 @@ impl StoredReading {
             radon: self.radon,
             radiation_rate: self.radiation_rate,
             radiation_total: self.radiation_total,
-            radon_avg_24h: None,
-            radon_avg_7d: None,
-            radon_avg_30d: None,
+            radon_avg_24h: self.radon_avg_24h,
+            radon_avg_7d: self.radon_avg_7d,
+            radon_avg_30d: self.radon_avg_30d,
         }
     }
 }
@@ -427,9 +440,6 @@ mod tests {
         // These fields are lost in storage but should have defaults
         assert_eq!(converted.interval, 0);
         assert_eq!(converted.age, 0);
-        assert!(converted.radon_avg_24h.is_none());
-        assert!(converted.radon_avg_7d.is_none());
-        assert!(converted.radon_avg_30d.is_none());
     }
 
     #[test]
@@ -439,8 +449,9 @@ mod tests {
         let converted = stored.to_reading();
 
         assert_eq!(converted.radon, Some(150));
-        // Note: radon averages are NOT preserved in storage
-        assert!(converted.radon_avg_24h.is_none());
+        assert_eq!(converted.radon_avg_24h, Some(145));
+        assert_eq!(converted.radon_avg_7d, Some(140));
+        assert_eq!(converted.radon_avg_30d, Some(138));
     }
 
     #[test]

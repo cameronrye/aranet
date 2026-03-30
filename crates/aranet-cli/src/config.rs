@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -153,6 +153,10 @@ pub struct GuiConfig {
     #[serde(default = "default_service_url")]
     pub service_url: String,
 
+    /// Optional API key for authenticated aranet-service deployments.
+    #[serde(default)]
+    pub service_api_key: Option<String>,
+
     /// Show CO2 readings in dashboard.
     #[serde(default = "default_true")]
     pub show_co2: bool,
@@ -234,6 +238,7 @@ impl Default for GuiConfig {
             default_export_format: default_export_format(),
             export_directory: String::new(),
             service_url: default_service_url(),
+            service_api_key: None,
             show_co2: true,
             show_temperature: true,
             show_humidity: true,
@@ -289,23 +294,49 @@ impl Config {
             .join("config.toml")
     }
 
-    /// Load config from file, or return default if not found
-    pub fn load() -> Self {
-        let path = Self::path();
-        if path.exists() {
-            match fs::read_to_string(&path) {
-                Ok(content) => match toml::from_str(&content) {
-                    Ok(config) => return config,
-                    Err(e) => {
-                        tracing::warn!("Failed to parse config file: {}", e);
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("Failed to read config file: {}", e);
-                }
+    /// Load config from the default path.
+    ///
+    /// Returns an error if the file exists but cannot be read or parsed.
+    pub fn load() -> Result<Self> {
+        Self::load_from_path(&Self::path())
+    }
+
+    /// Load config from the default path, returning defaults when the file is absent.
+    ///
+    /// Returns an error if the file exists but cannot be read or parsed.
+    pub fn load_or_default() -> Result<Self> {
+        Self::load_from_path_or_default(&Self::path())
+    }
+
+    /// Load config from an explicit path.
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    }
+
+    /// Load config from an explicit path, returning defaults when the file is absent.
+    pub fn load_from_path_or_default(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        Self::load_from_path(path)
+    }
+
+    /// Load config from the default path, logging a warning and falling back to defaults on error.
+    ///
+    /// This helper is for non-fatal UI paths that should remain usable while still surfacing
+    /// broken config files in the logs.
+    pub fn load_or_default_logged() -> Self {
+        match Self::load_or_default() {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!("Failed to load config file: {err:#}");
+                Self::default()
             }
         }
-        Self::default()
     }
 
     /// Save config to file
@@ -321,17 +352,6 @@ impl Config {
             .with_context(|| format!("Failed to write config: {}", path.display()))?;
         Ok(())
     }
-}
-
-/// Resolve device from arg, env var, or config.
-/// Also resolves aliases: if the device matches an alias name, returns the address.
-/// Falls back to last_device if no default device is set.
-#[allow(dead_code)]
-pub fn resolve_device(device: Option<String>, config: &Config) -> Option<String> {
-    device
-        .map(|d| resolve_alias(&d, config))
-        .or_else(|| config.device.clone())
-        .or_else(|| config.last_device.clone())
 }
 
 /// Resolve multiple devices, applying alias resolution to each.
@@ -386,7 +406,7 @@ pub fn print_device_source_feedback(device: &str, source: Option<&str>, quiet: b
 /// Update the last connected device in config.
 /// This is called after a successful connection.
 pub fn update_last_device(identifier: &str, name: Option<&str>) -> Result<()> {
-    let mut config = Config::load();
+    let mut config = Config::load_or_default()?;
     config.last_device = Some(identifier.to_string());
     config.last_device_name = name.map(|n| n.to_string());
     config.save()
@@ -431,47 +451,15 @@ fn get_first_known_device() -> Option<String> {
     devices.first().map(|d| d.id.clone())
 }
 
-/// Resolve timeout: use provided value, fall back to config, then default
-pub fn resolve_timeout(cmd_timeout: u64, config: &Config, default: u64) -> u64 {
-    // If the command timeout differs from clap's default, use it
-    // Otherwise, check config, then fall back to the provided default
-    if cmd_timeout != default {
-        cmd_timeout
-    } else {
-        config.timeout.unwrap_or(default)
-    }
+/// Resolve timeout: use provided value, fall back to config, then default.
+pub fn resolve_timeout(cmd_timeout: Option<u64>, config: &Config, default: u64) -> u64 {
+    cmd_timeout.or(config.timeout).unwrap_or(default)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_resolve_device_prefers_arg() {
-        let config = Config {
-            device: Some("config-device".to_string()),
-            ..Default::default()
-        };
-        let result = resolve_device(Some("arg-device".to_string()), &config);
-        assert_eq!(result, Some("arg-device".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_device_falls_back_to_config() {
-        let config = Config {
-            device: Some("config-device".to_string()),
-            ..Default::default()
-        };
-        let result = resolve_device(None, &config);
-        assert_eq!(result, Some("config-device".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_device_none_when_both_empty() {
-        let config = Config::default();
-        let result = resolve_device(None, &config);
-        assert_eq!(result, None);
-    }
+    use tempfile::tempdir;
 
     #[test]
     fn test_resolve_timeout_uses_explicit_value() {
@@ -479,27 +467,24 @@ mod tests {
             timeout: Some(60),
             ..Default::default()
         };
-        // Explicit value differs from default, so use it
-        let result = resolve_timeout(45, &config, 30);
+        let result = resolve_timeout(Some(45), &config, 30);
         assert_eq!(result, 45);
     }
 
     #[test]
-    fn test_resolve_timeout_uses_config_when_default() {
+    fn test_resolve_timeout_uses_config_when_missing() {
         let config = Config {
             timeout: Some(60),
             ..Default::default()
         };
-        // Value equals default, so use config
-        let result = resolve_timeout(30, &config, 30);
+        let result = resolve_timeout(None, &config, 30);
         assert_eq!(result, 60);
     }
 
     #[test]
     fn test_resolve_timeout_uses_default_when_no_config() {
         let config = Config::default();
-        // Value equals default and no config, so use default
-        let result = resolve_timeout(30, &config, 30);
+        let result = resolve_timeout(None, &config, 30);
         assert_eq!(result, 30);
     }
 
@@ -519,6 +504,51 @@ mod tests {
         assert!(config.behavior.auto_sync);
         assert!(config.behavior.remember_devices);
         assert!(config.behavior.load_cache);
+    }
+
+    #[test]
+    fn test_load_from_path_or_default_returns_default_when_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+
+        let config = Config::load_from_path_or_default(&path).unwrap();
+        assert!(config.device.is_none());
+        assert!(config.aliases.is_empty());
+    }
+
+    #[test]
+    fn test_load_from_path_reports_parse_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "device = [").unwrap();
+
+        let err = Config::load_from_path(&path).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse config file"));
+    }
+
+    #[test]
+    fn test_load_from_path_reads_valid_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+device = "Aranet4 12345"
+fahrenheit = true
+
+[aliases]
+office = "Aranet4 12345"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.device.as_deref(), Some("Aranet4 12345"));
+        assert!(config.fahrenheit);
+        assert_eq!(
+            config.aliases.get("office").map(String::as_str),
+            Some("Aranet4 12345")
+        );
     }
 
     #[test]

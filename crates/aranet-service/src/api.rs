@@ -34,6 +34,7 @@
 //! let app = api::router().with_state(state);
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -46,8 +47,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::collector::Collector;
+use crate::collector::{Collector, CollectorStartResult};
 use crate::config::DeviceConfig;
+use crate::state::CollectorState;
 use crate::state::{AppState, DeviceCollectionStats};
 
 /// Create the API router.
@@ -72,6 +74,7 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // Data endpoints
         .route("/api/devices", get(list_devices))
+        .route("/api/devices/current", get(list_current_readings))
         .route("/api/devices/{id}", get(get_device))
         .route("/api/devices/{id}/current", get(get_current_reading))
         .route("/api/devices/{id}/readings", get(get_readings))
@@ -158,22 +161,19 @@ pub struct PlatformInfo {
 /// For high-frequency monitoring, prefer `/api/health`.
 async fn health_detailed(State(state): State<Arc<AppState>>) -> Json<DetailedHealthResponse> {
     // Check database health
-    let database = {
-        let store = state.store.lock().await;
-        match store.list_devices() {
-            Ok(devices) => DatabaseHealth {
-                ok: true,
-                device_count: devices.len(),
-                reading_count: None, // Skip count for performance
-                error: None,
-            },
-            Err(e) => DatabaseHealth {
-                ok: false,
-                device_count: 0,
-                reading_count: None,
-                error: Some(e.to_string()),
-            },
-        }
+    let database = match state.with_store_read(|store| store.list_devices()).await {
+        Ok(devices) => DatabaseHealth {
+            ok: true,
+            device_count: devices.len(),
+            reading_count: None, // Skip count for performance
+            error: None,
+        },
+        Err(e) => DatabaseHealth {
+            ok: false,
+            device_count: 0,
+            reading_count: None,
+            error: Some(e.to_string()),
+        },
     };
 
     // Check collector health
@@ -263,6 +263,26 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// - `aranet_device_poll_success_total` - Total successful polls per device
 /// - `aranet_device_poll_failure_total` - Total failed polls per device
 ///
+/// Write a Prometheus metric family (HELP, TYPE, and values) to the output buffer.
+fn write_metric_family(
+    output: &mut String,
+    name: &str,
+    help: &str,
+    metric_type: &str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    output.push_str(&format!("# HELP {} {}\n", name, help));
+    output.push_str(&format!("# TYPE {} {}\n", name, metric_type));
+    for value in values {
+        output.push_str(value);
+        output.push('\n');
+    }
+    output.push('\n');
+}
+
 /// # Lock Acquisition
 ///
 /// Acquires read locks on config, store, and device_stats to gather metrics.
@@ -279,8 +299,8 @@ async fn prometheus_metrics(
     // Check if Prometheus is enabled
     let config = state.config.read().await;
     if !config.prometheus.enabled {
-        return Err(AppError::NotFound(
-            "Prometheus metrics endpoint is disabled".to_string(),
+        return Err(AppError::ServiceUnavailable(
+            "Prometheus metrics endpoint is disabled. Enable it in server.toml with [prometheus] enabled = true".to_string(),
         ));
     }
     drop(config);
@@ -296,9 +316,37 @@ async fn prometheus_metrics(
             .unwrap_or_default()
     ));
 
-    // Collector status metrics
-    let running = state.collector.is_running();
-    let uptime = state.collector.started_at().map(|s| {
+    // Collector status and per-device poll stats
+    build_collector_metrics(&mut output, &state.collector).await;
+
+    // Per-device reading metrics (CO2, temperature, humidity, etc.)
+    let device_readings = state
+        .with_store_read(|store| store.list_latest_readings())
+        .await?;
+
+    if !device_readings.is_empty() {
+        let config = state.config.read().await;
+        let alias_map: std::collections::HashMap<String, String> = config
+            .devices
+            .iter()
+            .filter_map(|d| d.alias.as_ref().map(|a| (d.address.clone(), a.clone())))
+            .collect();
+        drop(config);
+
+        build_device_metrics(&mut output, &device_readings, &alias_map);
+    }
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        output,
+    ))
+}
+
+/// Build collector-level metrics: running state, uptime, and per-device poll statistics.
+async fn build_collector_metrics(output: &mut String, collector: &CollectorState) {
+    let running = collector.is_running();
+    let uptime = collector.started_at().map(|s| {
         let now = OffsetDateTime::now_utc();
         (now - s).whole_seconds().max(0)
     });
@@ -324,239 +372,222 @@ async fn prometheus_metrics(
     }
 
     // Device collection stats
-    let device_stats = state.collector.device_stats.read().await;
+    let device_stats = collector.device_stats.read().await;
     if !device_stats.is_empty() {
-        output
-            .push_str("# HELP aranet_device_poll_success_total Total number of successful polls\n");
-        output.push_str("# TYPE aranet_device_poll_success_total counter\n");
+        let mut success_metrics = Vec::new();
+        let mut failure_metrics = Vec::new();
+        let mut polling_metrics = Vec::new();
+        let mut duration_metrics = Vec::new();
+
         for stat in device_stats.iter() {
             let alias = stat.alias.as_deref().unwrap_or(&stat.device_id);
-            output.push_str(&format!(
-                "aranet_device_poll_success_total{{device=\"{}\",address=\"{}\"}} {}\n",
-                escape_label_value(alias),
-                escape_label_value(&stat.device_id),
-                stat.success_count
-            ));
-        }
-        output.push('\n');
-
-        output.push_str("# HELP aranet_device_poll_failure_total Total number of failed polls\n");
-        output.push_str("# TYPE aranet_device_poll_failure_total counter\n");
-        for stat in device_stats.iter() {
-            let alias = stat.alias.as_deref().unwrap_or(&stat.device_id);
-            output.push_str(&format!(
-                "aranet_device_poll_failure_total{{device=\"{}\",address=\"{}\"}} {}\n",
-                escape_label_value(alias),
-                escape_label_value(&stat.device_id),
-                stat.failure_count
-            ));
-        }
-        output.push('\n');
-
-        output.push_str("# HELP aranet_device_polling Whether the device is currently being polled (1=yes, 0=no)\n");
-        output.push_str("# TYPE aranet_device_polling gauge\n");
-        for stat in device_stats.iter() {
-            let alias = stat.alias.as_deref().unwrap_or(&stat.device_id);
-            output.push_str(&format!(
-                "aranet_device_polling{{device=\"{}\",address=\"{}\"}} {}\n",
-                escape_label_value(alias),
-                escape_label_value(&stat.device_id),
-                if stat.polling { 1 } else { 0 }
-            ));
-        }
-        output.push('\n');
-    }
-    drop(device_stats);
-
-    // Get latest readings for all devices
-    // Clone the data we need while holding the lock briefly, then release it
-    let device_readings: Vec<_> = {
-        let store = state.store.lock().await;
-        let devices = store.list_devices().unwrap_or_default();
-        devices
-            .into_iter()
-            .filter_map(|device| {
-                store
-                    .get_latest_reading(&device.id)
-                    .ok()
-                    .flatten()
-                    .map(|reading| (device, reading))
-            })
-            .collect()
-    }; // Lock released here
-
-    if !device_readings.is_empty() {
-        // Sensor reading metrics
-        output.push_str("# HELP aranet_co2_ppm CO2 concentration in parts per million\n");
-        output.push_str("# TYPE aranet_co2_ppm gauge\n");
-
-        let mut co2_metrics = Vec::new();
-        let mut temp_metrics = Vec::new();
-        let mut humidity_metrics = Vec::new();
-        let mut pressure_metrics = Vec::new();
-        let mut battery_metrics = Vec::new();
-        let mut age_metrics = Vec::new();
-        let mut radon_metrics = Vec::new();
-        let mut radiation_rate_metrics = Vec::new();
-        let mut radiation_total_metrics = Vec::new();
-
-        for (device, reading) in &device_readings {
-            let device_name = device.name.as_deref().unwrap_or(&device.id);
-
             let labels = format!(
                 "device=\"{}\",address=\"{}\"",
-                escape_label_value(device_name),
-                escape_label_value(&device.id)
+                escape_label_value(alias),
+                escape_label_value(&stat.device_id)
             );
+            success_metrics.push(format!(
+                "aranet_device_poll_success_total{{{}}} {}",
+                labels, stat.success_count
+            ));
+            failure_metrics.push(format!(
+                "aranet_device_poll_failure_total{{{}}} {}",
+                labels, stat.failure_count
+            ));
+            polling_metrics.push(format!(
+                "aranet_device_polling{{{}}} {}",
+                labels,
+                if stat.polling { 1 } else { 0 }
+            ));
+            if let Some(duration_ms) = stat.last_poll_duration_ms {
+                duration_metrics.push(format!(
+                    "aranet_device_poll_duration_ms{{{}}} {}",
+                    labels, duration_ms
+                ));
+            }
+        }
 
+        write_metric_family(
+            &mut *output,
+            "aranet_device_poll_success_total",
+            "Total number of successful polls",
+            "counter",
+            &success_metrics,
+        );
+        write_metric_family(
+            &mut *output,
+            "aranet_device_poll_failure_total",
+            "Total number of failed polls",
+            "counter",
+            &failure_metrics,
+        );
+        write_metric_family(
+            &mut *output,
+            "aranet_device_polling",
+            "Whether the device is currently being polled (1=yes, 0=no)",
+            "gauge",
+            &polling_metrics,
+        );
+        write_metric_family(
+            &mut *output,
+            "aranet_device_poll_duration_ms",
+            "Duration of the last poll in milliseconds",
+            "gauge",
+            &duration_metrics,
+        );
+    }
+}
+
+/// Build per-device reading metrics from the latest stored readings.
+fn build_device_metrics(
+    output: &mut String,
+    device_readings: &[(aranet_store::StoredDevice, aranet_store::StoredReading)],
+    alias_map: &std::collections::HashMap<String, String>,
+) {
+    let mut co2_metrics = Vec::new();
+    let mut temp_metrics = Vec::new();
+    let mut humidity_metrics = Vec::new();
+    let mut pressure_metrics = Vec::new();
+    let mut battery_metrics = Vec::new();
+    let mut age_metrics = Vec::new();
+    let mut radon_metrics = Vec::new();
+    let mut radiation_rate_metrics = Vec::new();
+    let mut radiation_total_metrics = Vec::new();
+
+    for (device, reading) in device_readings {
+        let device_label = alias_map
+            .get(&device.id)
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| device.name.as_deref().unwrap_or(&device.id));
+
+        let labels = format!(
+            "device=\"{}\",address=\"{}\"",
+            escape_label_value(device_label),
+            escape_label_value(&device.id)
+        );
+
+        // Determine device type to only emit metrics for sensors the
+        // device actually has (avoids 0-value noise for missing sensors).
+        let device_type = resolve_device_type(device);
+
+        if device_type.is_none_or(|dt| dt.has_co2()) && reading.co2 > 0 {
             co2_metrics.push(format!("aranet_co2_ppm{{{}}} {}", labels, reading.co2));
+        }
+        if device_type.is_none_or(|dt| dt.has_temperature()) {
             temp_metrics.push(format!(
                 "aranet_temperature_celsius{{{}}} {:.2}",
                 labels, reading.temperature
             ));
+        }
+        if device_type.is_none_or(|dt| dt.has_humidity()) {
             humidity_metrics.push(format!(
                 "aranet_humidity_percent{{{}}} {}",
                 labels, reading.humidity
             ));
+        }
+        if device_type.is_none_or(|dt| dt.has_pressure()) {
             pressure_metrics.push(format!(
                 "aranet_pressure_hpa{{{}}} {:.2}",
                 labels, reading.pressure
             ));
-            battery_metrics.push(format!(
-                "aranet_battery_percent{{{}}} {}",
-                labels, reading.battery
+        }
+        battery_metrics.push(format!(
+            "aranet_battery_percent{{{}}} {}",
+            labels, reading.battery
+        ));
+
+        // Calculate reading age
+        let age_secs = (OffsetDateTime::now_utc() - reading.captured_at)
+            .whole_seconds()
+            .max(0);
+        age_metrics.push(format!(
+            "aranet_reading_age_seconds{{{}}} {}",
+            labels, age_secs
+        ));
+
+        // Radon (if available)
+        if let Some(radon) = reading.radon {
+            radon_metrics.push(format!("aranet_radon_bqm3{{{}}} {}", labels, radon));
+        }
+
+        // Radiation (if available)
+        if let Some(rate) = reading.radiation_rate {
+            radiation_rate_metrics.push(format!(
+                "aranet_radiation_rate_usvh{{{}}} {:.4}",
+                labels, rate
             ));
-
-            // Calculate reading age
-            let age_secs = (OffsetDateTime::now_utc() - reading.captured_at)
-                .whole_seconds()
-                .max(0);
-            age_metrics.push(format!(
-                "aranet_reading_age_seconds{{{}}} {}",
-                labels, age_secs
+        }
+        if let Some(total) = reading.radiation_total {
+            radiation_total_metrics.push(format!(
+                "aranet_radiation_total_msv{{{}}} {:.6}",
+                labels, total
             ));
-
-            // Radon (if available)
-            if let Some(radon) = reading.radon {
-                radon_metrics.push(format!("aranet_radon_bqm3{{{}}} {}", labels, radon));
-            }
-
-            // Radiation (if available)
-            if let Some(rate) = reading.radiation_rate {
-                radiation_rate_metrics.push(format!(
-                    "aranet_radiation_rate_usvh{{{}}} {:.4}",
-                    labels, rate
-                ));
-            }
-            if let Some(total) = reading.radiation_total {
-                radiation_total_metrics.push(format!(
-                    "aranet_radiation_total_msv{{{}}} {:.6}",
-                    labels, total
-                ));
-            }
-        }
-
-        // Output CO2 metrics
-        for m in &co2_metrics {
-            output.push_str(m);
-            output.push('\n');
-        }
-        output.push('\n');
-
-        // Temperature
-        if !temp_metrics.is_empty() {
-            output.push_str("# HELP aranet_temperature_celsius Temperature in degrees Celsius\n");
-            output.push_str("# TYPE aranet_temperature_celsius gauge\n");
-            for m in &temp_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-
-        // Humidity
-        if !humidity_metrics.is_empty() {
-            output.push_str("# HELP aranet_humidity_percent Relative humidity percentage\n");
-            output.push_str("# TYPE aranet_humidity_percent gauge\n");
-            for m in &humidity_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-
-        // Pressure
-        if !pressure_metrics.is_empty() {
-            output.push_str("# HELP aranet_pressure_hpa Atmospheric pressure in hectopascals\n");
-            output.push_str("# TYPE aranet_pressure_hpa gauge\n");
-            for m in &pressure_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-
-        // Battery
-        if !battery_metrics.is_empty() {
-            output.push_str("# HELP aranet_battery_percent Battery level percentage\n");
-            output.push_str("# TYPE aranet_battery_percent gauge\n");
-            for m in &battery_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-
-        // Reading age
-        if !age_metrics.is_empty() {
-            output.push_str("# HELP aranet_reading_age_seconds Age of the reading in seconds\n");
-            output.push_str("# TYPE aranet_reading_age_seconds gauge\n");
-            for m in &age_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-
-        // Radon
-        if !radon_metrics.is_empty() {
-            output.push_str("# HELP aranet_radon_bqm3 Radon concentration in Bq/m³\n");
-            output.push_str("# TYPE aranet_radon_bqm3 gauge\n");
-            for m in &radon_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-
-        // Radiation rate
-        if !radiation_rate_metrics.is_empty() {
-            output.push_str("# HELP aranet_radiation_rate_usvh Radiation rate in µSv/h\n");
-            output.push_str("# TYPE aranet_radiation_rate_usvh gauge\n");
-            for m in &radiation_rate_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-
-        // Radiation total
-        if !radiation_total_metrics.is_empty() {
-            output.push_str("# HELP aranet_radiation_total_msv Total radiation dose in mSv\n");
-            output.push_str("# TYPE aranet_radiation_total_msv gauge\n");
-            for m in &radiation_total_metrics {
-                output.push_str(m);
-                output.push('\n');
-            }
-            output.push('\n');
         }
     }
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
-        output,
-    ))
+    // Output all metric families
+    let metric_families = [
+        (
+            "aranet_co2_ppm",
+            "CO2 concentration in parts per million",
+            &co2_metrics,
+        ),
+        (
+            "aranet_temperature_celsius",
+            "Temperature in degrees Celsius",
+            &temp_metrics,
+        ),
+        (
+            "aranet_humidity_percent",
+            "Relative humidity percentage",
+            &humidity_metrics,
+        ),
+        (
+            "aranet_pressure_hpa",
+            "Atmospheric pressure in hectopascals",
+            &pressure_metrics,
+        ),
+        (
+            "aranet_battery_percent",
+            "Battery level percentage",
+            &battery_metrics,
+        ),
+        (
+            "aranet_reading_age_seconds",
+            "Age of the reading in seconds",
+            &age_metrics,
+        ),
+        (
+            "aranet_radon_bqm3",
+            "Radon concentration in Bq/m³",
+            &radon_metrics,
+        ),
+        (
+            "aranet_radiation_rate_usvh",
+            "Radiation rate in µSv/h",
+            &radiation_rate_metrics,
+        ),
+        (
+            "aranet_radiation_total_msv",
+            "Total radiation dose in mSv",
+            &radiation_total_metrics,
+        ),
+    ];
+
+    for (name, help, metrics) in &metric_families {
+        write_metric_family(output, name, help, "gauge", metrics);
+    }
+}
+
+/// Resolve a device's type from stored metadata, falling back to name-based detection.
+fn resolve_device_type(device: &aranet_store::StoredDevice) -> Option<aranet_types::DeviceType> {
+    device.device_type.or_else(|| {
+        device
+            .name
+            .as_deref()
+            .and_then(aranet_types::DeviceType::from_name)
+            .or_else(|| aranet_types::DeviceType::from_name(&device.id))
+    })
 }
 
 /// Escape special characters in Prometheus label values.
@@ -634,28 +665,29 @@ pub struct CollectorActionResponse {
 
 /// Start the collector.
 async fn collector_start(State(state): State<Arc<AppState>>) -> Json<CollectorActionResponse> {
-    if state.collector.is_running() {
-        return Json(CollectorActionResponse {
+    let collector = Collector::new(Arc::clone(&state));
+
+    match collector.start().await {
+        CollectorStartResult::Started => Json(CollectorActionResponse {
+            success: true,
+            message: "Collector started".to_string(),
+            running: true,
+        }),
+        CollectorStartResult::AlreadyRunning => Json(CollectorActionResponse {
             success: false,
             message: "Collector is already running".to_string(),
             running: true,
-        });
+        }),
+        CollectorStartResult::NoDevicesConfigured => Json(CollectorActionResponse {
+            success: false,
+            message: "No devices configured".to_string(),
+            running: false,
+        }),
     }
-
-    let mut collector = Collector::new(Arc::clone(&state));
-    collector.start().await;
-
-    Json(CollectorActionResponse {
-        success: true,
-        message: "Collector started".to_string(),
-        running: true,
-    })
 }
 
 /// Stop the collector.
 async fn collector_stop(State(state): State<Arc<AppState>>) -> Json<CollectorActionResponse> {
-    use std::time::Duration;
-
     if !state.collector.is_running() {
         return Json(CollectorActionResponse {
             success: false,
@@ -664,28 +696,14 @@ async fn collector_stop(State(state): State<Arc<AppState>>) -> Json<CollectorAct
         });
     }
 
-    // Signal all collector tasks to stop through the state
-    state.collector.signal_stop();
+    let collector = Collector::new(Arc::clone(&state));
+    collector.stop().await;
 
-    // Wait for device tasks to complete (with timeout)
-    let stopped_cleanly = state
-        .collector
-        .wait_for_device_tasks(Duration::from_secs(10))
-        .await;
-
-    if stopped_cleanly {
-        Json(CollectorActionResponse {
-            success: true,
-            message: "Collector stopped".to_string(),
-            running: false,
-        })
-    } else {
-        Json(CollectorActionResponse {
-            success: true,
-            message: "Collector stopped (some tasks timed out and were aborted)".to_string(),
-            running: false,
-        })
-    }
+    Json(CollectorActionResponse {
+        success: true,
+        message: "Collector stopped".to_string(),
+        running: false,
+    })
 }
 
 // ==========================================================================
@@ -717,6 +735,10 @@ pub struct DeviceConfigResponse {
 
 fn default_poll_interval() -> u64 {
     60
+}
+
+fn config_save_error(error: crate::config::ConfigError) -> AppError {
+    AppError::Internal(format!("Failed to save configuration: {}", error))
 }
 
 /// Get current configuration.
@@ -766,6 +788,9 @@ async fn update_config(
     let response = {
         let mut config = state.config.write().await;
 
+        // Clone current devices so we can restore on validation failure
+        let previous_devices = config.devices.clone();
+
         if let Some(devices) = request.devices {
             config.devices = devices
                 .into_iter()
@@ -777,12 +802,18 @@ async fn update_config(
                 .collect();
         }
 
-        // Validate the new config
+        // Validate the new config; restore previous state on failure
         if let Err(e) = config.validate() {
+            config.devices = previous_devices;
             return Err(AppError::BadRequest(format!(
                 "Invalid configuration: {}",
                 e
             )));
+        }
+
+        if let Err(e) = config.save(&state.config_path) {
+            config.devices = previous_devices;
+            return Err(config_save_error(e));
         }
 
         ConfigResponse {
@@ -801,7 +832,7 @@ async fn update_config(
         }
     };
 
-    // Persist config and signal reload if collector is running
+    // Signal reload after the new config has been persisted successfully.
     state.on_devices_changed().await;
 
     Ok(Json(response))
@@ -831,7 +862,7 @@ async fn add_device(
     State(state): State<Arc<AppState>>,
     Json(request): Json<AddDeviceRequest>,
 ) -> Result<(StatusCode, Json<DeviceConfigResponse>), AppError> {
-    {
+    let response = {
         let mut config = state.config.write().await;
 
         // Check if device already exists
@@ -866,28 +897,46 @@ async fn add_device(
         }
 
         config.devices.push(device);
-    }
 
-    // Persist config and signal reload if collector is running
+        if let Err(e) = config.save(&state.config_path) {
+            config.devices.pop();
+            return Err(config_save_error(e));
+        }
+
+        DeviceConfigResponse {
+            address: request.address.clone(),
+            alias: request.alias.clone(),
+            poll_interval: request.poll_interval,
+        }
+    };
+
+    // Signal reload after the new config has been persisted successfully.
     state.on_devices_changed().await;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(DeviceConfigResponse {
-            address: request.address,
-            alias: request.alias,
-            poll_interval: request.poll_interval,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// Request to update a device.
 #[derive(Debug, Deserialize)]
 pub struct UpdateDeviceRequest {
-    #[serde(default)]
-    pub alias: Option<String>,
+    /// Use `null` to clear the alias, omit the field to leave unchanged.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub alias: Option<Option<String>>,
     #[serde(default)]
     pub poll_interval: Option<u64>,
+}
+
+/// Deserialize a field that distinguishes between absent, null, and present.
+/// - absent → `None` (field not provided)
+/// - `null` → `Some(None)` (explicitly set to null)
+/// - `"value"` → `Some(Some("value"))` (set to a value)
+fn deserialize_optional_nullable<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 /// Update a device configuration.
@@ -901,40 +950,54 @@ async fn update_device(
 
         // Find the device (case-insensitive)
         let id_lower = id.to_lowercase();
-        let device = config
+        let device_index = config
             .devices
-            .iter_mut()
-            .find(|d| d.address.to_lowercase() == id_lower)
+            .iter()
+            .position(|d| d.address.to_lowercase() == id_lower)
             .ok_or_else(|| AppError::NotFound(format!("Device {} not found in config", id)))?;
+        let previous_device = config.devices[device_index].clone();
 
-        // Update fields if provided
-        if request.alias.is_some() {
-            device.alias = request.alias;
-        }
-        if let Some(poll_interval) = request.poll_interval {
-            device.poll_interval = poll_interval;
+        // Update fields if provided (Some(None) clears, Some(Some(v)) sets, None leaves unchanged)
+        {
+            let device = &mut config.devices[device_index];
+            if let Some(alias) = request.alias {
+                device.alias = alias;
+            }
+            if let Some(poll_interval) = request.poll_interval {
+                device.poll_interval = poll_interval;
+            }
+
+            // Validate the updated device
+            let errors = device.validate("device");
+            if !errors.is_empty() {
+                return Err(AppError::BadRequest(
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
         }
 
-        // Validate the updated device
-        let errors = device.validate("device");
-        if !errors.is_empty() {
-            return Err(AppError::BadRequest(
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ));
+        let response = {
+            let device = &config.devices[device_index];
+            DeviceConfigResponse {
+                address: device.address.clone(),
+                alias: device.alias.clone(),
+                poll_interval: device.poll_interval,
+            }
+        };
+
+        if let Err(e) = config.save(&state.config_path) {
+            config.devices[device_index] = previous_device;
+            return Err(config_save_error(e));
         }
 
-        DeviceConfigResponse {
-            address: device.address.clone(),
-            alias: device.alias.clone(),
-            poll_interval: device.poll_interval,
-        }
+        response
     };
 
-    // Persist config and signal reload if collector is running
+    // Signal reload after the new config has been persisted successfully.
     state.on_devices_changed().await;
 
     Ok(Json(response))
@@ -947,6 +1010,7 @@ async fn remove_device(
 ) -> Result<StatusCode, AppError> {
     {
         let mut config = state.config.write().await;
+        let previous_devices = config.devices.clone();
 
         // Find and remove the device (case-insensitive)
         let id_lower = id.to_lowercase();
@@ -961,9 +1025,14 @@ async fn remove_device(
                 id
             )));
         }
+
+        if let Err(e) = config.save(&state.config_path) {
+            config.devices = previous_devices;
+            return Err(config_save_error(e));
+        }
     }
 
-    // Persist config and signal reload if collector is running
+    // Signal reload after the new config has been persisted successfully.
     state.on_devices_changed().await;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1009,8 +1078,7 @@ impl From<aranet_store::StoredDevice> for DeviceResponse {
 async fn list_devices(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<DeviceResponse>>, AppError> {
-    let store = state.store.lock().await;
-    let devices = store.list_devices()?;
+    let devices = state.with_store_read(|store| store.list_devices()).await?;
     Ok(Json(devices.into_iter().map(Into::into).collect()))
 }
 
@@ -1019,26 +1087,148 @@ async fn get_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<DeviceResponse>, AppError> {
-    let store = state.store.lock().await;
-    let device = store
-        .get_device(&id)?
+    let device = state
+        .with_store_read(|store| store.get_device(&id))
+        .await?
         .ok_or(AppError::NotFound(format!("Device not found: {}", id)))?;
     Ok(Json(device.into()))
 }
 
+/// Default staleness threshold in seconds when no collector stats are available.
+///
+/// If the device has no active collector (e.g. passive-only), a reading older
+/// than this many seconds is considered stale.  The value (180s = 3 minutes)
+/// matches the typical Aranet4 default advertisement interval.
+const DEFAULT_STALE_THRESHOLD_SECS: i64 = 180;
+
+/// Response for the current reading endpoint, enriched with staleness metadata.
+#[derive(Debug, Serialize)]
+pub struct CurrentReadingResponse {
+    /// The reading data.
+    #[serde(flatten)]
+    pub reading: aranet_store::StoredReading,
+    /// Age of the reading in seconds.
+    pub age_seconds: i64,
+    /// Whether the reading is considered stale (age > 3x poll interval, or no collector stats).
+    pub stale: bool,
+}
+
+/// Latest reading for a device together with dashboard-friendly metadata.
+#[derive(Debug, Serialize)]
+pub struct DeviceLatestReadingResponse {
+    /// Device ID/address.
+    pub device_id: String,
+    /// Friendly alias from config, if configured.
+    pub alias: Option<String>,
+    /// Device name stored in the database, if available.
+    pub name: Option<String>,
+    /// Age of the reading in seconds.
+    pub age_seconds: i64,
+    /// Whether the reading is considered stale.
+    pub stale: bool,
+    /// The reading data.
+    pub reading: aranet_store::StoredReading,
+}
+
+fn reading_age_seconds(reading: &aranet_store::StoredReading) -> i64 {
+    (OffsetDateTime::now_utc() - reading.captured_at)
+        .whole_seconds()
+        .max(0)
+}
+
+fn reading_is_stale(
+    device_id: &str,
+    age_seconds: i64,
+    poll_intervals: &HashMap<String, u64>,
+) -> bool {
+    let threshold = poll_intervals
+        .get(device_id)
+        .map(|interval| *interval as i64 * 3)
+        .unwrap_or(DEFAULT_STALE_THRESHOLD_SECS);
+    age_seconds > threshold
+}
+
+/// List the latest reading for every device with current metadata.
+async fn list_current_readings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<DeviceLatestReadingResponse>>, AppError> {
+    let latest = state
+        .with_store_read(|store| store.list_latest_readings())
+        .await?;
+
+    let aliases = {
+        let config = state.config.read().await;
+        config
+            .devices
+            .iter()
+            .filter_map(|device| {
+                device
+                    .alias
+                    .as_ref()
+                    .map(|alias| (device.address.clone(), alias.clone()))
+            })
+            .collect::<HashMap<_, _>>()
+    };
+
+    let poll_intervals = {
+        let stats = state.collector.device_stats.read().await;
+        stats
+            .iter()
+            .map(|stat| (stat.device_id.clone(), stat.poll_interval))
+            .collect::<HashMap<_, _>>()
+    };
+
+    let response = latest
+        .into_iter()
+        .map(|(device, reading)| {
+            let age_seconds = reading_age_seconds(&reading);
+            DeviceLatestReadingResponse {
+                device_id: device.id.clone(),
+                alias: aliases.get(&device.id).cloned(),
+                name: device.name,
+                age_seconds,
+                stale: reading_is_stale(&device.id, age_seconds, &poll_intervals),
+                reading,
+            }
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
 /// Get the latest reading for a device.
+///
+/// Returns the reading enriched with `age_seconds` and a `stale` flag.
+/// A reading is considered stale if its age exceeds 3x the device's poll interval.
 async fn get_current_reading(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<aranet_store::StoredReading>, AppError> {
-    let store = state.store.lock().await;
-    let reading = store
-        .get_latest_reading(&id)?
+) -> Result<Json<CurrentReadingResponse>, AppError> {
+    let reading = state
+        .with_store_read(|store| store.get_latest_reading(&id))
+        .await?
         .ok_or(AppError::NotFound(format!(
             "No readings for device: {}",
             id
         )))?;
-    Ok(Json(reading))
+
+    let age_seconds = reading_age_seconds(&reading);
+
+    // Check staleness: stale if age > 3x poll interval (default 180s if not configured)
+    let stale = {
+        let stats = state.collector.device_stats.read().await;
+        let poll_intervals = stats
+            .iter()
+            .map(|stat| (stat.device_id.clone(), stat.poll_interval))
+            .collect::<HashMap<_, _>>();
+        reading_is_stale(&id, age_seconds, &poll_intervals)
+    };
+
+    Ok(Json(CurrentReadingResponse {
+        reading,
+        age_seconds,
+        stale,
+    }))
 }
 
 /// Query parameters for readings.
@@ -1050,16 +1240,52 @@ pub struct ReadingsQuery {
     pub offset: Option<u32>,
 }
 
+/// Maximum allowed limit for query results.
+const MAX_QUERY_LIMIT: u32 = 10_000;
+
 impl ReadingsQuery {
+    fn parse_timestamp(
+        field: &'static str,
+        value: Option<i64>,
+    ) -> Result<Option<OffsetDateTime>, AppError> {
+        value
+            .map(|timestamp| {
+                OffsetDateTime::from_unix_timestamp(timestamp).map_err(|_| {
+                    AppError::BadRequest(format!("Invalid '{}' timestamp: {}", field, timestamp))
+                })
+            })
+            .transpose()
+    }
+
+    fn since_datetime(&self) -> Result<Option<OffsetDateTime>, AppError> {
+        Self::parse_timestamp("since", self.since)
+    }
+
+    fn until_datetime(&self) -> Result<Option<OffsetDateTime>, AppError> {
+        Self::parse_timestamp("until", self.until)
+    }
+
     /// Validate the query parameters.
-    /// Returns an error if `since > until`.
+    /// Returns an error if timestamps are invalid, `since > until`, or `limit` exceeds the maximum.
     pub fn validate(&self) -> Result<(), AppError> {
-        if let (Some(since), Some(until)) = (self.since, self.until)
+        let since = self.since_datetime()?;
+        let until = self.until_datetime()?;
+
+        if let (Some(since), Some(until)) = (since, until)
             && since > until
         {
             return Err(AppError::BadRequest(format!(
                 "Invalid time range: 'since' ({}) must be less than or equal to 'until' ({})",
-                since, until
+                since.unix_timestamp(),
+                until.unix_timestamp()
+            )));
+        }
+        if let Some(limit) = self.limit
+            && limit > MAX_QUERY_LIMIT
+        {
+            return Err(AppError::BadRequest(format!(
+                "limit {} exceeds maximum of {}",
+                limit, MAX_QUERY_LIMIT
             )));
         }
         Ok(())
@@ -1118,14 +1344,10 @@ async fn get_readings(
 
     let mut query = aranet_store::ReadingQuery::new().device(&id);
 
-    if let Some(since) = params.since
-        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(since)
-    {
+    if let Some(dt) = params.since_datetime()? {
         query = query.since(dt);
     }
-    if let Some(until) = params.until
-        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(until)
-    {
+    if let Some(dt) = params.until_datetime()? {
         query = query.until(dt);
     }
 
@@ -1138,8 +1360,9 @@ async fn get_readings(
         query = query.offset(offset);
     }
 
-    let store = state.store.lock().await;
-    let mut readings = store.query_readings(&query)?;
+    let mut readings = state
+        .with_store_read(|store| store.query_readings(&query))
+        .await?;
 
     // Check if there are more items
     let has_more = params.limit.is_some_and(|l| readings.len() > l as usize);
@@ -1176,14 +1399,10 @@ async fn get_history(
 
     let mut query = aranet_store::HistoryQuery::new().device(&id);
 
-    if let Some(since) = params.since
-        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(since)
-    {
+    if let Some(dt) = params.since_datetime()? {
         query = query.since(dt);
     }
-    if let Some(until) = params.until
-        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(until)
-    {
+    if let Some(dt) = params.until_datetime()? {
         query = query.until(dt);
     }
 
@@ -1192,9 +1411,13 @@ async fn get_history(
     if let Some(limit) = request_limit {
         query = query.limit(limit);
     }
+    if let Some(offset) = params.offset {
+        query = query.offset(offset);
+    }
 
-    let store = state.store.lock().await;
-    let mut history = store.query_history(&query)?;
+    let mut history = state
+        .with_store_read(|store| store.query_history(&query))
+        .await?;
 
     // Check if there are more items
     let has_more = params.limit.is_some_and(|l| history.len() > l as usize);
@@ -1230,14 +1453,10 @@ async fn get_all_readings(
 
     let mut query = aranet_store::ReadingQuery::new();
 
-    if let Some(since) = params.since
-        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(since)
-    {
+    if let Some(dt) = params.since_datetime()? {
         query = query.since(dt);
     }
-    if let Some(until) = params.until
-        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(until)
-    {
+    if let Some(dt) = params.until_datetime()? {
         query = query.until(dt);
     }
 
@@ -1250,8 +1469,9 @@ async fn get_all_readings(
         query = query.offset(offset);
     }
 
-    let store = state.store.lock().await;
-    let mut readings = store.query_readings(&query)?;
+    let mut readings = state
+        .with_store_read(|store| store.query_readings(&query))
+        .await?;
 
     // Check if there are more items
     let has_more = params.limit.is_some_and(|l| readings.len() > l as usize);
@@ -1279,6 +1499,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error(transparent)]
     Store(#[from] aranet_store::Error),
     #[error("{0}")]
@@ -1291,6 +1513,7 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             AppError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
@@ -1305,26 +1528,81 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use axum::{
         body::Body,
+        extract::ConnectInfo,
         http::{Request, StatusCode},
     };
     use http_body_util::BodyExt;
+    use time::Duration;
     use tower::ServiceExt;
 
-    use crate::config::Config;
+    use crate::config::{Config, SecurityConfig};
+    use crate::middleware::RateLimitState;
+    use aranet_types::HistoryRecord;
+
+    fn test_config_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "aranet-service-api-unit-test-{}-{}.toml",
+            std::process::id(),
+            nanos
+        ))
+    }
 
     fn create_test_state() -> Arc<AppState> {
         let store = aranet_store::Store::open_in_memory().unwrap();
         let config = Config::default();
-        AppState::new(store, config)
+        AppState::with_config_path(store, config, test_config_path())
     }
 
     async fn response_body(response: axum::response::Response) -> String {
         let body = response.into_body();
         let bytes = body.collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn create_security_config() -> SecurityConfig {
+        SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("1234567890abcdef1234567890abcdef".to_string()),
+            rate_limit_enabled: true,
+            rate_limit_requests: 1,
+            rate_limit_window_secs: 60,
+            rate_limit_max_entries: 1024,
+            cors_origins: vec!["http://localhost:3000".to_string()],
+        }
+    }
+
+    fn request_with_connect_info(method: axum::http::Method, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .extension(ConnectInfo(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                12345,
+            )))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn create_full_app(security: SecurityConfig) -> axum::Router {
+        let state = create_test_state();
+        crate::app(
+            state,
+            Arc::new(security.clone()),
+            Arc::new(RateLimitState::new()),
+        )
+        .layer(crate::middleware::cors_layer(&security))
     }
 
     #[tokio::test]
@@ -1489,6 +1767,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_full_app_requires_api_key_for_protected_routes() {
+        let app = create_full_app(create_security_config());
+
+        let response = app
+            .oneshot(request_with_connect_info(
+                axum::http::Method::GET,
+                "/api/devices",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_full_app_accepts_api_key_header() {
+        let security = create_security_config();
+        let expected_key = security.api_key.clone().unwrap();
+        let app = create_full_app(security);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/devices")
+                    .header("X-API-Key", expected_key)
+                    .extension(ConnectInfo(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        12345,
+                    )))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_full_app_rate_limit_enforced() {
+        let mut security = SecurityConfig {
+            api_key_enabled: false,
+            api_key: None,
+            ..create_security_config()
+        };
+        security.rate_limit_requests = 1;
+        let app = create_full_app(security);
+
+        let first = app
+            .clone()
+            .oneshot(request_with_connect_info(
+                axum::http::Method::GET,
+                "/api/health",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app
+            .oneshot(request_with_connect_info(
+                axum::http::Method::GET,
+                "/api/health",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers().get("x-ratelimit-limit").unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn test_full_app_cors_preflight_uses_security_config() {
+        let mut security = SecurityConfig {
+            api_key_enabled: false,
+            api_key: None,
+            ..create_security_config()
+        };
+        security.rate_limit_enabled = false;
+        let app = create_full_app(security);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::OPTIONS)
+                    .uri("/api/health")
+                    .header("Origin", "http://localhost:3000")
+                    .header("Access-Control-Request-Method", "GET")
+                    .extension(ConnectInfo(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        12345,
+                    )))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "http://localhost:3000"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_readings_invalid_since_returns_bad_request() {
+        let state = create_test_state();
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices/test/readings?since=9223372036854775807")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_history_invalid_until_returns_bad_request() {
+        let state = create_test_state();
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices/test/history?until=9223372036854775807")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_readings_invalid_since_returns_bad_request() {
+        let state = create_test_state();
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/readings?since=9223372036854775807")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_history_respects_offset() {
+        let state = create_test_state();
+        {
+            let store = state.store.lock().await;
+            let records = vec![
+                HistoryRecord {
+                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+                    co2: 100,
+                    temperature: 20.0,
+                    pressure: 1000.0,
+                    humidity: 40,
+                    radon: None,
+                    radiation_rate: None,
+                    radiation_total: None,
+                },
+                HistoryRecord {
+                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(2),
+                    co2: 200,
+                    temperature: 21.0,
+                    pressure: 1001.0,
+                    humidity: 41,
+                    radon: None,
+                    radiation_rate: None,
+                    radiation_total: None,
+                },
+                HistoryRecord {
+                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(3),
+                    co2: 300,
+                    temperature: 22.0,
+                    pressure: 1002.0,
+                    humidity: 42,
+                    radon: None,
+                    radiation_rate: None,
+                    radiation_total: None,
+                },
+            ];
+            store.insert_history("test-device", &records).unwrap();
+        }
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices/test-device/history?limit=1&offset=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response_body(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(json["pagination"]["count"], 1);
+        assert_eq!(json["pagination"]["offset"], 1);
+        assert_eq!(json["pagination"]["limit"], 1);
+        assert!(json["pagination"]["has_more"].as_bool().unwrap());
+        assert_eq!(json["data"][0]["co2"], 200);
+    }
+
+    #[tokio::test]
     async fn test_readings_query_params() {
         let state = create_test_state();
         let app = router().with_state(state);
@@ -1511,13 +2015,13 @@ mod tests {
     fn test_health_response_serialization() {
         let response = HealthResponse {
             status: "ok",
-            version: "0.1.0",
+            version: env!("CARGO_PKG_VERSION"),
             timestamp: time::OffsetDateTime::now_utc(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("ok"));
-        assert!(json.contains("0.1.0"));
+        assert!(json.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
@@ -1549,6 +2053,18 @@ mod tests {
         assert!(query.until.is_none());
         assert!(query.limit.is_none());
         assert!(query.offset.is_none());
+    }
+
+    #[test]
+    fn test_readings_query_validate_rejects_invalid_timestamps() {
+        let query = ReadingsQuery {
+            since: Some(i64::MAX),
+            ..Default::default()
+        };
+
+        let error = query.validate().unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(error.to_string().contains("Invalid 'since' timestamp"));
     }
 
     #[test]
@@ -1828,7 +2344,7 @@ mod tests {
         let state = create_test_state();
         let app = router().with_state(Arc::clone(&state));
 
-        // Start collector (no devices, so just validates the endpoint)
+        // Start collector with no configured devices
         let response = app
             .oneshot(
                 Request::builder()
@@ -1845,8 +2361,62 @@ mod tests {
         let body = response_body(response).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
+        assert!(!json["success"].as_bool().unwrap());
+        assert_eq!(json["message"], "No devices configured");
+        assert!(!json["running"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_collector_start_stop_with_configured_device() {
+        let state = create_test_state();
+        {
+            let mut config = state.config.write().await;
+            config.devices.push(DeviceConfig {
+                address: "AA:BB:CC:DD:EE:FF".to_string(),
+                alias: Some("Test".to_string()),
+                poll_interval: 60,
+            });
+        }
+        let app = router().with_state(Arc::clone(&state));
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/collector/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let body = response_body(start).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
         assert!(json["success"].as_bool().unwrap());
         assert_eq!(json["message"], "Collector started");
+
+        let stop = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/collector/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let body = response_body(stop).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert!(json["success"].as_bool().unwrap());
+        assert_eq!(json["message"], "Collector stopped");
     }
 
     #[tokio::test]
@@ -2025,7 +2595,7 @@ mod tests {
         let json = r#"{"alias": "New Name", "poll_interval": 300}"#;
         let request: UpdateDeviceRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(request.alias, Some("New Name".to_string()));
+        assert_eq!(request.alias, Some(Some("New Name".to_string())));
         assert_eq!(request.poll_interval, Some(300));
     }
 
@@ -2405,6 +2975,102 @@ mod tests {
         // Check platform info
         assert!(json["platform"]["os"].is_string());
         assert!(json["platform"]["arch"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_staleness_threshold_default_when_no_collector_stats() {
+        let state = create_test_state();
+
+        // Insert a reading with a known captured_at in the past (>180s ago → stale)
+        {
+            let store = state.store.lock().await;
+            let reading = aranet_types::CurrentReading {
+                co2: 500,
+                temperature: 22.0,
+                pressure: 1013.0,
+                humidity: 50,
+                battery: 80,
+                status: aranet_types::Status::Green,
+                interval: 60,
+                age: 0,
+                captured_at: Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(200)),
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+                radon_avg_24h: None,
+                radon_avg_7d: None,
+                radon_avg_30d: None,
+            };
+            store.insert_reading("Aranet4 AABB0", &reading).unwrap();
+        }
+
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices/Aranet4%20AABB0/current")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json["stale"].as_bool().unwrap(),
+            "reading >180s old should be stale"
+        );
+        assert!(json["age_seconds"].as_i64().unwrap() >= 200);
+    }
+
+    #[tokio::test]
+    async fn test_staleness_threshold_fresh_reading() {
+        let state = create_test_state();
+
+        {
+            let store = state.store.lock().await;
+            let reading = aranet_types::CurrentReading {
+                co2: 400,
+                temperature: 21.0,
+                pressure: 1013.0,
+                humidity: 45,
+                battery: 90,
+                status: aranet_types::Status::Green,
+                interval: 60,
+                age: 0,
+                captured_at: Some(time::OffsetDateTime::now_utc()),
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+                radon_avg_24h: None,
+                radon_avg_7d: None,
+                radon_avg_30d: None,
+            };
+            store.insert_reading("Aranet4 AABB1", &reading).unwrap();
+        }
+
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices/Aranet4%20AABB1/current")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            !json["stale"].as_bool().unwrap(),
+            "fresh reading should not be stale"
+        );
     }
 
     #[tokio::test]

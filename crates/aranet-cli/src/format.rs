@@ -106,11 +106,7 @@ impl FormatOptions {
     /// Uses ASCII-only output for Plain mode (pipe-friendly).
     #[must_use]
     pub fn format_temp(&self, celsius: f32) -> String {
-        let value = if self.fahrenheit {
-            celsius * 9.0 / 5.0 + 32.0
-        } else {
-            celsius
-        };
+        let value = self.convert_temp(celsius);
         let unit = if self.fahrenheit { "F" } else { "C" };
 
         // Plain mode: ASCII-only (no degree symbol)
@@ -143,7 +139,7 @@ impl FormatOptions {
                 format!("{} Bq/m³", bq)
             }
         } else {
-            format!("{:.2} pCi/L", bq_to_pci(bq))
+            format!("{:.2} pCi/L", self.convert_radon(bq))
         }
     }
 
@@ -179,7 +175,7 @@ impl FormatOptions {
     #[must_use]
     pub fn format_pressure(&self, hpa: f32) -> String {
         if self.inhg {
-            format!("{:.2} inHg", hpa_to_inhg(hpa))
+            format!("{:.2} inHg", self.convert_pressure(hpa))
         } else {
             format!("{:.1} hPa", hpa)
         }
@@ -757,54 +753,71 @@ pub fn format_reading_csv(reading: &CurrentReading, opts: &FormatOptions) -> Str
     }
 }
 
+/// Core sensor reading fields shared across JSON output formats.
+///
+/// Use `#[serde(flatten)]` to embed these fields in format-specific structs.
+#[derive(Serialize)]
+struct ReadingJsonCore {
+    co2: u16,
+    temperature: f32,
+    temperature_unit: &'static str,
+    humidity: u8,
+    pressure: f32,
+    pressure_unit: &'static str,
+    battery: u8,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    radon_bq: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    radon_pci: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    radiation_rate: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    radiation_total: Option<f64>,
+}
+
+impl ReadingJsonCore {
+    fn from_reading(reading: &CurrentReading, opts: &FormatOptions) -> Self {
+        Self {
+            co2: reading.co2,
+            temperature: opts.convert_temp(reading.temperature),
+            temperature_unit: if opts.fahrenheit { "F" } else { "C" },
+            humidity: reading.humidity,
+            pressure: opts.convert_pressure(reading.pressure),
+            pressure_unit: if opts.inhg { "inHg" } else { "hPa" },
+            battery: reading.battery,
+            status: format!("{:?}", reading.status),
+            radon_bq: reading.radon,
+            radon_pci: reading.radon.map(bq_to_pci),
+            radiation_rate: reading.radiation_rate,
+            radiation_total: reading.radiation_total,
+        }
+    }
+}
+
 /// Format reading as JSON with temperature and pressure unit conversion applied.
 pub fn format_reading_json(reading: &CurrentReading, opts: &FormatOptions) -> Result<String> {
     #[derive(Serialize)]
     struct ReadingJson {
-        co2: u16,
-        temperature: f32,
-        temperature_unit: &'static str,
-        humidity: u8,
-        pressure: f32,
-        pressure_unit: &'static str,
-        battery: u8,
-        status: String,
+        #[serde(flatten)]
+        core: ReadingJsonCore,
         age: u16,
         interval: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radon_bq: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radon_pci: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         radon_avg_24h_bq: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         radon_avg_7d_bq: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         radon_avg_30d_bq: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radiation_rate: Option<f32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radiation_total: Option<f64>,
     }
 
     let json = ReadingJson {
-        co2: reading.co2,
-        temperature: opts.convert_temp(reading.temperature),
-        temperature_unit: if opts.fahrenheit { "F" } else { "C" },
-        humidity: reading.humidity,
-        pressure: opts.convert_pressure(reading.pressure),
-        pressure_unit: if opts.inhg { "inHg" } else { "hPa" },
-        battery: reading.battery,
-        status: format!("{:?}", reading.status),
+        core: ReadingJsonCore::from_reading(reading, opts),
         age: reading.age,
         interval: reading.interval,
-        radon_bq: reading.radon,
-        radon_pci: reading.radon.map(bq_to_pci),
         radon_avg_24h_bq: reading.radon_avg_24h,
         radon_avg_7d_bq: reading.radon_avg_7d,
         radon_avg_30d_bq: reading.radon_avg_30d,
-        radiation_rate: reading.radiation_rate,
-        radiation_total: reading.radiation_total,
     };
 
     opts.as_json(&json)
@@ -854,24 +867,10 @@ pub fn format_multi_reading_json(
     #[derive(Serialize)]
     struct DeviceReadingJson {
         device: String,
-        co2: u16,
-        temperature: f32,
-        temperature_unit: &'static str,
-        humidity: u8,
-        pressure: f32,
-        pressure_unit: &'static str,
-        battery: u8,
-        status: String,
+        #[serde(flatten)]
+        core: ReadingJsonCore,
         age: u16,
         interval: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radon_bq: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radon_pci: Option<f32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radiation_rate: Option<f32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        radiation_total: Option<f64>,
     }
 
     let json = MultiReadingJson {
@@ -880,20 +879,9 @@ pub fn format_multi_reading_json(
             .iter()
             .map(|dr| DeviceReadingJson {
                 device: dr.identifier.clone(),
-                co2: dr.reading.co2,
-                temperature: opts.convert_temp(dr.reading.temperature),
-                temperature_unit: if opts.fahrenheit { "F" } else { "C" },
-                humidity: dr.reading.humidity,
-                pressure: opts.convert_pressure(dr.reading.pressure),
-                pressure_unit: if opts.inhg { "inHg" } else { "hPa" },
-                battery: dr.reading.battery,
-                status: format!("{:?}", dr.reading.status),
+                core: ReadingJsonCore::from_reading(&dr.reading, opts),
                 age: dr.reading.age,
                 interval: dr.reading.interval,
-                radon_bq: dr.reading.radon,
-                radon_pci: dr.reading.radon.map(bq_to_pci),
-                radiation_rate: dr.reading.radiation_rate,
-                radiation_total: dr.reading.radiation_total,
             })
             .collect(),
     };
@@ -1297,9 +1285,7 @@ pub fn format_watch_line_with_device(
     device_name: &str,
     opts: &FormatOptions,
 ) -> String {
-    use chrono::Local;
-
-    let timestamp = Local::now().format("%H:%M:%S").to_string();
+    let timestamp = aranet_cli::local_now_fmt("[hour]:[minute]:[second]");
     let status = format_status(reading.status, opts.no_color);
 
     // Format device name with color
@@ -1475,6 +1461,7 @@ pub fn format_reading_json_with_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use aranet_types::DeviceType;
 
     // ========================================================================

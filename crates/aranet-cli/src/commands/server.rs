@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 
 /// Arguments for the server command.
 pub struct ServerArgs {
-    pub bind: String,
+    pub config: Option<PathBuf>,
+    pub bind: Option<String>,
     pub database: Option<PathBuf>,
     pub no_collector: bool,
     pub daemon: bool,
@@ -14,96 +15,49 @@ pub struct ServerArgs {
 
 /// Execute the server command.
 pub async fn cmd_server(args: ServerArgs) -> Result<()> {
-    use aranet_service::{AppState, Collector, Config};
-    use aranet_store::Store;
-    use axum::Router;
-    use std::sync::Arc;
-    use tower_http::trace::TraceLayer;
-    use tracing::info;
-
-    // Load or create config
-    let mut config = Config::load_default().unwrap_or_default();
-
-    // Override with CLI args
-    config.server.bind = args.bind.clone();
-    if let Some(db_path) = args.database {
-        config.storage.path = db_path;
-    }
-
     // Handle daemon mode
     if args.daemon {
-        return run_daemon(&config);
+        return run_daemon(&args);
     }
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("aranet_service=info".parse()?)
-                .add_directive("tower_http=debug".parse()?),
-        )
-        .init();
-
-    // Open the database
-    info!("Opening database at {:?}", config.storage.path);
-    let store = Store::open(&config.storage.path).context("Failed to open database")?;
-
-    // Create application state
-    let state = AppState::new(store, config.clone());
-
-    // Start the background collector
-    if !args.no_collector {
-        let mut collector = Collector::new(Arc::clone(&state));
-        collector.start().await;
-        info!("Background collector started");
-    } else {
-        info!("Background collector disabled");
-    }
-
-    // Build the router
-    let app = Router::new()
-        .merge(aranet_service::api::router())
-        .merge(aranet_service::ws::router())
-        .layer(TraceLayer::new_for_http())
-        .layer(aranet_service::middleware::cors_layer(&config.security))
-        .with_state(state);
-
-    // Parse bind address
-    let addr: std::net::SocketAddr = config.server.bind.parse().context("Invalid bind address")?;
-
-    println!("Starting Aranet API server on http://{}", addr);
-    println!("API endpoints:");
-    println!("  GET  /api/health              - Health check");
-    println!("  GET  /api/devices             - List all devices");
-    println!("  GET  /api/devices/:id         - Get device info");
-    println!("  GET  /api/devices/:id/current - Latest reading");
-    println!("  GET  /api/devices/:id/history - Query history");
-    println!("  WS   /api/ws                  - Real-time stream");
-    println!();
-    println!("Press Ctrl+C to stop");
-
-    // Run the server
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    aranet_service::init_tracing()?;
+    aranet_service::run(aranet_service::RunOptions {
+        config: args.config,
+        bind: args.bind,
+        database: args.database,
+        no_collector: args.no_collector,
+    })
+    .await
+    .context("Failed to run aranet-service")
 }
 
 /// Run the server as a background daemon.
-fn run_daemon(config: &aranet_service::Config) -> Result<()> {
+fn run_daemon(args: &ServerArgs) -> Result<()> {
     use std::process::Command;
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     // Build args without --daemon to avoid infinite recursion
-    let mut args = vec!["server".to_string()];
-    args.push("--bind".to_string());
-    args.push(config.server.bind.clone());
+    let mut daemon_args = vec!["server".to_string()];
 
-    if config.storage.path != aranet_store::default_db_path() {
-        args.push("--database".to_string());
-        args.push(config.storage.path.display().to_string());
+    if let Some(config_path) = &args.config {
+        daemon_args.push("--config".to_string());
+        daemon_args.push(config_path.display().to_string());
+    }
+
+    if let Some(bind) = &args.bind {
+        daemon_args.push("--bind".to_string());
+        daemon_args.push(bind.clone());
+    }
+
+    if let Some(database) = &args.database {
+        daemon_args.push("--database".to_string());
+        daemon_args.push(database.display().to_string());
+    }
+
+    if args.no_collector {
+        daemon_args.push("--no-collector".to_string());
     }
 
     // Spawn detached process
@@ -113,7 +67,7 @@ fn run_daemon(config: &aranet_service::Config) -> Result<()> {
 
         // Use setsid to create a new session
         let child = Command::new(&exe)
-            .args(&args)
+            .args(&daemon_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -122,7 +76,7 @@ fn run_daemon(config: &aranet_service::Config) -> Result<()> {
             .context("Failed to spawn daemon process")?;
 
         println!("Aranet server started in background (PID: {})", child.id());
-        println!("Listening on http://{}", config.server.bind);
+        println!("Detached process started successfully");
     }
 
     #[cfg(windows)]
@@ -132,7 +86,7 @@ fn run_daemon(config: &aranet_service::Config) -> Result<()> {
         const DETACHED_PROCESS: u32 = 0x00000008;
 
         let child = Command::new(&exe)
-            .args(&args)
+            .args(&daemon_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -141,7 +95,7 @@ fn run_daemon(config: &aranet_service::Config) -> Result<()> {
             .context("Failed to spawn daemon process")?;
 
         println!("Aranet server started in background (PID: {})", child.id());
-        println!("Listening on http://{}", config.server.bind);
+        println!("Detached process started successfully");
     }
 
     Ok(())

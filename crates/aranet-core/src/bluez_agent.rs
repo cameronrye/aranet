@@ -21,8 +21,15 @@ use tracing::{debug, info, warn};
 const STATE_IDLE: u8 = 0;
 const STATE_STARTING: u8 = 1;
 const STATE_REGISTERED: u8 = 2;
+const STATE_FAILED_PERMANENTLY: u8 = 3;
+
+/// Maximum agent registration attempts before giving up.
+/// Each failed attempt leaks a D-Bus connection (the spawned resource task
+/// is not abortable), so we cap retries to bound the leak.
+const MAX_AGENT_ATTEMPTS: u8 = 3;
 
 static AGENT_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
+static AGENT_ATTEMPTS: AtomicU8 = AtomicU8::new(0);
 static AGENT_PATH: &str = "/dev/rye/aranet/agent";
 const AGENT_CAPABILITY: &str = "NoInputNoOutput";
 
@@ -33,8 +40,8 @@ const AGENT_CAPABILITY: &str = "NoInputNoOutput";
 /// The agent runs in a background tokio task for the lifetime of the process.
 pub fn ensure_agent() {
     // Only transition from IDLE → STARTING; all other states are no-ops.
-    // This prevents duplicate spawns while still allowing retry after failure
-    // (which resets state back to IDLE).
+    // REGISTERED and FAILED_PERMANENTLY are terminal. STARTING transitions
+    // back to IDLE on failure (allowing retry on the next call).
     if AGENT_STATE
         .compare_exchange(
             STATE_IDLE,
@@ -52,12 +59,21 @@ pub fn ensure_agent() {
                 AGENT_STATE.store(STATE_REGISTERED, Ordering::SeqCst);
             }
             Err(e) => {
-                warn!(
-                    "Failed to register BlueZ agent: {e} — \
-                     BLE scans may hang if pairing is required"
-                );
-                // Reset to IDLE so a subsequent call can retry
-                AGENT_STATE.store(STATE_IDLE, Ordering::SeqCst);
+                let attempt = AGENT_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt >= MAX_AGENT_ATTEMPTS {
+                    warn!(
+                        "Failed to register BlueZ agent after {attempt} attempts: {e} — \
+                         giving up (BLE scans may hang if pairing is required)"
+                    );
+                    AGENT_STATE.store(STATE_FAILED_PERMANENTLY, Ordering::SeqCst);
+                } else {
+                    warn!(
+                        "Failed to register BlueZ agent (attempt {attempt}/{MAX_AGENT_ATTEMPTS}): \
+                         {e} — will retry on next BLE operation"
+                    );
+                    // Reset to IDLE so a subsequent call can retry
+                    AGENT_STATE.store(STATE_IDLE, Ordering::SeqCst);
+                }
             }
         }
     });
@@ -142,8 +158,10 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
     );
 
-    // Register with BlueZ (but don't request default agent to avoid
-    // overriding the user's desktop Bluetooth applet)
+    // Register with BlueZ as the default agent so all pairing requests
+    // (including passkey confirmation for public-address devices like Aranet4)
+    // are routed to us. Without being the default agent, BlueZ has no handler
+    // for pairing callbacks and pairing fails with "No agent available".
     let proxy = dbus::nonblock::Proxy::new(
         "org.bluez",
         "/org/bluez",
@@ -159,11 +177,41 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await?;
 
-    info!("BlueZ agent registered ({AGENT_CAPABILITY})");
+    let () = proxy
+        .method_call(
+            "org.bluez.AgentManager1",
+            "RequestDefaultAgent",
+            (dbus::Path::from(AGENT_PATH),),
+        )
+        .await?;
+
+    info!("BlueZ agent registered as default ({AGENT_CAPABILITY})");
 
     // Keep the task alive — the agent needs to stay registered.
     // When the process exits, BlueZ automatically cleans up the agent
     // since the D-Bus connection drops.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_state_constants_are_distinct() {
+        let states = [
+            STATE_IDLE,
+            STATE_STARTING,
+            STATE_REGISTERED,
+            STATE_FAILED_PERMANENTLY,
+        ];
+        for (i, a) in states.iter().enumerate() {
+            for (j, b) in states.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "States at index {i} and {j} must differ");
+                }
+            }
+        }
+    }
 }

@@ -3,8 +3,6 @@
 //! This module provides the [`AranetDevice`] trait that abstracts over
 //! real Bluetooth devices and mock devices for testing.
 
-use async_trait::async_trait;
-
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord};
 
 use crate::error::Result;
@@ -28,7 +26,7 @@ use crate::settings::{CalibrationData, MeasurementInterval};
 ///     Ok(())
 /// }
 /// ```
-#[async_trait]
+#[allow(async_fn_in_trait)]
 pub trait AranetDevice: Send + Sync {
     // --- Connection Management ---
 

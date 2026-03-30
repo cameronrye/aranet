@@ -14,13 +14,24 @@
 //! ```
 
 use std::env;
-use std::process::Command;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use aranet_store::Store;
+use aranet_types::HistoryRecord;
+use tempfile::TempDir;
+use time::{Duration, OffsetDateTime};
 
 /// Get path to the aranet binary
 fn get_binary_path() -> String {
+    if let Some(bin) = option_env!("CARGO_BIN_EXE_aranet") {
+        return bin.to_string();
+    }
+
     // Try release first, then debug
-    let release_path = env!("CARGO_MANIFEST_DIR").to_string() + "/../../target/release/Aranet";
-    let debug_path = env!("CARGO_MANIFEST_DIR").to_string() + "/../../target/debug/Aranet";
+    let release_path = env!("CARGO_MANIFEST_DIR").to_string() + "/../../target/release/aranet";
+    let debug_path = env!("CARGO_MANIFEST_DIR").to_string() + "/../../target/debug/aranet";
 
     if std::path::Path::new(&release_path).exists() {
         release_path
@@ -33,21 +44,113 @@ fn get_binary_path() -> String {
 }
 
 /// Run aranet command and return output
-fn run_aranet(args: &[&str]) -> std::process::Output {
+fn run_aranet(args: &[&str]) -> Output {
+    run_aranet_with_env(args, &[])
+}
+
+/// Run aranet command with additional environment variables.
+fn run_aranet_with_env(args: &[&str], envs: &[(String, String)]) -> Output {
     let binary = get_binary_path();
 
     if binary == "cargo" {
-        Command::new("cargo")
+        let mut command = Command::new("cargo");
+        command
             .args(["run", "--package", "aranet-cli", "--"])
-            .args(args)
-            .output()
-            .expect("Failed to run aranet via cargo")
+            .args(args);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("Failed to run aranet via cargo")
     } else {
-        Command::new(&binary)
-            .args(args)
-            .output()
-            .expect("Failed to run aranet binary")
+        let mut command = Command::new(&binary);
+        command.args(args);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("Failed to run aranet binary")
     }
+}
+
+fn create_test_env() -> (TempDir, Vec<(String, String)>, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = root.path().join("home");
+    let xdg_config_home = root.path().join("xdg-config");
+    let xdg_data_home = root.path().join("xdg-data");
+    let appdata = root.path().join("AppData").join("Roaming");
+    let localappdata = root.path().join("AppData").join("Local");
+
+    let (config_base, data_base) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library").join("Application Support"),
+            home.join("Library").join("Application Support"),
+        )
+    } else if cfg!(target_os = "windows") {
+        (appdata.clone(), localappdata.clone())
+    } else {
+        (xdg_config_home.clone(), xdg_data_home.clone())
+    };
+
+    fs::create_dir_all(&config_base).expect("config base dir");
+    fs::create_dir_all(&data_base).expect("data base dir");
+
+    let envs = vec![
+        ("HOME".to_string(), home.display().to_string()),
+        ("USERPROFILE".to_string(), home.display().to_string()),
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            xdg_config_home.display().to_string(),
+        ),
+        (
+            "XDG_DATA_HOME".to_string(),
+            xdg_data_home.display().to_string(),
+        ),
+        ("APPDATA".to_string(), appdata.display().to_string()),
+        (
+            "LOCALAPPDATA".to_string(),
+            localappdata.display().to_string(),
+        ),
+    ];
+
+    let config_path = config_base.join("aranet").join("config.toml");
+    let db_path = data_base.join("aranet").join("data.db");
+    (root, envs, config_path, db_path)
+}
+
+fn write_test_config(path: &Path, contents: &str) {
+    fs::create_dir_all(path.parent().expect("config parent")).expect("create config dir");
+    fs::write(path, contents).expect("write config");
+}
+
+fn seed_history_database(path: &Path, device_id: &str, alias: Option<&str>) {
+    fs::create_dir_all(path.parent().expect("db parent")).expect("create db dir");
+
+    let store = Store::open(path).expect("open store");
+    store
+        .upsert_device(device_id, alias)
+        .expect("upsert device");
+
+    let now = OffsetDateTime::now_utc();
+    let records = vec![
+        HistoryRecord {
+            timestamp: now - Duration::minutes(90),
+            co2: 810,
+            temperature: 21.4,
+            pressure: 1012.4,
+            humidity: 43,
+            ..Default::default()
+        },
+        HistoryRecord {
+            timestamp: now - Duration::minutes(30),
+            co2: 920,
+            temperature: 22.1,
+            pressure: 1013.1,
+            humidity: 46,
+            ..Default::default()
+        },
+    ];
+    store
+        .insert_history(device_id, &records)
+        .expect("insert history");
 }
 
 /// Get device from environment
@@ -164,6 +267,21 @@ fn test_config_show() {
     );
 }
 
+#[test]
+fn test_config_show_fails_on_invalid_config() {
+    let (_root, envs, config_path, _db_path) = create_test_env();
+    write_test_config(&config_path, "device = [");
+
+    let output = run_aranet_with_env(&["config", "show"], &envs);
+    assert!(!output.status.success(), "Invalid config should fail");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to parse config file"),
+        "stderr should mention parse failure: {stderr}"
+    );
+}
+
 // =============================================================================
 // Cache Commands (no device required)
 // =============================================================================
@@ -206,6 +324,105 @@ fn test_alias_list() {
         output.status.success(),
         "Alias list should succeed (even if empty)"
     );
+}
+
+// =============================================================================
+// Report Commands (no device required, uses cached data)
+// =============================================================================
+
+#[test]
+fn test_report_json_resolves_aliases() {
+    let (_root, envs, config_path, db_path) = create_test_env();
+    write_test_config(
+        &config_path,
+        r#"
+[aliases]
+office = "Aranet4 12345"
+"#,
+    );
+    seed_history_database(&db_path, "Aranet4 12345", Some("Office"));
+
+    let output = run_aranet_with_env(&["report", "--device", "office", "--format", "json"], &envs);
+    assert!(
+        output.status.success(),
+        "report should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("report JSON should be valid");
+    let reports = parsed.as_array().expect("report output should be an array");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["device_id"], "Aranet4 12345");
+    assert_eq!(reports[0]["record_count"], 2);
+    assert!(reports[0]["co2"].is_object());
+}
+
+#[test]
+fn test_report_uses_default_device_from_config() {
+    let (_root, envs, config_path, db_path) = create_test_env();
+    write_test_config(
+        &config_path,
+        r#"
+device = "Aranet4 12345"
+"#,
+    );
+    seed_history_database(&db_path, "Aranet4 12345", Some("Office"));
+
+    let output = run_aranet_with_env(&["report", "--format", "json"], &envs);
+    assert!(
+        output.status.success(),
+        "report should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("report JSON should be valid");
+    let reports = parsed.as_array().expect("report output should be an array");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["device_id"], "Aranet4 12345");
+    assert_eq!(reports[0]["record_count"], 2);
+}
+
+#[test]
+fn test_report_all_outputs_all_cached_devices() {
+    let (_root, envs, _config_path, db_path) = create_test_env();
+    seed_history_database(&db_path, "Aranet4 12345", Some("Office"));
+    seed_history_database(&db_path, "Aranet4 67890", Some("Bedroom"));
+
+    let output = run_aranet_with_env(&["report", "--all", "--format", "json"], &envs);
+    assert!(
+        output.status.success(),
+        "report --all should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("report --all JSON should be valid");
+    let reports = parsed.as_array().expect("report output should be an array");
+    assert_eq!(reports.len(), 2);
+}
+
+#[test]
+fn test_sync_all_json_empty_is_machine_readable() {
+    let (_root, envs, _config_path, _db_path) = create_test_env();
+
+    let output = run_aranet_with_env(&["sync", "--all", "--format", "json"], &envs);
+    assert!(
+        output.status.success(),
+        "sync --all --format json should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("sync JSON should be valid");
+    assert_eq!(parsed["total_devices"], 0);
+    assert_eq!(parsed["successful"], 0);
+    assert_eq!(parsed["failed"], 0);
 }
 
 // =============================================================================

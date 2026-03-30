@@ -206,7 +206,7 @@ impl AranetApp {
         screenshot_delay_frames: u32,
     ) -> Self {
         // Load GUI configuration from config file
-        let config = Config::load();
+        let config = Config::load_or_default_logged();
         let gui_config = config.gui.clone();
 
         // Initialize theme based on saved preferences (including compact mode)
@@ -1591,10 +1591,11 @@ impl eframe::App for AranetApp {
             }
         }
         if let Some(delta) = navigate_device
-            && !self.devices.is_empty()
+            && self.devices.len() > 1
         {
             let current = self.selected_device.unwrap_or(0) as i32;
-            let new_idx = (current + delta).clamp(0, self.devices.len() as i32 - 1) as usize;
+            let max_idx = self.devices.len() as i32 - 1;
+            let new_idx = (current + delta).clamp(0, max_idx) as usize;
             self.selected_device = Some(new_idx);
         }
 
@@ -1693,52 +1694,26 @@ impl eframe::App for AranetApp {
                         (Tab::Service, "Service", "4"),
                     ] {
                         let is_selected = self.active_tab == tab;
-                        let text_color = if is_selected {
-                            self.theme.accent
-                        } else {
-                            self.theme.text_secondary
-                        };
-
-                        let response = ui.add(
-                            egui::Label::new(
-                                RichText::new(label)
-                                    .size(self.theme.typography.body)
-                                    .color(text_color),
-                            )
-                            .selectable(false)
-                            .sense(egui::Sense::click()),
-                        );
+                        let response = components::nav_tab(ui, &self.theme, label, is_selected)
+                            .on_hover_text(format!("Press {}", shortcut));
 
                         if response.clicked() {
                             self.active_tab = tab;
                         }
-                        let rect = response.rect;
-                        response.on_hover_text(format!("Press {}", shortcut));
-
-                        // Underline for selected tab
-                        if is_selected {
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.min.x, rect.max.y + 2.0),
-                                    egui::vec2(rect.width(), 2.0),
-                                ),
-                                egui::CornerRadius::same(1),
-                                self.theme.accent,
-                            );
-                        }
-
-                        ui.add_space(self.theme.spacing.md);
+                        ui.add_space(self.theme.spacing.xs);
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Theme toggle
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new(self.theme_mode.icon())
-                                    .size(self.theme.typography.caption),
-                            ))
-                            .on_hover_text("Press T to toggle theme")
-                            .clicked()
+                        if components::themed_button(
+                            ui,
+                            &self.theme,
+                            self.theme_mode.icon(),
+                            self.theme.button_secondary(),
+                            self.theme.typography.caption,
+                        )
+                        .on_hover_text("Press T to toggle theme")
+                        .clicked()
                         {
                             self.theme_mode.toggle();
                             self.theme = Theme::for_mode_with_options(
@@ -1751,23 +1726,19 @@ impl eframe::App for AranetApp {
                         ui.add_space(self.theme.spacing.sm);
 
                         // Auto-refresh toggle
-                        let auto_color = if self.auto_refresh_enabled {
-                            self.theme.success
-                        } else {
-                            self.theme.text_muted
-                        };
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new(if self.auto_refresh_enabled {
-                                    "Auto: On"
-                                } else {
-                                    "Auto: Off"
-                                })
-                                .size(self.theme.typography.caption)
-                                .color(auto_color),
-                            ))
-                            .on_hover_text("Press A to toggle auto-refresh")
-                            .clicked()
+                        if components::toggle_chip(
+                            ui,
+                            &self.theme,
+                            if self.auto_refresh_enabled {
+                                "Auto On"
+                            } else {
+                                "Auto Off"
+                            },
+                            self.auto_refresh_enabled,
+                            self.theme.success,
+                        )
+                        .on_hover_text("Press A to toggle auto-refresh")
+                        .clicked()
                         {
                             self.auto_refresh_enabled = !self.auto_refresh_enabled;
                         }
@@ -1776,14 +1747,16 @@ impl eframe::App for AranetApp {
 
                         // Scan button
                         ui.add_enabled_ui(!self.scanning, |ui| {
-                            let btn_style = self.theme.button_primary();
-                            let scan_btn = egui::Button::new(
-                                RichText::new("Scan")
-                                    .size(self.theme.typography.body)
-                                    .color(btn_style.text),
+                            if components::themed_button(
+                                ui,
+                                &self.theme,
+                                "Scan",
+                                self.theme.button_primary(),
+                                self.theme.typography.body,
                             )
-                            .fill(btn_style.fill);
-                            if ui.add(scan_btn).on_hover_text("F5").clicked() {
+                            .on_hover_text("F5")
+                            .clicked()
+                            {
                                 self.send_command(Command::Scan {
                                     duration: SCAN_DURATION,
                                 });
@@ -2023,7 +1996,7 @@ impl eframe::App for AranetApp {
 impl AranetApp {
     /// Save GUI configuration to the config file.
     pub(crate) fn save_gui_config(&self) {
-        let mut config = Config::load();
+        let mut config = Config::load_or_default_logged();
         config.gui = self.gui_config.clone();
         if let Err(e) = config.save() {
             debug!("Failed to save GUI config: {}", e);
@@ -2062,7 +2035,15 @@ impl AranetApp {
             self.add_toast("Data logging disabled".to_string(), ToastType::Info);
         } else {
             // Create log file path
-            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let timestamp = {
+                let now = time::OffsetDateTime::now_local()
+                    .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+                now.format(
+                    &time::format_description::parse("[year][month][day]_[hour][minute][second]")
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default()
+            };
             let log_dir = dirs::data_local_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("aranet")
@@ -2119,7 +2100,15 @@ impl AranetApp {
             );
         }
 
-        let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+        let timestamp = {
+            let now = time::OffsetDateTime::now_local()
+                .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            now.format(
+                &time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]")
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_default()
+        };
         let radon = reading.radon.map(|r| r.to_string()).unwrap_or_default();
         let radiation = reading
             .radiation_rate

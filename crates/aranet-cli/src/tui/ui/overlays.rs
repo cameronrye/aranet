@@ -655,7 +655,7 @@ fn draw_comparison_device(
     match device.device_type {
         Some(DeviceType::AranetRadon) => {
             if let Some(radon) = reading.radon {
-                let color = radon_color(radon);
+                let color = radon_color(theme, radon);
                 lines.push(Line::from(vec![
                     Span::styled("Radon: ", Style::default().fg(theme.text_secondary)),
                     Span::styled(
@@ -667,7 +667,7 @@ fn draw_comparison_device(
         }
         _ => {
             if reading.co2 > 0 {
-                let color = co2_color(reading.co2);
+                let color = co2_color(theme, reading.co2);
                 lines.push(Line::from(vec![
                     Span::styled("CO2: ", Style::default().fg(theme.text_secondary)),
                     Span::styled(
@@ -684,7 +684,7 @@ fn draw_comparison_device(
         Span::styled("Temp: ", Style::default().fg(theme.text_secondary)),
         Span::styled(
             format!("{:.1}C", reading.temperature),
-            Style::default().fg(theme.text_primary),
+            Style::default().fg(theme.sensor_temperature),
         ),
     ]));
 
@@ -693,12 +693,12 @@ fn draw_comparison_device(
         Span::styled("Humidity: ", Style::default().fg(theme.text_secondary)),
         Span::styled(
             format!("{}%", reading.humidity),
-            Style::default().fg(theme.text_primary),
+            Style::default().fg(theme.sensor_humidity),
         ),
     ]));
 
     // Battery
-    let color = battery_color(reading.battery);
+    let color = battery_color(theme, reading.battery);
     lines.push(Line::from(vec![
         Span::styled("Battery: ", Style::default().fg(theme.text_secondary)),
         Span::styled(format!("{}%", reading.battery), Style::default().fg(color)),

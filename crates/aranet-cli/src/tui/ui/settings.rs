@@ -4,8 +4,7 @@ use aranet_core::settings::{BluetoothRange, RadonUnit, TemperatureUnit};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::colors::battery_color;
-use super::rssi_display;
+use super::colors::{battery_color, signal_strength_display};
 use super::theme::BORDER_TYPE;
 use crate::tui::app::App;
 
@@ -53,7 +52,7 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     // Show RSSI signal strength if available
     if let Some(rssi) = device.rssi {
-        let (bars, color) = rssi_display(rssi);
+        let (bars, color) = signal_strength_display(&theme, rssi);
         info_lines.push(Line::from(vec![
             Span::styled("  Signal:       ", Style::default().fg(theme.text_muted)),
             Span::styled(bars, Style::default().fg(color)),
@@ -93,7 +92,7 @@ pub(super) fn draw_settings_panel(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  Battery:      ", Style::default().fg(theme.text_muted)),
             Span::styled(
                 format!("{}%", reading.battery),
-                Style::default().fg(battery_color(reading.battery)),
+                Style::default().fg(battery_color(&theme, reading.battery)),
             ),
         ]));
     }

@@ -5,7 +5,7 @@
 
 use eframe::egui::{self, Color32, RichText, Sense, Ui};
 
-use super::theme::Theme;
+use super::theme::{ButtonStyle, Theme};
 use super::types::Trend;
 
 /// Render a styled metric card with value, unit, and optional trend.
@@ -150,6 +150,97 @@ pub fn status_badge(ui: &mut Ui, theme: &Theme, text: &str, color: Color32) {
         });
 }
 
+/// Render a themed button using the shared button style tokens.
+pub fn themed_button(
+    ui: &mut Ui,
+    theme: &Theme,
+    text: &str,
+    style: ButtonStyle,
+    text_size: f32,
+) -> egui::Response {
+    let stroke = if style.border == Color32::TRANSPARENT {
+        egui::Stroke::NONE
+    } else {
+        egui::Stroke::new(1.0, style.border)
+    };
+
+    ui.add(
+        egui::Button::new(RichText::new(text).color(style.text).size(text_size))
+            .fill(style.fill)
+            .stroke(stroke)
+            .corner_radius(egui::CornerRadius::same(theme.rounding.sm as u8))
+            .min_size(egui::vec2(0.0, theme.spacing.lg + 2.0)),
+    )
+}
+
+/// Render a pill-shaped toggle chip for tabs and filters.
+pub fn toggle_chip(
+    ui: &mut Ui,
+    theme: &Theme,
+    text: &str,
+    selected: bool,
+    active_color: Color32,
+) -> egui::Response {
+    let fill = if selected {
+        theme.tint_medium(active_color)
+    } else {
+        theme.bg_card
+    };
+    let text_color = if selected {
+        active_color
+    } else {
+        theme.text_secondary
+    };
+    let stroke = if selected {
+        active_color
+    } else {
+        theme.border_subtle
+    };
+
+    ui.add(
+        egui::Button::new(
+            RichText::new(text)
+                .color(text_color)
+                .size(theme.typography.caption + 1.0),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(theme.rounding.full as u8))
+        .min_size(egui::vec2(0.0, theme.spacing.lg + 2.0)),
+    )
+}
+
+/// Render a prominent navigation tab button.
+pub fn nav_tab(ui: &mut Ui, theme: &Theme, text: &str, selected: bool) -> egui::Response {
+    let fill = if selected {
+        theme.tint_medium(theme.accent)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let text_color = if selected {
+        theme.accent
+    } else {
+        theme.text_secondary
+    };
+    let stroke = if selected {
+        theme.accent
+    } else {
+        theme.border_subtle
+    };
+
+    ui.add(
+        egui::Button::new(
+            RichText::new(text)
+                .color(text_color)
+                .size(theme.typography.body),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(theme.rounding.md as u8))
+        .min_size(egui::vec2(84.0, theme.spacing.xl)),
+    )
+}
+
 /// Render a connection status indicator dot.
 pub fn status_dot(ui: &mut Ui, color: Color32, tooltip: &str) -> egui::Response {
     let size = 8.0;
@@ -166,7 +257,7 @@ pub fn co2_gauge(ui: &mut Ui, theme: &Theme, co2: u16) {
     let max_ppm = 2500.0_f32;
     let pct = (co2 as f32 / max_ppm).min(1.0);
 
-    let available_width = ui.available_width().min(280.0);
+    let available_width = ui.available_width();
     let bar_height = 14.0;
     let indicator_height = 20.0; // Space above bar for value indicator
     let label_height = 18.0;

@@ -44,6 +44,7 @@ impl DeviceType {
     /// assert_eq!(DeviceType::from_name("AranetRn+ 306B8"), Some(DeviceType::AranetRadon));
     /// assert_eq!(DeviceType::from_name("RN+ Radon"), Some(DeviceType::AranetRadon));
     /// assert_eq!(DeviceType::from_name("Aranet Radiation"), Some(DeviceType::AranetRadiation));
+    /// assert_eq!(DeviceType::from_name("Aranet\u{2622} 30ED1"), Some(DeviceType::AranetRadiation));
     /// assert_eq!(DeviceType::from_name("Unknown Device"), None);
     /// ```
     #[must_use]
@@ -64,15 +65,13 @@ impl DeviceType {
         if name_lower.contains("aranetrn+")
             || Self::contains_word(&name_lower, "rn+")
             || Self::contains_word(&name_lower, "aranet radon")
-            || (name_lower.starts_with("radon") || name_lower.contains(" radon"))
+            || Self::contains_word(&name_lower, "radon")
         {
             return Some(DeviceType::AranetRadon);
         }
 
-        // Check for Radiation devices
-        if Self::contains_word(&name_lower, "radiation")
-            || Self::contains_word(&name_lower, "aranet radiation")
-        {
+        // Check for Radiation devices (name may contain ☢ symbol instead of "radiation")
+        if Self::contains_word(&name_lower, "radiation") || name_lower.contains('\u{2622}') {
             return Some(DeviceType::AranetRadiation);
         }
 
@@ -82,27 +81,61 @@ impl DeviceType {
     /// Check if a string contains a word at a word boundary.
     ///
     /// A word boundary is defined as the start/end of the string or a non-alphanumeric character.
+    /// Checks all occurrences, not just the first.
     fn contains_word(haystack: &str, needle: &str) -> bool {
-        if let Some(pos) = haystack.find(needle) {
+        let mut start = 0;
+        while let Some(pos) = haystack[start..].find(needle) {
+            let abs_pos = start + pos;
+
             // Check character before the match (if any)
-            let before_ok = pos == 0
-                || haystack[..pos]
+            let before_ok = abs_pos == 0
+                || haystack[..abs_pos]
                     .chars()
                     .last()
                     .is_none_or(|c| !c.is_alphanumeric());
 
             // Check character after the match (if any)
-            let end_pos = pos + needle.len();
+            let end_pos = abs_pos + needle.len();
             let after_ok = end_pos >= haystack.len()
                 || haystack[end_pos..]
                     .chars()
                     .next()
                     .is_none_or(|c| !c.is_alphanumeric());
 
-            before_ok && after_ok
-        } else {
-            false
+            if before_ok && after_ok {
+                return true;
+            }
+
+            start = abs_pos + 1;
+            if start >= haystack.len() {
+                break;
+            }
         }
+        false
+    }
+
+    /// Returns `true` if this device type has a CO2 sensor.
+    #[must_use]
+    pub fn has_co2(&self) -> bool {
+        matches!(self, DeviceType::Aranet4)
+    }
+
+    /// Returns `true` if this device type has a temperature sensor.
+    #[must_use]
+    pub fn has_temperature(&self) -> bool {
+        !matches!(self, DeviceType::AranetRadiation)
+    }
+
+    /// Returns `true` if this device type has a humidity sensor.
+    #[must_use]
+    pub fn has_humidity(&self) -> bool {
+        self.has_temperature()
+    }
+
+    /// Returns `true` if this device type has a pressure sensor.
+    #[must_use]
+    pub fn has_pressure(&self) -> bool {
+        matches!(self, DeviceType::Aranet4 | DeviceType::AranetRadon)
     }
 
     /// Returns the BLE characteristic UUID for reading current sensor values.
@@ -230,7 +263,7 @@ impl fmt::Display for Status {
 pub const MIN_CURRENT_READING_BYTES: usize = 13;
 
 /// Minimum number of bytes required to parse an Aranet2 [`CurrentReading`].
-pub const MIN_ARANET2_READING_BYTES: usize = 7;
+pub const MIN_ARANET2_READING_BYTES: usize = 12;
 
 /// Minimum number of bytes required to parse an Aranet Radon [`CurrentReading`] (advertisement format).
 pub const MIN_RADON_READING_BYTES: usize = 15;
@@ -240,6 +273,13 @@ pub const MIN_RADON_GATT_READING_BYTES: usize = 18;
 
 /// Minimum number of bytes required to parse an Aranet Radiation [`CurrentReading`].
 pub const MIN_RADIATION_READING_BYTES: usize = 28;
+
+/// Sentinel value used by the Aranet Radon firmware to indicate that an
+/// averaging period is still accumulating data and no result is available yet.
+///
+/// Radon average values (24h, 7d, 30d) at or above this threshold should be
+/// treated as "in progress" rather than valid measurements.
+pub const RADON_AVERAGE_IN_PROGRESS: u32 = 0xFF00_0000;
 
 /// Current reading from an Aranet sensor.
 ///
@@ -358,7 +398,7 @@ impl CurrentReading {
 
         let mut buf = data;
         let co2 = buf.get_u16_le();
-        let temp_raw = buf.get_u16_le();
+        let temp_raw = buf.get_i16_le();
         let pressure_raw = buf.get_u16_le();
         let humidity = buf.get_u8();
         let battery = buf.get_u8();
@@ -385,19 +425,21 @@ impl CurrentReading {
         })
     }
 
-    /// Parse a `CurrentReading` from raw bytes (Aranet2 format).
+    /// Parse a `CurrentReading` from raw bytes (Aranet2 GATT format).
     ///
     /// The byte format is:
-    /// - bytes 0-1: Temperature (u16 LE, divide by 20 for Celsius)
-    /// - byte 2: Humidity (u8)
-    /// - byte 3: Battery (u8)
-    /// - byte 4: Status (u8)
-    /// - bytes 5-6: Interval (u16 LE)
+    /// - bytes 0-1: Unknown/header (u16 LE)
+    /// - bytes 2-3: Interval (u16 LE, seconds)
+    /// - bytes 4-5: Age (u16 LE, seconds since last reading)
+    /// - byte 6: Battery (u8)
+    /// - bytes 7-8: Temperature (u16 LE, divide by 20 for Celsius)
+    /// - bytes 9-10: Humidity (u16 LE, divide by 10 for %)
+    /// - byte 11: Status flags (bits\[0:1] = humidity, bits\[2:3] = temperature)
     ///
     /// # Errors
     ///
     /// Returns [`ParseError::InsufficientBytes`] if `data` contains fewer than
-    /// [`MIN_ARANET2_READING_BYTES`] (7) bytes.
+    /// [`MIN_ARANET2_READING_BYTES`] (12) bytes.
     #[must_use = "parsing returns a Result that should be handled"]
     pub fn from_bytes_aranet2(data: &[u8]) -> Result<Self, ParseError> {
         use bytes::Buf;
@@ -410,21 +452,28 @@ impl CurrentReading {
         }
 
         let mut buf = data;
-        let temp_raw = buf.get_u16_le();
-        let humidity = buf.get_u8();
-        let battery = buf.get_u8();
-        let status = Status::from(buf.get_u8());
+        let _header = buf.get_u16_le();
         let interval = buf.get_u16_le();
+        let age = buf.get_u16_le();
+        let battery = buf.get_u8();
+        let temp_raw = buf.get_i16_le();
+        let humidity_raw = buf.get_u16_le();
+        let status_flags = buf.get_u8();
+
+        // Status flags: bits[2:3] = temperature status (use as overall status)
+        let status = Status::from((status_flags >> 2) & 0x03);
 
         Ok(CurrentReading {
             co2: 0, // Aranet2 doesn't have CO2
             temperature: f32::from(temp_raw) / 20.0,
             pressure: 0.0, // Aranet2 doesn't have pressure
-            humidity,
+            // Humidity is reported in tenths of a percent; clamp to 100% as a
+            // safeguard against sensor malfunction reporting out-of-range values.
+            humidity: (humidity_raw / 10).min(100) as u8,
             battery,
             status,
             interval,
-            age: 0,
+            age,
             captured_at: None,
             radon: None,
             radiation_rate: None,
@@ -485,15 +534,11 @@ impl CurrentReading {
         let battery = buf.get_u8();
 
         // Parse sensor values
-        let temp_raw = buf.get_u16_le();
+        let temp_raw = buf.get_i16_le();
         let pressure_raw = buf.get_u16_le();
         let humidity_raw = buf.get_u16_le();
         let radon = buf.get_u32_le();
-        let status = if buf.has_remaining() {
-            Status::from(buf.get_u8())
-        } else {
-            Status::Green
-        };
+        let status = Status::from(buf.get_u8());
 
         // Parse optional working averages (extended format, 47 bytes)
         // Each average is a pair: (time: u32, value: u32)
@@ -506,18 +551,19 @@ impl CurrentReading {
             let _time_30d = buf.get_u32_le();
             let avg_30d_raw = buf.get_u32_le();
 
-            // Values >= 0xff000000 indicate "in progress" (not yet available)
-            let avg_24h = if avg_24h_raw >= 0xff00_0000 {
+            // Values at or above RADON_AVERAGE_IN_PROGRESS are reserved by the
+            // firmware to indicate the averaging period is still accumulating.
+            let avg_24h = if avg_24h_raw >= RADON_AVERAGE_IN_PROGRESS {
                 None
             } else {
                 Some(avg_24h_raw)
             };
-            let avg_7d = if avg_7d_raw >= 0xff00_0000 {
+            let avg_7d = if avg_7d_raw >= RADON_AVERAGE_IN_PROGRESS {
                 None
             } else {
                 Some(avg_7d_raw)
             };
-            let avg_30d = if avg_30d_raw >= 0xff00_0000 {
+            let avg_30d = if avg_30d_raw >= RADON_AVERAGE_IN_PROGRESS {
                 None
             } else {
                 Some(avg_30d_raw)
@@ -532,7 +578,9 @@ impl CurrentReading {
             co2: 0,
             temperature: f32::from(temp_raw) / 20.0,
             pressure: f32::from(pressure_raw) / 10.0,
-            humidity: (humidity_raw / 10).min(100) as u8, // Convert from 10ths to percent
+            // Humidity is reported in tenths of a percent; clamp to 100% as a
+            // safeguard against sensor malfunction reporting out-of-range values.
+            humidity: (humidity_raw / 10).min(100) as u8,
             battery,
             status,
             interval,
@@ -587,11 +635,7 @@ impl CurrentReading {
         let dose_rate_nsv = buf.get_u32_le();
         let total_dose_nsv = buf.get_u64_le();
         let _duration = buf.get_u64_le(); // Duration in seconds (not stored)
-        let status = if buf.has_remaining() {
-            Status::from(buf.get_u8())
-        } else {
-            Status::Green
-        };
+        let status = Status::from(buf.get_u8());
 
         // Convert units: nSv/h -> µSv/h, nSv -> mSv
         let dose_rate_usv = dose_rate_nsv as f32 / 1000.0;
@@ -797,6 +841,24 @@ impl CurrentReadingBuilder {
             return Err(ParseError::InvalidValue(format!(
                 "pressure {} is outside valid range (800-1200 hPa)",
                 self.reading.pressure
+            )));
+        }
+
+        // CO2 range check (0 is valid for non-CO2 devices; sensor max is ~10000 ppm)
+        if self.reading.co2 > 10_000 {
+            return Err(ParseError::InvalidValue(format!(
+                "co2 {} exceeds maximum sensor range of 10000 ppm",
+                self.reading.co2
+            )));
+        }
+
+        // Radon range check (typical indoor range: 0–10000 Bq/m³)
+        if let Some(radon) = self.reading.radon
+            && radon > 10_000
+        {
+            return Err(ParseError::InvalidValue(format!(
+                "radon {} exceeds maximum expected range of 10000 Bq/m³",
+                radon
             )));
         }
 

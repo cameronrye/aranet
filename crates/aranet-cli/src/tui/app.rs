@@ -567,7 +567,12 @@ pub struct ServiceState {
 
 impl App {
     /// Create a new application with the given command and event channels.
-    pub fn new(command_tx: mpsc::Sender<Command>, event_rx: mpsc::Receiver<SensorEvent>) -> Self {
+    pub fn new(
+        command_tx: mpsc::Sender<Command>,
+        event_rx: mpsc::Receiver<SensorEvent>,
+        service_url: String,
+        service_api_key: Option<String>,
+    ) -> Self {
         Self {
             should_quit: false,
             active_tab: Tab::default(),
@@ -614,11 +619,12 @@ impl App {
             syncing: false,
             export_format: ExportFormat::default(),
             do_not_disturb: false,
-            service_client: aranet_core::service_client::ServiceClient::new(
-                "http://localhost:8080",
+            service_client: aranet_core::service_client::ServiceClient::new_with_api_key(
+                &service_url,
+                service_api_key,
             )
             .ok(),
-            service_url: "http://localhost:8080".to_string(),
+            service_url,
             service_status: None,
             service_refreshing: false,
             service_selected_item: 0,
@@ -715,11 +721,90 @@ impl App {
     ///
     /// Returns a list of commands to send to the worker (for auto-connect, auto-sync, etc.).
     pub fn handle_sensor_event(&mut self, event: SensorEvent) -> Vec<Command> {
+        match event {
+            // Device discovery and connection lifecycle
+            SensorEvent::CachedDataLoaded { .. }
+            | SensorEvent::ScanStarted
+            | SensorEvent::ScanComplete { .. }
+            | SensorEvent::DeviceConnecting { .. }
+            | SensorEvent::DeviceConnected { .. }
+            | SensorEvent::DeviceDisconnected { .. }
+            | SensorEvent::AliasChanged { .. }
+            | SensorEvent::DeviceForgotten { .. }
+            | SensorEvent::SignalStrengthUpdate { .. }
+            | SensorEvent::BackgroundPollingStarted { .. }
+            | SensorEvent::BackgroundPollingStopped { .. } => self.handle_device_event(event),
+
+            // Reading updates and history
+            SensorEvent::ReadingUpdated { .. }
+            | SensorEvent::HistoryLoaded { .. }
+            | SensorEvent::HistorySyncStarted { .. }
+            | SensorEvent::HistorySynced { .. }
+            | SensorEvent::HistorySyncProgress { .. } => self.handle_reading_event(event),
+
+            // Device settings changes
+            SensorEvent::IntervalChanged { .. }
+            | SensorEvent::SettingsLoaded { .. }
+            | SensorEvent::BluetoothRangeChanged { .. }
+            | SensorEvent::SmartHomeChanged { .. } => {
+                self.handle_settings_event(event);
+                Vec::new()
+            }
+
+            // Error events
+            SensorEvent::ScanError { .. }
+            | SensorEvent::ConnectionError { .. }
+            | SensorEvent::ReadingError { .. }
+            | SensorEvent::HistorySyncError { .. }
+            | SensorEvent::IntervalError { .. }
+            | SensorEvent::BluetoothRangeError { .. }
+            | SensorEvent::SmartHomeError { .. }
+            | SensorEvent::AliasError { .. }
+            | SensorEvent::ForgetDeviceError { .. } => {
+                self.handle_error_event(event);
+                Vec::new()
+            }
+
+            // Service status and management
+            SensorEvent::ServiceStatusRefreshed { .. }
+            | SensorEvent::ServiceStatusError { .. }
+            | SensorEvent::ServiceCollectorStarted
+            | SensorEvent::ServiceCollectorStopped
+            | SensorEvent::ServiceCollectorError { .. } => {
+                self.handle_service_event(event);
+                Vec::new()
+            }
+
+            // Misc events
+            SensorEvent::OperationCancelled { operation } => {
+                self.push_status_message(format!("{} cancelled", operation));
+                Vec::new()
+            }
+
+            // System service events - not displayed in TUI
+            SensorEvent::SystemServiceStatus { .. }
+            | SensorEvent::SystemServiceInstalled
+            | SensorEvent::SystemServiceUninstalled
+            | SensorEvent::SystemServiceStarted
+            | SensorEvent::SystemServiceStopped
+            | SensorEvent::SystemServiceError { .. }
+            | SensorEvent::ServiceConfigFetched { .. }
+            | SensorEvent::ServiceConfigError { .. }
+            | SensorEvent::ServiceDeviceAdded { .. }
+            | SensorEvent::ServiceDeviceUpdated { .. }
+            | SensorEvent::ServiceDeviceRemoved { .. }
+            | SensorEvent::ServiceDeviceError { .. } => Vec::new(),
+        }
+    }
+
+    /// Handle device discovery, connection, disconnection, and identity events.
+    ///
+    /// Returns commands for auto-connect or auto-sync side effects.
+    fn handle_device_event(&mut self, event: SensorEvent) -> Vec<Command> {
         let mut commands = Vec::new();
 
         match event {
             SensorEvent::CachedDataLoaded { devices } => {
-                // Collect device IDs before handling (for auto-connect)
                 let device_ids: Vec<String> = devices.iter().map(|d| d.id.clone()).collect();
                 self.handle_cached_data(devices);
 
@@ -735,7 +820,6 @@ impl App {
             SensorEvent::ScanComplete { devices } => {
                 self.scanning = false;
                 self.push_status_message(format!("Found {} device(s)", devices.len()));
-                // Add discovered devices to our list
                 for discovered in devices {
                     let id_str = discovered.id.to_string();
                     if !self.devices.iter().any(|d| d.id == id_str) {
@@ -745,15 +829,6 @@ impl App {
                         self.devices.push(device);
                     }
                 }
-            }
-            SensorEvent::ScanError { error } => {
-                self.scanning = false;
-                let error_msg = format!("Scan: {}", error);
-                self.set_error(error_msg);
-                self.push_status_message(format!(
-                    "Scan error: {} (press E for details)",
-                    error.chars().take(40).collect::<String>()
-                ));
             }
             SensorEvent::DeviceConnecting { device_id } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
@@ -791,62 +866,64 @@ impl App {
                     device.connected_at = None;
                 }
             }
-            SensorEvent::ConnectionError {
-                device_id, error, ..
-            } => {
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .map(|d| d.display_name().to_string())
-                    .unwrap_or_else(|| device_id.clone());
-                let error_msg = format!("{}: {}", device_name, error);
-                self.set_error(error_msg);
-                self.push_status_message(format!(
-                    "Connection error: {} (press E for details)",
-                    error.chars().take(40).collect::<String>()
-                ));
+            SensorEvent::AliasChanged { device_id, alias } => {
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
-                    device.status = ConnectionStatus::Error(error.clone());
-                    device.error = Some(error);
-                    device.last_updated = Some(Instant::now());
+                    device.name = alias;
+                }
+                self.push_status_message("Device renamed".to_string());
+            }
+            SensorEvent::DeviceForgotten { device_id } => {
+                if let Some(pos) = self.devices.iter().position(|d| d.id == device_id) {
+                    self.devices.remove(pos);
+                    if self.selected_device >= self.devices.len() && !self.devices.is_empty() {
+                        self.selected_device = self.devices.len() - 1;
+                    }
+                }
+                self.push_status_message("Device forgotten".to_string());
+            }
+            SensorEvent::SignalStrengthUpdate {
+                device_id,
+                rssi,
+                quality: _,
+            } => {
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.rssi = Some(rssi);
                 }
             }
-            SensorEvent::ReadingUpdated { device_id, reading } => {
-                // Check thresholds for alerts
-                self.check_thresholds(&device_id, &reading);
+            SensorEvent::BackgroundPollingStarted {
+                device_id: _,
+                interval_secs,
+            } => {
+                self.push_status_message(format!(
+                    "Background polling started ({}s interval)",
+                    interval_secs
+                ));
+            }
+            SensorEvent::BackgroundPollingStopped { device_id: _ } => {
+                self.push_status_message("Background polling stopped".to_string());
+            }
+            _ => {}
+        }
 
-                // Log reading to file if enabled
+        self.ensure_selected_device_visible();
+        commands
+    }
+
+    /// Handle reading updates and history sync events.
+    ///
+    /// Returns commands for side effects (currently none, but kept for consistency).
+    fn handle_reading_event(&mut self, event: SensorEvent) -> Vec<Command> {
+        match event {
+            SensorEvent::ReadingUpdated { device_id, reading } => {
+                self.check_thresholds(&device_id, &reading);
                 self.log_reading(&device_id, &reading);
 
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
-                    // Update session statistics
                     device.session_stats.update(&reading);
-                    // Store previous reading for trend calculation
                     device.previous_reading = device.reading.take();
                     device.reading = Some(reading);
                     device.last_updated = Some(Instant::now());
                     device.error = None;
-                }
-            }
-            SensorEvent::ReadingError {
-                device_id, error, ..
-            } => {
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .map(|d| d.display_name().to_string())
-                    .unwrap_or_else(|| device_id.clone());
-                let error_msg = format!("{}: {}", device_name, error);
-                self.set_error(error_msg);
-                self.push_status_message(format!(
-                    "Reading error: {} (press E for details)",
-                    error.chars().take(40).collect::<String>()
-                ));
-                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
-                    device.error = Some(error);
-                    device.last_updated = Some(Instant::now());
                 }
             }
             SensorEvent::HistoryLoaded { device_id, records } => {
@@ -866,26 +943,25 @@ impl App {
                 }
                 self.push_status_message(format!("Synced {} records for {}", count, device_id));
             }
-            SensorEvent::HistorySyncError {
-                device_id, error, ..
+            SensorEvent::HistorySyncProgress {
+                device_id: _,
+                downloaded,
+                total,
             } => {
-                self.syncing = false;
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .map(|d| d.display_name().to_string())
-                    .unwrap_or_else(|| device_id.clone());
-                let error_msg = format!("{}: {}", device_name, error);
-                self.set_error(error_msg);
                 self.push_status_message(format!(
-                    "History sync failed: {} (press E for details)",
-                    error.chars().take(40).collect::<String>()
+                    "Syncing history: {}/{} records",
+                    downloaded, total
                 ));
-                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
-                    device.error = Some(error);
-                }
             }
+            _ => {}
+        }
+
+        Vec::new()
+    }
+
+    /// Handle device settings change confirmations (interval, BT range, smart home).
+    fn handle_settings_event(&mut self, event: SensorEvent) {
+        match event {
             SensorEvent::IntervalChanged {
                 device_id,
                 interval_secs,
@@ -896,36 +972,6 @@ impl App {
                     reading.interval = interval_secs;
                 }
                 self.push_status_message(format!("Interval set to {}m", interval_secs / 60));
-            }
-            SensorEvent::IntervalError {
-                device_id,
-                error,
-                context,
-            } => {
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .map(|d| d.display_name().to_string())
-                    .unwrap_or_else(|| device_id.clone());
-                // Include suggestion from context if available
-                let error_msg = if let Some(ref ctx) = context {
-                    if let Some(ref suggestion) = ctx.suggestion {
-                        format!("{}: {}. {}", device_name, error, suggestion)
-                    } else {
-                        format!("{}: {}", device_name, error)
-                    }
-                } else {
-                    format!("{}: {}", device_name, error)
-                };
-                self.set_error(error_msg);
-                self.push_status_message(format!(
-                    "Set interval failed: {} (press E for details)",
-                    error.chars().take(40).collect::<String>()
-                ));
-                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
-                    device.error = Some(error);
-                }
             }
             SensorEvent::SettingsLoaded {
                 device_id,
@@ -943,33 +989,6 @@ impl App {
                 let range = if extended { "Extended" } else { "Standard" };
                 self.push_status_message(format!("Bluetooth range set to {}", range));
             }
-            SensorEvent::BluetoothRangeError {
-                device_id,
-                error,
-                context,
-            } => {
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .and_then(|d| d.name.clone())
-                    .unwrap_or_else(|| device_id.clone());
-                // Include suggestion from context if available
-                let error_msg = if let Some(ref ctx) = context {
-                    if let Some(ref suggestion) = ctx.suggestion {
-                        format!("{}: {}. {}", device_name, error, suggestion)
-                    } else {
-                        format!("{}: {}", device_name, error)
-                    }
-                } else {
-                    format!("{}: {}", device_name, error)
-                };
-                self.set_error(error_msg);
-                self.push_status_message(format!(
-                    "Set BT range failed: {} (press E for details)",
-                    error.chars().take(40).collect::<String>()
-                ));
-            }
             SensorEvent::SmartHomeChanged {
                 device_id: _,
                 enabled,
@@ -977,33 +996,129 @@ impl App {
                 let mode = if enabled { "enabled" } else { "disabled" };
                 self.push_status_message(format!("Smart Home {}", mode));
             }
+            _ => {}
+        }
+    }
+
+    /// Handle all error events by setting the error state and displaying a status message.
+    fn handle_error_event(&mut self, event: SensorEvent) {
+        match event {
+            SensorEvent::ScanError { error } => {
+                self.scanning = false;
+                let error_msg = format!("Scan: {}", error);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "Scan error: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+            }
+            SensorEvent::ConnectionError {
+                device_id, error, ..
+            } => {
+                let device_name = self.device_display_name(&device_id);
+                let error_msg = format!("{}: {}", device_name, error);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "Connection error: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.status = ConnectionStatus::Error(error.clone());
+                    device.error = Some(error);
+                    device.last_updated = Some(Instant::now());
+                }
+            }
+            SensorEvent::ReadingError {
+                device_id, error, ..
+            } => {
+                let device_name = self.device_display_name(&device_id);
+                let error_msg = format!("{}: {}", device_name, error);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "Reading error: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.error = Some(error);
+                    device.last_updated = Some(Instant::now());
+                }
+            }
+            SensorEvent::HistorySyncError {
+                device_id, error, ..
+            } => {
+                self.syncing = false;
+                let device_name = self.device_display_name(&device_id);
+                let error_msg = format!("{}: {}", device_name, error);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "History sync failed: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.error = Some(error);
+                }
+            }
+            SensorEvent::IntervalError {
+                device_id,
+                error,
+                context,
+            } => {
+                let device_name = self.device_display_name(&device_id);
+                let error_msg = Self::format_error_with_context(&device_name, &error, &context);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "Set interval failed: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.error = Some(error);
+                }
+            }
+            SensorEvent::BluetoothRangeError {
+                device_id,
+                error,
+                context,
+            } => {
+                let device_name = self.device_name_or_id(&device_id);
+                let error_msg = Self::format_error_with_context(&device_name, &error, &context);
+                self.set_error(error_msg);
+                self.push_status_message(format!(
+                    "Set BT range failed: {} (press E for details)",
+                    error.chars().take(40).collect::<String>()
+                ));
+            }
             SensorEvent::SmartHomeError {
                 device_id,
                 error,
                 context,
             } => {
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .and_then(|d| d.name.clone())
-                    .unwrap_or_else(|| device_id.clone());
-                // Include suggestion from context if available
-                let error_msg = if let Some(ref ctx) = context {
-                    if let Some(ref suggestion) = ctx.suggestion {
-                        format!("{}: {}. {}", device_name, error, suggestion)
-                    } else {
-                        format!("{}: {}", device_name, error)
-                    }
-                } else {
-                    format!("{}: {}", device_name, error)
-                };
+                let device_name = self.device_name_or_id(&device_id);
+                let error_msg = Self::format_error_with_context(&device_name, &error, &context);
                 self.set_error(error_msg);
                 self.push_status_message(format!(
                     "Set Smart Home failed: {} (press E for details)",
                     error.chars().take(40).collect::<String>()
                 ));
             }
+            SensorEvent::AliasError {
+                device_id: _,
+                error,
+            } => {
+                self.push_status_message(format!("Rename failed: {}", error));
+            }
+            SensorEvent::ForgetDeviceError {
+                device_id: _,
+                error,
+            } => {
+                self.push_status_message(format!("Forget failed: {}", error));
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle service status and collector management events.
+    fn handle_service_event(&mut self, event: SensorEvent) {
+        match event {
             SensorEvent::ServiceStatusRefreshed {
                 reachable,
                 collector_running,
@@ -1014,7 +1129,7 @@ impl App {
                 self.service_status = Some(ServiceState {
                     reachable,
                     collector_running,
-                    started_at: None, // We could compute from uptime if needed
+                    started_at: None,
                     uptime_seconds,
                     devices: devices
                         .into_iter()
@@ -1026,7 +1141,7 @@ impl App {
                             success_count: d.success_count,
                             failure_count: d.failure_count,
                             last_poll_at: d.last_poll_at,
-                            last_error_at: None, // Not tracked in messages, derived from last_error
+                            last_error_at: None,
                             last_error: d.last_error,
                         })
                         .collect(),
@@ -1056,85 +1171,40 @@ impl App {
             SensorEvent::ServiceCollectorError { error } => {
                 self.push_status_message(format!("Collector error: {}", error));
             }
-            SensorEvent::AliasChanged { device_id, alias } => {
-                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
-                    device.name = alias;
-                }
-                self.push_status_message("Device renamed".to_string());
-            }
-            SensorEvent::AliasError {
-                device_id: _,
-                error,
-            } => {
-                self.push_status_message(format!("Rename failed: {}", error));
-            }
-            SensorEvent::DeviceForgotten { device_id } => {
-                if let Some(pos) = self.devices.iter().position(|d| d.id == device_id) {
-                    self.devices.remove(pos);
-                    if self.selected_device >= self.devices.len() && !self.devices.is_empty() {
-                        self.selected_device = self.devices.len() - 1;
-                    }
-                }
-                self.push_status_message("Device forgotten".to_string());
-            }
-            SensorEvent::ForgetDeviceError {
-                device_id: _,
-                error,
-            } => {
-                self.push_status_message(format!("Forget failed: {}", error));
-            }
-            SensorEvent::HistorySyncProgress {
-                device_id: _,
-                downloaded,
-                total,
-            } => {
-                self.push_status_message(format!(
-                    "Syncing history: {}/{} records",
-                    downloaded, total
-                ));
-            }
-            SensorEvent::OperationCancelled { operation } => {
-                self.push_status_message(format!("{} cancelled", operation));
-            }
-            SensorEvent::BackgroundPollingStarted {
-                device_id: _,
-                interval_secs,
-            } => {
-                self.push_status_message(format!(
-                    "Background polling started ({}s interval)",
-                    interval_secs
-                ));
-            }
-            SensorEvent::BackgroundPollingStopped { device_id: _ } => {
-                self.push_status_message("Background polling stopped".to_string());
-            }
-            SensorEvent::SignalStrengthUpdate {
-                device_id,
-                rssi,
-                quality: _,
-            } => {
-                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
-                    device.rssi = Some(rssi);
-                }
-            }
-            // System service events - not displayed in TUI
-            SensorEvent::SystemServiceStatus { .. }
-            | SensorEvent::SystemServiceInstalled
-            | SensorEvent::SystemServiceUninstalled
-            | SensorEvent::SystemServiceStarted
-            | SensorEvent::SystemServiceStopped
-            | SensorEvent::SystemServiceError { .. }
-            | SensorEvent::ServiceConfigFetched { .. }
-            | SensorEvent::ServiceConfigError { .. }
-            | SensorEvent::ServiceDeviceAdded { .. }
-            | SensorEvent::ServiceDeviceUpdated { .. }
-            | SensorEvent::ServiceDeviceRemoved { .. }
-            | SensorEvent::ServiceDeviceError { .. } => {
-                // TUI doesn't display system service status
-            }
+            _ => {}
         }
+    }
 
-        commands
+    /// Get the display name for a device, falling back to its ID.
+    fn device_display_name(&self, device_id: &str) -> String {
+        self.devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .map(|d| d.display_name().to_string())
+            .unwrap_or_else(|| device_id.to_string())
+    }
+
+    /// Get the device name (not alias), falling back to its ID.
+    fn device_name_or_id(&self, device_id: &str) -> String {
+        self.devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.name.clone())
+            .unwrap_or_else(|| device_id.to_string())
+    }
+
+    /// Format an error message, including the suggestion from context if available.
+    fn format_error_with_context(
+        device_name: &str,
+        error: &str,
+        context: &Option<aranet_core::messages::ErrorContext>,
+    ) -> String {
+        if let Some(ctx) = context
+            && let Some(suggestion) = &ctx.suggestion
+        {
+            return format!("{}: {}. {}", device_name, error, suggestion);
+        }
+        format!("{}: {}", device_name, error)
     }
 
     /// Get a reference to the currently selected device, if any.
@@ -1142,21 +1212,82 @@ impl App {
         self.devices.get(self.selected_device)
     }
 
+    /// Get device indices matching the current filter.
+    #[must_use]
+    pub fn filtered_device_indices(&self) -> Vec<usize> {
+        self.devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| match self.device_filter {
+                DeviceFilter::All => true,
+                DeviceFilter::Aranet4Only => {
+                    matches!(d.device_type, Some(DeviceType::Aranet4))
+                }
+                DeviceFilter::RadonOnly => {
+                    matches!(d.device_type, Some(DeviceType::AranetRadon))
+                }
+                DeviceFilter::RadiationOnly => {
+                    matches!(d.device_type, Some(DeviceType::AranetRadiation))
+                }
+                DeviceFilter::ConnectedOnly => {
+                    matches!(d.status, ConnectionStatus::Connected)
+                }
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Update selection to match the currently visible filtered list.
+    pub fn ensure_selected_device_visible(&mut self) {
+        if self.devices.is_empty() {
+            self.selected_device = 0;
+            return;
+        }
+
+        let filtered = self.filtered_device_indices();
+        if filtered.is_empty() {
+            return;
+        }
+
+        if !filtered.contains(&self.selected_device) {
+            self.selected_device = filtered[0];
+            self.reset_history_scroll();
+        }
+    }
+
+    /// Select a device by its current filtered row.
+    pub fn select_filtered_row(&mut self, row: usize) {
+        if let Some(index) = self.filtered_device_indices().get(row).copied() {
+            self.selected_device = index;
+            self.reset_history_scroll();
+        }
+    }
+
     /// Select the next device in the list.
     pub fn select_next_device(&mut self) {
-        if !self.devices.is_empty() {
-            self.selected_device = (self.selected_device + 1) % self.devices.len();
+        let filtered = self.filtered_device_indices();
+        if !filtered.is_empty() {
+            let current = filtered
+                .iter()
+                .position(|&idx| idx == self.selected_device)
+                .unwrap_or(0);
+            self.selected_device = filtered[(current + 1) % filtered.len()];
             self.reset_history_scroll();
         }
     }
 
     /// Select the previous device in the list.
     pub fn select_previous_device(&mut self) {
-        if !self.devices.is_empty() {
-            self.selected_device = self
-                .selected_device
-                .checked_sub(1)
-                .unwrap_or(self.devices.len() - 1);
+        let filtered = self.filtered_device_indices();
+        if !filtered.is_empty() {
+            let current = filtered
+                .iter()
+                .position(|&idx| idx == self.selected_device)
+                .unwrap_or(0);
+            self.selected_device = filtered
+                .get(current.checked_sub(1).unwrap_or(filtered.len() - 1))
+                .copied()
+                .unwrap_or(self.selected_device);
             self.reset_history_scroll();
         }
     }
@@ -1196,31 +1327,10 @@ impl App {
         self.history_scroll = 0; // Reset scroll when filter changes
     }
 
-    /// Get devices matching current filter.
-    pub fn filtered_devices(&self) -> Vec<&DeviceState> {
-        self.devices
-            .iter()
-            .filter(|d| match self.device_filter {
-                DeviceFilter::All => true,
-                DeviceFilter::Aranet4Only => {
-                    matches!(d.device_type, Some(DeviceType::Aranet4))
-                }
-                DeviceFilter::RadonOnly => {
-                    matches!(d.device_type, Some(DeviceType::AranetRadon))
-                }
-                DeviceFilter::RadiationOnly => {
-                    matches!(d.device_type, Some(DeviceType::AranetRadiation))
-                }
-                DeviceFilter::ConnectedOnly => {
-                    matches!(d.status, ConnectionStatus::Connected)
-                }
-            })
-            .collect()
-    }
-
     /// Cycle device filter to next option.
     pub fn cycle_device_filter(&mut self) {
         self.device_filter = self.device_filter.next();
+        self.ensure_selected_device_visible();
         self.push_status_message(format!("Filter: {}", self.device_filter.label()));
     }
 
@@ -1306,13 +1416,69 @@ impl App {
         }
     }
 
+    /// Add a new alert if one doesn't already exist for this device and category.
+    fn add_alert(
+        &mut self,
+        device_id: &str,
+        category: &str,
+        message: String,
+        level: aranet_core::Co2Level,
+        severity: AlertSeverity,
+    ) {
+        if self
+            .alerts
+            .iter()
+            .any(|a| a.device_id == device_id && a.message.contains(category))
+        {
+            return;
+        }
+
+        let device_name = self
+            .devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.name.clone());
+
+        self.alerts.push(Alert {
+            device_id: device_id.to_string(),
+            device_name: device_name.clone(),
+            message: message.clone(),
+            level,
+            triggered_at: Instant::now(),
+            severity,
+        });
+
+        self.alert_history.push_back(AlertRecord {
+            device_name: device_name.unwrap_or_else(|| device_id.to_string()),
+            message,
+            timestamp: time::OffsetDateTime::now_utc(),
+            severity,
+        });
+
+        while self.alert_history.len() > MAX_ALERT_HISTORY {
+            self.alert_history.pop_front();
+        }
+
+        if self.bell_enabled && !self.do_not_disturb {
+            print!("\x07");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+        }
+    }
+
+    /// Clear alerts matching a device and category (unless sticky alerts are on).
+    fn clear_alert(&mut self, device_id: &str, category: &str) {
+        if !self.sticky_alerts {
+            self.alerts
+                .retain(|a| !(a.device_id == device_id && a.message.contains(category)));
+        }
+    }
+
     /// Check if a reading exceeds thresholds and create an alert if needed.
     pub fn check_thresholds(&mut self, device_id: &str, reading: &CurrentReading) {
         // Check CO2 against custom threshold
         if reading.co2 > 0 && reading.co2 >= self.co2_alert_threshold {
             let level = self.thresholds.evaluate_co2(reading.co2);
-
-            // Determine severity based on how far above threshold
             let severity = if reading.co2 >= self.co2_alert_threshold * 2 {
                 AlertSeverity::Critical
             } else if reading.co2 >= (self.co2_alert_threshold * 3) / 2 {
@@ -1320,177 +1486,54 @@ impl App {
             } else {
                 AlertSeverity::Info
             };
-
-            // Check if we already have a CO2 alert for this device
-            if !self
-                .alerts
-                .iter()
-                .any(|a| a.device_id == device_id && a.message.contains("CO2"))
-            {
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .and_then(|d| d.name.clone());
-
-                let message = format!("CO2 at {} ppm - {}", reading.co2, level.action());
-
-                self.alerts.push(Alert {
-                    device_id: device_id.to_string(),
-                    device_name: device_name.clone(),
-                    message: message.clone(),
-                    level,
-                    triggered_at: Instant::now(),
-                    severity,
-                });
-
-                // Add to alert history (newest at back), O(1)
-                self.alert_history.push_back(AlertRecord {
-                    device_name: device_name.unwrap_or_else(|| device_id.to_string()),
-                    message,
-                    timestamp: time::OffsetDateTime::now_utc(),
-                    severity,
-                });
-
-                // Keep history limited to last MAX_ALERT_HISTORY entries
-                while self.alert_history.len() > MAX_ALERT_HISTORY {
-                    self.alert_history.pop_front(); // Remove oldest (front), O(1)
-                }
-
-                // Ring terminal bell if enabled and not in Do Not Disturb mode
-                if self.bell_enabled && !self.do_not_disturb {
-                    print!("\x07"); // ASCII BEL character
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                }
-            }
-        } else if reading.co2 > 0 && !self.sticky_alerts {
-            // Clear CO2 alert if level improved below threshold (unless sticky)
-            self.alerts
-                .retain(|a| !(a.device_id == device_id && a.message.contains("CO2")));
+            let message = format!("CO2 at {} ppm - {}", reading.co2, level.action());
+            self.add_alert(device_id, "CO2", message, level, severity);
+        } else if reading.co2 > 0 {
+            self.clear_alert(device_id, "CO2");
         }
 
         // Check battery level
         if reading.battery > 0 && reading.battery < 20 {
-            // Check if we already have a battery alert for this device
-            let has_battery_alert = self
-                .alerts
-                .iter()
-                .any(|a| a.device_id == device_id && a.message.contains("Battery"));
-
-            if !has_battery_alert {
-                let device_name = self
-                    .devices
-                    .iter()
-                    .find(|d| d.id == device_id)
-                    .and_then(|d| d.name.clone());
-
-                // Determine severity: < 10% is Critical, 10-20% is Warning
-                let (message, severity) = if reading.battery < 10 {
-                    (
-                        format!("Battery critically low: {}%", reading.battery),
-                        AlertSeverity::Critical,
-                    )
-                } else {
-                    (
-                        format!("Battery low: {}%", reading.battery),
-                        AlertSeverity::Warning,
-                    )
-                };
-
-                self.alerts.push(Alert {
-                    device_id: device_id.to_string(),
-                    device_name: device_name.clone(),
-                    message: message.clone(),
-                    level: aranet_core::Co2Level::Good, // Not applicable, just a placeholder
-                    triggered_at: Instant::now(),
-                    severity,
-                });
-
-                // Add to alert history (newest at back), O(1)
-                self.alert_history.push_back(AlertRecord {
-                    device_name: device_name.unwrap_or_else(|| device_id.to_string()),
-                    message,
-                    timestamp: time::OffsetDateTime::now_utc(),
-                    severity,
-                });
-
-                // Keep history limited to last MAX_ALERT_HISTORY entries
-                while self.alert_history.len() > MAX_ALERT_HISTORY {
-                    self.alert_history.pop_front(); // Remove oldest (front), O(1)
-                }
-
-                // Ring terminal bell if enabled and not in Do Not Disturb mode
-                if self.bell_enabled && !self.do_not_disturb {
-                    print!("\x07"); // ASCII BEL character
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                }
-            }
-        } else if reading.battery >= 20 && !self.sticky_alerts {
-            // Clear battery alert if battery improved (unless sticky)
-            self.alerts
-                .retain(|a| !(a.device_id == device_id && a.message.contains("Battery")));
+            let (message, severity) = if reading.battery < 10 {
+                (
+                    format!("Battery critically low: {}%", reading.battery),
+                    AlertSeverity::Critical,
+                )
+            } else {
+                (
+                    format!("Battery low: {}%", reading.battery),
+                    AlertSeverity::Warning,
+                )
+            };
+            self.add_alert(
+                device_id,
+                "Battery",
+                message,
+                aranet_core::Co2Level::Good,
+                severity,
+            );
+        } else if reading.battery >= 20 {
+            self.clear_alert(device_id, "Battery");
         }
 
         // Check radon against custom threshold
         if let Some(radon) = reading.radon {
             if radon >= self.radon_alert_threshold as u32 {
-                // Check if we already have a radon alert for this device
-                let has_radon_alert = self
-                    .alerts
-                    .iter()
-                    .any(|a| a.device_id == device_id && a.message.contains("Radon"));
-
-                if !has_radon_alert {
-                    let device_name = self
-                        .devices
-                        .iter()
-                        .find(|d| d.id == device_id)
-                        .and_then(|d| d.name.clone());
-
-                    // Determine severity: 2x threshold is Critical, at threshold is Warning
-                    let severity = if radon >= (self.radon_alert_threshold as u32) * 2 {
-                        AlertSeverity::Critical
-                    } else {
-                        AlertSeverity::Warning
-                    };
-
-                    let message = format!("Radon high: {} Bq/m³", radon);
-
-                    self.alerts.push(Alert {
-                        device_id: device_id.to_string(),
-                        device_name: device_name.clone(),
-                        message: message.clone(),
-                        level: aranet_core::Co2Level::Good, // Not applicable, just a placeholder
-                        triggered_at: Instant::now(),
-                        severity,
-                    });
-
-                    // Add to alert history (newest at back), O(1)
-                    self.alert_history.push_back(AlertRecord {
-                        device_name: device_name.unwrap_or_else(|| device_id.to_string()),
-                        message,
-                        timestamp: time::OffsetDateTime::now_utc(),
-                        severity,
-                    });
-
-                    // Keep history limited to last MAX_ALERT_HISTORY entries
-                    while self.alert_history.len() > MAX_ALERT_HISTORY {
-                        self.alert_history.pop_front(); // Remove oldest (front), O(1)
-                    }
-
-                    // Ring terminal bell if enabled and not in Do Not Disturb mode
-                    if self.bell_enabled && !self.do_not_disturb {
-                        print!("\x07"); // ASCII BEL character
-                        use std::io::Write;
-                        std::io::stdout().flush().ok();
-                    }
-                }
-            } else if !self.sticky_alerts {
-                // Clear radon alert if level improved (unless sticky)
-                self.alerts
-                    .retain(|a| !(a.device_id == device_id && a.message.contains("Radon")));
+                let severity = if radon >= (self.radon_alert_threshold as u32) * 2 {
+                    AlertSeverity::Critical
+                } else {
+                    AlertSeverity::Warning
+                };
+                let message = format!("Radon high: {} Bq/m³", radon);
+                self.add_alert(
+                    device_id,
+                    "Radon",
+                    message,
+                    aranet_core::Co2Level::Good,
+                    severity,
+                );
+            } else {
+                self.clear_alert(device_id, "Radon");
             }
         }
     }
@@ -1525,7 +1568,15 @@ impl App {
             self.push_status_message("Logging disabled".to_string());
         } else {
             // Create log file path
-            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let timestamp = {
+                let now = time::OffsetDateTime::now_local()
+                    .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+                now.format(
+                    &time::format_description::parse("[year][month][day]_[hour][minute][second]")
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default()
+            };
             let log_dir = dirs::data_local_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("aranet")
@@ -1576,7 +1627,15 @@ impl App {
             );
         }
 
-        let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+        let timestamp = {
+            let now = time::OffsetDateTime::now_local()
+                .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            now.format(
+                &time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]")
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_default()
+        };
         let radon = reading.radon.map(|r| r.to_string()).unwrap_or_default();
         let radiation = reading
             .radiation_rate
@@ -1775,6 +1834,11 @@ impl App {
     /// Reserved for future UI support of custom date range selection.
     #[allow(dead_code)]
     pub fn set_custom_date_filter(&mut self, start: Option<time::Date>, end: Option<time::Date>) {
+        if let (Some(s), Some(e)) = (start, end)
+            && e < s
+        {
+            self.push_status_message("Warning: end date is before start date".to_string());
+        }
         self.history_filter = HistoryFilter::Custom { start, end };
         self.history_scroll = 0;
         self.push_status_message("Custom date range set".to_string());

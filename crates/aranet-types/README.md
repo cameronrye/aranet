@@ -38,14 +38,14 @@ This crate provides shared types for interacting with Aranet devices (Aranet4, A
 
 ```toml
 [dependencies]
-aranet-types = "0.1"
+aranet-types = "0.2"
 ```
 
 To disable serde support:
 
 ```toml
 [dependencies]
-aranet-types = { version = "0.1", default-features = false }
+aranet-types = { version = "0.2", default-features = false }
 ```
 
 ## Usage

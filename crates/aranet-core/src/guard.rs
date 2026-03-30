@@ -94,8 +94,19 @@ impl Drop for DeviceGuard {
             // Try to get a runtime handle to perform async disconnect
             if let Ok(handle) = Handle::try_current() {
                 handle.spawn(async move {
-                    if let Err(e) = device.disconnect().await {
-                        warn!("Failed to disconnect device in guard drop: {}", e);
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        device.disconnect(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("Failed to disconnect device in guard drop: {}", e);
+                        }
+                        Err(_) => {
+                            warn!("Timeout disconnecting device in guard drop");
+                        }
                     }
                 });
             } else {

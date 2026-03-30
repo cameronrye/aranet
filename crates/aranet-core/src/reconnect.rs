@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -189,6 +188,7 @@ pub struct ReconnectingDevice {
 impl ReconnectingDevice {
     /// Create a new reconnecting device wrapper.
     pub async fn connect(identifier: &str, options: ReconnectOptions) -> Result<Self> {
+        options.validate()?;
         let device = Arc::new(Device::connect(identifier).await?);
 
         // Cache the name and device type for synchronous access
@@ -368,12 +368,11 @@ impl ReconnectingDevice {
     /// will still proceed. Call `reset_cancellation()` explicitly if you want to
     /// clear a previous cancellation before starting a new reconnection attempt.
     pub async fn reconnect(&self) -> Result<()> {
-        // Only reset if not already cancelled - this prevents a race condition
-        // where cancel_reconnect() is called just before reconnect() starts
-        // and would be immediately cleared.
-        if !self.is_cancelled() {
-            self.reset_cancellation();
-        }
+        // Do not reset cancellation here — callers must explicitly call
+        // reset_cancellation() before reconnect() if they want to clear
+        // a previous cancellation. This avoids a race where
+        // cancel_reconnect() fires between is_cancelled() and
+        // reset_cancellation(), silently discarding the cancel request.
 
         *self.state.write().await = ConnectionState::Reconnecting;
         *self.attempt_count.write().await = 0;
@@ -486,7 +485,6 @@ impl ReconnectingDevice {
 }
 
 // Implement the AranetDevice trait for ReconnectingDevice
-#[async_trait]
 impl AranetDevice for ReconnectingDevice {
     async fn is_connected(&self) -> bool {
         ReconnectingDevice::is_connected(self).await

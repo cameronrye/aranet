@@ -67,9 +67,10 @@ Restart-Service bthserv
 aranet scan --timeout 30
 ```
 
-5. **Try passive scanning** (doesn't require active Bluetooth queries):
+5. **Try passive reads** if Smart Home broadcasting is enabled on the device:
 ```bash
-aranet scan --passive
+aranet read --passive
+aranet watch --passive
 ```
 
 </div>
@@ -89,18 +90,18 @@ aranet scan --passive
 
 3. **Retry with longer timeout:**
 ```bash
-aranet read <ADDRESS> --timeout 60
+aranet read --device <ADDRESS> --timeout 60
 ```
 
 4. **Check device battery** - Low battery can affect Bluetooth transmission power. Use:
 ```bash
-aranet info <ADDRESS>
+aranet info --device <ADDRESS>
 ```
 
 5. **Reset the device connection:**
 ```bash
 # Disconnect and reconnect to the device
-aranet read <ADDRESS>
+aranet read --device <ADDRESS>
 ```
 
 </div>
@@ -300,26 +301,26 @@ Aranet devices can store weeks of data. Large downloads take time due to BLE ban
 
 1. **Use incremental sync** - only download new data:
 ```bash
-aranet sync <ADDRESS>
+aranet sync --device <ADDRESS>
 ```
 
 2. **Filter by date range:**
 ```bash
-aranet history <ADDRESS> --since 2026-01-01 --until 2026-01-15
+aranet history --device <ADDRESS> --since 2026-01-01 --until 2026-01-15
 ```
 
 3. **Limit the number of records:**
 ```bash
-aranet history <ADDRESS> --limit 1000
+aranet history --device <ADDRESS> --count 1000
 ```
 
 4. **Download to local database for future queries:**
 ```bash
 # Sync downloads history to the local SQLite database
-aranet sync <ADDRESS>
+aranet sync --device <ADDRESS>
 
 # Query cached data without connecting to device
-aranet cache history <ADDRESS>
+aranet cache history --device <ADDRESS>
 ```
 
 </div>
@@ -333,13 +334,13 @@ aranet cache history <ADDRESS>
 
 ```bash
 # Standard CSV with headers
-aranet history <ADDRESS> --format csv > data.csv
+aranet history --device <ADDRESS> --format csv > data.csv
 
 # JSON for programmatic use
-aranet history <ADDRESS> --format json > data.json
+aranet history --device <ADDRESS> --format json > data.json
 
 # Plain text (default)
-aranet history <ADDRESS> --format text
+aranet history --device <ADDRESS> --format text
 ```
 
 **For Excel compatibility:** Open the CSV file in Excel. If characters display incorrectly, use Excel's "Get Data from Text/CSV" import feature and select UTF-8 encoding.
@@ -359,7 +360,7 @@ aranet history <ADDRESS> --format text
 2. **Check device interval** - history timestamps are calculated from the device's current time minus intervals
 3. **Use JSON output** for precise timestamp inspection:
 ```bash
-aranet history <ADDRESS> --format json
+aranet history --device <ADDRESS> --format json
 ```
 
 **If device time is significantly wrong,** you may need to reconfigure the device using the official Aranet Home app.
@@ -389,15 +390,9 @@ export TERM=xterm-256color
 aranet tui
 ```
 
-3. **Force basic mode:**
-```bash
-aranet tui --style basic
-```
+3. **Use a terminal with solid Unicode and color support** - iTerm2, Kitty, Windows Terminal, and Alacritty work well.
 
-4. **Disable Unicode if symbols don't render:**
-```bash
-aranet tui --ascii
-```
+4. **If rendering is still broken, verify your locale and font** so box-drawing characters and symbols are available.
 
 </div>
 </details>
@@ -423,7 +418,7 @@ aranet tui --ascii
 /Applications/Aranet.app/Contents/MacOS/aranet-gui
 
 # Linux
-aranet-gui --debug
+aranet-gui
 ```
 
 4. **Reset GUI settings:**
@@ -488,9 +483,8 @@ aranet read -d living-room -d bedroom -d office
 
 **TUI - Monitor multiple devices:**
 ```bash
-aranet tui --devices living-room,bedroom,office
-# Or monitor all aliased devices:
-aranet tui --all
+aranet tui
+# Press `s` to scan and `C` to connect all known devices.
 ```
 
 **Set up aliases for easy access:**
@@ -507,19 +501,23 @@ aranet alias list
 <summary>How do I integrate with Home Assistant?</summary>
 <div class="faq-content">
 
-Use the `aranet-service` daemon to expose a REST API:
+Use `aranet-service` with MQTT enabled so Home Assistant can discover supported sensors automatically:
 
 ```bash
 # Start the service
-aranet-service --port 8080
-
-# The API is now available at http://localhost:8080
-# GET /devices - List all devices
-# GET /devices/:id/current - Get current readings
-# GET /devices/:id/history - Get historical data
+aranet-service --bind 127.0.0.1:8080
 ```
 
-Then configure Home Assistant to poll the REST API using the [RESTful sensor integration](https://www.home-assistant.io/integrations/rest/).
+```toml
+[mqtt]
+enabled = true
+broker = "mqtt://localhost:1883"
+topic_prefix = "aranet"
+homeassistant = true
+ha_discovery_prefix = "homeassistant"
+```
+
+See the [Home Assistant integration guide](/aranet/docs/service/home-assistant/) for the full setup.
 
 </div>
 </details>
@@ -536,10 +534,7 @@ The Aranet4 uses the following thresholds (configurable on the device):
 | Warning | 1000-1400 ppm | Amber | Consider ventilating |
 | Poor | > 1400 ppm | Red | Ventilation needed |
 
-These thresholds can be customized:
-```bash
-aranet set <ADDRESS> --co2-warning 800 --co2-alarm 1200
-```
+These thresholds are reported from the device, but the CLI currently exposes only interval, range, and Smart Home settings. If you need to change CO₂ warning/alarm thresholds, use the official Aranet Home app.
 
 </div>
 </details>
@@ -572,8 +567,8 @@ If you've tried the solutions above and still have problems:
 3. **Join the discussion** on GitHub Discussions for general questions
 
 <Aside type="tip">
-Include the `--debug` flag when running commands to get more detailed output for bug reports:
+Use `--verbose` and, when needed, `RUST_LOG=debug` for richer bug reports:
 ```bash
-aranet --debug scan
+RUST_LOG=debug aranet --verbose scan
 ```
 </Aside>

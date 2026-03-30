@@ -17,6 +17,7 @@ fn get_chart_metric_data(
     history: &[HistoryRecord],
     metric: u8,
     device_type: Option<DeviceType>,
+    theme: &super::theme::AppTheme,
 ) -> (Vec<u64>, Color, &'static str) {
     match metric {
         App::METRIC_TEMP => {
@@ -25,20 +26,20 @@ fn get_chart_metric_data(
                 .iter()
                 .map(|r| ((r.temperature + 40.0) * 10.0) as u64) // Offset to handle negatives
                 .collect();
-            (data, Color::Yellow, "Temp")
+            (data, theme.sensor_temperature, "Temp")
         }
         App::METRIC_HUMIDITY => {
             // Humidity data
             let data: Vec<u64> = history.iter().map(|r| r.humidity as u64).collect();
-            (data, Color::Cyan, "Humidity")
+            (data, theme.sensor_humidity, "Humidity")
         }
         _ => {
             // Primary metric (CO2/Radon/Radiation)
             let data = sparkline_data(history, device_type);
             let (color, label) = match device_type {
-                Some(DeviceType::AranetRadon) => (Color::Cyan, "Radon"),
-                Some(DeviceType::AranetRadiation) => (Color::Magenta, "Radiation"),
-                _ => (Color::Green, "CO2"),
+                Some(DeviceType::AranetRadon) => (theme.series_radon, "Radon"),
+                Some(DeviceType::AranetRadiation) => (theme.series_radiation, "Radiation"),
+                _ => (theme.series_co2, "CO2"),
             };
             (data, color, label)
         }
@@ -188,7 +189,7 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
         let mut title_spans = vec![Span::styled(" Trend ", theme.title_style())];
         for &metric in &metrics_to_show {
             let (_, color, label) =
-                get_chart_metric_data(&device.history, metric, device.device_type);
+                get_chart_metric_data(&device.history, metric, device.device_type, &theme);
             title_spans.push(Span::styled(
                 format!("[{}] ", label),
                 Style::default().fg(color),
@@ -231,7 +232,7 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
         let chart_width = chart_rows.first().map(|r| r.width as usize).unwrap_or(0);
         for (i, &metric) in metrics_to_show.iter().enumerate() {
             let (data, color, _label) =
-                get_chart_metric_data(&device.history, metric, device.device_type);
+                get_chart_metric_data(&device.history, metric, device.device_type, &theme);
             if !data.is_empty() {
                 // Resample data to fill the entire width
                 let resampled = resample_sparkline_data(&data, chart_width);

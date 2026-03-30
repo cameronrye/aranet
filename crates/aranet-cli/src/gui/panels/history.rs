@@ -168,6 +168,31 @@ impl AranetApp {
                         .color(self.theme.text_muted),
                 );
             });
+
+            // Validate date range: warn if end < start
+            let parse_for_validation = |s: &str| -> Option<time::Date> {
+                let parts: Vec<&str> = s.trim().split('-').collect();
+                if parts.len() != 3 {
+                    return None;
+                }
+                let year: i32 = parts[0].parse().ok()?;
+                let month = time::Month::try_from(parts[1].parse::<u8>().ok()?).ok()?;
+                let day: u8 = parts[2].parse().ok()?;
+                time::Date::from_calendar_date(year, month, day).ok()
+            };
+            if let (Some(start), Some(end)) = (
+                parse_for_validation(&self.custom_date_start),
+                parse_for_validation(&self.custom_date_end),
+            ) && end < start
+            {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("⚠ End date is before start date")
+                            .size(self.theme.typography.caption)
+                            .color(self.theme.warning),
+                    );
+                });
+            }
         }
 
         ui.add_space(self.theme.spacing.lg);

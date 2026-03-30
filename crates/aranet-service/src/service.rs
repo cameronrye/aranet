@@ -4,7 +4,7 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use service_manager::{
     RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx,
@@ -29,6 +29,9 @@ pub enum ServiceError {
 
     #[error("User-level services not supported on this platform")]
     UserLevelNotSupported,
+
+    #[error("Failed to resolve current working directory: {0}")]
+    CurrentDirectory(#[source] std::io::Error),
 }
 
 /// Service management level
@@ -132,16 +135,17 @@ fn get_label() -> ServiceLabel {
 }
 
 /// Install aranet-service as a system service.
-pub fn install(level: Level) -> Result<(), ServiceError> {
+pub fn install(level: Level, options: &aranet_service::RunOptions) -> Result<(), ServiceError> {
     let manager = get_manager(level)?;
     let program = get_executable_path()?;
     let label = get_label();
+    let args = build_install_args(options)?;
 
     manager
         .install(ServiceInstallCtx {
             label,
             program,
-            args: vec![OsString::from("run")],
+            args,
             contents: None,
             username: None,
             working_directory: None,
@@ -154,6 +158,41 @@ pub fn install(level: Level) -> Result<(), ServiceError> {
         .map_err(ServiceError::Manager)?;
 
     Ok(())
+}
+
+fn build_install_args(options: &aranet_service::RunOptions) -> Result<Vec<OsString>, ServiceError> {
+    let mut args = vec![OsString::from("run")];
+
+    if let Some(config) = &options.config {
+        args.push(OsString::from("--config"));
+        args.push(resolve_service_path(config)?.into_os_string());
+    }
+
+    if let Some(bind) = &options.bind {
+        args.push(OsString::from("--bind"));
+        args.push(OsString::from(bind));
+    }
+
+    if let Some(database) = &options.database {
+        args.push(OsString::from("--database"));
+        args.push(resolve_service_path(database)?.into_os_string());
+    }
+
+    if options.no_collector {
+        args.push(OsString::from("--no-collector"));
+    }
+
+    Ok(args)
+}
+
+fn resolve_service_path(path: &Path) -> Result<PathBuf, ServiceError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()
+            .map_err(ServiceError::CurrentDirectory)?
+            .join(path))
+    }
 }
 
 /// Uninstall the aranet-service system service.
@@ -243,4 +282,43 @@ fn is_service_reachable() -> bool {
 pub enum ServiceStatus {
     Running,
     Stopped,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_install_args_preserves_runtime_options() {
+        let options = aranet_service::RunOptions {
+            config: Some(PathBuf::from("config/server.toml")),
+            bind: Some("0.0.0.0:9090".to_string()),
+            database: Some(PathBuf::from("/tmp/aranet.db")),
+            no_collector: true,
+        };
+
+        let args = build_install_args(&options).unwrap();
+        let cwd = env::current_dir().unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("run"),
+                OsString::from("--config"),
+                cwd.join("config/server.toml").into_os_string(),
+                OsString::from("--bind"),
+                OsString::from("0.0.0.0:9090"),
+                OsString::from("--database"),
+                OsString::from("/tmp/aranet.db"),
+                OsString::from("--no-collector"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_install_args_omits_unset_options() {
+        let args = build_install_args(&aranet_service::RunOptions::default()).unwrap();
+
+        assert_eq!(args, vec![OsString::from("run")]);
+    }
 }

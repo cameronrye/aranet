@@ -48,6 +48,15 @@ use crate::error::Result;
 use crate::scan::get_adapter;
 use crate::uuid::MANUFACTURER_ID;
 
+/// Bitwise-exact comparison of two `Option<f32>` values (handles NaN correctly).
+fn opt_f32_eq(a: Option<f32>, b: Option<f32>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.to_bits() == y.to_bits(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// A reading from passive advertisement monitoring.
 #[derive(Debug, Clone)]
 pub struct PassiveReading {
@@ -180,15 +189,67 @@ impl PassiveMonitor {
         tokio::spawn(async move {
             info!("Starting passive monitor");
 
+            // Acquire the adapter once and reuse across scan cycles.
+            // On persistent errors we re-acquire it in case the adapter
+            // was reset or the D-Bus connection was lost.
+            let mut adapter = loop {
+                match get_adapter().await {
+                    Ok(a) => break a,
+                    Err(e) => {
+                        warn!("Passive monitor failed to get adapter: {e} — retrying in 10s");
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                info!("Passive monitor cancelled while waiting for adapter");
+                                return;
+                            }
+                            _ = sleep(Duration::from_secs(10)) => {}
+                        }
+                    }
+                }
+            };
+            let mut consecutive_errors: u32 = 0;
+
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
                         info!("Passive monitor cancelled");
                         break;
                     }
-                    result = monitor.scan_cycle() => {
-                        if let Err(e) = result {
-                            warn!("Passive monitor scan error: {}", e);
+                    result = monitor.scan_cycle_with_adapter(&adapter) => {
+                        match result {
+                            Ok(()) => {
+                                consecutive_errors = 0;
+                            }
+                            Err(e) => {
+                                consecutive_errors += 1;
+                                warn!(
+                                    "Passive monitor scan error ({consecutive_errors} consecutive): {e}"
+                                );
+                                // After several consecutive failures, try to
+                                // re-acquire the adapter — it may have been
+                                // reset or the D-Bus connection may have died.
+                                if consecutive_errors >= 5 {
+                                    warn!("Passive monitor: re-acquiring adapter after {} consecutive errors", consecutive_errors);
+                                    match get_adapter().await {
+                                        Ok(a) => {
+                                            adapter = a;
+                                            info!("Passive monitor: adapter re-acquired");
+                                            consecutive_errors = 0;
+                                        }
+                                        Err(e2) => {
+                                            // Adapter re-acquisition failed — back off
+                                            // longer to avoid thrashing when the adapter
+                                            // is permanently unavailable.
+                                            warn!("Passive monitor: failed to re-acquire adapter: {}. Backing off.", e2);
+                                            let backoff = std::cmp::min(
+                                                monitor.options.scan_interval.saturating_mul(consecutive_errors),
+                                                std::time::Duration::from_secs(300),
+                                            );
+                                            sleep(backoff).await;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         // Wait before next scan cycle
                         sleep(monitor.options.scan_interval).await;
@@ -198,10 +259,8 @@ impl PassiveMonitor {
         })
     }
 
-    /// Perform a single scan cycle.
-    async fn scan_cycle(&self) -> Result<()> {
-        let adapter = get_adapter().await?;
-
+    /// Perform a single scan cycle using a pre-existing adapter.
+    async fn scan_cycle_with_adapter(&self, adapter: &btleplug::platform::Adapter) -> Result<()> {
         // Start scanning
         adapter.start_scan(ScanFilter::default()).await?;
         sleep(self.options.scan_duration).await;
@@ -279,13 +338,13 @@ impl PassiveMonitor {
                 return true;
             }
 
-            // Check if values have changed
+            // Check if values have changed (use total_cmp for floats to handle NaN correctly)
             if cached.data.co2 != data.co2
-                || cached.data.temperature != data.temperature
+                || !opt_f32_eq(cached.data.temperature, data.temperature)
                 || cached.data.humidity != data.humidity
-                || cached.data.pressure != data.pressure
+                || !opt_f32_eq(cached.data.pressure, data.pressure)
                 || cached.data.radon != data.radon
-                || cached.data.radiation_dose_rate != data.radiation_dose_rate
+                || !opt_f32_eq(cached.data.radiation_dose_rate, data.radiation_dose_rate)
                 || cached.data.battery != data.battery
             {
                 return true;
@@ -357,5 +416,139 @@ mod tests {
         let _rx1 = monitor.subscribe();
         let _rx2 = monitor.subscribe();
         assert_eq!(monitor.subscriber_count(), 2);
+    }
+
+    /// Helper to create test advertisement data with sensible defaults.
+    fn make_adv_data() -> AdvertisementData {
+        AdvertisementData {
+            device_type: aranet_types::DeviceType::Aranet4,
+            co2: Some(800),
+            temperature: Some(22.5),
+            pressure: Some(1013.2),
+            humidity: Some(45),
+            battery: 85,
+            status: aranet_types::Status::Green,
+            interval: 300,
+            age: 120,
+            radon: None,
+            radiation_dose_rate: None,
+            counter: Some(5),
+            flags: 0x22,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_first_reading() {
+        let monitor = PassiveMonitor::default();
+        let data = make_adv_data();
+
+        // First reading for a device should always be emitted.
+        assert!(monitor.should_emit("device-1", &data).await);
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_duplicate_suppressed() {
+        let monitor = PassiveMonitor::default();
+        let data = make_adv_data();
+
+        // Populate the cache.
+        monitor.cache.write().await.insert(
+            "device-1".to_string(),
+            CachedReading {
+                data: data.clone(),
+                received_at: std::time::Instant::now(),
+            },
+        );
+
+        // Identical reading should be suppressed.
+        assert!(!monitor.should_emit("device-1", &data).await);
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_on_value_change() {
+        let monitor = PassiveMonitor::default();
+        let data = make_adv_data();
+
+        monitor.cache.write().await.insert(
+            "device-1".to_string(),
+            CachedReading {
+                data: data.clone(),
+                received_at: std::time::Instant::now(),
+            },
+        );
+
+        // Changed CO2 should trigger emission.
+        let mut changed = data.clone();
+        changed.co2 = Some(900);
+        assert!(monitor.should_emit("device-1", &changed).await);
+
+        // Changed battery should trigger emission.
+        let mut changed = data.clone();
+        changed.battery = 50;
+        assert!(monitor.should_emit("device-1", &changed).await);
+
+        // Changed temperature should trigger emission.
+        let mut changed = data;
+        changed.temperature = Some(23.0);
+        assert!(monitor.should_emit("device-1", &changed).await);
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_on_counter_change() {
+        let monitor = PassiveMonitor::default();
+        let data = make_adv_data();
+
+        monitor.cache.write().await.insert(
+            "device-1".to_string(),
+            CachedReading {
+                data: data.clone(),
+                received_at: std::time::Instant::now(),
+            },
+        );
+
+        // Counter increment means a new measurement was taken.
+        let mut changed = data;
+        changed.counter = Some(6);
+        assert!(monitor.should_emit("device-1", &changed).await);
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_on_stale_cache() {
+        let opts = PassiveMonitorOptions {
+            max_reading_age: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let monitor = PassiveMonitor::new(opts);
+        let data = make_adv_data();
+
+        // Insert a reading that is already "old".
+        monitor.cache.write().await.insert(
+            "device-1".to_string(),
+            CachedReading {
+                data: data.clone(),
+                received_at: std::time::Instant::now() - Duration::from_millis(50),
+            },
+        );
+
+        // Identical data should still be emitted because the cache entry expired.
+        assert!(monitor.should_emit("device-1", &data).await);
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_different_device() {
+        let monitor = PassiveMonitor::default();
+        let data = make_adv_data();
+
+        // Cache a reading for device-1.
+        monitor.cache.write().await.insert(
+            "device-1".to_string(),
+            CachedReading {
+                data: data.clone(),
+                received_at: std::time::Instant::now(),
+            },
+        );
+
+        // device-2 has no cache entry, so it should emit even with identical data.
+        assert!(monitor.should_emit("device-2", &data).await);
     }
 }

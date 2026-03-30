@@ -164,7 +164,7 @@ fn parse_aranet4_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
     // Skip to sensor data at offset 8
     let mut buf = &data[8..];
     let co2 = buf.get_u16_le();
-    let temp_raw = buf.get_u16_le();
+    let temp_raw = buf.get_i16_le();
     let pressure_raw = buf.get_u16_le();
     let humidity = buf.get_u8();
     let battery = buf.get_u8();
@@ -194,45 +194,6 @@ fn parse_aranet4_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
     })
 }
 
-/// Parse Aranet4 advertisement data (legacy format for tests).
-#[allow(dead_code)]
-fn parse_aranet4_advertisement(data: &[u8]) -> Result<AdvertisementData> {
-    if data.len() < 16 {
-        return Err(Error::InvalidData(format!(
-            "Aranet4 advertisement requires 16 bytes, got {}",
-            data.len()
-        )));
-    }
-
-    let mut buf = &data[1..]; // Skip device type byte
-    let flags = buf.get_u8();
-    let co2 = buf.get_u16_le();
-    let temp_raw = buf.get_u16_le();
-    let pressure_raw = buf.get_u16_le();
-    let humidity = buf.get_u8();
-    let battery = buf.get_u8();
-    let status = Status::from(buf.get_u8());
-    let interval = buf.get_u16_le();
-    let age = buf.get_u16_le();
-    let counter = buf.get_u8();
-
-    Ok(AdvertisementData {
-        device_type: DeviceType::Aranet4,
-        co2: Some(co2),
-        temperature: Some(temp_raw as f32 / 20.0),
-        pressure: Some(pressure_raw as f32 / 10.0),
-        humidity: Some(humidity),
-        battery,
-        status,
-        interval,
-        age,
-        radon: None,
-        radiation_dose_rate: None,
-        counter: Some(counter),
-        flags,
-    })
-}
-
 /// Parse Aranet2 advertisement data (v2 format - actual device format).
 ///
 /// Format (after device type byte removed, 19+ bytes):
@@ -256,13 +217,13 @@ fn parse_aranet2_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
     let flags = data[0];
     // Skip to sensor data at offset 7
     let mut buf = &data[7..];
-    let temp_raw = buf.get_u16_le();
+    let temp_raw = buf.get_i16_le();
     let _unused = buf.get_u16_le();
     let humidity_raw = buf.get_u16_le();
     let battery = buf.get_u8();
     let status_raw = buf.get_u8();
-    // Status for Aranet2 encodes both temp and humidity status
-    let status = Status::from(status_raw & 0x03);
+    // Status for Aranet2: bits[0:1] = humidity, bits[2:3] = temperature
+    let status = Status::from((status_raw >> 2) & 0x03);
     let interval = buf.get_u16_le();
     let age = buf.get_u16_le();
     let counter = if !buf.is_empty() {
@@ -276,7 +237,7 @@ fn parse_aranet2_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
         co2: None,
         temperature: Some(temp_raw as f32 * 0.05),
         pressure: None,
-        humidity: Some((humidity_raw as f32 * 0.1).min(100.0) as u8),
+        humidity: Some((humidity_raw as f32 * 0.1).clamp(0.0, 100.0) as u8),
         battery,
         status,
         interval,
@@ -315,7 +276,7 @@ fn parse_aranet_radon_advertisement_v2(data: &[u8]) -> Result<AdvertisementData>
     // Skip to sensor data at offset 7 (7 bytes of basic info)
     let mut buf = &data[7..];
     let radon = buf.get_u16_le() as u32;
-    let temp_raw = buf.get_u16_le();
+    let temp_raw = buf.get_i16_le();
     let pressure_raw = buf.get_u16_le();
     let humidity_raw = buf.get_u16_le();
     let _reserved = buf.get_u8(); // Unknown/reserved byte (skipped in Python)
@@ -334,7 +295,7 @@ fn parse_aranet_radon_advertisement_v2(data: &[u8]) -> Result<AdvertisementData>
         co2: None,
         temperature: Some(temp_raw as f32 * 0.05),
         pressure: Some(pressure_raw as f32 * 0.1),
-        humidity: Some((humidity_raw as f32 * 0.1).min(100.0) as u8),
+        humidity: Some((humidity_raw as f32 * 0.1).clamp(0.0, 100.0) as u8),
         battery,
         status,
         interval,
@@ -403,117 +364,6 @@ fn parse_aranet_radiation_advertisement_v2(data: &[u8]) -> Result<AdvertisementD
     })
 }
 
-/// Parse Aranet2 advertisement data (legacy format for tests).
-#[allow(dead_code)]
-fn parse_aranet2_advertisement(data: &[u8]) -> Result<AdvertisementData> {
-    if data.len() < 12 {
-        return Err(Error::InvalidData(format!(
-            "Aranet2 advertisement requires at least 12 bytes, got {}",
-            data.len()
-        )));
-    }
-
-    let mut buf = &data[1..];
-    let flags = buf.get_u8();
-    let temp_raw = buf.get_u16_le();
-    let humidity_raw = buf.get_u16_le();
-    let battery = buf.get_u8();
-    let status = Status::from(buf.get_u8());
-    let interval = buf.get_u16_le();
-    let age = buf.get_u16_le();
-
-    Ok(AdvertisementData {
-        device_type: DeviceType::Aranet2,
-        co2: None,
-        temperature: Some(temp_raw as f32 / 20.0),
-        pressure: None,
-        humidity: Some((humidity_raw / 10).min(100) as u8),
-        battery,
-        status,
-        interval,
-        age,
-        radon: None,
-        radiation_dose_rate: None,
-        counter: None,
-        flags,
-    })
-}
-
-/// Parse Aranet Radon advertisement data (legacy format for tests).
-#[allow(dead_code)]
-fn parse_aranet_radon_advertisement(data: &[u8]) -> Result<AdvertisementData> {
-    if data.len() < 18 {
-        return Err(Error::InvalidData(format!(
-            "Aranet Radon advertisement requires at least 18 bytes, got {}",
-            data.len()
-        )));
-    }
-
-    let mut buf = &data[1..];
-    let flags = buf.get_u8();
-    let temp_raw = buf.get_u16_le();
-    let pressure_raw = buf.get_u16_le();
-    let humidity_raw = buf.get_u16_le();
-    let battery = buf.get_u8();
-    let status = Status::from(buf.get_u8());
-    let interval = buf.get_u16_le();
-    let age = buf.get_u16_le();
-    let radon = buf.get_u32_le();
-
-    Ok(AdvertisementData {
-        device_type: DeviceType::AranetRadon,
-        co2: None,
-        temperature: Some(temp_raw as f32 / 20.0),
-        pressure: Some(pressure_raw as f32 / 10.0),
-        humidity: Some((humidity_raw / 10).min(100) as u8),
-        battery,
-        status,
-        interval,
-        age,
-        radon: Some(radon),
-        radiation_dose_rate: None,
-        counter: None,
-        flags,
-    })
-}
-
-/// Parse Aranet Radiation advertisement data (legacy format for tests).
-#[allow(dead_code)]
-fn parse_aranet_radiation_advertisement(data: &[u8]) -> Result<AdvertisementData> {
-    if data.len() < 16 {
-        return Err(Error::InvalidData(format!(
-            "Aranet Radiation advertisement requires at least 16 bytes, got {}",
-            data.len()
-        )));
-    }
-
-    let mut buf = &data[1..];
-    let flags = buf.get_u8();
-    let battery = buf.get_u8();
-    let status = Status::from(buf.get_u8());
-    let interval = buf.get_u16_le();
-    let age = buf.get_u16_le();
-    // Dose rate is in nSv/h, convert to µSv/h
-    let dose_rate_nsv = buf.get_u32_le();
-    let dose_rate_usv = dose_rate_nsv as f32 / 1000.0;
-
-    Ok(AdvertisementData {
-        device_type: DeviceType::AranetRadiation,
-        co2: None,
-        temperature: None,
-        pressure: None,
-        humidity: None,
-        battery,
-        status,
-        interval,
-        age,
-        radon: None,
-        radiation_dose_rate: Some(dose_rate_usv),
-        counter: None,
-        flags,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,7 +410,7 @@ mod tests {
             0x00, 0x00, // unused
             0xC2, 0x01, // humidity_raw = 450 (450 * 0.1 = 45%)
             85,   // battery
-            1,    // status = Green
+            0x04, // status flags: bits[2:3] = 01 = Green (temperature status)
             0x2C, 0x01, // interval = 300
             0x3C, 0x00, // age = 60
         ];
@@ -571,6 +421,7 @@ mod tests {
         assert!((result.temperature.unwrap() - 22.5).abs() < 0.01);
         assert_eq!(result.humidity, Some(45));
         assert_eq!(result.battery, 85);
+        assert_eq!(result.status, Status::Green);
     }
 
     #[test]

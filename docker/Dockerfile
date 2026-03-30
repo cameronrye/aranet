@@ -32,8 +32,8 @@ RUN mkdir -p crates/aranet-types/src && echo "pub fn dummy() {}" > crates/aranet
     mkdir -p crates/aranet-tui/src && echo "fn main() {}" > crates/aranet-tui/src/main.rs && \
     mkdir -p crates/aranet-gui/src && echo "fn main() {}" > crates/aranet-gui/src/main.rs
 
-# Build dependencies only
-RUN cargo build --release -p aranet-service --features full || true
+# Build dependencies only (may fail for dummy sources, that's expected)
+RUN cargo build --release -p aranet-service --features full 2>/dev/null; exit 0
 
 # Copy actual source code
 COPY crates/aranet-types/src crates/aranet-types/src
@@ -59,6 +59,7 @@ RUN apt-get update && apt-get install -y \
     libdbus-1-3 \
     libssl3 \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user

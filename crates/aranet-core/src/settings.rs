@@ -135,7 +135,7 @@ impl Device {
     /// measurement cycle completes.
     ///
     /// Note: This method does not verify the write succeeded. For verified
-    /// writes, use [`set_interval_verified`].
+    /// writes, use [`Self::set_interval_verified`].
     pub async fn set_interval(&self, interval: MeasurementInterval) -> Result<()> {
         info!("Setting measurement interval to {:?}", interval);
 
@@ -190,7 +190,7 @@ impl Device {
     /// without connecting (passive scanning).
     ///
     /// Note: This method does not verify the write succeeded. For verified
-    /// writes, use [`set_smart_home_verified`].
+    /// writes, use [`Self::set_smart_home_verified`].
     pub async fn set_smart_home(&self, enabled: bool) -> Result<()> {
         info!("Setting Smart Home integration to {}", enabled);
 
@@ -234,7 +234,7 @@ impl Device {
     /// Set the Bluetooth range.
     ///
     /// Note: This method does not verify the write succeeded. For verified
-    /// writes, use [`set_bluetooth_range_verified`].
+    /// writes, use [`Self::set_bluetooth_range_verified`].
     pub async fn set_bluetooth_range(&self, range: BluetoothRange) -> Result<()> {
         info!("Setting Bluetooth range to {:?}", range);
 

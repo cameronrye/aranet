@@ -106,8 +106,9 @@ pub fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // Load config to get service URL
-    let config = Config::load();
+    let config = Config::load_or_default()?;
     let service_url = config.gui.service_url.clone();
+    let service_api_key = config.gui.service_api_key.clone();
 
     // Get store path (shared database location)
     let store_path = default_db_path();
@@ -133,8 +134,13 @@ pub fn run() -> Result<()> {
             }
         };
         rt.block_on(async {
-            let worker =
-                SensorWorker::with_service_url(command_rx, event_tx, store_path, &service_url);
+            let worker = SensorWorker::with_service_config(
+                command_rx,
+                event_tx,
+                store_path,
+                &service_url,
+                service_api_key,
+            );
 
             // Send startup commands: load cached data and fetch service status
             if let Err(e) = startup_command_tx.send(Command::LoadCachedData).await {
@@ -277,8 +283,9 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
     }
 
     // Load config to get service URL and GUI settings
-    let config = Config::load();
+    let config = Config::load_or_default()?;
     let service_url = config.gui.service_url.clone();
+    let service_api_key = config.gui.service_api_key.clone();
 
     // Get store path (shared database location) - not used in demo mode
     let store_path = default_db_path();
@@ -307,8 +314,13 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
             }
         };
         rt.block_on(async {
-            let worker =
-                SensorWorker::with_service_url(command_rx, event_tx, store_path, &service_url);
+            let worker = SensorWorker::with_service_config(
+                command_rx,
+                event_tx,
+                store_path,
+                &service_url,
+                service_api_key,
+            );
 
             // Send startup commands (skip in demo mode)
             if !is_demo {

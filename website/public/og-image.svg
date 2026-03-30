@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">Aranet Rust Ecosystem</title>
+  <desc id="desc">CLI, service, dashboard, and libraries for Aranet environmental sensors.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.55" stop-color="#111827"/>
+      <stop offset="1" stop-color="#1f2937"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="180" y1="160" x2="1020" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10b981"/>
+      <stop offset="0.5" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#ef4444"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="28" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+
+  <circle cx="1020" cy="122" r="130" fill="#10b981" opacity="0.12"/>
+  <circle cx="104" cy="566" r="170" fill="#0ea5e9" opacity="0.12"/>
+  <circle cx="980" cy="520" r="180" fill="#ef4444" opacity="0.08"/>
+
+  <rect x="72" y="72" width="1056" height="486" rx="36" fill="rgba(15, 23, 42, 0.62)" stroke="rgba(148, 163, 184, 0.18)"/>
+
+  <g transform="translate(120, 138) scale(7.2)" filter="url(#glow)">
+    <path d="M18.2785 7C19.7816 7 21 8.11929 21 9.5C21 10.8807 19.7816 12 18.2785 12H3" stroke="url(#accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M17.9375 20C19.0766 20 20.5 19.5 20.5 17.5C20.5 15.5 19.0766 15 17.9375 15H3" stroke="url(#accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M10.4118 4C11.8412 4 13 5.11929 13 6.5C13 7.88071 11.8412 9 10.4118 9H3" stroke="url(#accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <text x="328" y="230" fill="#f8fafc" font-family="Inter, system-ui, sans-serif" font-size="88" font-weight="700" letter-spacing="-0.04em">
+    Aranet
+  </text>
+  <text x="328" y="292" fill="#cbd5e1" font-family="Inter, system-ui, sans-serif" font-size="38" font-weight="500" letter-spacing="-0.02em">
+    <tspan x="328" dy="0">Rust ecosystem for environmental</tspan>
+    <tspan x="328" dy="46">sensor monitoring</tspan>
+  </text>
+
+  <g transform="translate(328 396)">
+    <rect width="168" height="54" rx="27" fill="rgba(16, 185, 129, 0.12)" stroke="rgba(16, 185, 129, 0.45)"/>
+    <text x="84" y="35" text-anchor="middle" fill="#a7f3d0" font-family="Inter, system-ui, sans-serif" font-size="24" font-weight="600">CLI</text>
+
+    <rect x="188" width="202" height="54" rx="27" fill="rgba(14, 165, 233, 0.12)" stroke="rgba(14, 165, 233, 0.45)"/>
+    <text x="289" y="35" text-anchor="middle" fill="#bae6fd" font-family="Inter, system-ui, sans-serif" font-size="24" font-weight="600">Dashboard</text>
+
+    <rect x="410" width="164" height="54" rx="27" fill="rgba(245, 158, 11, 0.12)" stroke="rgba(245, 158, 11, 0.45)"/>
+    <text x="492" y="35" text-anchor="middle" fill="#fde68a" font-family="Inter, system-ui, sans-serif" font-size="24" font-weight="600">Service</text>
+  </g>
+
+  <text x="120" y="520" fill="#94a3b8" font-family="Inter, system-ui, sans-serif" font-size="30" font-weight="500">
+    BLE • MQTT • Prometheus • InfluxDB • Webhooks • Home Assistant
+  </text>
+</svg>

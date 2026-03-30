@@ -127,7 +127,7 @@ impl ReadingQuery {
 
     /// Limit the maximum number of results returned.
     ///
-    /// Use with `offset()` for pagination. Values are capped at [`MAX_QUERY_LIMIT`]
+    /// Use with `offset()` for pagination. Values are capped at `MAX_QUERY_LIMIT`
     /// to prevent resource exhaustion.
     pub fn limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit.min(MAX_QUERY_LIMIT));
@@ -138,8 +138,10 @@ impl ReadingQuery {
     ///
     /// Use with `limit()` for pagination. For example, to get page 2
     /// with 50 items per page: `.limit(50).offset(50)`.
+    ///
+    /// Values are capped at `MAX_QUERY_LIMIT` to prevent degenerate queries.
     pub fn offset(mut self, offset: u32) -> Self {
-        self.offset = Some(offset);
+        self.offset = Some(offset.min(MAX_QUERY_LIMIT));
         self
     }
 
@@ -188,7 +190,8 @@ impl ReadingQuery {
 
         let mut sql = format!(
             "SELECT id, device_id, captured_at, co2, temperature, pressure, humidity, \
-             battery, status, radon, radiation_rate, radiation_total \
+             battery, status, radon, radiation_rate, radiation_total, \
+             radon_avg_24h, radon_avg_7d, radon_avg_30d \
              FROM readings {} ORDER BY captured_at {}",
             where_clause, order
         );
@@ -291,7 +294,7 @@ impl HistoryQuery {
 
     /// Limit the maximum number of results returned.
     ///
-    /// Use with `offset()` for pagination. Values are capped at [`MAX_QUERY_LIMIT`]
+    /// Use with `offset()` for pagination. Values are capped at `MAX_QUERY_LIMIT`
     /// to prevent resource exhaustion.
     pub fn limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit.min(MAX_QUERY_LIMIT));
@@ -302,8 +305,10 @@ impl HistoryQuery {
     ///
     /// Use with `limit()` for pagination. For example, to get page 3
     /// with 100 items per page: `.limit(100).offset(200)`.
+    ///
+    /// Values are capped at `MAX_QUERY_LIMIT` to prevent degenerate queries.
     pub fn offset(mut self, offset: u32) -> Self {
-        self.offset = Some(offset);
+        self.offset = Some(offset.min(MAX_QUERY_LIMIT));
         self
     }
 
@@ -314,6 +319,61 @@ impl HistoryQuery {
     pub fn oldest_first(mut self) -> Self {
         self.newest_first = false;
         self
+    }
+
+    /// Build the SQL WHERE clause and parameters.
+    pub(crate) fn build_where(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let mut conditions = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(ref device_id) = self.device_id {
+            conditions.push("device_id = ?");
+            params.push(Box::new(device_id.clone()));
+        }
+
+        if let Some(since) = self.since {
+            conditions.push("timestamp >= ?");
+            params.push(Box::new(since.unix_timestamp()));
+        }
+
+        if let Some(until) = self.until {
+            conditions.push("timestamp <= ?");
+            params.push(Box::new(until.unix_timestamp()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        (where_clause, params)
+    }
+
+    /// Build a SELECT query using the configured filters, ordering, and pagination.
+    pub(crate) fn build_sql_with_select(&self, select: &str) -> String {
+        let (where_clause, _) = self.build_where();
+        let order = if self.newest_first { "DESC" } else { "ASC" };
+
+        let mut sql = format!("{select} {where_clause} ORDER BY timestamp {order}");
+
+        if let Some(limit) = self.limit {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        if let Some(offset) = self.offset {
+            sql.push_str(&format!(" OFFSET {}", offset));
+        }
+
+        sql
+    }
+
+    /// Build the full SQL query for history rows.
+    pub(crate) fn build_sql(&self) -> String {
+        self.build_sql_with_select(
+            "SELECT id, device_id, timestamp, synced_at, co2, temperature, pressure, \
+             humidity, radon, radiation_rate, radiation_total FROM history",
+        )
     }
 }
 
@@ -523,6 +583,9 @@ mod tests {
         assert!(sql.contains("radon"));
         assert!(sql.contains("radiation_rate"));
         assert!(sql.contains("radiation_total"));
+        assert!(sql.contains("radon_avg_24h"));
+        assert!(sql.contains("radon_avg_7d"));
+        assert!(sql.contains("radon_avg_30d"));
     }
 
     // ==================== HistoryQuery Tests ====================
@@ -650,10 +713,10 @@ mod tests {
 
     #[test]
     fn test_reading_query_large_pagination() {
-        // Limit is clamped to MAX_QUERY_LIMIT, but offset is not
+        // Both limit and offset are clamped to MAX_QUERY_LIMIT
         let query = ReadingQuery::new().limit(u32::MAX).offset(u32::MAX);
         let sql = query.build_sql();
         assert!(sql.contains(&format!("LIMIT {}", MAX_QUERY_LIMIT)));
-        assert!(sql.contains(&format!("OFFSET {}", u32::MAX)));
+        assert!(sql.contains(&format!("OFFSET {}", MAX_QUERY_LIMIT)));
     }
 }

@@ -3,9 +3,10 @@ title: Installation
 description: How to install the Aranet CLI on macOS, Linux, and Windows.
 ---
 
-import { Steps, Tabs, TabItem, Aside, Badge, Card, CardGrid } from '@astrojs/starlight/components';
+import { Steps, Tabs, TabItem, Aside, Badge, Card, CardGrid, Code } from '@astrojs/starlight/components';
+import { CURRENT_RELEASE, CURRENT_RELEASE_TAG } from '../../../site-config.mjs';
 
-<Badge text="v0.1.11" variant="success" /> Latest Release
+<Badge text={CURRENT_RELEASE_TAG} variant="success" /> Latest Release
 
 ## Pre-built Binaries
 
@@ -54,6 +55,23 @@ Download binaries directly from GitHub Releases:
   All releases include SHA256 checksums. View all versions on the [GitHub Releases](https://github.com/cameronrye/aranet/releases) page.
 </Aside>
 
+## Docker
+
+Run aranet-service in a container (requires BLE access on the host):
+
+```bash
+docker compose up -d
+# Dashboard: http://localhost:8080/dashboard
+```
+
+Or use the full monitoring stack with Prometheus and Grafana:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+```
+
+See [Service Deployment](/aranet/docs/service/deployment/#docker) for configuration details.
+
 ## Install from crates.io
 
 Install using Cargo (requires Rust toolchain):
@@ -61,6 +79,8 @@ Install using Cargo (requires Rust toolchain):
 ```bash
 cargo install aranet-cli
 ```
+
+This installs the `aranet` executable.
 
 ## Build from Source
 
@@ -151,10 +171,7 @@ Generate shell completions for your shell:
 
 Add `aranet-core` to your `Cargo.toml`:
 
-```toml
-[dependencies]
-aranet-core = "0.1"
-```
+<Code lang="toml" code={`[dependencies]\naranet-core = "${CURRENT_RELEASE.series}"`} />
 
 ## Verify Installation
 
@@ -170,8 +187,3 @@ aranet doctor
 # Scan for devices (requires Bluetooth)
 aranet scan --timeout 5
 ```
-
----
-
-Made with ❤️ by [Cameron Rye](https://rye.dev/)
-

@@ -3,7 +3,8 @@ title: Service Deployment
 description: Deploy aranet-service as a background system service.
 ---
 
-import { Aside, Steps, Tabs, TabItem, Badge } from '@astrojs/starlight/components';
+import { Aside, Steps, Tabs, TabItem, Badge, Code } from '@astrojs/starlight/components';
+import { CURRENT_RELEASE } from '../../../../site-config.mjs';
 
 This guide covers deploying aranet-service as a persistent background service on various platforms.
 
@@ -105,8 +106,7 @@ launchctl load ~/Library/LaunchAgents/dev.rye.aranet.plist
 4. Enable and start
    ```bash
    sudo systemctl daemon-reload
-   sudo systemctl enable aranet
-   sudo systemctl start aranet
+   sudo systemctl enable --now dev.rye.aranet
    ```
 </Steps>
 
@@ -161,19 +161,41 @@ cp distribution/systemd/aranet.service ~/.config/systemd/user/
 # Edit to remove User/Group and adjust paths
 # Then enable
 systemctl --user daemon-reload
-systemctl --user enable aranet
-systemctl --user start aranet
+systemctl --user enable --now dev.rye.aranet
 ```
 
 ## Docker
 
-See [Docker Setup](/aranet/docker/README.md) for detailed Docker deployment.
+A multi-stage `Dockerfile` and `docker-compose.yml` are provided at the repository root. BLE access requires privileged mode and D-Bus passthrough.
 
 ### Quick Start
 
 ```bash
-cd docker
-docker-compose up -d
+# Standalone service with BLE
+docker compose up -d
+
+# Dashboard: http://localhost:8080/dashboard
+```
+
+### Full Monitoring Stack
+
+Use the `docker/` directory for a Prometheus + Grafana stack:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+```
+
+### Build from Source
+
+```bash
+docker build -t aranet-service .
+docker run -d --name aranet-service \
+  --privileged --network host \
+  -v /var/run/dbus:/var/run/dbus \
+  -v aranet-data:/data \
+  -v ./server.toml:/app/server.toml:ro \
+  -e RUST_LOG=aranet_service=info \
+  aranet-service
 ```
 
 ### Production Deployment
@@ -182,23 +204,31 @@ docker-compose up -d
 # docker-compose.prod.yml
 services:
   aranet-service:
-    image: ghcr.io/cameronrye/aranet-service:latest
+    build: .
     restart: always
     ports:
       - "8080:8080"
     volumes:
       - aranet-data:/data
       - ./server.toml:/app/server.toml:ro
+      - /var/run/dbus:/var/run/dbus
+    privileged: true
+    network_mode: host
     environment:
       - RUST_LOG=aranet_service=info
-    deploy:
-      resources:
-        limits:
-          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  aranet-data:
 ```
 
 <Aside type="caution">
-  Docker containers cannot access Bluetooth by default. For BLE support, run in privileged mode or use the host network.
+  Docker containers cannot access Bluetooth by default. BLE support requires privileged mode with D-Bus socket passthrough (`/var/run/dbus`) and host networking.
 </Aside>
 
 ## Configuration
@@ -230,13 +260,102 @@ For production deployments, enable API authentication and rate limiting:
 ```toml
 [security]
 api_key_enabled = true
-api_key = "your-secure-random-key-at-least-16-chars"
+api_key = "your-secure-random-key-at-least-32-chars"
 rate_limit_enabled = true
 rate_limit_requests = 100
 rate_limit_window_secs = 60
 ```
 
-See [API Security](/docs/service/security/) for detailed configuration.
+See [API Security](/aranet/docs/service/security/) for detailed configuration.
+
+### Webhook Notifications
+
+Configure HTTP POST alerts when sensor thresholds are exceeded:
+
+```toml
+[webhooks]
+enabled = true
+co2_threshold = 1000        # ppm
+radon_threshold = 300       # Bq/m³
+battery_threshold = 10      # percent
+cooldown_secs = 300         # seconds between repeat alerts per device
+
+[[webhooks.endpoints]]
+url = "https://hooks.slack.com/services/T00/B00/xxx"
+events = ["co2_high", "radon_high", "battery_low"]
+
+[[webhooks.endpoints]]
+url = "https://ntfy.sh/my-aranet-alerts"
+events = ["co2_high"]
+headers = { "Authorization" = "Bearer tk_xxx" }
+```
+
+Each webhook POST sends a JSON payload:
+
+```json
+{
+  "event": "co2_high",
+  "device_id": "Aranet4 AAAAA",
+  "alias": "office",
+  "value": 1200.0,
+  "threshold": 1000.0,
+  "unit": "ppm",
+  "reading": { ... },
+  "timestamp": "2026-03-28T12:00:00Z"
+}
+```
+
+Valid event types: `co2_high`, `radon_high`, `battery_low`.
+
+### InfluxDB Export
+
+Export sensor readings to InfluxDB v2 in real time:
+
+```toml
+[influxdb]
+enabled = true
+url = "http://localhost:8086"
+token = "your-influxdb-token"
+org = "my-org"
+bucket = "aranet"
+measurement = "aranet"
+precision = "s"             # s, ms, us, or ns
+```
+
+Data is written using the InfluxDB v2 line protocol: `aranet,device=office,address=Aranet4+AAAAA co2=450i,temperature=22.50,humidity=45i,pressure=1013.50,battery=85i`.
+
+### mDNS Service Discovery
+
+When running, aranet-service automatically advertises itself on the local network via mDNS:
+
+- Service type: `_aranet._tcp.local.`
+- HTTP service: `_http._tcp.local.`
+- Properties: `version`, `path` (`/api`), `dashboard` (`/dashboard`)
+
+Clients can discover the service without manual IP configuration:
+
+```bash
+# macOS
+dns-sd -B _aranet._tcp local.
+
+# Linux (avahi)
+avahi-browse -r _aranet._tcp
+```
+
+### Grafana Dashboard
+
+A pre-built Grafana dashboard is included at `grafana/aranet-dashboard.json`. To import:
+
+1. Open Grafana and navigate to **Dashboards > Import**
+2. Click **Upload JSON file** and select `grafana/aranet-dashboard.json`
+3. Select your Prometheus data source and click **Import**
+
+The dashboard includes panels for:
+- CO₂ gauges with threshold coloring
+- Environment time series (temperature, humidity, pressure)
+- Radon and radiation displays
+- Battery levels per device
+- Collector statistics (poll success/failure, duration)
 
 ### Environment Variables
 
@@ -277,6 +396,7 @@ scrape_configs:
 | `aranet_collector_uptime_seconds` | gauge | Collector uptime |
 | `aranet_device_poll_success_total` | counter | Successful polls |
 | `aranet_device_poll_failure_total` | counter | Failed polls |
+| `aranet_device_poll_duration_ms` | gauge | Per-device poll duration |
 
 ## Multi-Device Setup
 
@@ -350,15 +470,16 @@ docker logs -f aranet-service
 
 ### Health Check
 
-```bash
-# Basic health check
+<Code
+  lang="bash"
+  code={`# Basic health check
 curl http://localhost:8080/api/health
-# {"status":"ok","version":"0.1.12","timestamp":"2026-02-01T10:30:00Z"}
+# {"status":"ok","version":"${CURRENT_RELEASE.version}","timestamp":"${CURRENT_RELEASE.date}T10:30:00Z"}
 
 # Detailed health check with diagnostics
 curl http://localhost:8080/api/health/detailed
-# Returns database, collector, and platform diagnostics
-```
+# Returns database, collector, and platform diagnostics`}
+/>
 
 ### Prometheus Metrics
 

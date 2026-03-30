@@ -3,7 +3,29 @@ title: CLI Commands
 description: Complete reference for all Aranet CLI commands.
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
+
+## Global Options
+
+These options apply to most commands:
+
+| Option | Description |
+|--------|-------------|
+| `-v, --verbose` | Enable verbose logging |
+| `-q, --quiet` | Suppress non-essential output |
+| `--json` | Shorthand for JSON output where supported |
+| `--compact` | Emit compact JSON instead of pretty-printed JSON |
+| `--no-color` | Disable colored output |
+| `--style <MODE>` | Visual style: `rich`, `minimal`, `plain` |
+| `-o, --output <FILE>` | Write output to a file instead of stdout |
+
+Common unit flags:
+
+| Option | Description |
+|--------|-------------|
+| `--fahrenheit` / `--celsius` | Override temperature units |
+| `--inhg` / `--hpa` | Override pressure units |
+| `--bq` / `--pci` | Override radon units |
 
 ## scan
 
@@ -13,25 +35,17 @@ Discover nearby Aranet devices via Bluetooth.
 aranet scan [OPTIONS]
 ```
 
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-t, --timeout <SECONDS>` | `10` | Scan duration in seconds |
-
-### Example
+| Option | Description |
+|--------|-------------|
+| `-t, --timeout <SECONDS>` | Scan duration in seconds |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
+| `--no-header` | Omit the CSV header row |
+| `-a, --alias` | Interactively save aliases for discovered devices |
 
 ```bash
-$ aranet scan --timeout 15
-
-Scanning for Aranet devices (timeout: 15s)...
-
-Found 2 devices:
-  Aranet4 17C3C    AA:BB:CC:DD:EE:FF    RSSI: -45 dBm
-  AranetRn+ 306B8  11:22:33:44:55:66    RSSI: -52 dBm
+aranet scan --timeout 15
+aranet scan --alias
 ```
-
----
 
 ## read
 
@@ -41,596 +55,326 @@ Read current sensor measurements from one or more devices.
 aranet read [OPTIONS]
 ```
 
-### Options
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias; can be repeated or comma-separated |
+| `-T, --timeout <SECONDS>` | Connection timeout per device |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
+| `--passive` | Read from BLE advertisements without connecting |
+| `--no-header` | Omit the CSV header row |
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-d, --device <ADDRESS>` | interactive | Device address(es), can be specified multiple times or comma-separated |
-| `-f, --format <FORMAT>` | `text` | Output format: `text`, `json`, `csv` |
-| `--passive` | - | Read from BLE advertisements without connecting |
-| `--inhg` | - | Display pressure in inches of mercury |
-| `--hpa` | - | Display pressure in hPa (default) |
-| `--fahrenheit` | - | Display temperature in Fahrenheit |
-
-### Example
-
-<Tabs>
-  <TabItem label="Single Device">
 ```bash
-$ aranet read --device AA:BB:CC:DD:EE:FF
-
-CO₂:         847 ppm   [GREEN]
-Temperature: 22.4°C
-Humidity:    45%
-Pressure:    1013.2 hPa
-Battery:     87%
+aranet read --device AA:BB:CC:DD:EE:FF
+aranet read -d living-room -d bedroom
+aranet read --device living-room --passive --json
 ```
-  </TabItem>
-  <TabItem label="Multi-Device">
-```bash
-$ aranet read -d living-room -d bedroom
-
--- living-room --
-CO₂:         847 ppm   [GREEN]
-Temperature: 22.4°C
-...
-
--- bedroom --
-CO₂:         523 ppm   [GREEN]
-Temperature: 20.1°C
-...
-```
-  </TabItem>
-  <TabItem label="Passive Mode">
-```bash
-# Read from advertisements without connecting
-$ aranet read --device AA:BB:CC:DD:EE:FF --passive
-```
-  </TabItem>
-  <TabItem label="JSON">
-```bash
-$ aranet read --device AA:BB:CC:DD:EE:FF --format json
-
-{
-  "co2": 847,
-  "temperature": 22.4,
-  "humidity": 45,
-  "pressure": 1013.2,
-  "battery": 87,
-  "status": "green",
-  "interval": 300,
-  "age": 135
-}
-```
-  </TabItem>
-</Tabs>
 
 <Aside>
-  When no device is specified, an interactive picker will scan for nearby devices and let you choose.
+  If you omit `--device`, the CLI uses the configured or last-used device when available. Otherwise it falls back to the interactive picker.
 </Aside>
-
----
-
-## history
-
-Download historical measurements from a device.
-
-```bash
-aranet history [OPTIONS]
-```
-
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-d, --device <ADDRESS>` | interactive | Device address |
-| `-c, --count <N>` | `0` (all) | Number of records to retrieve |
-| `-f, --format <FORMAT>` | `text` | Output format: `text`, `json`, `csv` |
-| `--since <DATE>` | - | Filter records since this date (RFC3339 or YYYY-MM-DD) |
-| `--until <DATE>` | - | Filter records until this date |
-| `-o, --output <FILE>` | - | Write output to file |
-
-### Example
-
-<Tabs>
-  <TabItem label="Basic">
-```bash
-$ aranet history --device AA:BB:CC:DD:EE:FF --output history.csv --format csv
-
-Downloading history...
-[==========] 100% Download complete
-Downloaded 1440 records to history.csv
-```
-  </TabItem>
-  <TabItem label="Date Filter">
-```bash
-# Download only records from a specific date range
-$ aranet history --device AA:BB:CC:DD:EE:FF --since 2026-01-15 --until 2026-01-16
-```
-  </TabItem>
-</Tabs>
-
----
-
-## info
-
-Display device information.
-
-```bash
-aranet info [OPTIONS]
-```
-
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-d, --device <ADDRESS>` | auto-detect | Device address |
-
-### Example
-
-```bash
-$ aranet info --device AA:BB:CC:DD:EE:FF
-
-Device Information
-╭──────────────┬─────────────────╮
-│ Property     │ Value           │
-├──────────────┼─────────────────┤
-│ Name         │ Aranet4 17C3C   │
-│ Model        │ Aranet4         │
-│ Serial       │ 12345678        │
-│ Firmware     │ v1.4.19         │
-│ Hardware     │ v1.0            │
-│ Software     │ v1.0            │
-│ Manufacturer │ SAF Tehnika     │
-╰──────────────┴─────────────────╯
-```
-
----
 
 ## status
 
-Quick one-line reading with colored CO2 status indicator.
+Show a one-line summary for a device.
 
 ```bash
 aranet status [OPTIONS]
 ```
 
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-d, --device <ADDRESS>` | auto-detect | Device address (MAC or UUID) |
-| `--brief` | - | Super-compact single-line output |
-
-### Example
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias |
+| `-T, --timeout <SECONDS>` | Connection timeout |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
+| `--brief` | Emit a compact single-line summary |
+| `--no-header` | Omit the CSV header row |
 
 ```bash
-$ aranet status --device AA:BB:CC:DD:EE:FF
-
-Aranet4 17C3C: 847 ppm [GREEN] 22.4C 45% 1013 hPa
-
-# Brief mode for scripts
-$ aranet status --device AA:BB:CC:DD:EE:FF --brief
-
-Aranet4 17C3C: 800 ppm [GREEN] | 22.5C | 45% | 85%
+aranet status --device living-room
+aranet status --device living-room --brief
 ```
 
----
+## history
+
+Download historical measurements from a device, or read them from the local cache.
+
+```bash
+aranet history [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias |
+| `-T, --timeout <SECONDS>` | Connection timeout |
+| `-c, --count <N>` | Number of records to retrieve (`0` means all) |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
+| `--since <DATE>` | Filter records after this RFC3339 or `YYYY-MM-DD` timestamp |
+| `--until <DATE>` | Filter records before this RFC3339 or `YYYY-MM-DD` timestamp |
+| `--cache` | Read from the local cache instead of connecting to the device |
+| `--no-header` | Omit the CSV header row |
+
+```bash
+aranet history --device living-room --output history.csv --format csv
+aranet history --device living-room --since 2026-03-01 --until 2026-03-07
+aranet history --device living-room --cache --count 100 --format json
+```
+
+## info
+
+Display device metadata such as model, firmware, and serial number.
+
+```bash
+aranet info [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias |
+| `-T, --timeout <SECONDS>` | Connection timeout |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
+| `--no-header` | Omit the CSV header row |
+
+```bash
+aranet info --device living-room
+```
 
 ## set
 
-Modify device settings.
+Modify supported device settings.
 
 ```bash
-aranet set [OPTIONS] <SETTING> <VALUE>
+aranet set [OPTIONS] <SUBCOMMAND>
 ```
 
-### Settings
+| Subcommand | Description |
+|------------|-------------|
+| `interval <MINUTES>` | Set the measurement interval in minutes; valid values are `1`, `2`, `5`, `10` |
+| `range <MODE>` | Set Bluetooth range mode; valid values are `standard`, `extended` |
+| `smart-home <BOOL>` | Enable or disable Smart Home BLE advertisements |
 
-| Setting | Values | Description |
-|---------|--------|-------------|
-| `interval` | `1`, `2`, `5`, `10` | Measurement interval in minutes |
-| `range` | `standard`, `extended` | Bluetooth range |
-| `smart_home` | `on`, `off` | Smart Home integration |
-
-### Example
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias |
+| `-T, --timeout <SECONDS>` | Connection timeout |
+| `-f, --force` | Skip the confirmation prompt |
 
 ```bash
-# Set measurement interval to 2 minutes
-aranet set --device AA:BB:CC:DD:EE:FF interval 2
-
-# Enable extended Bluetooth range
-aranet set --device AA:BB:CC:DD:EE:FF range extended
-
-# Enable Smart Home integration
-aranet set --device AA:BB:CC:DD:EE:FF smart_home on
+aranet set --device living-room interval 5
+aranet set --device living-room range extended
+aranet set --device living-room smart-home on
 ```
-
-<Aside type="caution">
-  Changing the measurement interval affects battery life. Shorter intervals use more power.
-</Aside>
-
----
 
 ## watch
 
-Continuously monitor sensor readings with auto-reconnect.
+Continuously monitor a device, or all devices passively.
 
 ```bash
 aranet watch [OPTIONS]
 ```
 
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-d, --device <ADDRESS>` | all devices | Device address (MAC or UUID) |
-| `-i, --interval <SECONDS>` | 60 | Polling interval in seconds |
-| `-n, --count <N>` | unlimited | Number of readings before exiting |
-| `--passive` | false | Read from BLE advertisements (requires Smart Home enabled) |
-
-### Examples
-
-**Watch a specific device (active connection):**
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias |
+| `-T, --timeout <SECONDS>` | Connection timeout |
+| `-i, --interval <SECONDS>` | Poll interval |
+| `-n, --count <N>` | Stop after `N` samples (`0` means unlimited) |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
+| `--passive` | Watch BLE advertisements instead of opening a connection |
+| `--no-header` | Omit the CSV header row |
 
 ```bash
-$ aranet watch --device AA:BB:CC:DD:EE:FF
-
-Watching: AA:BB:CC:DD:EE:FF
-Interval: 60s | Press Ctrl+C to stop
---------------------------------------------------
-[10:00:00] 847 ppm | 22.4 C | 45% | 95%
-[10:05:00] 823 ppm | 22.5 C | 44% | 95%
+aranet watch --device living-room --interval 30
+aranet watch --passive
+aranet watch --device basement --passive --count 10
 ```
 
-**Watch all devices passively (no connection required):**
-
-```bash
-$ aranet watch --passive
-
-Watching: all devices (passive)
-Interval: 60s | Press Ctrl+C to stop
-------------------------------------------------------------
-[10:00:00]  [Aranet4 17C3C]   [GREEN]  523 ppm   22.1C  45%  1013.2 hPa  BAT 87%
-[10:00:00]  [AranetRn+ 306B8] [AMBER]  101 pCi/L 14.6C  32%  981.4 hPa   BAT 95%
-[10:01:30]  [Aranet4 17C3C]   [GREEN]  518 ppm   22.2C  44%  1013.1 hPa  BAT 87%
-```
-
-**Watch a specific device passively:**
-
-```bash
-$ aranet watch --passive --device "AranetRn+ 306B8"
-```
-
-:::note
-Passive mode requires **Smart Home integration** to be enabled on the device. This broadcasts sensor data in BLE advertisements, allowing readings without connecting.
-:::
-
----
-
-## config
-
-Manage the configuration file (`~/.config/aranet/config.toml`).
-
-```bash
-aranet config <SUBCOMMAND>
-```
-
-### Subcommands
-
-| Subcommand | Description |
-|------------|-------------|
-| `show` | Display current configuration |
-| `get <KEY>` | Get a configuration value |
-| `set <KEY> <VALUE>` | Set a configuration value |
-| `unset <KEY>` | Remove a configuration value |
-| `path` | Print the config file path |
-| `init` | Initialize default configuration |
-
-### Example
-
-```bash
-# Show current configuration
-$ aranet config show
-
-device = "AA:BB:CC:DD:EE:FF"
-format = "text"
-no_color = false
-fahrenheit = false
-
-# Print config file path
-$ aranet config path
-
-/Users/you/.config/aranet/config.toml
-```
-
-### Configuration Options
-
-```toml
-# ~/.config/aranet/config.toml
-
-# Default device address
-device = "AA:BB:CC:DD:EE:FF"
-
-# Default output format: text, json, csv
-format = "text"
-
-# Disable colored output
-no_color = false
-
-# Use Fahrenheit for temperature
-fahrenheit = false
-
-# Use inHg for pressure
-inhg = false
-
-# Use Bq/m³ for radon (instead of pCi/L)
-bq = false
-
-# Device aliases
-[aliases]
-living-room = "AA:BB:CC:DD:EE:FF"
-bedroom = "11:22:33:44:55:66"
-```
-
----
-
-## completions
-
-Generate shell completion scripts.
-
-```bash
-aranet completions <SHELL>
-```
-
-### Shells
-
-`bash`, `zsh`, `fish`, `powershell`, `elvish`
-
-### Example
-
-```bash
-# Generate and install zsh completions
-aranet completions zsh > ~/.zfunc/_aranet
-```
-
----
+<Aside type="note">
+  Passive mode requires Smart Home broadcasting to be enabled on the device.
+</Aside>
 
 ## alias
 
-Manage device aliases (friendly names for device addresses).
+Manage friendly names for device addresses.
 
 ```bash
 aranet alias <SUBCOMMAND>
 ```
 
-### Subcommands
+| Subcommand | Description |
+|------------|-------------|
+| `list` | List configured aliases |
+| `set <NAME> <ADDRESS>` | Create or update an alias |
+| `remove <NAME>` | Delete an alias |
+
+```bash
+aranet alias set living-room AA:BB:CC:DD:EE:FF
+aranet alias list
+aranet alias remove living-room
+```
+
+## config
+
+Manage the CLI configuration file.
+
+```bash
+aranet config <SUBCOMMAND>
+```
 
 | Subcommand | Description |
 |------------|-------------|
-| `list` | Show all saved device aliases |
-| `set <name> <address>` | Create or update an alias |
-| `remove <name>` | Delete an alias |
+| `show` | Print the full config |
+| `get <KEY>` | Print a single config value |
+| `set <KEY> <VALUE>` | Update a config value |
+| `unset <KEY>` | Remove a config value |
+| `path` | Print the config file path |
+| `init` | Create a default config file |
 
-### Example
+Supported keys: `device`, `format`, `timeout`, `no-color`, `fahrenheit`, `inhg`, `bq`.
 
 ```bash
-# Create an alias
-$ aranet alias set living-room AA:BB:CC:DD:EE:FF
-Added alias 'living-room' -> AA:BB:CC:DD:EE:FF
-
-# List all aliases
-$ aranet alias list
-╭─────────────┬───────────────────╮
-│ Alias       │ Device Address    │
-├─────────────┼───────────────────┤
-│ bedroom     │ 11:22:33:44:55:66 │
-│ living-room │ AA:BB:CC:DD:EE:FF │
-╰─────────────┴───────────────────╯
-
-# Use alias instead of address
-$ aranet read -d living-room
-
-# Remove an alias
-$ aranet alias remove bedroom
-Removed alias 'bedroom'
+aranet config init
+aranet config set device living-room
+aranet config set format json
+aranet config show
 ```
-
-<Aside>
-  Aliases are stored in your config file (`~/.config/aranet/config.toml`) under the `[aliases]` section.
-</Aside>
-
----
 
 ## sync
 
-Download device history to the local database for offline access.
+Sync device history into the local SQLite cache.
 
 ```bash
 aranet sync [OPTIONS]
 ```
 
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-d, --device <ADDRESS>` | required | Device address or alias |
-| `--full` | false | Re-download all history (instead of incremental) |
-
-### Example
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias |
+| `-T, --timeout <SECONDS>` | Connection timeout |
+| `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
+| `--full` | Re-download all history instead of syncing incrementally |
+| `--all` | Sync all known devices from the database |
 
 ```bash
-# Incremental sync (only new records since last sync)
-$ aranet sync --device AA:BB:CC:DD:EE:FF
+aranet sync --device living-room
+aranet sync --device living-room --full
+aranet sync --all --format json
+```
 
-Syncing history from Aranet4 17C3C...
-[==========] 100% Downloaded 42 new records
-Sync complete. Total cached: 1482 records
+## report
 
-# Full sync (re-download everything)
-$ aranet sync --device living-room --full
+Generate summary reports from cached history.
 
-Syncing history from Aranet4 17C3C (full)...
-[==========] 100% Downloaded 1482 records
-Sync complete.
+```bash
+aranet report [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-d, --device <ADDRESS>` | Device address or alias |
+| `--all` | Report on every cached device |
+| `-p, --period <PERIOD>` | `daily`, `weekly`, or `monthly` |
+| `-f, --format <FORMAT>` | Output format: `text` or `json` |
+
+```bash
+aranet report --device living-room
+aranet report --device living-room --period weekly --format json
+aranet report --all --period monthly
 ```
 
 <Aside>
-  History is stored in a local SQLite database. Use `aranet cache info` to see the database location.
+  `report` works entirely from the local cache populated by `aranet sync`.
 </Aside>
-
----
 
 ## cache
 
-Query cached data from the local database without connecting to a device.
+Query and maintain the local SQLite cache directly.
 
 ```bash
 aranet cache <SUBCOMMAND>
 ```
 
-### Subcommands
-
 | Subcommand | Description |
 |------------|-------------|
-| `devices` | List all cached devices |
-| `stats` | Show cache statistics |
-| `history` | Query cached history records |
+| `devices` | List cached devices |
+| `stats [--device <ADDRESS>]` | Show cache statistics |
+| `history --device <ADDRESS>` | Query cached history records |
+| `aggregate --device <ADDRESS>` | Show min/max/avg aggregates |
+| `export --device <ADDRESS>` | Export cached history to CSV or JSON |
+| `prune --older-than <DURATION>` | Delete older cache records |
 | `info` | Show database path and size |
-
-### Examples
-
-**List cached devices:**
+| `import` | Import history from CSV or JSON |
 
 ```bash
-$ aranet cache devices
-
-Cached Devices:
-╭─────────────────┬───────────────────┬──────────────┬─────────────╮
-│ Name            │ Address           │ Last Sync    │ Records     │
-├─────────────────┼───────────────────┼──────────────┼─────────────┤
-│ Aranet4 17C3C   │ AA:BB:CC:DD:EE:FF │ 2 hours ago  │ 1482        │
-│ AranetRn+ 306B8 │ 11:22:33:44:55:66 │ 1 day ago    │ 720         │
-╰─────────────────┴───────────────────┴──────────────┴─────────────╯
+aranet cache devices
+aranet cache stats --device living-room
+aranet cache history --device living-room --count 50 --format json
+aranet cache aggregate --device living-room --since 2026-03-01
+aranet cache export --device living-room --format csv --output living-room.csv
+aranet cache prune --older-than 90d --history-only --vacuum
+aranet cache import --format json --input export.json
 ```
 
-**Show cache statistics:**
+## server
+
+Launch the bundled HTTP API server and dashboard from the CLI.
 
 ```bash
-$ aranet cache stats
-
-Cache Statistics:
-  Devices:  2
-  Readings: 156
-  History:  2202
-  Database: 1.2 MB
+aranet server [OPTIONS]
 ```
 
-**Query cached history:**
+| Option | Description |
+|--------|-------------|
+| `-c, --config <PATH>` | Path to the `aranet-service` configuration file |
+| `-b, --bind <ADDR>` | Bind address override |
+| `--database <PATH>` | Database path override |
+| `--no-collector` | Start the API without background polling |
+| `--daemon` | Detach and run in the background |
 
 ```bash
-$ aranet cache history --device AA:BB:CC:DD:EE:FF --count 10
-
-# With date filters
-$ aranet cache history --device living-room --since 2026-01-15 --until 2026-01-16
+aranet server --bind 127.0.0.1:8080
+aranet server --config ~/.config/aranet/server.toml --no-collector
 ```
 
-**Show database info:**
+## completions
+
+Generate shell completions.
 
 ```bash
-$ aranet cache info
-
-Database Path: /Users/you/Library/Application Support/aranet/data.db
-Database Size: 1.2 MB
+aranet completions <SHELL>
 ```
 
----
-
-## tui
-
-Launch the interactive terminal dashboard for real-time monitoring.
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
 
 ```bash
-aranet tui
+aranet completions zsh > ~/.zfunc/_aranet
 ```
-
-### Features
-
-The TUI dashboard provides a full-featured monitoring interface with:
-
-- **Multi-device monitoring** with auto-refresh
-- **Sparkline charts** with min/max labels and time axis
-- **Threshold alerts** with severity levels and terminal bell
-- **Light/dark theme** toggle
-- **Mouse support** for device and tab selection
-- **Export history** to CSV
-- **Comparison view** for side-by-side readings
-
-### Key Bindings
-
-| Key | Action |
-|-----|--------|
-| `Tab` / `Shift+Tab` | Next/Previous tab |
-| `j` / `k` / `↑` / `↓` | Navigate devices |
-| `Enter` | Connect/Disconnect or edit setting |
-| `s` | Scan for devices |
-| `r` | Refresh reading |
-| `g` | Full-screen chart |
-| `v` | Comparison view |
-| `e` | Export history to CSV |
-| `t` | Toggle theme |
-| `?` | Show help |
-| `q` | Quit |
-
-### Example
-
-```bash
-$ aranet tui
-
-┌─ Aranet Monitor ─────────────── *2/3 CO2:847 !1 ─┐
-│ ┌─ Devices ───────┐ ┌─ Readings ─────────────────┤
-│ │ * Aranet4 17C3C │ │ CO2         847 ppm  ->    │
-│ │   AranetRn+ 306 │ │ Temperature  22.4 C        │
-│ └─────────────────┘ └────────────────────────────┤
-└──────────────────────────────────────────────────┘
-```
-
-See the [aranet-tui README](https://github.com/cameronrye/aranet/tree/main/crates/aranet-tui) for the complete keyboard reference.
-
----
 
 ## doctor
 
-Run BLE diagnostics and permission checks to troubleshoot connectivity issues.
+Run BLE diagnostics and permission checks.
 
 ```bash
 aranet doctor
 ```
 
-### Example
-
 ```bash
-$ aranet doctor
-
-Aranet Doctor - BLE Diagnostics
-
-Running diagnostics...
-
-Results:
-------------------------------------
-[PASS] Bluetooth Adapter: Found and accessible
-[PASS] BLE Scanning: Found 2 device(s): Aranet4 17C3C, AranetRn+ 306B8
-
-All checks passed! Your system is ready to use Aranet devices.
+aranet doctor
 ```
 
-If there are issues, the doctor will provide platform-specific troubleshooting tips:
+## examples
 
-- **macOS**: Bluetooth permissions in System Settings
-- **Linux**: BlueZ installation, bluetooth group membership
-- **Windows**: Bluetooth drivers and settings
+Print a curated set of common command examples.
 
----
+```bash
+aranet examples
+```
 
-Made with ❤️ by [Cameron Rye](https://rye.dev/)
+## tui
 
+Launch the interactive terminal dashboard.
+
+```bash
+aranet tui
+```
+
+The default `aranet-cli` release includes the `tui` subcommand. If you install the standalone TUI package instead, use `aranet-tui`.

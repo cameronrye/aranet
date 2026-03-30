@@ -136,7 +136,9 @@ impl ErrorContext {
             crate::Error::Io(_) => {
                 Self::transient(error.to_string(), "I/O error occurred. Try again.")
             }
-            crate::Error::InvalidConfig(_) => Self::permanent(error.to_string()),
+            crate::Error::InvalidConfig(_) | crate::Error::Unsupported(_) => {
+                Self::permanent(error.to_string())
+            }
         }
     }
 }

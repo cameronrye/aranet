@@ -17,7 +17,7 @@ The Aranet project aims to be the definitive Rust ecosystem for Aranet environme
 | 3 | TUI Dashboard | <Badge text="DONE" variant="success" /> | 44 features implemented |
 | 4 | GUI Application | <Badge text="DONE" variant="success" /> | Full MVP with charts and multi-device |
 | 5 | Data Persistence & API | <Badge text="DONE" variant="success" /> | aranet-store and aranet-service complete |
-| 6 | Integrations | <Badge text="DONE" variant="success" /> | Prometheus metrics, MQTT publisher |
+| 6 | Integrations | <Badge text="DONE" variant="success" /> | Prometheus, MQTT, Webhooks, InfluxDB, mDNS, Grafana |
 
 ## Phase 2: CLI Tool (Complete)
 
@@ -110,11 +110,11 @@ External system integrations for monitoring and IoT:
   <Card title="MQTT Publisher" icon="external">
     Broadcast readings to MQTT brokers for Home Assistant and IoT
   </Card>
-  <Card title="Service Control" icon="setting">
-    CLI commands for service install/start/stop management
+  <Card title="Webhooks & InfluxDB" icon="warning">
+    HTTP POST alerts for threshold breaches and InfluxDB v2 export
   </Card>
-  <Card title="Configuration API" icon="document">
-    Runtime configuration management via REST API
+  <Card title="mDNS & Grafana" icon="external">
+    Automatic service discovery and pre-built Grafana dashboard
   </Card>
 </CardGrid>
 
@@ -122,6 +122,10 @@ External system integrations for monitoring and IoT:
 
 - **Prometheus**: Sensor metrics, collector statistics, push gateway support
 - **MQTT**: Topic-based publishing, TLS support, configurable QoS
+- **Webhooks**: HTTP POST alerts for CO₂, radon, and battery thresholds (Slack/Discord/PagerDuty)
+- **InfluxDB**: Real-time export to InfluxDB v2 via line protocol
+- **mDNS**: Automatic network discovery via `_aranet._tcp.local.`
+- **Grafana**: Pre-built dashboard template with gauges, time series, and collector stats
 - **Service management**: `aranet-service service install/start/stop`
 - **Dynamic config**: Add/remove devices without restart
 
@@ -142,10 +146,5 @@ We welcome contributions! Areas where help is especially appreciated:
 1. **Testing with hardware** — Help test with Aranet2, Radiation sensors
 2. **GUI/TUI polish** — UI/UX improvements
 3. **Documentation** — Examples, tutorials, translations
-4. **Integrations** — Home Assistant, InfluxDB, Grafana dashboards
+4. **Integrations** — Home Assistant native component, additional IoT platforms
 5. **Device support** — Aranet2 history, Radiation history download
-
----
-
-Made with ❤️ by [Cameron Rye](https://rye.dev/)
-

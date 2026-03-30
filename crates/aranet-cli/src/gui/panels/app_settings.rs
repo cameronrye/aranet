@@ -880,7 +880,7 @@ impl AranetApp {
                 ui.add_space(self.theme.spacing.sm);
 
                 // Load the behavior config for display
-                let behavior_config = Config::load().behavior;
+                let behavior_config = Config::load_or_default_logged().behavior;
 
                 // Auto-connect toggle
                 ui.horizontal(|ui| {
@@ -916,7 +916,7 @@ impl AranetApp {
 
                             if ui.add(btn).clicked() && !is_selected {
                                 // Save behavior config separately
-                                let mut full_config = Config::load();
+                                let mut full_config = Config::load_or_default_logged();
                                 full_config.behavior.auto_connect = val;
                                 let _ = full_config.save();
                             }
@@ -959,7 +959,7 @@ impl AranetApp {
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
                             if ui.add(btn).clicked() && !is_selected {
-                                let mut full_config = Config::load();
+                                let mut full_config = Config::load_or_default_logged();
                                 full_config.behavior.auto_sync = val;
                                 let _ = full_config.save();
                             }
@@ -1002,7 +1002,7 @@ impl AranetApp {
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
                             if ui.add(btn).clicked() && !is_selected {
-                                let mut full_config = Config::load();
+                                let mut full_config = Config::load_or_default_logged();
                                 full_config.behavior.remember_devices = val;
                                 let _ = full_config.save();
                             }
@@ -1045,7 +1045,7 @@ impl AranetApp {
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
                             if ui.add(btn).clicked() && !is_selected {
-                                let mut full_config = Config::load();
+                                let mut full_config = Config::load_or_default_logged();
                                 full_config.behavior.load_cache = val;
                                 let _ = full_config.save();
                             }

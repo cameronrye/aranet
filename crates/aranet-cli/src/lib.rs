@@ -28,6 +28,11 @@
 //! | `set` | Configure device settings |
 //! | `watch` | Continuously monitor a device |
 //! | `config` | Manage CLI configuration |
+//! | `alias` | Manage device aliases |
+//! | `sync` | Sync history to the local cache |
+//! | `cache` | Query cached data |
+//! | `report` | Summarize cached history |
+//! | `doctor` | Run Bluetooth diagnostics |
 //! | `completions` | Generate shell completions |
 //!
 //! # Output Formats
@@ -88,6 +93,15 @@
 // Re-export core dependencies for convenience
 pub use aranet_core;
 pub use aranet_types;
+
+/// Get the current local time formatted with the given `time` format description string.
+///
+/// Falls back to UTC if the local timezone cannot be determined.
+pub fn local_now_fmt(fmt: &str) -> String {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let format = time::format_description::parse(fmt).unwrap_or_default();
+    now.format(&format).unwrap_or_default()
+}
 
 // Config module - needed by both TUI and GUI
 pub mod config;

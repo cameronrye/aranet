@@ -5,9 +5,9 @@ description: Get up and running with Aranet sensors in minutes.
 
 import { Steps, Aside, Code } from '@astrojs/starlight/components';
 
-This guide walks you through scanning for devices, reading sensor data, and downloading history.
+This guide walks you through scanning for devices, reading sensor data, caching history, and starting the local dashboard.
 
-![CLI Demo](https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/cli-read.gif)
+![CLI Demo](/aranet/screenshots/cli-read.gif)
 
 ## Scan for Devices
 
@@ -108,6 +108,38 @@ timestamp,co2,temperature,humidity,pressure
 ...
 ```
 
+## Sync to the Local Cache
+
+Pull history into the local SQLite cache so you can query it later without reconnecting:
+
+```bash
+# Sync a specific device
+aranet sync --device AA:BB:CC:DD:EE:FF
+
+# Or sync every remembered device
+aranet sync --all
+```
+
+Generate a summary report from cached data:
+
+```bash
+# Daily report for one device
+aranet report --device living-room
+
+# Weekly report for all cached devices
+aranet report --all --period weekly --format json
+```
+
+## Start the API Server and Dashboard
+
+The CLI can launch the bundled `aranet-service` HTTP API and dashboard:
+
+```bash
+aranet server --bind 127.0.0.1:8080
+```
+
+Then open `http://127.0.0.1:8080/dashboard` in your browser.
+
 ## Using the Library
 
 For programmatic access, use `aranet-core` in your Rust code:
@@ -141,10 +173,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Next Steps
 
 - Learn about all [CLI commands](/aranet/docs/cli/commands/)
+- Deploy the [background service](/aranet/docs/service/deployment/)
 - Understand the [BLE protocol](/aranet/docs/protocol/overview/)
 - Check the [API documentation](/aranet/api/aranet_core/)
-
----
-
-Made with ❤️ by [Cameron Rye](https://rye.dev/)
-

@@ -35,12 +35,12 @@ use anyhow::Result;
 #[cfg(feature = "cli")]
 use clap::{CommandFactory, Parser};
 #[cfg(feature = "cli")]
-use cli::{AliasSubcommand, Cli, Commands, ConfigAction, ConfigKey, OutputFormat};
+use cli::{AliasSubcommand, Cli, Commands, ConfigAction, ConfigKey, OutputFormat, ReportFormat};
 #[cfg(feature = "cli")]
 use commands::{
     AliasAction, HistoryArgs, ServerArgs, SyncArgs, WatchArgs, cmd_alias, cmd_cache, cmd_doctor,
-    cmd_history, cmd_info, cmd_read, cmd_scan, cmd_server, cmd_set, cmd_status, cmd_sync,
-    cmd_watch,
+    cmd_history, cmd_info, cmd_read, cmd_report, cmd_scan, cmd_server, cmd_set, cmd_status,
+    cmd_sync, cmd_watch,
 };
 #[cfg(feature = "cli")]
 use config::{Config, get_device_source, resolve_alias_with_info, resolve_timeout};
@@ -87,6 +87,25 @@ async fn main() -> Result<()> {
         return handle_alias_command(action, cli.quiet);
     }
 
+    // Handle server command early so it doesn't depend on the interactive CLI config.
+    if let Commands::Server {
+        ref config,
+        ref bind,
+        ref database,
+        no_collector,
+        daemon,
+    } = cli.command
+    {
+        return cmd_server(ServerArgs {
+            config: config.clone(),
+            bind: bind.clone(),
+            database: database.clone(),
+            no_collector,
+            daemon,
+        })
+        .await;
+    }
+
     // Handle TUI command early (when both features enabled)
     #[cfg(feature = "tui")]
     if let Commands::Tui = cli.command {
@@ -100,7 +119,7 @@ async fn main() -> Result<()> {
     }
 
     // Load config for device resolution
-    let config = Config::load();
+    let config = Config::load_or_default()?;
 
     // Initialize tracing (write to stderr so stdout is clean for data)
     let filter = if cli.quiet {
@@ -117,7 +136,7 @@ async fn main() -> Result<()> {
         .init();
 
     let output = cli.output.as_ref();
-    let no_color = cli.no_color || config.no_color;
+    let no_color = cli.no_color || config.no_color || no_color_from_env();
     let quiet = cli.quiet;
     let compact = cli.compact;
     let style = cli.style;
@@ -300,20 +319,26 @@ async fn main() -> Result<()> {
         Commands::Cache { action } => {
             cmd_cache(action, &config)?;
         }
-        Commands::Server {
-            bind,
-            database,
-            no_collector,
-            daemon,
+        Commands::Report {
+            device,
+            all,
+            period,
+            format,
+            output: out,
         } => {
-            cmd_server(ServerArgs {
-                bind,
-                database,
-                no_collector,
-                daemon,
-            })
-            .await?;
+            let format = format.or(if cli.json {
+                Some(ReportFormat::Json)
+            } else {
+                None
+            });
+            let device = if all {
+                None
+            } else {
+                resolve_device_with_hint(device, &config, quiet)
+            };
+            cmd_report(device, all, period, format, out, &config)?;
         }
+        Commands::Server { .. } => unreachable!(), // Handled above
         Commands::Config { .. } => unreachable!(),
         Commands::Alias { .. } => unreachable!(),
         Commands::Completions { .. } => unreachable!(),
@@ -346,7 +371,7 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
             println!("{}", Config::path().display());
         }
         ConfigAction::Show => {
-            let config = Config::load();
+            let config = Config::load_or_default()?;
             println!("{}", toml::to_string_pretty(&config)?);
         }
         ConfigAction::Init => {
@@ -359,7 +384,7 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
             }
         }
         ConfigAction::Get { key } => {
-            let config = Config::load();
+            let config = Config::load_or_default()?;
             let value = match key {
                 ConfigKey::Device => config.device.unwrap_or_default(),
                 ConfigKey::Format => config.format.unwrap_or_else(|| "text".to_string()),
@@ -372,7 +397,7 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
             println!("{}", value);
         }
         ConfigAction::Set { key, value } => {
-            let mut config = Config::load();
+            let mut config = Config::load_or_default()?;
             match key {
                 ConfigKey::Device => config.device = Some(value.clone()),
                 ConfigKey::Format => {
@@ -422,7 +447,7 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
             println!("Set {:?} = {}", key, value);
         }
         ConfigAction::Unset { key } => {
-            let mut config = Config::load();
+            let mut config = Config::load_or_default()?;
             match key {
                 ConfigKey::Device => config.device = None,
                 ConfigKey::Format => config.format = None,
@@ -465,18 +490,22 @@ fn parse_format(s: &str) -> Option<OutputFormat> {
 #[cfg(feature = "cli")]
 fn resolve_format_with_config(
     cli_json: bool,
-    cmd_format: OutputFormat,
+    cmd_format: Option<OutputFormat>,
     config_format: Option<OutputFormat>,
 ) -> OutputFormat {
     if cli_json {
         OutputFormat::Json
-    } else if !matches!(cmd_format, OutputFormat::Text) {
-        // Command explicitly specified a non-default format
+    } else if let Some(cmd_format) = cmd_format {
         cmd_format
     } else {
-        // Use config format if available, otherwise default to text
         config_format.unwrap_or(OutputFormat::Text)
     }
+}
+
+/// Respect the de-facto NO_COLOR standard, which is enabled by presence.
+#[cfg(feature = "cli")]
+fn no_color_from_env() -> bool {
+    std::env::var_os("NO_COLOR").is_some()
 }
 
 /// Resolve multiple devices with alias feedback.
@@ -569,6 +598,7 @@ fn print_examples() {
     println!("  aranet history --since 2024-01-01");
     println!("  aranet history -f csv > data.csv # Export to CSV file");
     println!("  aranet history -f json           # Export as JSON");
+    println!("  aranet report --period weekly    # Summarize cached history");
     println!();
     println!("{}", "Device Management:".bold());
     println!("  aranet alias list                # Show saved aliases");
@@ -598,46 +628,50 @@ mod tests {
 
     #[test]
     fn test_resolve_format_json_flag_overrides_text() {
-        let result = resolve_format_with_config(true, OutputFormat::Text, None);
+        let result = resolve_format_with_config(true, None, None);
         assert!(matches!(result, OutputFormat::Json));
     }
 
     #[test]
     fn test_resolve_format_json_flag_overrides_csv() {
-        let result = resolve_format_with_config(true, OutputFormat::Csv, None);
+        let result = resolve_format_with_config(true, Some(OutputFormat::Csv), None);
         assert!(matches!(result, OutputFormat::Json));
     }
 
     #[test]
     fn test_resolve_format_json_flag_overrides_config() {
-        let result = resolve_format_with_config(true, OutputFormat::Text, Some(OutputFormat::Csv));
+        let result = resolve_format_with_config(true, None, Some(OutputFormat::Csv));
         assert!(matches!(result, OutputFormat::Json));
     }
 
     #[test]
     fn test_resolve_format_explicit_csv_used() {
-        let result = resolve_format_with_config(false, OutputFormat::Csv, None);
+        let result = resolve_format_with_config(false, Some(OutputFormat::Csv), None);
         assert!(matches!(result, OutputFormat::Csv));
     }
 
     #[test]
     fn test_resolve_format_explicit_json_used() {
-        let result = resolve_format_with_config(false, OutputFormat::Json, None);
+        let result = resolve_format_with_config(false, Some(OutputFormat::Json), None);
         assert!(matches!(result, OutputFormat::Json));
     }
 
     #[test]
     fn test_resolve_format_config_fallback() {
-        // When cmd format is default (Text) and no --json flag, use config
-        let result =
-            resolve_format_with_config(false, OutputFormat::Text, Some(OutputFormat::Json));
+        let result = resolve_format_with_config(false, None, Some(OutputFormat::Json));
         assert!(matches!(result, OutputFormat::Json));
     }
 
     #[test]
     fn test_resolve_format_default_text() {
-        // When no config and no explicit format, use Text
-        let result = resolve_format_with_config(false, OutputFormat::Text, None);
+        let result = resolve_format_with_config(false, None, None);
+        assert!(matches!(result, OutputFormat::Text));
+    }
+
+    #[test]
+    fn test_resolve_format_explicit_text_overrides_config() {
+        let result =
+            resolve_format_with_config(false, Some(OutputFormat::Text), Some(OutputFormat::Json));
         assert!(matches!(result, OutputFormat::Text));
     }
 

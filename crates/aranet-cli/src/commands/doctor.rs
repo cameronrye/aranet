@@ -55,31 +55,35 @@ pub async fn cmd_doctor(verbose: bool, no_color: bool) -> Result<()> {
     println!();
 
     let mut checks: Vec<Check> = Vec::new();
-    let total_checks = 4;
+    let mut check_num = 0;
 
     // Check 1: Bluetooth adapter availability
-    print_check_start(1, total_checks, "Bluetooth Adapter", no_color);
+    check_num += 1;
+    print_check_start(check_num, "Bluetooth Adapter", no_color);
     let adapter_check = check_adapter().await;
     print_check_result(&adapter_check, no_color);
     let adapter_ok = adapter_check.passed;
     checks.push(adapter_check);
 
     // Check 2: Bluetooth permissions (platform-specific)
-    print_check_start(2, total_checks, "Bluetooth Permissions", no_color);
+    check_num += 1;
+    print_check_start(check_num, "Bluetooth Permissions", no_color);
     let permission_check = check_permissions().await;
     print_check_result(&permission_check, no_color);
     checks.push(permission_check);
 
     // Check 3: Scan for devices (only if adapter is available)
     if adapter_ok {
-        print_check_start(3, total_checks, "Device Scan", no_color);
+        check_num += 1;
+        print_check_start(check_num, "Device Scan", no_color);
         let scan_check = check_scan().await;
         print_check_result(&scan_check, no_color);
         checks.push(scan_check);
     }
 
     // Check 4: Config file validity
-    print_check_start(4, total_checks, "Configuration", no_color);
+    check_num += 1;
+    print_check_start(check_num, "Configuration", no_color);
     let config_check = check_config();
     print_check_result(&config_check, no_color);
     checks.push(config_check);
@@ -122,13 +126,13 @@ pub async fn cmd_doctor(verbose: bool, no_color: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_check_start(num: usize, total: usize, name: &str, no_color: bool) {
+fn print_check_start(num: usize, name: &str, no_color: bool) {
     // Use simple static output instead of a spinner that can't animate during sync blocking
     use std::io::{Write, stdout};
     if no_color {
-        print!("[{}/{}] {} ... ", num, total, name);
+        print!("[{}] {} ... ", num, name);
     } else {
-        print!("{} {} ... ", format!("[{}/{}]", num, total).dimmed(), name);
+        print!("{} {} ... ", format!("[{}]", num).dimmed(), name);
     }
     // Flush to ensure the message appears before the blocking operation
     let _ = stdout().flush();
@@ -247,25 +251,27 @@ async fn check_permissions() -> Check {
 fn check_config() -> Check {
     use crate::config::Config;
 
-    // Config::load() returns Self directly (defaults if file not found)
-    let config = Config::load();
-    let alias_count = config.aliases.len();
-    let default_device = config.device.is_some();
     let config_path = Config::path();
-    let config_exists = config_path.exists();
+    if !config_path.exists() {
+        return Check::pass("Configuration", "No config file (using defaults)");
+    }
 
-    let msg = if config_exists {
-        format!(
-            "Valid ({} alias{}, default device: {})",
-            alias_count,
-            if alias_count == 1 { "" } else { "es" },
-            if default_device { "set" } else { "not set" }
-        )
-    } else {
-        "No config file (using defaults)".to_string()
-    };
-
-    Check::pass("Configuration", msg)
+    match Config::load() {
+        Ok(config) => {
+            let alias_count = config.aliases.len();
+            let default_device = config.device.is_some();
+            Check::pass(
+                "Configuration",
+                format!(
+                    "Valid ({} alias{}, default device: {})",
+                    alias_count,
+                    if alias_count == 1 { "" } else { "es" },
+                    if default_device { "set" } else { "not set" }
+                ),
+            )
+        }
+        Err(err) => Check::warn("Configuration", format!("Invalid config file ({err})")),
+    }
 }
 
 fn print_troubleshooting_help(verbose: bool, no_color: bool) {

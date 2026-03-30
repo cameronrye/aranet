@@ -18,7 +18,7 @@ pub enum AliasAction {
 }
 
 pub fn cmd_alias(action: AliasAction, quiet: bool) -> Result<()> {
-    let mut config = Config::load();
+    let mut config = Config::load_or_default()?;
 
     match action {
         AliasAction::List => {

@@ -1137,7 +1137,7 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(aranet_co2_ppm, device)",
+        "definition": "label_values(aranet_battery_percent, device)",
         "hide": 0,
         "includeAll": true,
         "label": "Device",
@@ -1145,7 +1145,7 @@
         "name": "device",
         "options": [],
         "query": {
-          "query": "label_values(aranet_co2_ppm, device)",
+          "query": "label_values(aranet_battery_percent, device)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,

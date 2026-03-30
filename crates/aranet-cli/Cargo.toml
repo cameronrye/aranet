@@ -1,6 +1,6 @@
 [package]
 name = "aranet-cli"
-version = "0.1.13"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "hardware-support"]
 include = ["src/**/*", "Cargo.toml", "README.md", "assets/**/*"]
 
 [[bin]]
-name = "Aranet"
+name = "aranet"
 path = "src/main.rs"
 
 [features]
@@ -26,10 +26,10 @@ tui = ["dep:ratatui", "dep:crossterm"]
 gui = ["dep:egui", "dep:eframe", "dep:egui_plot", "dep:image", "dep:tray-icon", "dep:notify-rust", "dep:open", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]
-aranet-core = { version = "0.1.13", path = "../aranet-core", features = ["service-client"] }
-aranet-service = { version = "0.1.13", path = "../aranet-service" }
-aranet-store = { version = "0.1.13", path = "../aranet-store" }
-aranet-types = { version = "0.1.13", path = "../aranet-types" }
+aranet-core = { version = "0.2.0", path = "../aranet-core", features = ["service-client"] }
+aranet-service = { version = "0.2.0", path = "../aranet-service" }
+aranet-store = { version = "0.2.0", path = "../aranet-store" }
+aranet-types = { version = "0.2.0", path = "../aranet-types" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -43,8 +43,6 @@ toml.workspace = true
 futures.workspace = true
 owo-colors = "4"
 terminal_size = "0.4"
-human-panic = "2.0.6"
-chrono = "0.4.43"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
@@ -117,7 +115,7 @@ priority = "optional"
 # Assets to include in the package
 assets = [
     # Binary
-    ["target/release/Aranet", "usr/bin/aranet", "755"],
+    ["target/release/aranet", "usr/bin/aranet", "755"],
     # Man page (if exists)
     # ["target/release/aranet.1", "usr/share/man/man1/", "644"],
     # Shell completions

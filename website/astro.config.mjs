@@ -39,6 +39,15 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Service',
+          items: [
+            { slug: 'docs/service/deployment' },
+            { slug: 'docs/service/security' },
+            { slug: 'docs/service/websocket-api' },
+            { slug: 'docs/service/home-assistant' },
+          ],
+        },
+        {
           label: 'API Reference',
           items: [
             { slug: 'docs/rust-docs' },
@@ -65,11 +74,19 @@ export default defineConfig({
       head: [
         {
           tag: 'meta',
-          attrs: { property: 'og:image', content: '/aranet/og-image.png' },
+          attrs: { property: 'og:image', content: '/aranet/og-image.svg' },
         },
         {
           tag: 'meta',
           attrs: { property: 'og:type', content: 'website' },
+        },
+        {
+          tag: 'meta',
+          attrs: { name: 'twitter:card', content: 'summary_large_image' },
+        },
+        {
+          tag: 'meta',
+          attrs: { name: 'twitter:image', content: '/aranet/og-image.svg' },
         },
         {
           tag: 'script',
@@ -114,4 +131,3 @@ export default defineConfig({
     }),
   ],
 });
-

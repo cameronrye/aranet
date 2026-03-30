@@ -15,7 +15,6 @@
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord, Status};
@@ -254,7 +253,10 @@ impl MockDevice {
         self.check_should_fail().await?;
 
         let history = self.history.read().await;
-        let start = options.start_index.unwrap_or(0) as usize;
+        // History indices are 1-based inclusive. Convert to 0-based:
+        // start: 1-based → 0-based by subtracting 1
+        // end: 1-based inclusive → 0-based exclusive (value stays the same)
+        let start = options.start_index.unwrap_or(1).saturating_sub(1) as usize;
         let end = options
             .end_index
             .map(|e| e as usize)
@@ -452,7 +454,6 @@ impl MockDevice {
 }
 
 // Implement the AranetDevice trait for MockDevice
-#[async_trait]
 impl AranetDevice for MockDevice {
     // --- Connection Management ---
 
@@ -919,16 +920,16 @@ mod tests {
             .collect();
         device.add_history(records).await;
 
-        // Download with range
+        // Download with range (1-based inclusive indices)
         let options = HistoryOptions {
-            start_index: Some(1),
+            start_index: Some(2),
             end_index: Some(4),
             ..Default::default()
         };
         let history = device.download_history_with_options(options).await.unwrap();
         assert_eq!(history.len(), 3);
-        assert_eq!(history[0].co2, 810); // Second record (index 1)
-        assert_eq!(history[2].co2, 830); // Fourth record (index 3)
+        assert_eq!(history[0].co2, 810); // Second record (1-based index 2)
+        assert_eq!(history[2].co2, 830); // Fourth record (1-based index 4)
     }
 
     #[tokio::test]
@@ -1059,19 +1060,28 @@ mod tests {
         device.set_rssi(-55);
 
         // Test that trait methods return same values as direct methods
-        let trait_device: &dyn AranetDevice = &device;
+        // Use a generic helper to exercise the trait through static dispatch
+        async fn check_device(
+            trait_device: &impl AranetDevice,
+        ) -> (aranet_types::CurrentReading, u8, i16) {
+            let reading = trait_device.read_current().await.unwrap();
+            let battery = trait_device.read_battery().await.unwrap();
+            let rssi = trait_device.read_rssi().await.unwrap();
+            (reading, battery, rssi)
+        }
 
-        assert_eq!(trait_device.name(), Some("Trait Test"));
-        assert_eq!(trait_device.device_type(), Some(DeviceType::Aranet4));
-        assert!(trait_device.is_connected().await);
+        let trait_device = &device;
 
-        let reading = trait_device.read_current().await.unwrap();
+        assert_eq!(AranetDevice::name(trait_device), Some("Trait Test"));
+        assert_eq!(
+            AranetDevice::device_type(trait_device),
+            Some(DeviceType::Aranet4)
+        );
+        assert!(AranetDevice::is_connected(trait_device).await);
+
+        let (reading, battery, rssi) = check_device(trait_device).await;
         assert_eq!(reading.co2, 999);
-
-        let battery = trait_device.read_battery().await.unwrap();
         assert_eq!(battery, 77);
-
-        let rssi = trait_device.read_rssi().await.unwrap();
         assert_eq!(rssi, -55);
     }
 }

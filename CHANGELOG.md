@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-28
+
+### Added
+
+- **Docker support** - Multi-stage `Dockerfile` and `docker-compose.yml` at the repo root for containerized deployment with BLE passthrough, health checks, and persistent storage
+- **Homebrew formula automation** - GitHub Actions workflow (`.github/workflows/homebrew.yml`) automatically publishes updated Homebrew formulae to the `cameronrye/homebrew-aranet` tap on each release
+- **CLI cached reports** - `aranet report` summarizes cached daily, weekly, or monthly history in text or JSON without reconnecting to devices
+- **Webhook notifications** - HTTP POST alerts when CO2, radon, or battery thresholds are exceeded, with configurable endpoints, per-device cooldowns, and custom headers for Slack/Discord/PagerDuty integration
+- **InfluxDB export** - Real-time sensor data export to InfluxDB v2 using line protocol, with configurable organization, bucket, and measurement names
+- **mDNS service discovery** - Automatic network advertisement via `_aranet._tcp.local.` and `_http._tcp.local.` so clients can discover the service without manual IP configuration
+- **Grafana dashboard template** - Pre-built dashboard (`grafana/aranet-dashboard.json`) with panels for CO2 gauges, environment time series, radon/radiation, battery levels, and collector statistics
+- **Improved web dashboard** - Tab-based UI with Overview (live sparklines), History (interactive charts with statistics), and Service Status (collector health and per-device poll stats)
+- **Home Assistant MQTT auto-discovery** - `mqtt.homeassistant = true` publishes discovery payloads while `mqtt.ha_discovery_prefix` controls the HA discovery namespace
+- **E2E API tests** - 27 integration tests covering health, devices, readings, configuration, authentication, Prometheus metrics, and broadcast channel integration
+- **BLE adapter serialization** - Semaphore-based locking ensures only one device uses the Bluetooth adapter at a time, preventing connection contention
+- **Staggered device startup** - Devices start polling with a 5-second stagger to avoid adapter contention on boot
+- **Cached BLE manager** - Shared `Manager` instance with automatic reset on D-Bus connection failure
+- **Poll duration metric** - New `aranet_device_poll_duration_ms` Prometheus gauge tracks how long each device poll takes
+- **Staleness detection** - `/api/devices/:id/current` now returns `age_seconds` and `stale` fields
+- **`DeviceType` capability methods** - `has_co2()`, `has_temperature()`, `has_humidity()`, `has_pressure()` for querying sensor capabilities
+- **Aranet Radiation ☢ symbol detection** - `DeviceType::from_name` now recognizes the Unicode ☢ (U+2622) in device names
+
+### Changed
+
+- **Aranet2 GATT protocol** - Fixed parsing to use correct 12-byte format with proper field ordering (header, interval, age, battery, temp, humidity, status flags)
+- **Aranet2 status bit extraction** - Status is now read from bits[2:3] (temperature status) instead of bits[0:1]
+- **Aranet2 humidity parsing** - Humidity is now parsed as u16 LE divided by 10 (was u8 raw)
+- **BlueZ agent** - Now registers as default agent with retry cap (max 3 attempts) and permanent failure state
+- **Prometheus metrics** - Metrics are now filtered by device capabilities (e.g., Aranet2 won't emit `aranet_co2_ppm`)
+- **Prometheus device labels** - Device labels now use configured aliases when available
+- **MQTT publishing** - Published topics now use configured aliases when available and include radon averages when present
+- **Passive monitor** - Retries adapter acquisition on startup instead of exiting immediately; logs all consecutive errors
+- **Service discovery retry** - Automatically disconnects and retries when BlueZ returns 0 services (stale state)
+- **Connection timeouts** - `challenging_environment()` preset now uses 90s connection / 30s discovery timeouts
+
+### Breaking
+
+- **`GET /api/devices/:id/current`** now returns `CurrentReadingResponse` with `age_seconds` and `stale` fields alongside the reading (previously returned raw `StoredReading`)
+- **WebSocket query-token auth** - the `token` query parameter is now accepted only on `/api/ws`; REST and metrics requests must send `X-API-Key`
+
+### Internal
+
+- Bumped Rust edition to 2024 with minimum supported Rust version 1.90
+- Removed legacy advertisement parsers (v1 format) — only v2 parsers are used
+- Consolidated GATT reading parsers in `aranet-core` to delegate to `aranet-types::CurrentReading`
+- Extracted `spawn_staggered_device_tasks()` helper to deduplicate collector startup logic
+- Synchronized all crate versions to 0.2.0
+
 ## [0.1.13] - 2026-03-25
 
 ### Added

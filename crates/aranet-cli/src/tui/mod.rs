@@ -34,6 +34,8 @@ use tracing::info;
 
 use aranet_store::default_db_path;
 
+use crate::config::Config;
+
 /// Set up the terminal for TUI rendering.
 ///
 /// Enables raw mode, mouse capture, and switches to the alternate screen buffer.
@@ -65,6 +67,10 @@ pub fn restore_terminal() -> Result<()> {
 /// 4. Runs the main event loop
 /// 5. Ensures graceful shutdown
 pub async fn run() -> Result<()> {
+    let config = Config::load_or_default()?;
+    let service_url = config.gui.service_url.clone();
+    let service_api_key = config.gui.service_api_key.clone();
+
     // Create communication channels
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
     let (event_tx, event_rx) = mpsc::channel::<SensorEvent>(32);
@@ -74,11 +80,21 @@ pub async fn run() -> Result<()> {
     info!("Store path: {:?}", store_path);
 
     // Create and spawn the background worker
-    let worker = SensorWorker::new(cmd_rx, event_tx, store_path);
+    let worker = if service_api_key.is_none() && service_url == "http://localhost:8080" {
+        SensorWorker::new(cmd_rx, event_tx, store_path)
+    } else {
+        SensorWorker::with_service_config(
+            cmd_rx,
+            event_tx,
+            store_path,
+            &service_url,
+            service_api_key.clone(),
+        )
+    };
     let worker_handle = tokio::spawn(worker.run());
 
     // Create the application
-    let mut app = App::new(cmd_tx.clone(), event_rx);
+    let mut app = App::new(cmd_tx.clone(), event_rx, service_url, service_api_key);
 
     // Set up terminal
     let mut terminal = setup_terminal()?;

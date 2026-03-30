@@ -13,6 +13,14 @@ pub enum OutputFormat {
     Csv,
 }
 
+/// Output format for cached summary reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum ReportFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 /// Visual styling mode for output
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum StyleMode {
@@ -33,8 +41,8 @@ pub struct DeviceArgs {
     pub device: Option<String>,
 
     /// Connection timeout in seconds
-    #[arg(short = 'T', long, default_value = "30")]
-    pub timeout: u64,
+    #[arg(short = 'T', long)]
+    pub timeout: Option<u64>,
 }
 
 /// Device arguments that support multiple devices
@@ -45,16 +53,16 @@ pub struct MultiDeviceArgs {
     pub device: Vec<String>,
 
     /// Connection timeout in seconds (per device)
-    #[arg(short = 'T', long, default_value = "30")]
-    pub timeout: u64,
+    #[arg(short = 'T', long)]
+    pub timeout: Option<u64>,
 }
 
 /// Reusable output format arguments
 #[derive(Debug, Clone, Args)]
 pub struct OutputArgs {
     /// Output format
-    #[arg(short, long, value_enum, default_value = "text")]
-    pub format: OutputFormat,
+    #[arg(short, long, value_enum)]
+    pub format: Option<OutputFormat>,
 
     /// Use Fahrenheit for temperature display (overrides --celsius and config)
     #[arg(long, conflicts_with = "celsius")]
@@ -121,6 +129,69 @@ impl OutputArgs {
     }
 }
 
+/// Output/unit arguments for cached summary reports.
+#[derive(Debug, Clone, Args, Default)]
+pub struct ReportOutputArgs {
+    /// Use Fahrenheit for temperature display (overrides --celsius and config)
+    #[arg(long, conflicts_with = "celsius")]
+    pub fahrenheit: bool,
+
+    /// Use Celsius for temperature display (default, overrides config)
+    #[arg(long, conflicts_with = "fahrenheit")]
+    pub celsius: bool,
+
+    /// Use inHg for pressure display (overrides --hpa and config)
+    #[arg(long, conflicts_with = "hpa")]
+    pub inhg: bool,
+
+    /// Use hPa for pressure display (default, overrides config)
+    #[arg(long, conflicts_with = "inhg")]
+    pub hpa: bool,
+
+    /// Display radon in Bq/m³ (default, overrides config)
+    #[arg(long, conflicts_with = "pci")]
+    pub bq: bool,
+
+    /// Display radon in pCi/L (overrides --bq and config)
+    #[arg(long, conflicts_with = "bq")]
+    pub pci: bool,
+}
+
+impl ReportOutputArgs {
+    /// Resolve fahrenheit setting: explicit flags override config.
+    pub fn resolve_fahrenheit(&self, config_fahrenheit: bool) -> bool {
+        if self.fahrenheit {
+            true
+        } else if self.celsius {
+            false
+        } else {
+            config_fahrenheit
+        }
+    }
+
+    /// Resolve inhg setting: explicit flags override config.
+    pub fn resolve_inhg(&self, config_inhg: bool) -> bool {
+        if self.inhg {
+            true
+        } else if self.hpa {
+            false
+        } else {
+            config_inhg
+        }
+    }
+
+    /// Resolve bq setting: explicit flags override config.
+    pub fn resolve_bq(&self, config_bq: bool) -> bool {
+        if self.bq {
+            true
+        } else if self.pci {
+            false
+        } else {
+            config_bq
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "aranet")]
 #[command(
@@ -147,7 +218,7 @@ pub struct Cli {
     pub compact: bool,
 
     /// Disable colored output
-    #[arg(long, global = true, env = "NO_COLOR")]
+    #[arg(long, global = true)]
     pub no_color: bool,
 
     /// Visual styling mode (minimal, rich, plain)
@@ -173,12 +244,12 @@ pub enum Commands {
     /// Scan for nearby Aranet devices
     Scan {
         /// Scan timeout in seconds
-        #[arg(short, long, default_value = "10")]
-        timeout: u64,
+        #[arg(short, long)]
+        timeout: Option<u64>,
 
         /// Output format
-        #[arg(short, long, value_enum, default_value = "text")]
-        format: OutputFormat,
+        #[arg(short, long, value_enum)]
+        format: Option<OutputFormat>,
 
         /// Omit header row in CSV output (useful for appending)
         #[arg(long)]
@@ -246,8 +317,8 @@ pub enum Commands {
         device: DeviceArgs,
 
         /// Output format
-        #[arg(short, long, value_enum, default_value = "text")]
-        format: OutputFormat,
+        #[arg(short, long, value_enum)]
+        format: Option<OutputFormat>,
 
         /// Omit header row in CSV output (useful for appending)
         #[arg(long)]
@@ -319,8 +390,8 @@ pub enum Commands {
         device: DeviceArgs,
 
         /// Output format
-        #[arg(short, long, value_enum, default_value = "text")]
-        format: OutputFormat,
+        #[arg(short, long, value_enum)]
+        format: Option<OutputFormat>,
 
         /// Force full sync (re-download all history)
         #[arg(long)]
@@ -337,13 +408,39 @@ pub enum Commands {
         action: CacheAction,
     },
 
+    /// Generate summary report from cached data
+    Report {
+        /// Device address or alias (uses the configured or remembered device when omitted)
+        #[arg(short, long)]
+        device: Option<String>,
+
+        /// Generate reports for all cached devices
+        #[arg(long, conflicts_with = "device")]
+        all: bool,
+
+        /// Report period
+        #[arg(short, long, value_enum, default_value = "daily")]
+        period: ReportPeriod,
+
+        /// Output format
+        #[arg(short, long, value_enum)]
+        format: Option<ReportFormat>,
+
+        #[command(flatten)]
+        output: ReportOutputArgs,
+    },
+
     /// Start the HTTP API server
     Server {
-        /// Bind address (default: 127.0.0.1:8080)
-        #[arg(short, long, default_value = "127.0.0.1:8080")]
-        bind: String,
+        /// Path to the aranet-service configuration file
+        #[arg(short, long)]
+        config: Option<std::path::PathBuf>,
 
-        /// Database path (uses default location if not specified)
+        /// Bind address (overrides server.toml)
+        #[arg(short, long)]
+        bind: Option<String>,
+
+        /// Database path (overrides server.toml)
         #[arg(long)]
         database: Option<std::path::PathBuf>,
 
@@ -363,6 +460,18 @@ pub enum Commands {
     /// Launch native desktop GUI
     #[cfg(feature = "gui")]
     Gui,
+}
+
+/// Report time period
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum ReportPeriod {
+    /// Last 24 hours
+    #[default]
+    Daily,
+    /// Last 7 days
+    Weekly,
+    /// Last 30 days
+    Monthly,
 }
 
 /// Cache subcommands for querying local database
@@ -440,6 +549,25 @@ pub enum CacheAction {
         /// Filter records until this date/time
         #[arg(long)]
         until: Option<String>,
+    },
+
+    /// Delete old data from the cache
+    Prune {
+        /// Delete records older than this duration (e.g., "90d", "6m", "1y")
+        #[arg(long, value_name = "DURATION")]
+        older_than: String,
+
+        /// Only prune history records (keep readings)
+        #[arg(long)]
+        history_only: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Also run VACUUM to reclaim disk space
+        #[arg(long)]
+        vacuum: bool,
     },
 
     /// Show database path and info

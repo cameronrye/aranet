@@ -34,7 +34,6 @@ crossterm = "0.29"
 egui = "0.33"
 eframe = "0.33"
 futures = "0.3"
-async-trait = "0.1"
 rand = "0.9"
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.9"
@@ -53,7 +52,7 @@ lto = "thin"
 
 # Config for 'cargo dist'
 [workspace.metadata.dist]
-# The preferred cargo-dist version to use in CI (Conditions to К update this are the same
+# The preferred cargo-dist version to use in CI (Conditions to update this are the same
 # having issues/incremental improvements released.)
 cargo-dist-version = "0.31.0"
 # CI backends to support
@@ -63,6 +62,7 @@ installers = ["shell", "powershell", "homebrew"]
 # Target platforms to build for
 targets = [
     "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",

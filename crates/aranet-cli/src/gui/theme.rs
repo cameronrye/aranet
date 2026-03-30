@@ -25,8 +25,8 @@ impl ThemeMode {
     /// Get the icon/label for the current theme.
     pub fn icon(&self) -> &'static str {
         match self {
-            ThemeMode::Dark => "Light Mode",
-            ThemeMode::Light => "Dark Mode",
+            ThemeMode::Dark => "Light",
+            ThemeMode::Light => "Dark",
         }
     }
 }

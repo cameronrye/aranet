@@ -5,9 +5,9 @@ description: Overview of the Aranet command-line interface.
 
 import { Aside } from '@astrojs/starlight/components';
 
-The `aranet` CLI provides a fast, scriptable interface for interacting with Aranet environmental sensors.
+The `aranet` CLI provides a fast, scriptable interface for interacting with Aranet environmental sensors, the local cache, and the bundled HTTP service.
 
-![CLI Demo](https://raw.githubusercontent.com/cameronrye/aranet/main/assets/screenshots/cli-scan.gif)
+![CLI Demo](/aranet/screenshots/cli-scan.gif)
 
 ## Features
 
@@ -16,6 +16,8 @@ The `aranet` CLI provides a fast, scriptable interface for interacting with Aran
 - **Multi-Device Support** — Read from multiple devices in parallel
 - **Passive Mode** — Read from BLE advertisements without connecting
 - **Historical Data** — Download measurement history with timestamps and date filters
+- **Offline Cache** — Sync device history into SQLite for offline queries
+- **Cached Reports** — Generate daily, weekly, or monthly summaries with `aranet report`
 - **Progress Bars** — Visual progress for history downloads
 - **Device Aliases** — Save friendly names for device addresses
 - **Device Info** — Query device metadata (serial, firmware, model)
@@ -24,15 +26,18 @@ The `aranet` CLI provides a fast, scriptable interface for interacting with Aran
 - **Unit Conversion** — Fahrenheit, inHg pressure, pCi/L radon options
 - **Interactive Picker** — Select devices from a menu when none specified
 - **Export** — Output in text, JSON, or CSV formats
+- **Embedded Service Launcher** — Start the HTTP API/dashboard with `aranet server`
 - **Shell Completions** — Auto-complete for bash, zsh, fish, PowerShell
 
 ## Installation
 
 ```bash
-# Build from source
-git clone https://github.com/cameronrye/aranet.git
-cd aranet
-cargo install --path crates/aranet-cli
+# Homebrew
+brew tap cameronrye/aranet
+brew install aranet
+
+# Or crates.io
+cargo install aranet-cli
 ```
 
 ## Basic Usage
@@ -49,6 +54,13 @@ aranet read --device <ADDRESS>
 
 # Download history
 aranet history --device <ADDRESS> --output data.csv
+
+# Sync and summarize cached history
+aranet sync --all
+aranet report --all --period weekly
+
+# Start the local API and dashboard
+aranet server --bind 127.0.0.1:8080
 ```
 
 ## Global Options
@@ -59,11 +71,13 @@ aranet history --device <ADDRESS> --output data.csv
 | `-q, --quiet` | Suppress non-essential output |
 | `-o, --output <FILE>` | Write output to file instead of stdout |
 | `--json` | Output in JSON format (shorthand for `--format json`) |
+| `--compact` | Emit compact JSON when combined with `--json` or `--format json` |
 | `--no-color` | Disable colored output |
 | `--style <MODE>` | Visual styling: `rich` (default), `minimal`, `plain` |
 | `--fahrenheit` | Display temperature in Fahrenheit |
 | `--inhg` | Display pressure in inches of mercury |
-| `--bq` | Display radon in Bq/m3 (instead of pCi/L) |
+| `--bq` | Display radon in Bq/m3 |
+| `--pci` | Display radon in pCi/L |
 | `-h, --help` | Show help information |
 | `--version` | Show version number |
 
@@ -125,20 +139,6 @@ aranet history --device <ADDRESS> --format csv
 | Variable | Description |
 |----------|-------------|
 | `ARANET_DEVICE` | Default device address |
+| `ARANET_STYLE` | Default visual style (`rich`, `minimal`, `plain`) |
 | `RUST_LOG` | Log level (debug, info, warn, error) |
 | `NO_COLOR` | Disable colored output (any value) |
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | Success |
-| `1` | General error |
-| `2` | Device not found |
-| `3` | Connection failed |
-| `4` | Bluetooth unavailable |
-
----
-
-Made with ❤️ by [Cameron Rye](https://rye.dev/)
-

@@ -46,7 +46,13 @@ pub use store::{HistoryAggregates, HistoryStats, ImportResult, Store};
 /// - Windows: `C:\Users\<user>\AppData\Local\aranet\data.db`
 pub fn default_db_path() -> std::path::PathBuf {
     dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                "Could not determine platform data directory; \
+                 falling back to current directory for database"
+            );
+            std::path::PathBuf::from(".")
+        })
         .join("aranet")
         .join("data.db")
 }

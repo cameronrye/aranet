@@ -26,13 +26,13 @@ wss://your-server:8080/api/ws
 If API key authentication is enabled in your configuration, include the key in the connection URL or headers.
 
 <Aside type="note">
-  WebSocket connections are subject to the same authentication requirements as REST endpoints. See [API Security](/docs/service/security/) for configuration details.
+  WebSocket connections are subject to the same authentication requirements as REST endpoints. See [API Security](/aranet/docs/service/security/) for configuration details.
 </Aside>
 
 ### Using Query Parameter
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/api/ws?api_key=your-key');
+const ws = new WebSocket('ws://localhost:8080/api/ws?token=your-key');
 ```
 
 ### Using Headers (where supported)
@@ -60,12 +60,13 @@ async with websockets.connect(
 
 ## Message Format
 
-When a new reading is collected, the server broadcasts a JSON message:
+Clients receive an initial snapshot of the latest reading for each device, followed by live updates. Both use the same payload shape:
 
 ```json
 {
   "device_id": "Aranet4 17C3C",
   "reading": {
+    "id": 42,
     "device_id": "Aranet4 17C3C",
     "co2": 750,
     "temperature": 23.5,
@@ -73,8 +74,6 @@ When a new reading is collected, the server broadcasts a JSON message:
     "pressure": 1013.25,
     "battery": 85,
     "status": "Green",
-    "interval": 60,
-    "age": 5,
     "captured_at": "2024-01-15T10:30:00Z",
     "radon": null,
     "radiation_rate": null,
@@ -87,6 +86,7 @@ When a new reading is collected, the server broadcasts a JSON message:
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `id` | number | Database row ID for this stored reading |
 | `device_id` | string | Device Bluetooth address or name |
 | `co2` | number | CO₂ concentration in ppm |
 | `temperature` | number | Temperature in °C |
@@ -94,8 +94,6 @@ When a new reading is collected, the server broadcasts a JSON message:
 | `pressure` | number | Atmospheric pressure in hPa |
 | `battery` | number | Battery level in % (0-100) |
 | `status` | string | Air quality: "Green", "Yellow", "Red", "Error" |
-| `interval` | number | Device measurement interval in seconds |
-| `age` | number | Reading age in seconds when captured |
 | `captured_at` | string | ISO 8601 timestamp (UTC) |
 | `radon` | number \| null | Radon level in Bq/m³ (Aranet Rn+ only) |
 | `radiation_rate` | number \| null | Radiation rate in µSv/h (Aranet Radiation only) |

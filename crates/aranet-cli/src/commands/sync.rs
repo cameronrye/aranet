@@ -5,7 +5,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use aranet_core::HistoryOptions;
 use aranet_store::Store;
-use tracing::{debug, info};
+use indicatif::ProgressBar;
+use serde::Serialize;
+use tracing::info;
 
 use crate::cli::{DeviceArgs, OutputFormat};
 use crate::config::Config;
@@ -20,124 +22,223 @@ pub struct SyncArgs {
     pub all: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct SingleDeviceSyncSummary {
+    device: String,
+    name: String,
+    status: &'static str,
+    downloaded: usize,
+    inserted: usize,
+    total_cached: u64,
+    total_on_device: u16,
+}
+
+impl SingleDeviceSyncSummary {
+    fn synced(
+        device: String,
+        name: String,
+        downloaded: usize,
+        inserted: usize,
+        total_cached: u64,
+        total_on_device: u16,
+    ) -> Self {
+        Self {
+            device,
+            name,
+            status: "synced",
+            downloaded,
+            inserted,
+            total_cached,
+            total_on_device,
+        }
+    }
+
+    fn up_to_date(device: String, name: String, total_cached: u64, total_on_device: u16) -> Self {
+        Self {
+            device,
+            name,
+            status: "up_to_date",
+            downloaded: 0,
+            inserted: 0,
+            total_cached,
+            total_on_device,
+        }
+    }
+}
+
+fn build_history_options(start_index: u16, progress: Option<ProgressBar>) -> HistoryOptions {
+    let options = HistoryOptions::default().start_index(start_index);
+
+    if let Some(pb_for_callback) = progress {
+        options.with_progress(move |progress| {
+            let percent = (progress.overall_progress * 100.0) as u64;
+            pb_for_callback.set_position(percent);
+            pb_for_callback.set_message(format!(
+                "Downloading {:?} ({}/{})",
+                progress.current_param, progress.param_index, progress.total_params
+            ));
+        })
+    } else {
+        options
+    }
+}
+
+fn render_single_device_sync_json(summary: &SingleDeviceSyncSummary) -> Result<String> {
+    Ok(serde_json::to_string_pretty(summary)?)
+}
+
+fn render_sync_all_json(
+    total_devices: usize,
+    successful: usize,
+    failed: usize,
+    total_downloaded: usize,
+    total_inserted: usize,
+    devices: Vec<serde_json::Value>,
+) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "total_devices": total_devices,
+        "successful": successful,
+        "failed": failed,
+        "total_downloaded": total_downloaded,
+        "total_inserted": total_inserted,
+        "devices": devices,
+    }))?)
+}
+
+fn print_single_device_sync_summary(
+    format: OutputFormat,
+    summary: &SingleDeviceSyncSummary,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", render_single_device_sync_json(summary)?);
+        }
+        _ if summary.status == "up_to_date" => {
+            println!("Already up to date - no new readings to sync");
+            println!("Total cached: {}", summary.total_cached);
+            println!("Total on device: {}", summary.total_on_device);
+        }
+        _ => {
+            println!("Downloaded: {} records", summary.downloaded);
+            println!("New records: {}", summary.inserted);
+            println!("Total cached: {}", summary.total_cached);
+            println!("Total on device: {}", summary.total_on_device);
+        }
+    }
+
+    Ok(())
+}
+
 /// Execute the sync command.
 pub async fn cmd_sync(args: SyncArgs, config: &Config) -> Result<()> {
     // Open the store
     let store = Store::open_default().context("Failed to open database")?;
+    let timeout_secs = crate::config::resolve_timeout(args.device.timeout, config, 30);
 
     // If --all flag is set, sync all known devices
     if args.all {
-        return sync_all_devices(&store, args.format, args.full, args.device.timeout).await;
+        return sync_all_devices(&store, args.format, args.full, timeout_secs).await;
     }
 
     // Resolve device address from args, env, or config
     let device_input = args.device.device.clone().or_else(|| config.device.clone());
     let device_address = require_device_interactive(device_input).await?;
-    let timeout = Duration::from_secs(args.device.timeout);
+    let timeout = Duration::from_secs(timeout_secs);
 
     // Connect to device
     let device = crate::util::connect_device_with_progress(&device_address, timeout, true).await?;
+    let sync_result: Result<SingleDeviceSyncSummary> = async {
+        // Get device info for display
+        let device_info = device.read_device_info().await?;
+        let device_name = if device_info.name.is_empty() {
+            device_address.clone()
+        } else {
+            device_info.name.clone()
+        };
 
-    // Get device info for display
-    let device_info = device.read_device_info().await?;
-    let device_name = if device_info.name.is_empty() {
-        device_address.clone()
-    } else {
-        device_info.name.clone()
-    };
+        // Store device info
+        store.upsert_device(&device_address, Some(&device_name))?;
+        store.update_device_info(&device_address, &device_info)?;
 
-    // Store device info
-    store.upsert_device(&device_address, Some(&device_name))?;
-    store.update_device_info(&device_address, &device_info)?;
+        // Get history info to know total count
+        let history_info = device.get_history_info().await?;
+        let total_on_device = history_info.total_readings;
 
-    // Get history info to know total count
-    let history_info = device.get_history_info().await?;
-    let total_on_device = history_info.total_readings;
-
-    // Calculate sync start based on incremental sync
-    let start_index = if args.full {
-        info!(
-            "Full sync requested, downloading all {} records",
-            total_on_device
-        );
-        1u16
-    } else {
-        let start = store.calculate_sync_start(&device_address, total_on_device)?;
-        if start > total_on_device {
-            println!("Already up to date - no new readings to sync");
-            if let Err(e) = device.disconnect().await {
-                debug!("Failed to disconnect after sync: {e}");
+        // Calculate sync start based on incremental sync
+        let start_index = if args.full {
+            info!(
+                "Full sync requested, downloading all {} records",
+                total_on_device
+            );
+            1u16
+        } else {
+            let start = store.calculate_sync_start(&device_address, total_on_device)?;
+            if start > total_on_device {
+                let total_cached = store.count_history(Some(&device_address))?;
+                return Ok(SingleDeviceSyncSummary::up_to_date(
+                    device_address.clone(),
+                    device_name,
+                    total_cached,
+                    total_on_device,
+                ));
             }
-            return Ok(());
-        }
-        info!(
-            "Incremental sync: downloading records {} to {}",
-            start, total_on_device
+            info!(
+                "Incremental sync: downloading records {} to {}",
+                start, total_on_device
+            );
+            start
+        };
+
+        let records_to_download = total_on_device.saturating_sub(start_index) + 1;
+        eprintln!(
+            "Syncing {} ({} records)...",
+            device_name, records_to_download
         );
-        start
-    };
 
-    // Download history
-    let records_to_download = total_on_device.saturating_sub(start_index) + 1;
-    println!(
-        "Syncing {} ({} records)...",
-        device_name, records_to_download
-    );
+        let pb = if matches!(args.format, OutputFormat::Json) {
+            None
+        } else {
+            let pb = style::download_progress_bar();
+            pb.set_message("Downloading history...");
+            Some(pb)
+        };
 
-    // Create progress bar
-    let pb = style::download_progress_bar();
-    pb.set_message("Downloading history...");
-    let pb_for_callback = pb.clone();
+        let history_opts = build_history_options(start_index, pb.clone());
+        let history_result = device
+            .download_history_with_options(history_opts)
+            .await
+            .context("Failed to download history");
 
-    let history_opts = HistoryOptions::default().with_progress(move |progress| {
-        let percent = (progress.overall_progress * 100.0) as u64;
-        pb_for_callback.set_position(percent);
-        pb_for_callback.set_message(format!(
-            "Downloading {:?} ({}/{})",
-            progress.current_param, progress.param_index, progress.total_params
-        ));
-    });
-
-    let history = device
-        .download_history_with_options(history_opts)
-        .await
-        .context("Failed to download history")?;
-
-    pb.finish_with_message("Download complete");
-    if let Err(e) = device.disconnect().await {
-        debug!("Failed to disconnect after sync: {e}");
-    }
-
-    // Store history records
-    let inserted = store.insert_history(&device_address, &history)?;
-
-    // Update sync state
-    store.update_sync_state(&device_address, total_on_device, total_on_device)?;
-
-    // Report results
-    let total_cached = store.count_history(Some(&device_address))?;
-
-    match args.format {
-        OutputFormat::Json => {
-            let result = serde_json::json!({
-                "device": device_address,
-                "name": device_name,
-                "downloaded": history.len(),
-                "inserted": inserted,
-                "total_cached": total_cached,
-                "total_on_device": total_on_device,
-            });
-            println!("{}", serde_json::to_string_pretty(&result)?);
+        if let Some(pb) = pb {
+            if history_result.is_ok() {
+                pb.finish_with_message("Download complete");
+            } else {
+                pb.finish_and_clear();
+            }
         }
-        _ => {
-            println!("Downloaded: {} records", history.len());
-            println!("New records: {}", inserted);
-            println!("Total cached: {}", total_cached);
-            println!("Total on device: {}", total_on_device);
-        }
-    }
 
-    Ok(())
+        let history = history_result?;
+
+        // Store history records
+        let inserted = store.insert_history(&device_address, &history)?;
+
+        // Update sync state
+        store.update_sync_state(&device_address, total_on_device, total_on_device)?;
+
+        let total_cached = store.count_history(Some(&device_address))?;
+        Ok(SingleDeviceSyncSummary::synced(
+            device_address.clone(),
+            device_name,
+            history.len(),
+            inserted,
+            total_cached,
+            total_on_device,
+        ))
+    }
+    .await;
+    crate::util::disconnect_device(&device).await;
+    let summary = sync_result?;
+    print_single_device_sync_summary(args.format, &summary)
 }
 
 /// Sync all known devices from the database.
@@ -150,8 +251,18 @@ async fn sync_all_devices(
     let devices = store.list_devices().context("Failed to list devices")?;
 
     if devices.is_empty() {
-        println!("No devices found in database. Run 'aranet scan' first to discover devices.");
-        return Ok(());
+        return match format {
+            OutputFormat::Json => {
+                println!("{}", render_sync_all_json(0, 0, 0, 0, 0, Vec::new())?);
+                Ok(())
+            }
+            _ => {
+                println!(
+                    "No devices found in database. Run 'aranet scan' first to discover devices."
+                );
+                Ok(())
+            }
+        };
     }
 
     let timeout = Duration::from_secs(timeout_secs);
@@ -162,7 +273,7 @@ async fn sync_all_devices(
     let mut total_inserted = 0usize;
     let mut results = Vec::new();
 
-    println!("Syncing {} device(s)...\n", total_devices);
+    eprintln!("Syncing {} device(s)...\n", total_devices);
 
     for (idx, stored_device) in devices.iter().enumerate() {
         let device_name = stored_device
@@ -170,7 +281,7 @@ async fn sync_all_devices(
             .as_ref()
             .unwrap_or(&stored_device.id)
             .clone();
-        println!("[{}/{}] Syncing {}...", idx + 1, total_devices, device_name);
+        eprintln!("[{}/{}] Syncing {}...", idx + 1, total_devices, device_name);
 
         match sync_single_device(store, &stored_device.id, &device_name, full, timeout).await {
             Ok((downloaded, inserted)) => {
@@ -184,7 +295,7 @@ async fn sync_all_devices(
                     "downloaded": downloaded,
                     "inserted": inserted,
                 }));
-                println!(
+                eprintln!(
                     "  [PASS] Downloaded {} records, {} new\n",
                     downloaded, inserted
                 );
@@ -197,7 +308,7 @@ async fn sync_all_devices(
                     "status": "failed",
                     "error": e.to_string(),
                 }));
-                println!("  [FAIL] {}\n", e);
+                eprintln!("  [FAIL] {}\n", e);
             }
         }
     }
@@ -205,15 +316,17 @@ async fn sync_all_devices(
     // Summary
     match format {
         OutputFormat::Json => {
-            let summary = serde_json::json!({
-                "total_devices": total_devices,
-                "successful": successful,
-                "failed": failed,
-                "total_downloaded": total_downloaded,
-                "total_inserted": total_inserted,
-                "devices": results,
-            });
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            println!(
+                "{}",
+                render_sync_all_json(
+                    total_devices,
+                    successful,
+                    failed,
+                    total_downloaded,
+                    total_inserted,
+                    results,
+                )?
+            );
         }
         _ => {
             println!("---");
@@ -240,53 +353,94 @@ async fn sync_single_device(
 ) -> Result<(usize, usize)> {
     // Connect to device
     let device = crate::util::connect_device_with_progress(device_address, timeout, false).await?;
+    let sync_result: Result<(usize, usize)> = async {
+        // Get device info and update store
+        let device_info = device.read_device_info().await?;
+        store.update_device_info(device_address, &device_info)?;
 
-    // Get device info and update store
-    let device_info = device.read_device_info().await?;
-    store.update_device_info(device_address, &device_info)?;
+        // Get history info to know total count
+        let history_info = device.get_history_info().await?;
+        let total_on_device = history_info.total_readings;
 
-    // Get history info to know total count
-    let history_info = device.get_history_info().await?;
-    let total_on_device = history_info.total_readings;
-
-    // Calculate sync start based on incremental sync
-    let start_index = if full {
-        info!(
-            "{}: Full sync requested, downloading all {} records",
-            device_name, total_on_device
-        );
-        1u16
-    } else {
-        let start = store.calculate_sync_start(device_address, total_on_device)?;
-        if start > total_on_device {
-            if let Err(e) = device.disconnect().await {
-                debug!("Failed to disconnect after sync: {e}");
+        // Calculate sync start based on incremental sync
+        let start_index = if full {
+            info!(
+                "{}: Full sync requested, downloading all {} records",
+                device_name, total_on_device
+            );
+            1u16
+        } else {
+            let start = store.calculate_sync_start(device_address, total_on_device)?;
+            if start > total_on_device {
+                return Ok((0, 0)); // Already up to date
             }
-            return Ok((0, 0)); // Already up to date
-        }
-        info!(
-            "{}: Incremental sync: downloading records {} to {}",
-            device_name, start, total_on_device
-        );
-        start
-    };
+            info!(
+                "{}: Incremental sync: downloading records {} to {}",
+                device_name, start, total_on_device
+            );
+            start
+        };
 
-    // Download history (without progress bar to keep output clean for multiple devices)
-    let history_opts = HistoryOptions::default().start_index(start_index);
-    let history = device
-        .download_history_with_options(history_opts)
-        .await
-        .context("Failed to download history")?;
+        // Download history (without progress bar to keep output clean for multiple devices)
+        let history_opts = build_history_options(start_index, None);
+        let history = device
+            .download_history_with_options(history_opts)
+            .await
+            .context("Failed to download history")?;
 
-    if let Err(e) = device.disconnect().await {
-        debug!("Failed to disconnect after sync: {e}");
+        // Store history records
+        let inserted = store.insert_history(device_address, &history)?;
+
+        // Update sync state
+        store.update_sync_state(device_address, total_on_device, total_on_device)?;
+
+        Ok((history.len(), inserted))
+    }
+    .await;
+    crate::util::disconnect_device(&device).await;
+
+    sync_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_history_options_sets_start_index_without_progress() {
+        let options = build_history_options(42, None);
+        assert_eq!(options.start_index, Some(42));
+        assert!(options.progress_callback.is_none());
     }
 
-    // Store history records
-    let inserted = store.insert_history(device_address, &history)?;
+    #[test]
+    fn test_build_history_options_sets_start_index_with_progress() {
+        let options = build_history_options(7, Some(ProgressBar::hidden()));
+        assert_eq!(options.start_index, Some(7));
+        assert!(options.progress_callback.is_some());
+    }
 
-    // Update sync state
-    store.update_sync_state(device_address, total_on_device, total_on_device)?;
+    #[test]
+    fn test_render_single_device_sync_json_is_valid() {
+        let json = render_single_device_sync_json(&SingleDeviceSyncSummary::up_to_date(
+            "device-1".to_string(),
+            "Office".to_string(),
+            12,
+            12,
+        ))
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["device"], "device-1");
+        assert_eq!(parsed["status"], "up_to_date");
+        assert_eq!(parsed["downloaded"], 0);
+    }
 
-    Ok((history.len(), inserted))
+    #[test]
+    fn test_render_sync_all_json_is_valid() {
+        let json = render_sync_all_json(2, 1, 1, 10, 4, Vec::new()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["total_devices"], 2);
+        assert_eq!(parsed["successful"], 1);
+        assert_eq!(parsed["failed"], 1);
+    }
 }

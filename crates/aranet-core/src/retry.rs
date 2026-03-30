@@ -372,6 +372,8 @@ fn is_retryable(error: &Error) -> bool {
         Error::Io(_) => true,
         // Invalid configuration is not retryable
         Error::InvalidConfig(_) => false,
+        // Unsupported operations are not retryable
+        Error::Unsupported(_) => false,
     }
 }
 

@@ -39,6 +39,43 @@ retain = true
 # password = "secret"
 # Keep-alive interval in seconds
 keep_alive = 60
+# Enable Home Assistant MQTT auto-discovery
+homeassistant = false
+# Home Assistant discovery topic prefix
+ha_discovery_prefix = "homeassistant"
+
+[webhooks]
+# Enable webhook notifications when thresholds are exceeded
+enabled = false
+# CO2 threshold in ppm (triggers "co2_high" event)
+co2_threshold = 1000
+# Radon threshold in Bq/m³ (triggers "radon_high" event)
+radon_threshold = 300
+# Battery threshold in % (triggers "battery_low" event when at or below)
+battery_threshold = 10
+# Minimum interval between alerts per device per event type (in seconds)
+cooldown_secs = 300
+
+# [[webhooks.endpoints]]
+# url = "https://hooks.slack.com/services/T00/B00/xxx"
+# events = ["co2_high", "radon_high", "battery_low"]
+# headers = { "Authorization" = "Bearer token" }
+
+[influxdb]
+# Enable InfluxDB v2 export
+enabled = false
+# InfluxDB server URL
+# url = "http://localhost:8086"
+# API token for authentication
+# token = "your-influxdb-token"
+# Organization name
+# org = "my-org"
+# Bucket for storing measurements
+# bucket = "aranet"
+# Measurement name for sensor readings
+# measurement = "aranet"
+# Write precision: s, ms, us, or ns
+# precision = "s"
 
 # Device configurations
 # Each device needs an address (Bluetooth name or MAC) and optional alias

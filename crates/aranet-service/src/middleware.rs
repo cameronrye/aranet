@@ -19,7 +19,7 @@ use axum::{
 };
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::SecurityConfig;
 
@@ -124,8 +124,9 @@ pub async fn api_key_auth(
         return next.run(request).await;
     }
 
-    // Skip auth for health endpoint (monitoring should work without auth)
-    if request.uri().path() == "/api/health" {
+    // Skip auth for the lightweight health endpoint and the dashboard shell.
+    // The dashboard still authenticates its API and WebSocket requests separately.
+    if matches!(request.uri().path(), "/api/health" | "/" | "/dashboard") {
         return next.run(request).await;
     }
 
@@ -133,14 +134,22 @@ pub async fn api_key_auth(
     let mut provided_key = headers.get("X-API-Key").and_then(|v| v.to_str().ok());
 
     // For WebSocket connections, also check query parameter
-    // (browsers cannot set custom headers during WebSocket upgrade)
+    // (browsers cannot set custom headers during WebSocket upgrade).
+    //
+    // SECURITY NOTE: Query parameters may be logged by reverse proxies,
+    // appear in browser history, and leak via Referer headers. Prefer the
+    // X-API-Key header for non-browser clients.
     if provided_key.is_none()
+        && request.uri().path() == "/api/ws"
         && let Some(query) = request.uri().query()
     {
         provided_key = query.split('&').find_map(|param| {
             let mut parts = param.splitn(2, '=');
             match (parts.next(), parts.next()) {
-                (Some("token"), Some(value)) => Some(value),
+                (Some("token"), Some(value)) => {
+                    debug!("WebSocket auth via query parameter (prefer X-API-Key header)");
+                    Some(value)
+                }
                 _ => None,
             }
         });
@@ -163,7 +172,7 @@ pub async fn api_key_auth(
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": "Invalid or missing API key",
-                "hint": "Provide a valid API key in the X-API-Key header or as a 'token' query parameter"
+                "hint": "Provide a valid API key in the X-API-Key header, or use the 'token' query parameter only for /api/ws"
             })),
         )
             .into_response()
@@ -217,32 +226,11 @@ pub async fn rate_limit(
 
 /// Constant-time byte comparison to prevent timing attacks.
 ///
-/// Both length and content are compared in constant time to avoid
-/// leaking information about either the expected or provided key.
+/// Delegates to the `subtle` crate which uses compiler barriers to prevent
+/// the optimizer from introducing timing side channels.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // XOR lengths and fold into the result to avoid leaking key length via timing.
-    // We iterate over the longer of the two slices, comparing against the shorter
-    // one (wrapping the index) so we always do the same amount of work.
-    let len_diff = a.len() ^ b.len();
-    let max_len = a.len().max(b.len());
-
-    // Both empty: equal only if lengths match (they do, both 0).
-    // One empty: len_diff != 0 so result is already non-zero.
-    if max_len == 0 {
-        return true;
-    }
-
-    // If either slice is empty, we can't index into it — but len_diff
-    // is already non-zero, guaranteeing a false result.
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-
-    let mut result = len_diff as u8;
-    for i in 0..max_len {
-        result |= a[i % a.len()] ^ b[i % b.len()];
-    }
-    result == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 /// Build a CORS layer from the security configuration.
@@ -251,6 +239,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// all origins are permitted (not recommended for production).
 pub fn cors_layer(config: &SecurityConfig) -> CorsLayer {
     if config.cors_origins.iter().any(|o| o == "*") {
+        warn!(
+            "CORS is configured to allow all origins ('*'). This is not recommended for production."
+        );
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -312,6 +303,22 @@ pub fn validate_device_id(id: &str) -> Result<String, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    fn test_security_config() -> Arc<SecurityConfig> {
+        Arc::new(SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("1234567890abcdef1234567890abcdef".to_string()),
+            rate_limit_enabled: false,
+            ..Default::default()
+        })
+    }
 
     #[test]
     fn test_sanitize_device_name_normal() {
@@ -502,5 +509,49 @@ mod tests {
         assert_eq!(extract_token("foo=bar"), None);
         assert_eq!(extract_token(""), None);
         assert_eq!(extract_token("tokenx=abc123"), None);
+    }
+
+    #[tokio::test]
+    async fn test_api_key_query_token_allowed_for_websocket_route_only() {
+        let app = Router::new()
+            .route("/api/ws", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_security_config(),
+                api_key_auth,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws?token=1234567890abcdef1234567890abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_key_query_token_rejected_for_rest_route() {
+        let app = Router::new()
+            .route("/api/devices", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_security_config(),
+                api_key_auth,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices?token=1234567890abcdef1234567890abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

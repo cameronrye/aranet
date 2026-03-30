@@ -202,13 +202,14 @@ impl From<&Error> for ErrorCategory {
             Error::CharacteristicNotFound { .. } | Error::WriteFailed { .. } => {
                 ErrorCategory::Operation
             }
-            Error::Bluetooth(_) | Error::Io(_) | Error::Cancelled => ErrorCategory::Other,
+            Error::Unsupported(_) | Error::Bluetooth(_) | Error::Io(_) | Error::Cancelled => {
+                ErrorCategory::Other
+            }
         }
     }
 }
 
 /// A recorded operation for timing analysis.
-/// Reserved for future use in operation timing analysis.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct RecordedOperation {
@@ -220,7 +221,6 @@ struct RecordedOperation {
 }
 
 /// Types of operations being tracked.
-/// Reserved for future use in operation timing analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum OperationType {

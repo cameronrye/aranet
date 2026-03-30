@@ -33,13 +33,15 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - Passive monitoring via BLE advertisements (no connection required)
   - Platform-specific configuration (macOS, Linux, Windows)
   - Bluetooth diagnostics and troubleshooting utilities
+  - BLE adapter serialization with semaphore-based locking
+  - Automatic BlueZ agent registration on Linux to prevent BLE pairing hangs
 - **aranet-cli** — Command-line interface for quick readings and data export
   - Multi-device reading with parallel connections
   - Interactive device picker, device aliases
   - Passive reading from BLE advertisements
   - Progress bars for history download
   - `--since`/`--until` date filters, `--inhg` pressure unit
-  - Local data caching with `sync` and `cache` commands
+  - Local data caching with `sync`, `cache`, and `report` commands
 - **aranet-store** — Local SQLite-based data persistence
   - Incremental history sync (download only new records)
   - Query cached data without device connection
@@ -60,8 +62,14 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - HTTP API for devices, readings, history queries
   - WebSocket real-time streaming
   - Prometheus metrics endpoint (`/metrics`) with detailed health checks
-  - MQTT publisher for IoT integration
+  - MQTT publisher for IoT integration and Home Assistant auto-discovery
   - System service management (install/start/stop as launchd/systemd service)
+  - Webhook notifications for CO₂/radon/battery threshold alerts (Slack/Discord/PagerDuty)
+  - InfluxDB v2 real-time export via line protocol
+  - mDNS service discovery (`_aranet._tcp.local.`)
+  - Pre-built Grafana dashboard template
+  - Built-in web dashboard with live sparklines, history charts, and service status
+  - Staleness detection on current readings (`age_seconds`, `stale`)
 
 ## Screenshots
 
@@ -71,10 +79,37 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
 
 ## Installation
 
-Install the CLI from [crates.io](https://crates.io/crates/aranet-cli):
+Install the CLI with Homebrew:
+
+```bash
+brew tap cameronrye/aranet
+brew install aranet
+```
+
+Or use the release installer scripts:
+
+```bash
+# macOS and Linux
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.sh | sh
+
+# Windows
+irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex
+```
+
+Or install from [crates.io](https://crates.io/crates/aranet-cli):
 
 ```bash
 cargo install aranet-cli
+```
+
+This installs the `aranet` executable.
+
+Or run with Docker:
+
+```bash
+docker compose up -d
+# Dashboard: http://localhost:8080/dashboard
 ```
 
 Or build from source:
@@ -91,7 +126,7 @@ Add `aranet-core` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-aranet-core = "0.1"
+aranet-core = "0.2"
 ```
 
 ## Quick Start
@@ -105,19 +140,19 @@ aranet scan
 ### Read current measurements
 
 ```bash
-aranet read <DEVICE_ADDRESS>
+aranet read --device <DEVICE_ADDRESS>
 ```
 
 ### Download measurement history
 
 ```bash
-aranet history <DEVICE_ADDRESS> --output history.csv
+aranet history --device <DEVICE_ADDRESS> --output history.csv
 ```
 
 ### View device information
 
 ```bash
-aranet info <DEVICE_ADDRESS>
+aranet info --device <DEVICE_ADDRESS>
 ```
 
 ### Read from multiple devices
@@ -133,6 +168,20 @@ aranet read -d living-room,bedroom  # using aliases
 aranet alias set living-room AA:BB:CC:DD:EE:FF
 aranet alias list
 aranet read -d living-room
+```
+
+### Generate cached reports
+
+```bash
+aranet report --device living-room --period weekly
+aranet report --all --format json
+```
+
+### Start the background service and dashboard
+
+```bash
+aranet server --bind 127.0.0.1:8080
+# Dashboard: http://127.0.0.1:8080/dashboard
 ```
 
 ### Diagnose BLE issues
@@ -153,6 +202,8 @@ aranet/
 │   ├── aranet-cli/      # CLI tool
 │   ├── aranet-tui/      # Terminal dashboard
 │   └── aranet-gui/      # Desktop GUI (egui)
+├── docker/              # Docker Compose stack (Prometheus + Grafana)
+├── grafana/             # Pre-built Grafana dashboard template
 └── docs/                # Protocol documentation
 ```
 
@@ -192,11 +243,9 @@ Here are some features and improvements that would be great additions to the pro
 |---------|-------------|------------|
 | Aranet2 history download | Implement history data retrieval for Aranet2 devices | Medium |
 | Aranet Radiation history | Complete history download support for Aranet Radiation sensors | Medium |
-| Home Assistant integration | Create a Home Assistant custom component using aranet-core | Medium |
-| InfluxDB export | Direct export to InfluxDB time-series database | Easy |
+| Home Assistant component | Native Home Assistant custom component using aranet-core (MQTT integration already available) | Medium |
 | Calibration support | Add device calibration commands for CO2 sensors | Medium |
 | Data visualization | Enhanced charting and trend analysis in TUI/GUI | Medium |
-| Grafana dashboard | Pre-built dashboard templates for Prometheus metrics | Easy |
 
 If you're interested in tackling any of these, please open an issue to discuss your approach before starting work. We're happy to provide guidance and answer questions!
 
