@@ -286,11 +286,14 @@ impl Default for BehaviorConfig {
 }
 
 impl Config {
-    /// Get the config file path
+    /// Get the config file path.
+    ///
+    /// Checks `ARANET_CONFIG_DIR` first, then falls back to the platform config directory.
     pub fn path() -> PathBuf {
-        dirs::config_dir()
+        std::env::var_os("ARANET_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| dirs::config_dir().map(|d| d.join("aranet")))
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("aranet")
             .join("config.toml")
     }
 

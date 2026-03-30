@@ -73,46 +73,25 @@ fn run_aranet_with_env(args: &[&str], envs: &[(String, String)]) -> Output {
 
 fn create_test_env() -> (TempDir, Vec<(String, String)>, PathBuf, PathBuf) {
     let root = tempfile::tempdir().expect("tempdir");
-    let home = root.path().join("home");
-    let xdg_config_home = root.path().join("xdg-config");
-    let xdg_data_home = root.path().join("xdg-data");
-    let appdata = root.path().join("AppData").join("Roaming");
-    let localappdata = root.path().join("AppData").join("Local");
+    let config_dir = root.path().join("config").join("aranet");
+    let data_dir = root.path().join("data").join("aranet");
 
-    let (config_base, data_base) = if cfg!(target_os = "macos") {
-        (
-            home.join("Library").join("Application Support"),
-            home.join("Library").join("Application Support"),
-        )
-    } else if cfg!(target_os = "windows") {
-        (appdata.clone(), localappdata.clone())
-    } else {
-        (xdg_config_home.clone(), xdg_data_home.clone())
-    };
-
-    fs::create_dir_all(&config_base).expect("config base dir");
-    fs::create_dir_all(&data_base).expect("data base dir");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::create_dir_all(&data_dir).expect("data dir");
 
     let envs = vec![
-        ("HOME".to_string(), home.display().to_string()),
-        ("USERPROFILE".to_string(), home.display().to_string()),
         (
-            "XDG_CONFIG_HOME".to_string(),
-            xdg_config_home.display().to_string(),
+            "ARANET_CONFIG_DIR".to_string(),
+            config_dir.display().to_string(),
         ),
         (
-            "XDG_DATA_HOME".to_string(),
-            xdg_data_home.display().to_string(),
-        ),
-        ("APPDATA".to_string(), appdata.display().to_string()),
-        (
-            "LOCALAPPDATA".to_string(),
-            localappdata.display().to_string(),
+            "ARANET_DATA_DIR".to_string(),
+            data_dir.display().to_string(),
         ),
     ];
 
-    let config_path = config_base.join("aranet").join("config.toml");
-    let db_path = data_base.join("aranet").join("data.db");
+    let config_path = config_dir.join("config.toml");
+    let db_path = data_dir.join("data.db");
     (root, envs, config_path, db_path)
 }
 

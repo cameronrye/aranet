@@ -41,11 +41,14 @@ pub use store::{HistoryAggregates, HistoryStats, ImportResult, Store};
 
 /// Default database path following platform conventions.
 ///
+/// Checks `ARANET_DATA_DIR` first, then falls back to the platform data directory:
 /// - Linux: `~/.local/share/aranet/data.db`
 /// - macOS: `~/Library/Application Support/aranet/data.db`
 /// - Windows: `C:\Users\<user>\AppData\Local\aranet\data.db`
 pub fn default_db_path() -> std::path::PathBuf {
-    dirs::data_local_dir()
+    std::env::var_os("ARANET_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("aranet")))
         .unwrap_or_else(|| {
             tracing::warn!(
                 "Could not determine platform data directory; \
@@ -53,6 +56,5 @@ pub fn default_db_path() -> std::path::PathBuf {
             );
             std::path::PathBuf::from(".")
         })
-        .join("aranet")
         .join("data.db")
 }
