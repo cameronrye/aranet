@@ -11,7 +11,6 @@
 class Aranet < Formula
   desc "CLI and GUI for Aranet environmental sensors (CO2, radon, temperature, humidity)"
   homepage "https://github.com/cameronrye/aranet"
-  version "{{VERSION}}"
   license "MIT"
 
   on_macos do
@@ -83,4 +82,3 @@ class Aranet < Formula
     assert_match version.to_s, shell_output("#{bin}/aranet --version")
   end
 end
-
