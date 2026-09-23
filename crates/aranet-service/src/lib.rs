@@ -258,6 +258,17 @@ pub fn init_tracing() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Request span that records the path only. The default span records the full
+/// URI, which would write `/api/ws?token=<API key>` into the service logs.
+fn request_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        version = ?request.version(),
+    )
+}
+
 /// Build the fully layered HTTP application used in production and end-to-end tests.
 pub fn app(
     state: Arc<AppState>,
@@ -276,7 +287,7 @@ pub fn app(
             (security_config, rate_limit_state),
             middleware::rate_limit,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .with_state(state)
 }
 
@@ -424,4 +435,59 @@ async fn shutdown_signal(mut collector: Option<Collector>, state: Arc<AppState>)
     state.collector.signal_stop();
 
     tracing::info!("Graceful shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_span_omits_query_string() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = Router::new()
+            .route("/api/ws", get(|| async { "ok" }))
+            .layer(TraceLayer::new_for_http().make_span_with(request_span));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws?token=supersecret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("/api/ws"), "request was not logged: {logs}");
+        assert!(
+            !logs.contains("supersecret"),
+            "query string leaked into logs: {logs}"
+        );
+    }
 }
