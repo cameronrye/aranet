@@ -2798,6 +2798,53 @@ invalid-timestamp,test-device,800,22.5,1013.25,45,
         assert_eq!(results[2].co2, 740);
     }
 
+    #[test]
+    fn test_query_readings_with_offset_only() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5u16 {
+            let mut reading = create_test_reading();
+            reading.co2 = 700 + i * 10;
+            reading.captured_at =
+                Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::from(i) + 1));
+            store.insert_reading("offset-device", &reading).unwrap();
+        }
+
+        let query = ReadingQuery::new()
+            .device("offset-device")
+            .oldest_first()
+            .offset(2);
+        let readings = store.query_readings(&query).unwrap();
+        assert_eq!(readings.len(), 3);
+        assert_eq!(readings[0].co2, 720);
+    }
+
+    #[test]
+    fn test_query_history_with_offset_only() {
+        let store = Store::open_in_memory().unwrap();
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let records: Vec<HistoryRecord> = (0..5i64)
+            .map(|i| HistoryRecord {
+                timestamp: base + time::Duration::minutes(i * 10),
+                co2: 700 + i as u16 * 10,
+                temperature: 22.0,
+                pressure: 1013.0,
+                humidity: 45,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            })
+            .collect();
+        store.insert_history("offset-device", &records).unwrap();
+
+        let query = HistoryQuery::new()
+            .device("offset-device")
+            .oldest_first()
+            .offset(2);
+        let history = store.query_history(&query).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].co2, 720);
+    }
+
     // ==================== Device Tests ====================
 
     #[test]
