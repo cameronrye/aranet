@@ -11,17 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Aranet2 and Aranet Radiation advertisements** are decoded at the offsets real devices use; Radiation dose rate is no longer reported 10× too high
 - **History download** no longer drops the newest record, and no longer spins forever if a device repeats a packet
-- **Duplicate history rows** — re-syncing a device no longer inserts copies of records already stored (timestamps are anchored when the device is queried and matched within 30 s)
-- **`aranet sync`** now honours aliases and the default device, and stores history under the device address like other commands
-- **`aranet status`** shows radon in pCi/L correctly (previously printed the Bq/m³ value with a pCi/L label); **`aranet report`** labels the radon threshold it actually counts
+- **Duplicate history rows** — re-syncing a device no longer inserts copies of records already stored. History timestamps are anchored when the device is queried, and a record within 30 s of one already stored for the same device is skipped as a duplicate (see Changed)
+- **`aranet sync`** resolves aliases like `read` and `status` do, and stores history under the connected device's address like other commands (see Changed)
+- **`aranet status`** shows radon in pCi/L correctly (previously printed the Bq/m³ value with a pCi/L label); **`aranet report`** labels the radon threshold it actually counts, and its radon "time above" percentage now counts only records that have a radon value
 - **`aranet set smart-home true|false`** is accepted
 - **Service API** — `offset` without `limit` no longer returns 500; a rejected device update no longer corrupts the running configuration
-- **Service WebSocket** — API keys containing `+`, `/` or `=` now work from the dashboard
-- **macOS** — no longer leaks an OS thread on every Bluetooth connection
+- **Service WebSocket** — API keys containing `+`, `/` or `=` now work from the dashboard, which URL-encodes the `?token=` value. Clients that send the key unencoded keep working
+- **macOS** — no longer leaks an OS thread on every Bluetooth connection. The shared Bluetooth adapter runs on a background thread of its own, so it keeps working for programs that use more than one tokio runtime, and it is replaced if its CoreBluetooth thread stops
+
+### Changed
+
+- **`aranet sync` with no device and no default device configured** now falls back to the last-used device, then the first device in the database, as `read` and `status` do. It used to scan and prompt for a device, or fail with "No device specified" when not run interactively
+- **Where `aranet sync` stores history** — 0.2.1 stores history under the device address. History that 0.2.0 synced under a device name or alias stays under that ID, and `report`, `history` and `cache` queries for the old ID stop receiving new records. The first sync after upgrading downloads the device's whole history buffer again under the address, and `aranet sync --all` syncs the sensor once for each ID it is stored under
+- **History deduplication window** — records within 30 s of a record already stored for the same device are skipped, both when syncing and in `aranet cache import` (so an import can now report skipped duplicates that are not exact timestamp matches). Aranet devices measure at most once a minute, so real records are never this close. Duplicate rows already in the database are not removed
 
 ### Security
 
-- **Linux BlueZ agent** only approves pairing for devices aranet is connecting to (previously approved any device while running)
+- **Linux BlueZ agent** only approves pairing for devices aranet is connecting to (previously approved any device while running), and always rejects requests from remote devices to use the host's own Bluetooth profiles (such as HID input). While aranet runs it is BlueZ's default agent, so pairing and authorization requests from other devices are rejected rather than passed to the desktop's agent; pair other devices from the desktop's Bluetooth settings, or stop aranet first
 - **Service logs** no longer record request query strings, which could include the API key
 
 ## [0.2.0] - 2026-03-28
