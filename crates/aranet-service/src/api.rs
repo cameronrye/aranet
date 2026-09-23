@@ -957,28 +957,28 @@ async fn update_device(
             .ok_or_else(|| AppError::NotFound(format!("Device {} not found in config", id)))?;
         let previous_device = config.devices[device_index].clone();
 
-        // Update fields if provided (Some(None) clears, Some(Some(v)) sets, None leaves unchanged)
-        {
-            let device = &mut config.devices[device_index];
-            if let Some(alias) = request.alias {
-                device.alias = alias;
-            }
-            if let Some(poll_interval) = request.poll_interval {
-                device.poll_interval = poll_interval;
-            }
-
-            // Validate the updated device
-            let errors = device.validate("device");
-            if !errors.is_empty() {
-                return Err(AppError::BadRequest(
-                    errors
-                        .iter()
-                        .map(|e| e.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ));
-            }
+        // Build and validate the updated entry before touching shared state, so a
+        // rejected request can't leave invalid values behind for the next save.
+        // (Some(None) clears, Some(Some(v)) sets, None leaves unchanged.)
+        let mut updated = previous_device.clone();
+        if let Some(alias) = request.alias {
+            updated.alias = alias;
         }
+        if let Some(poll_interval) = request.poll_interval {
+            updated.poll_interval = poll_interval;
+        }
+
+        let errors = updated.validate("device");
+        if !errors.is_empty() {
+            return Err(AppError::BadRequest(
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        config.devices[device_index] = updated;
 
         let response = {
             let device = &config.devices[device_index];
@@ -2264,6 +2264,38 @@ mod tests {
 
         assert_eq!(json["alias"], "Updated Name");
         assert_eq!(json["poll_interval"], 300);
+    }
+
+    #[tokio::test]
+    async fn test_update_device_rejected_update_leaves_config_unchanged() {
+        let state = create_test_state();
+        {
+            let mut config = state.config.write().await;
+            config.devices.push(DeviceConfig {
+                address: "AA:BB:CC:DD:EE:FF".to_string(),
+                alias: Some("Original".to_string()),
+                poll_interval: 60,
+            });
+        }
+
+        let app = router().with_state(Arc::clone(&state));
+        let request_body = serde_json::json!({ "alias": "Renamed", "poll_interval": 0 });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config/devices/AA:BB:CC:DD:EE:FF")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let config = state.config.read().await;
+        assert_eq!(config.devices[0].alias.as_deref(), Some("Original"));
+        assert_eq!(config.devices[0].poll_interval, 60);
     }
 
     #[tokio::test]
