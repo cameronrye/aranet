@@ -255,8 +255,13 @@ const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug";
 
 /// Initialize the default tracing subscriber used by the service binaries.
 pub fn init_tracing() -> anyhow::Result<()> {
-    let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(DEFAULT_LOG_DIRECTIVES.parse()?);
+    // `EnvFilter::add_directive` parses a single directive, not a comma-separated
+    // list (only `EnvFilter::new`/`from_str` split on commas), so
+    // `DEFAULT_LOG_DIRECTIVES` must be split and each directive added in turn.
+    let mut filter = tracing_subscriber::EnvFilter::from_default_env();
+    for directive in DEFAULT_LOG_DIRECTIVES.split(',') {
+        filter = filter.add_directive(directive.parse()?);
+    }
 
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     Ok(())
@@ -504,6 +509,17 @@ mod tests {
         assert!(
             !logs.contains("supersecret"),
             "query string leaked into logs: {logs}"
+        );
+    }
+
+    #[test]
+    fn test_init_tracing_builds_valid_filter() {
+        // Regression test for `DEFAULT_LOG_DIRECTIVES` being fed whole into
+        // `EnvFilter::add_directive`, which parses a single directive and errors
+        // on the comma-separated list, making every call fail at runtime.
+        assert!(
+            init_tracing().is_ok(),
+            "init_tracing() failed to build its EnvFilter"
         );
     }
 }
