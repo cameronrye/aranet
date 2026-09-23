@@ -7,6 +7,18 @@ use time::{Duration, OffsetDateTime};
 use crate::cli::{ReportFormat, ReportOutputArgs, ReportPeriod};
 use crate::config::Config;
 
+/// Radon level the report measures "time above" against (EU reference level).
+const RADON_REPORT_THRESHOLD_BQ: f64 = 300.0;
+
+/// [`RADON_REPORT_THRESHOLD_BQ`] expressed in the unit being displayed.
+fn radon_threshold_label(bq: bool) -> String {
+    if bq {
+        format!("{RADON_REPORT_THRESHOLD_BQ:.0} Bq/m\u{00b3}")
+    } else {
+        format!("{:.1} pCi/L", RADON_REPORT_THRESHOLD_BQ * 0.027)
+    }
+}
+
 /// Execute the report command.
 pub fn cmd_report(
     device: Option<String>,
@@ -190,12 +202,15 @@ fn generate_device_report(
         .filter_map(|r| r.radon.map(|v| v as f64))
         .collect();
     let radon = if !radon_vals.is_empty() {
-        let above_300 = radon_vals.iter().filter(|&&v| v >= 300.0).count();
+        let above = radon_vals
+            .iter()
+            .filter(|&&v| v >= RADON_REPORT_THRESHOLD_BQ)
+            .count();
         Some(MetricSummary {
             min: radon_vals.iter().copied().reduce(f64::min).unwrap_or(0.0),
             max: radon_vals.iter().copied().reduce(f64::max).unwrap_or(0.0),
             avg: radon_vals.iter().sum::<f64>() / radon_vals.len() as f64,
-            time_above_threshold: Some((above_300 as f64 / count as f64) * 100.0),
+            time_above_threshold: Some((above as f64 / radon_vals.len() as f64) * 100.0),
         })
     } else {
         None
@@ -280,7 +295,7 @@ fn print_device_report(report: &DeviceReport, fahrenheit: bool, inhg: bool, bq: 
                 radon.min, radon.max, radon.avg
             );
             if let Some(pct) = radon.time_above_threshold {
-                println!("    Time above 300 Bq/m\u{00b3}: {:.1}%", pct);
+                println!("    Time above {}: {:.1}%", radon_threshold_label(bq), pct);
             }
         } else {
             let to_pci = |bq_val: f64| bq_val * 0.027;
@@ -292,7 +307,7 @@ fn print_device_report(report: &DeviceReport, fahrenheit: bool, inhg: bool, bq: 
                 to_pci(radon.avg)
             );
             if let Some(pct) = radon.time_above_threshold {
-                println!("    Time above 4.0 pCi/L: {:.1}%", pct);
+                println!("    Time above {}: {:.1}%", radon_threshold_label(bq), pct);
             }
         }
     }
@@ -331,5 +346,43 @@ mod tests {
         let store = seed_store(&["device-1", "device-2"]);
         let err = resolve_report_devices(&store, None, false).unwrap_err();
         assert!(err.to_string().contains("--all"));
+    }
+
+    #[test]
+    fn test_radon_threshold_label_matches_counted_threshold() {
+        assert_eq!(radon_threshold_label(true), "300 Bq/m\u{00b3}");
+        assert_eq!(radon_threshold_label(false), "8.1 pCi/L");
+    }
+
+    #[test]
+    fn test_radon_time_above_threshold_counts_radon_records_only() {
+        let store = Store::open_in_memory().unwrap();
+        let now = OffsetDateTime::now_utc();
+        let record = |mins_ago: i64, radon: Option<u32>| aranet_types::HistoryRecord {
+            timestamp: now - Duration::minutes(mins_ago),
+            co2: 0,
+            temperature: 21.0,
+            pressure: 1000.0,
+            humidity: 40,
+            radon,
+            radiation_rate: None,
+            radiation_total: None,
+        };
+        store
+            .insert_history(
+                "rn",
+                &[
+                    record(40, Some(100)),
+                    record(30, Some(400)),
+                    record(20, None),
+                    record(10, None),
+                ],
+            )
+            .unwrap();
+
+        let report = generate_device_report(&store, "rn", now - Duration::hours(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.radon.unwrap().time_above_threshold, Some(50.0));
     }
 }

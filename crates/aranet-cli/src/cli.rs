@@ -148,7 +148,7 @@ pub struct ReportOutputArgs {
     #[arg(long, conflicts_with = "inhg")]
     pub hpa: bool,
 
-    /// Display radon in Bq/m³ (default, overrides config)
+    /// Display radon in Bq/m³ (overrides config)
     #[arg(long, conflicts_with = "pci")]
     pub bq: bool,
 
