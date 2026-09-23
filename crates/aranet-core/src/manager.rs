@@ -983,7 +983,7 @@ impl DeviceManager {
 
                         // Sort by priority (higher priority checked first)
                         let mut sorted_devices = devices_to_check;
-                        sorted_devices.sort_by(|a, b| b.3.cmp(&a.3));
+                        sorted_devices.sort_by_key(|d| std::cmp::Reverse(d.3));
 
                         for (id, device_opt, auto_reconnect, _priority) in sorted_devices {
                             let should_reconnect = match device_opt {
