@@ -449,6 +449,37 @@ pub struct HistoryInfo {
     pub seconds_since_update: u16,
 }
 
+/// Wall-clock reference for converting device history indices to timestamps.
+///
+/// Captured once, immediately after `seconds_since_update` is read, so the
+/// timestamps don't shift by however long the download takes. Index
+/// `total_readings` is the newest record on the device; each lower index is
+/// one interval older.
+#[derive(Debug, Clone, Copy)]
+struct HistoryAnchor {
+    newest_record_at: OffsetDateTime,
+    total_readings: u16,
+    interval_seconds: u16,
+}
+
+impl HistoryAnchor {
+    fn new(info: &HistoryInfo, read_at: OffsetDateTime) -> Self {
+        Self {
+            newest_record_at: read_at
+                - time::Duration::seconds(i64::from(info.seconds_since_update)),
+            total_readings: info.total_readings,
+            interval_seconds: info.interval_seconds,
+        }
+    }
+
+    /// Timestamp of the record at 1-based device `index`.
+    fn timestamp_for(&self, index: u32) -> OffsetDateTime {
+        let readings_ago = i64::from(self.total_readings) - i64::from(index);
+        self.newest_record_at
+            - time::Duration::seconds(readings_ago * i64::from(self.interval_seconds))
+    }
+}
+
 impl Device {
     /// Get information about the stored history.
     pub async fn get_history_info(&self) -> Result<HistoryInfo> {
@@ -519,6 +550,9 @@ impl Device {
         use aranet_types::DeviceType;
 
         let info = self.get_history_info().await?;
+        // Capture "now" as close as possible to the seconds-since-update read so
+        // every sync maps the same device record to the same timestamp.
+        let anchor = HistoryAnchor::new(&info, OffsetDateTime::now_utc());
         info!(
             "Device has {} readings, interval {}s, last update {}s ago",
             info.total_readings, info.interval_seconds, info.seconds_since_update
@@ -582,6 +616,7 @@ impl Device {
                 // For radon devices, download radon instead of CO2, and use Humidity2
                 self.download_radon_history_internal(
                     &info,
+                    anchor,
                     start_idx,
                     end_idx,
                     &options,
@@ -593,6 +628,7 @@ impl Device {
                 // For Aranet2, download temperature and humidity only
                 self.download_aranet2_history_internal(
                     &info,
+                    anchor,
                     start_idx,
                     end_idx,
                     &options,
@@ -604,6 +640,7 @@ impl Device {
                 // For Aranet4 (and unknown devices), download CO2, temp, pressure, humidity
                 self.download_aranet4_history_internal(
                     &info,
+                    anchor,
                     start_idx,
                     end_idx,
                     &options,
@@ -665,6 +702,7 @@ impl Device {
     async fn download_aranet4_history_internal(
         &self,
         info: &HistoryInfo,
+        anchor: HistoryAnchor,
         start_idx: u16,
         end_idx: u16,
         options: &HistoryOptions,
@@ -750,7 +788,8 @@ impl Device {
             .await?;
 
         let records = build_history_records(
-            info,
+            &anchor,
+            start_idx,
             &co2_values,
             &temp_values,
             &pressure_values,
@@ -766,6 +805,7 @@ impl Device {
     async fn download_aranet2_history_internal(
         &self,
         info: &HistoryInfo,
+        anchor: HistoryAnchor,
         start_idx: u16,
         end_idx: u16,
         options: &HistoryOptions,
@@ -819,7 +859,15 @@ impl Device {
             .await?;
 
         // Build records with no CO2, no pressure, no radon
-        let records = build_history_records(info, &[], &temp_values, &[], &humidity_values, &[]);
+        let records = build_history_records(
+            &anchor,
+            start_idx,
+            &[],
+            &temp_values,
+            &[],
+            &humidity_values,
+            &[],
+        );
 
         info!("Downloaded {} Aranet2 history records", records.len());
         Ok(records)
@@ -829,6 +877,7 @@ impl Device {
     async fn download_radon_history_internal(
         &self,
         info: &HistoryInfo,
+        anchor: HistoryAnchor,
         start_idx: u16,
         end_idx: u16,
         options: &HistoryOptions,
@@ -923,7 +972,8 @@ impl Device {
             .await?;
 
         let records = build_history_records(
-            info,
+            &anchor,
+            start_idx,
             &[],
             &temp_values,
             &pressure_values,
@@ -1391,12 +1441,18 @@ fn apply_v2_packet<T>(
 
 /// Build history records from downloaded parameter arrays.
 ///
+/// Element `i` of each array is the record at 1-based device index
+/// `start_idx + i`; its timestamp comes from `anchor` for that index, so a
+/// partial download (e.g. `end_index < total_readings`) keeps the device's
+/// real record times instead of being stamped as the newest records.
+///
 /// For Aranet4: pass co2_values and empty radon_values.
 /// For AranetRn+: pass empty co2_values and radon_values.
 /// Humidity is converted differently based on whether radon_values is populated
 /// (radon devices use Humidity2 encoding: tenths of a percent).
 fn build_history_records(
-    info: &HistoryInfo,
+    anchor: &HistoryAnchor,
+    start_idx: u16,
     co2_values: &[u16],
     temp_values: &[u16],
     pressure_values: &[u16],
@@ -1428,14 +1484,9 @@ fn build_history_records(
         );
     }
 
-    let now = OffsetDateTime::now_utc();
-    let latest_reading_time = now - time::Duration::seconds(info.seconds_since_update as i64);
-
     (0..count)
         .map(|i| {
-            let readings_ago = (count - 1 - i) as i64;
-            let timestamp = latest_reading_time
-                - time::Duration::seconds(readings_ago * info.interval_seconds as i64);
+            let timestamp = anchor.timestamp_for(u32::from(start_idx) + i as u32);
 
             let humidity = if is_radon || is_aranet2 {
                 // Humidity2 is stored as tenths of a percent
@@ -1709,5 +1760,71 @@ mod tests {
         );
         assert_eq!(progress, PacketProgress::Done);
         assert_eq!(values.len(), 2);
+    }
+
+    // --- HistoryAnchor / build_history_records timestamp tests ---
+
+    fn anchor_fixture(total: u16, interval: u16, ago: u16) -> (HistoryAnchor, OffsetDateTime) {
+        let read_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let info = HistoryInfo {
+            total_readings: total,
+            interval_seconds: interval,
+            seconds_since_update: ago,
+        };
+        (HistoryAnchor::new(&info, read_at), read_at)
+    }
+
+    #[test]
+    fn test_history_anchor_newest_record_time() {
+        let (anchor, read_at) = anchor_fixture(100, 600, 120);
+        assert_eq!(
+            anchor.timestamp_for(100),
+            read_at - time::Duration::seconds(120)
+        );
+        assert_eq!(
+            anchor.timestamp_for(99),
+            read_at - time::Duration::seconds(120 + 600)
+        );
+    }
+
+    #[test]
+    fn test_build_history_records_timestamps_follow_device_indices() {
+        // Downloading only the three OLDEST records of a 1000-record buffer must
+        // stamp them ~999 intervals ago, not as the newest three.
+        let (anchor, read_at) = anchor_fixture(1000, 600, 120);
+        let records = build_history_records(
+            &anchor,
+            1,
+            &[800, 810, 820],
+            &[450; 3],
+            &[10130; 3],
+            &[45; 3],
+            &[],
+        );
+        let newest = read_at - time::Duration::seconds(120);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[0].timestamp,
+            newest - time::Duration::seconds(999 * 600)
+        );
+        assert_eq!(
+            records[2].timestamp,
+            newest - time::Duration::seconds(997 * 600)
+        );
+    }
+
+    #[test]
+    fn test_build_history_records_newest_record_matches_anchor() {
+        let (anchor, read_at) = anchor_fixture(1000, 600, 120);
+        let records = build_history_records(
+            &anchor,
+            998,
+            &[800, 810, 820],
+            &[450; 3],
+            &[10130; 3],
+            &[45; 3],
+            &[],
+        );
+        assert_eq!(records[2].timestamp, read_at - time::Duration::seconds(120));
     }
 }
