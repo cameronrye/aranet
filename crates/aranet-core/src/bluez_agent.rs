@@ -12,8 +12,10 @@
 //! "Just Works" pairing, unblocking service discovery and characteristic reads.
 //!
 //! The agent is registered as BlueZ's default agent, so it receives pairing and
-//! authorization requests for every device near the host. It approves them only
-//! for devices that `aranet-core` is connecting to and rejects everything else.
+//! authorization requests for every device near the host. It approves pairing
+//! only for devices that `aranet-core` is connecting to and rejects everything
+//! else. It always rejects `AuthorizeService`, since aranet never needs a remote
+//! device to connect to the host's own profiles.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -88,6 +90,25 @@ fn check_allowed(device: &dbus::Path) -> Result<(), dbus_crossroads::MethodErr> 
         )
             .into())
     }
+}
+
+/// Answer BlueZ's `AuthorizeService` request: always reject.
+///
+/// BlueZ asks this when a remote device connects to one of the host's own
+/// profiles (HID input, audio, PAN, ...). aranet is only ever a GATT client of
+/// the sensor, so the Aranet flow never needs it. The pairing allow-list is
+/// keyed by an address that Aranet devices broadcast in the clear, so approving
+/// here would let anyone spoofing that address reach those profiles, for
+/// example to inject keystrokes over HID.
+fn authorize_service(device: &dbus::Path, uuid: &str) -> Result<(), dbus_crossroads::MethodErr> {
+    warn!(
+        "BlueZ agent: rejecting AuthorizeService {uuid} for {device} (aranet never accepts host profile connections)"
+    );
+    Err((
+        "org.bluez.Error.Rejected",
+        "aranet does not authorize host profile connections",
+    )
+        .into())
 }
 
 /// Ensure a BlueZ agent is registered for this process.
@@ -191,10 +212,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "AuthorizeService",
             ("device", "uuid"),
             (),
-            |_, _, (device, uuid): (dbus::Path, String)| {
-                debug!("BlueZ agent: AuthorizeService {uuid} for {device}");
-                check_allowed(&device)
-            },
+            |_, _, (device, uuid): (dbus::Path, String)| authorize_service(&device, &uuid),
         );
 
         b.method("Cancel", (), (), |_, _, ()| {
@@ -298,5 +316,44 @@ mod tests {
         assert!(is_pairing_allowed("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01"));
         assert!(!is_pairing_allowed("/org/bluez/hci0/dev_11_22_33_44_55_66"));
         assert!(!is_pairing_allowed("/org/bluez/hci0"));
+    }
+
+    fn device(path: &str) -> dbus::Path<'static> {
+        dbus::Path::new(path.to_owned()).unwrap()
+    }
+
+    fn assert_rejected(result: Result<(), dbus_crossroads::MethodErr>) {
+        let err = result.expect_err("request should be rejected");
+        assert_eq!(&**err.errorname(), "org.bluez.Error.Rejected");
+    }
+
+    #[test]
+    fn test_check_allowed_rejects_unknown_device() {
+        assert_rejected(check_allowed(&device(
+            "/org/bluez/hci0/dev_11_22_33_44_55_02",
+        )));
+    }
+
+    #[test]
+    fn test_check_allowed_accepts_allowed_device() {
+        allow_pairing("AA:BB:CC:DD:EE:03");
+        assert!(check_allowed(&device("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_03")).is_ok());
+    }
+
+    #[test]
+    fn test_authorize_service_rejected_even_for_allowed_device() {
+        // aranet is only a GATT client, so it never needs a remote device to
+        // connect to the host's own profiles (HID, audio, PAN). An allowed
+        // address can be spoofed from its advertisements, so allowing it here
+        // would open those profiles to anyone nearby.
+        allow_pairing("AA:BB:CC:DD:EE:04");
+        assert_rejected(authorize_service(
+            &device("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_04"),
+            "00001124-0000-1000-8000-00805f9b34fb",
+        ));
+        assert_rejected(authorize_service(
+            &device("/org/bluez/hci0/dev_11_22_33_44_55_05"),
+            "00001124-0000-1000-8000-00805f9b34fb",
+        ));
     }
 }
