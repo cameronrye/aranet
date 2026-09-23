@@ -194,32 +194,36 @@ fn parse_aranet4_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
     })
 }
 
-/// Parse Aranet2 advertisement data (v2 format - actual device format).
+/// Parse Aranet2 advertisement data.
 ///
-/// Format (after device type byte removed, 19+ bytes):
-/// - bytes 0-7: Basic info (flags, version, etc.)
-/// - bytes 8-9: Temperature (u16 LE, *0.05 for °C)
-/// - bytes 10-11: unused
-/// - bytes 12-13: Humidity (u16 LE, *0.1 for %)
-/// - byte 14: Battery (u8)
-/// - byte 15: Status (u8)
-/// - bytes 16-17: Interval (u16 LE, seconds)
-/// - bytes 18-19: Age (u16 LE, seconds)
-/// - byte 20: Counter (u8)
+/// Layout after the device-type byte is removed. It is the AranetRn+ layout with
+/// the radon and pressure slots unused (reference: Aranet4-Python
+/// `<xxxxxxxxHHHHBBBHHB` applied to the full payload):
+/// - byte 0: flags
+/// - bytes 1-8: basic info
+/// - bytes 9-10: temperature (u16 LE, ×0.05 °C)
+/// - bytes 11-12: unused
+/// - bytes 13-14: humidity (u16 LE, ×0.1 %)
+/// - byte 15: unused
+/// - byte 16: battery (%)
+/// - byte 17: status (bits 2-3 = temperature status)
+/// - bytes 18-19: interval (s)
+/// - bytes 20-21: age (s)
+/// - byte 22: counter (optional)
 fn parse_aranet2_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
-    if data.len() < 19 {
+    if data.len() < 22 {
         return Err(Error::InvalidData(format!(
-            "Aranet2 advertisement requires at least 19 bytes, got {}",
+            "Aranet2 advertisement requires at least 22 bytes, got {}",
             data.len()
         )));
     }
 
     let flags = data[0];
-    // Skip to sensor data at offset 7
-    let mut buf = &data[7..];
+    let mut buf = &data[9..];
     let temp_raw = buf.get_i16_le();
     let _unused = buf.get_u16_le();
     let humidity_raw = buf.get_u16_le();
+    let _unused = buf.get_u8();
     let battery = buf.get_u8();
     let status_raw = buf.get_u8();
     // Status for Aranet2: bits[0:1] = humidity, bits[2:3] = temperature
@@ -402,17 +406,19 @@ mod tests {
     fn test_parse_aranet2_advertisement() {
         // Aranet2 v2 format: device type 0x01, then 19+ bytes
         // Flags byte has bit 5 set (0x20) for Smart Home integration
-        let data: [u8; 20] = [
+        let data: [u8; 24] = [
             0x01, // device type = Aranet2
             0x20, // flags (bit 5 = integrations enabled)
-            0x13, 0x04, 0x01, 0x00, 0x0E, 0x0F, // basic info (6 bytes)
+            0x13, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // basic info (8 bytes)
             0xC2, 0x01, // temp_raw = 450 (450 * 0.05 = 22.5°C)
             0x00, 0x00, // unused
             0xC2, 0x01, // humidity_raw = 450 (450 * 0.1 = 45%)
+            0x00, // unused
             85,   // battery
             0x04, // status flags: bits[2:3] = 01 = Green (temperature status)
             0x2C, 0x01, // interval = 300
             0x3C, 0x00, // age = 60
+            0x07, // counter
         ];
 
         let result = parse_advertisement(&data).unwrap();
@@ -422,6 +428,30 @@ mod tests {
         assert_eq!(result.humidity, Some(45));
         assert_eq!(result.battery, 85);
         assert_eq!(result.status, Status::Green);
+    }
+
+    /// Real Aranet2 advertisement (manufacturer data after the 0x0702 company ID),
+    /// from Home Assistant's aranet integration test fixtures.
+    /// The device reported 24.8 °C, 52.4 % RH, battery 79 %, 60 s interval.
+    const ARANET2_CAPTURE: [u8; 24] = [
+        0x01, 0x21, 0x04, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x00, 0x0c,
+        0x02, 0x00, 0x4f, 0x00, 0x3c, 0x00, 0x01, 0x00, 0x80,
+    ];
+
+    #[test]
+    fn test_parse_aranet2_real_capture() {
+        let result = parse_advertisement(&ARANET2_CAPTURE).unwrap();
+        assert_eq!(result.device_type, DeviceType::Aranet2);
+        assert!(
+            (result.temperature.unwrap() - 24.8).abs() < 0.01,
+            "temperature was {:?}",
+            result.temperature
+        );
+        assert_eq!(result.humidity, Some(52));
+        assert_eq!(result.battery, 79);
+        assert_eq!(result.interval, 60);
+        assert_eq!(result.age, 1);
+        assert_eq!(result.counter, Some(0x80));
     }
 
     #[test]
