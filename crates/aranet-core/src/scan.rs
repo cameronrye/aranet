@@ -182,9 +182,53 @@ impl ScanOptions {
 /// adapter per connection leaks a thread per poll. Other platforms create
 /// adapters cheaply and stay uncached, so a dead D-Bus connection can still
 /// be recovered by `reset_manager`.
+///
+/// The adapter is created on [`run_on_process_runtime`], because btleplug runs
+/// its event loop (device discovery, and each peripheral's notification task)
+/// on the runtime that creates it. Created on a caller's runtime, it would stop
+/// seeing devices, with no error, once that runtime shut down, which happens
+/// after every `#[tokio::test]` and in any program that builds a runtime per
+/// call.
 static ADAPTER: RwLock<Option<Adapter>> = RwLock::const_new(None);
 
+/// Runtime for tasks that must outlive the caller's runtime. It is created on
+/// first use and runs one worker thread for the rest of the process.
+static PROCESS_RUNTIME: std::sync::Mutex<Option<tokio::runtime::Runtime>> =
+    std::sync::Mutex::new(None);
+
+/// Run `future` to completion on [`PROCESS_RUNTIME`]. Tasks it spawns keep
+/// running after the caller's runtime shuts down.
+async fn run_on_process_runtime<F>(future: F) -> Result<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = {
+        let mut guard = PROCESS_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(runtime) => runtime.handle().clone(),
+            None => {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("aranet-ble")
+                    .enable_all()
+                    .build()?;
+                let handle = runtime.handle().clone();
+                *guard = Some(runtime);
+                handle
+            }
+        }
+    };
+    let output = handle.spawn(future).await.map_err(std::io::Error::from)?;
+    Ok(output)
+}
+
 /// Get the first available Bluetooth adapter.
+///
+/// On macOS the adapter is created once and shared by every caller in the
+/// process, whichever tokio runtime they use. Its background tasks run on a
+/// dedicated one-thread runtime that lives as long as the process, and a new
+/// adapter replaces it if its CoreBluetooth thread stops.
 pub async fn get_adapter() -> Result<Adapter> {
     if cfg!(target_os = "macos") {
         cached_adapter().await
@@ -194,16 +238,46 @@ pub async fn get_adapter() -> Result<Adapter> {
 }
 
 async fn cached_adapter() -> Result<Adapter> {
-    if let Some(adapter) = ADAPTER.read().await.as_ref() {
-        return Ok(adapter.clone());
+    let cached = ADAPTER.read().await.clone();
+    if let Some(adapter) = cached
+        && adapter_thread_is_running(&adapter).await
+    {
+        return Ok(adapter);
     }
     let mut guard = ADAPTER.write().await;
     if let Some(adapter) = guard.as_ref() {
-        return Ok(adapter.clone());
+        if adapter_thread_is_running(adapter).await {
+            return Ok(adapter.clone());
+        }
+        warn!("CoreBluetooth adapter thread has stopped; creating a new adapter");
     }
-    let adapter = create_adapter().await?;
+    let adapter = run_on_process_runtime(create_adapter()).await??;
     *guard = Some(adapter.clone());
     Ok(adapter)
+}
+
+/// Whether the cached adapter's CoreBluetooth thread still takes requests.
+///
+/// btleplug's CoreBluetooth thread can panic (for example when services are
+/// discovered after a connect has timed out). Every later request on that
+/// adapter then fails with "Channel closed", so it has to be replaced. A reply
+/// that is merely slow keeps the adapter: only a closed channel proves the
+/// thread is gone.
+async fn adapter_thread_is_running(adapter: &Adapter) -> bool {
+    let adapter = adapter.clone();
+    // Run on the process runtime so the timeout works even if the caller's
+    // runtime has no time driver.
+    let state = run_on_process_runtime(async move {
+        tokio::time::timeout(Duration::from_secs(2), adapter.adapter_state()).await
+    })
+    .await;
+    match state {
+        Ok(Ok(Err(e))) => {
+            debug!("Cached Bluetooth adapter is unusable: {e}");
+            false
+        }
+        _ => true,
+    }
 }
 
 async fn create_adapter() -> Result<Adapter> {
@@ -734,6 +808,31 @@ mod tests {
                 },
             )
         ));
+    }
+
+    // ==================== Process Runtime Tests ====================
+
+    #[test]
+    fn test_tasks_spawned_on_process_runtime_outlive_the_caller_runtime() {
+        // btleplug spawns the adapter's event loop from inside adapter creation;
+        // that task must keep running after the caller's runtime shuts down.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller
+            .block_on(run_on_process_runtime(async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tx.send(()).unwrap();
+                });
+            }))
+            .unwrap();
+        drop(caller);
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("task spawned on the process runtime died with the caller's runtime");
     }
 
     // ==================== DiscoveredDevice Tests ====================

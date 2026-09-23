@@ -935,3 +935,41 @@ async fn test_get_adapter_does_not_spawn_a_thread_per_call() {
         "get_adapter leaked threads: {baseline} -> {after}"
     );
 }
+
+/// btleplug runs the CoreBluetooth adapter's event loop on the tokio runtime
+/// that created the adapter. Each `#[tokio::test]` (and any library user that
+/// builds a runtime per call) drops its runtime when done, so an adapter cached
+/// from a runtime that has shut down would silently stop discovering devices.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires BLE hardware and an Aranet device in range (macOS)"]
+fn test_get_adapter_still_discovers_after_its_runtime_shuts_down() {
+    // Current-thread runtimes, like `#[tokio::test]`, so no extra worker threads.
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    };
+
+    let first = runtime();
+    first.block_on(async {
+        aranet_core::scan::get_adapter().await.expect("adapter");
+    });
+    drop(first);
+
+    let second = runtime();
+    let devices = second.block_on(async {
+        let options = ScanOptions::default()
+            .duration_secs(10)
+            .filter_aranet_only(true);
+        timeout(Duration::from_secs(30), scan_with_options(options))
+            .await
+            .expect("scan timed out")
+            .expect("scan failed")
+    });
+    assert!(
+        !devices.is_empty(),
+        "no Aranet devices discovered after the adapter's first runtime shut down"
+    );
+}
