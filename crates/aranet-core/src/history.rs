@@ -965,6 +965,8 @@ impl Device {
         let mut current_idx = start_idx;
         let mut consecutive_wrong_param = 0u32;
         const MAX_WRONG_PARAM_RETRIES: u32 = 5;
+        let mut consecutive_stalls = 0u32;
+        const MAX_STALLED_PACKETS: u32 = 5;
 
         while current_idx <= end_idx {
             // Send V2 history request using command constant
@@ -1029,33 +1031,46 @@ impl Device {
                 break;
             }
 
-            // Parse data values
+            // Parse data values and decide what to request next
             let data = &response[10..];
-            let num_values = (data.len() / value_size).min(resp_count);
-
-            for i in 0..num_values {
-                let idx = resp_start + i as u16;
-                if idx > end_idx {
+            match apply_v2_packet(
+                &mut values,
+                current_idx,
+                end_idx,
+                resp_start,
+                resp_count,
+                data,
+                value_size,
+                &value_parser,
+            ) {
+                PacketProgress::Done => {
+                    on_progress(values.len());
+                    debug!("Reached end of requested range");
                     break;
                 }
-                if let Some(value) = value_parser(data, i) {
-                    values.insert(idx, value);
+                PacketProgress::Continue(next_idx) => {
+                    consecutive_stalls = 0;
+                    current_idx = next_idx;
+                    debug!(
+                        "Downloaded {} values, next index: {}",
+                        values.len(),
+                        current_idx
+                    );
+                    on_progress(values.len());
                 }
-            }
-
-            current_idx = resp_start + num_values as u16;
-            debug!(
-                "Downloaded {} values, next index: {}",
-                num_values, current_idx
-            );
-
-            // Report progress
-            on_progress(values.len());
-
-            // Check if we've downloaded all available data
-            if (resp_start as usize + resp_count) >= end_idx as usize {
-                debug!("Reached end of requested range");
-                break;
+                PacketProgress::Stalled => {
+                    consecutive_stalls += 1;
+                    warn!(
+                        "History packet for {:?} made no progress at index {} (retry {}/{})",
+                        param, current_idx, consecutive_stalls, MAX_STALLED_PACKETS
+                    );
+                    if consecutive_stalls >= MAX_STALLED_PACKETS {
+                        return Err(Error::InvalidData(format!(
+                            "History download for {param:?} stalled at index {current_idx}"
+                        )));
+                    }
+                    sleep(read_delay).await;
+                }
             }
         }
 
@@ -1317,6 +1332,63 @@ impl Device {
     }
 }
 
+/// Outcome of applying one V2 history response packet.
+#[derive(Debug, PartialEq, Eq)]
+enum PacketProgress {
+    /// More records remain; request the next packet starting at this index.
+    Continue(u16),
+    /// Every index up to and including `end_idx` has been received.
+    Done,
+    /// The packet did not move the download forward (stale repeat, or a
+    /// count with no payload). The caller should retry, then give up.
+    Stalled,
+}
+
+/// Store the values from one V2 history packet and decide what to request next.
+///
+/// `resp_start` and `resp_count` come from the packet header; `data` is the
+/// payload after the 10-byte header. `end_idx` is inclusive.
+#[allow(clippy::too_many_arguments)]
+fn apply_v2_packet<T>(
+    values: &mut BTreeMap<u16, T>,
+    current_idx: u16,
+    end_idx: u16,
+    resp_start: u16,
+    resp_count: usize,
+    data: &[u8],
+    value_size: usize,
+    value_parser: &impl Fn(&[u8], usize) -> Option<T>,
+) -> PacketProgress {
+    let num_values = (data.len() / value_size).min(resp_count);
+    if num_values == 0 {
+        return PacketProgress::Stalled;
+    }
+
+    for i in 0..num_values {
+        let Some(idx) = resp_start.checked_add(i as u16) else {
+            break;
+        };
+        if idx > end_idx {
+            break;
+        }
+        if let Some(value) = value_parser(data, i) {
+            values.insert(idx, value);
+        }
+    }
+
+    // Index of the last value carried by this packet (num_values >= 1).
+    let last_idx = u32::from(resp_start) + num_values as u32 - 1;
+    if last_idx >= u32::from(end_idx) {
+        return PacketProgress::Done;
+    }
+    // last_idx < end_idx <= u16::MAX, so this fits in u16.
+    let next_idx = (last_idx + 1) as u16;
+    if next_idx <= current_idx {
+        return PacketProgress::Stalled;
+    }
+    PacketProgress::Continue(next_idx)
+}
+
 /// Build history records from downloaded parameter arrays.
 ///
 /// For Aranet4: pass co2_values and empty radon_values.
@@ -1565,5 +1637,77 @@ mod tests {
         let debug_str = format!("{:?}", info);
         assert!(debug_str.contains("total_readings"));
         assert!(debug_str.contains("500"));
+    }
+
+    // --- apply_v2_packet tests ---
+
+    fn parse_u16(data: &[u8], i: usize) -> Option<u16> {
+        data.get(i * 2..i * 2 + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u16_payload(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn test_apply_v2_packet_does_not_stop_one_record_early() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&(1..=99).collect::<Vec<u16>>());
+        let progress = apply_v2_packet(&mut values, 1, 100, 1, 99, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Continue(100));
+        assert_eq!(values.len(), 99);
+    }
+
+    #[test]
+    fn test_apply_v2_packet_done_after_last_index() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&[42]);
+        let progress = apply_v2_packet(&mut values, 100, 100, 100, 1, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Done);
+        assert_eq!(values.get(&100), Some(&42));
+    }
+
+    #[test]
+    fn test_apply_v2_packet_ignores_values_past_end() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&[1, 2, 3, 4]);
+        let progress = apply_v2_packet(&mut values, 9, 10, 9, 4, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Done);
+        assert_eq!(values.keys().copied().collect::<Vec<_>>(), vec![9, 10]);
+    }
+
+    #[test]
+    fn test_apply_v2_packet_count_without_payload_is_stalled() {
+        let mut values: BTreeMap<u16, u16> = BTreeMap::new();
+        let progress = apply_v2_packet(&mut values, 1, 100, 1, 5, &[], 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Stalled);
+    }
+
+    #[test]
+    fn test_apply_v2_packet_repeated_old_packet_is_stalled() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&[1, 2, 3]);
+        // We asked for index 50; the device repeated the packet for 1..=3.
+        let progress = apply_v2_packet(&mut values, 50, 100, 1, 3, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Stalled);
+    }
+
+    #[test]
+    fn test_apply_v2_packet_near_u16_max_does_not_overflow() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&[1, 2, 3, 4, 5]);
+        let progress = apply_v2_packet(
+            &mut values,
+            65534,
+            u16::MAX,
+            65534,
+            5,
+            &payload,
+            2,
+            &parse_u16,
+        );
+        assert_eq!(progress, PacketProgress::Done);
+        assert_eq!(values.len(), 2);
     }
 }
