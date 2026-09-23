@@ -66,8 +66,12 @@
 //! configured security settings.
 //!
 //! For WebSocket connections, browsers cannot set custom headers. Use the `token`
-//! query parameter only on `/api/ws` instead:
+//! query parameter only on `/api/ws` instead, URL-encoding the key (for example
+//! with `encodeURIComponent(key)` in JavaScript):
 //! `ws://localhost:8080/api/ws?token=your-api-key`
+//!
+//! A key sent unencoded is also accepted: `+` in the token is kept as `+`, not
+//! read as a space, so base64 keys containing `+`, `/` or `=` work either way.
 //!
 //! **Note**: Query parameters may be logged by proxies or appear in browser history.
 //! For sensitive deployments, consider using a short-lived token exchange endpoint

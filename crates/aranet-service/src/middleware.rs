@@ -106,25 +106,38 @@ impl RateLimitState {
     }
 }
 
-/// Query parameters accepted on the WebSocket upgrade route.
-#[derive(serde::Deserialize)]
-struct WsAuthQuery {
-    token: Option<String>,
-}
-
-/// The percent-decoded `?token=` value on `/api/ws`, if present.
+/// The `?token=` value on `/api/ws`, in each form that may match the API key.
 ///
-/// Browsers can't set headers on a WebSocket upgrade, so the dashboard sends
-/// `encodeURIComponent(key)`; comparing the raw query value would reject any
-/// key containing `+`, `/` or `=`.
-fn ws_query_token(uri: &axum::http::Uri) -> Option<String> {
+/// Browsers can't set headers on a WebSocket upgrade, so the key travels in the
+/// query. The dashboard sends `encodeURIComponent(key)`, while other clients
+/// paste a base64 key in as it is, leaving `+`, `/` and `=` unencoded. The value
+/// is percent-decoded without form decoding's `+`-to-space rule, so both forms
+/// give back the key. The raw value is returned too when it differs, so a key
+/// containing a literal `%` still matches when sent unencoded, as in 0.2.0.
+/// A repeated `token` parameter yields nothing, so the request fails closed.
+fn ws_query_tokens(uri: &axum::http::Uri) -> Vec<String> {
     if uri.path() != "/api/ws" {
-        return None;
+        return Vec::new();
     }
-    axum::extract::Query::<WsAuthQuery>::try_from_uri(uri)
-        .ok()?
-        .0
-        .token
+    let mut values = uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .map(|param| param.split_once('=').unwrap_or((param, "")))
+        .filter(|(name, _)| *name == "token")
+        .map(|(_, value)| value);
+    let (Some(raw), None) = (values.next(), values.next()) else {
+        return Vec::new();
+    };
+
+    let mut tokens = Vec::with_capacity(2);
+    if let Ok(decoded) = percent_encoding::percent_decode_str(raw).decode_utf8() {
+        tokens.push(decoded.into_owned());
+    }
+    if tokens.first().map(String::as_str) != Some(raw) {
+        tokens.push(raw.to_owned());
+    }
+    tokens
 }
 
 /// API key authentication middleware.
@@ -158,22 +171,24 @@ pub async fn api_key_auth(
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let provided_key = header_key.or_else(|| {
-        let token = ws_query_token(request.uri());
-        if token.is_some() {
-            debug!("WebSocket auth via query parameter (prefer X-API-Key header)");
+    let provided_keys = match header_key {
+        Some(key) => vec![key],
+        None => {
+            let tokens = ws_query_tokens(request.uri());
+            if !tokens.is_empty() {
+                debug!("WebSocket auth via query parameter (prefer X-API-Key header)");
+            }
+            tokens
         }
-        token
-    });
-
-    // Validate
-    let valid = match (&config.api_key, provided_key.as_deref()) {
-        (Some(expected), Some(provided)) => {
-            // Use constant-time comparison to prevent timing attacks
-            constant_time_eq(expected.as_bytes(), provided.as_bytes())
-        }
-        _ => false,
     };
+
+    // Validate with constant-time comparisons to prevent timing attacks. Every
+    // candidate is compared, so the timing doesn't reveal which form matched.
+    let valid = config.api_key.as_deref().is_some_and(|expected| {
+        provided_keys.iter().fold(false, |valid, provided| {
+            valid | constant_time_eq(expected.as_bytes(), provided.as_bytes())
+        })
+    });
 
     if valid {
         next.run(request).await
@@ -501,22 +516,47 @@ mod tests {
         let _layer = cors_layer(&config);
     }
 
-    #[test]
-    fn test_ws_query_token_decodes_percent_encoding() {
-        let uri: axum::http::Uri = "/api/ws?token=abc%2Bdef%2Fghi%3D".parse().unwrap();
-        assert_eq!(ws_query_token(&uri).as_deref(), Some("abc+def/ghi="));
+    fn tokens_for(uri: &str) -> Vec<String> {
+        ws_query_tokens(&uri.parse().unwrap())
     }
 
     #[test]
-    fn test_ws_query_token_only_on_ws_route() {
-        let uri: axum::http::Uri = "/api/devices?token=abc".parse().unwrap();
-        assert_eq!(ws_query_token(&uri), None);
+    fn test_ws_query_tokens_decodes_percent_encoding() {
+        assert_eq!(
+            tokens_for("/api/ws?token=abc%2Bdef%2Fghi%3D"),
+            vec!["abc+def/ghi=", "abc%2Bdef%2Fghi%3D"]
+        );
     }
 
     #[test]
-    fn test_ws_query_token_ignores_other_params() {
-        let uri: axum::http::Uri = "/api/ws?tokenx=abc&foo=bar".parse().unwrap();
-        assert_eq!(ws_query_token(&uri), None);
+    fn test_ws_query_tokens_keeps_raw_plus() {
+        assert_eq!(
+            tokens_for("/api/ws?foo=1&token=abc+def/ghi="),
+            vec!["abc+def/ghi="]
+        );
+    }
+
+    #[test]
+    fn test_ws_query_tokens_keeps_literal_percent() {
+        assert_eq!(tokens_for("/api/ws?token=50%"), vec!["50%"]);
+        assert_eq!(tokens_for("/api/ws?token=a%41"), vec!["aA", "a%41"]);
+    }
+
+    #[test]
+    fn test_ws_query_tokens_only_on_ws_route() {
+        assert!(tokens_for("/api/devices?token=abc").is_empty());
+    }
+
+    #[test]
+    fn test_ws_query_tokens_ignores_other_params() {
+        assert!(tokens_for("/api/ws?tokenx=abc&foo=bar").is_empty());
+        assert!(tokens_for("/api/ws").is_empty());
+    }
+
+    #[test]
+    fn test_ws_query_tokens_rejects_repeated_token() {
+        assert!(tokens_for("/api/ws?token=abc&token=abc").is_empty());
+        assert!(tokens_for("/api/ws?token&token=abc").is_empty());
     }
 
     #[tokio::test]
@@ -542,6 +582,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Send `uri` through the auth middleware with a base64-style key (`+`, `/`, `=`).
+    async fn ws_status_with_base64_key(uri: &str) -> StatusCode {
+        let config = Arc::new(SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("abc+def/ghi=0123456789abcdef0123".to_string()),
+            rate_limit_enabled: false,
+            ..Default::default()
+        });
+        let app = Router::new()
+            .route("/api/ws", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(config, api_key_auth));
+
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_api_key_query_token_accepts_raw_base64_key() {
+        // Clients that paste the key into the URL unencoded, as the docs show,
+        // worked in 0.2.0 and must keep working: `+` is not a space here.
+        assert_eq!(
+            ws_status_with_base64_key("/api/ws?token=abc+def/ghi=0123456789abcdef0123").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_key_query_token_accepts_mixed_encoding() {
+        assert_eq!(
+            ws_status_with_base64_key("/api/ws?token=abc%2Bdef/ghi%3d0123456789abcdef0123").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_key_query_token_rejects_wrong_or_duplicate_token() {
+        assert_eq!(
+            ws_status_with_base64_key("/api/ws?token=abc+def/ghi=0123456789abcdef0124").await,
+            StatusCode::UNAUTHORIZED
+        );
+        // `+` must not be read as a space and a space must not be read as `+`.
+        assert_eq!(
+            ws_status_with_base64_key("/api/ws?token=abc%20def/ghi=0123456789abcdef0123").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            ws_status_with_base64_key(
+                "/api/ws?token=abc+def/ghi=0123456789abcdef0123&token=abc+def/ghi=0123456789abcdef0123"
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

@@ -32,8 +32,11 @@ If API key authentication is enabled in your configuration, include the key in t
 ### Using Query Parameter
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/api/ws?token=your-key');
+const apiKey = 'your-key';
+const ws = new WebSocket(`ws://localhost:8080/api/ws?token=${encodeURIComponent(apiKey)}`);
 ```
+
+URL-encode the key as shown. Keys sent unencoded are accepted too, with `+`, `/` and `=` read literally.
 
 ### Using Headers (where supported)
 
