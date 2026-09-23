@@ -69,8 +69,11 @@ curl -H "X-API-Key: $ARANET_API_KEY" http://localhost:8080/metrics
 Non-browser clients can still use `X-API-Key`. Browser clients can use the `token` query parameter, but only on `/api/ws`:
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/api/ws?token=your-api-key');
+const apiKey = 'your-api-key';
+const ws = new WebSocket(`ws://localhost:8080/api/ws?token=${encodeURIComponent(apiKey)}`);
 ```
+
+URL-encode the key as shown. A key pasted in unencoded also works: `+`, `/` and `=` in the token are read literally, so `+` is never turned into a space.
 
 <Aside type="note">
   The `token` query parameter is accepted only for `/api/ws`. REST endpoints still require the `X-API-Key` header.

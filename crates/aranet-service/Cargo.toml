@@ -73,6 +73,8 @@ notify-rust = { version = "4", optional = true }
 
 # Constant-time comparison for API key authentication
 subtle = "2"
+# Decode WebSocket `?token=` values without turning `+` into a space
+percent-encoding = "2"
 
 # mDNS service discovery
 mdns-sd = "0.11"
