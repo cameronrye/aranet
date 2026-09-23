@@ -81,7 +81,11 @@ fn format_status_text(
         )
     } else if let Some(radon) = reading.radon {
         // AranetRn+ - with colored radon
-        let radon_display = style::format_radon_colored(radon, opts.no_color);
+        let radon_display = if opts.bq {
+            style::format_radon_colored(radon, opts.no_color)
+        } else {
+            style::format_radon_pci_colored(radon, bq_to_pci(radon), opts.no_color)
+        };
         let humidity_display = style::format_humidity_colored(reading.humidity, opts.no_color);
         format!(
             "{}: {} {} {} {} {} {:.1}hPa\n",
@@ -215,5 +219,35 @@ fn format_status_csv(
                 .map(|r| format!("{:.3}", r))
                 .unwrap_or_default()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::StyleMode;
+
+    fn radon_reading(bq: u32) -> aranet_types::CurrentReading {
+        aranet_types::CurrentReading::builder()
+            .radon(bq)
+            .temperature(21.0)
+            .humidity(40)
+            .build()
+    }
+
+    #[test]
+    fn test_status_text_converts_radon_to_pci_by_default() {
+        let opts = FormatOptions::new(true, false, StyleMode::Plain);
+        let line = format_status_text("Rn", &radon_reading(150), &opts);
+        assert!(line.contains("4.05 pCi/L"), "got: {line}");
+        assert!(!line.contains("150 pCi/L"), "got: {line}");
+    }
+
+    #[test]
+    fn test_status_text_keeps_bq_when_requested() {
+        let mut opts = FormatOptions::new(true, false, StyleMode::Plain);
+        opts.bq = true;
+        let line = format_status_text("Rn", &radon_reading(150), &opts);
+        assert!(line.contains("150 Bq/m3"), "got: {line}");
     }
 }
