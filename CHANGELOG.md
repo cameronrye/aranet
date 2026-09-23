@@ -14,20 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Duplicate history rows** — re-syncing a device no longer inserts copies of records already stored. History timestamps are anchored when the device is queried, and a record within 30 s of one already stored for the same device is skipped as a duplicate (see Changed)
 - **`aranet sync`** resolves aliases like `read` and `status` do, and stores history under the connected device's address like other commands (see Changed)
 - **`aranet status`** shows radon in pCi/L correctly (previously printed the Bq/m³ value with a pCi/L label); **`aranet report`** labels the radon threshold it actually counts, and its radon "time above" percentage now counts only records that have a radon value
-- **`aranet set smart-home true|false`** is accepted
+- **`aranet set smart-home true|false`** is accepted (see Changed)
 - **Service API** — `offset` without `limit` no longer returns 500; a rejected device update no longer corrupts the running configuration
-- **Service WebSocket** — API keys containing `+`, `/` or `=` now work from the dashboard, which URL-encodes the `?token=` value. Clients that send the key unencoded keep working
+- **Service WebSocket** — API keys containing `+`, `/` or `=` now work from the dashboard, which URL-encodes the `?token=` value. Clients that send the key unencoded keep working (see Changed)
 - **macOS** — no longer leaks an OS thread on every Bluetooth connection. The shared Bluetooth adapter runs on a background thread of its own, so it keeps working for programs that use more than one tokio runtime, and it is replaced if its CoreBluetooth thread stops
 
 ### Changed
 
-- **`aranet sync` with no device and no default device configured** now falls back to the last-used device, then the first device in the database, as `read` and `status` do. It used to scan and prompt for a device, or fail with "No device specified" when not run interactively
+- **`aranet sync` with no device and no default device configured** now falls back to the last-used device, then (when `behavior.load_cache` is on, the default) the most recently seen device in the local database, as `read` and `status` do. It used to scan and prompt for a device, or fail with "No device specified" when not run interactively
 - **Where `aranet sync` stores history** — 0.2.1 stores history under the device address. History that 0.2.0 synced under a device name or alias stays under that ID, and `report`, `history` and `cache` queries for the old ID stop receiving new records. The first sync after upgrading downloads the device's whole history buffer again under the address, and `aranet sync --all` syncs the sensor once for each ID it is stored under
-- **History deduplication window** — records within 30 s of a record already stored for the same device are skipped, both when syncing and in `aranet cache import` (so an import can now report skipped duplicates that are not exact timestamp matches). Aranet devices measure at most once a minute, so real records are never this close. Duplicate rows already in the database are not removed
+- **History deduplication window** — records within 30 s of a record already stored for the same device are skipped on every history write, including `aranet cache import` (so an import can now report skipped duplicates that are not exact timestamp matches). Aranet devices measure at most once a minute, so real records are never this close. Duplicate rows already in the database are not removed. Rows that 0.2.0 stored were shifted by the length of their download, which can exceed 30 s, so the first download after upgrading that overlaps them (such as `aranet history`, which saves the whole buffer) may still add a copy
+- **`aranet set smart-home` without a value** is now an error. 0.2.0 release builds read it as `false`, a request to turn Smart Home off
+- **Service WebSocket** — when the API key is sent as `?token=`, a request with more than one `token` parameter is now rejected. 0.2.0 used the first one
 
 ### Security
 
-- **Linux BlueZ agent** only approves pairing for devices aranet is connecting to (previously approved any device while running), and always rejects requests from remote devices to use the host's own Bluetooth profiles (such as HID input). While aranet runs it is BlueZ's default agent, so pairing and authorization requests from other devices are rejected rather than passed to the desktop's agent; pair other devices from the desktop's Bluetooth settings, or stop aranet first
+- **Linux BlueZ agent** — aranet was already BlueZ's default agent while running, and 0.2.0 approved every pairing and authorization request from any device. It now approves pairing, confirmation and authorization only for devices aranet has connected to (or tried to) since it started, and always rejects `AuthorizeService`, which lets a remote device use the host's own Bluetooth profiles (such as HID input). As before, these requests don't reach the desktop's agent while aranet runs; pair other devices from the desktop's Bluetooth settings, or stop aranet first
 - **Service logs** no longer record request query strings, which could include the API key
 
 ## [0.2.0] - 2026-03-28
