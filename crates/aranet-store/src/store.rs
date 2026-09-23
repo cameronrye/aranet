@@ -822,9 +822,15 @@ impl Store {
 
     /// Insert history records with automatic deduplication.
     ///
-    /// Records are deduplicated by `(device_id, timestamp)` - if a record with
-    /// the same timestamp already exists for this device, it is skipped.
-    /// This allows safe re-syncing without creating duplicates.
+    /// A record is skipped when the same device already has a record within
+    /// ±30 seconds of its timestamp, including a record inserted earlier in the
+    /// same call. Device history timestamps are reconstructed on every download
+    /// and can land a second or two away from the stored copy, so an exact
+    /// `(device_id, timestamp)` match would store re-synced records twice. The
+    /// shortest Aranet measurement interval is 60 seconds, so distinct records
+    /// from one device are never this close together. This allows safe
+    /// re-syncing without creating duplicates. Existing rows are never changed
+    /// or removed.
     ///
     /// # Arguments
     ///
@@ -1598,7 +1604,14 @@ impl Store {
     /// 2024-01-15T10:30:00Z,Aranet4 17C3C,800,22.5,1013.25,45,
     /// ```
     ///
-    /// Returns the number of records imported (deduplicated by device_id + timestamp).
+    /// Records go through [`Store::insert_history`], so a row is skipped (and
+    /// counted in [`ImportResult::skipped`]) when the same device already has a
+    /// record within ±30 seconds of its timestamp, whether stored earlier or
+    /// imported from an earlier row of this file. The shortest Aranet
+    /// measurement interval is 60 seconds, so closer records are treated as the
+    /// same measurement.
+    ///
+    /// Returns the numbers of records imported and skipped.
     pub fn import_history_csv(&self, csv_data: &str) -> Result<ImportResult> {
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(true)
@@ -1810,7 +1823,14 @@ impl Store {
     ///
     /// Expected JSON format: an array of StoredHistoryRecord objects.
     ///
-    /// Returns the number of records imported (deduplicated by device_id + timestamp).
+    /// Records go through [`Store::insert_history`], so a record is skipped (and
+    /// counted in [`ImportResult::skipped`]) when the same device already has a
+    /// record within ±30 seconds of its timestamp, whether stored earlier or
+    /// imported from an earlier entry of this file. The shortest Aranet
+    /// measurement interval is 60 seconds, so closer records are treated as the
+    /// same measurement.
+    ///
+    /// Returns the numbers of records imported and skipped.
     pub fn import_history_json(&self, json_data: &str) -> Result<ImportResult> {
         let records: Vec<StoredHistoryRecord> = serde_json::from_str(json_data)?;
 
@@ -2027,6 +2047,47 @@ mod tests {
         let resync = vec![record_at(2), record_at(62), record_at(122), record_at(182)];
         assert_eq!(store.insert_history("dev", &resync).unwrap(), 1);
         assert_eq!(store.count_history(Some("dev")).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_insert_history_skips_resynced_records_that_drifted_earlier() {
+        let store = Store::open_in_memory().unwrap();
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let record_at = |offset_secs: i64| HistoryRecord {
+            timestamp: base + time::Duration::seconds(offset_secs),
+            co2: 800,
+            temperature: 22.0,
+            pressure: 1013.0,
+            humidity: 45,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        };
+
+        let first = vec![record_at(0), record_at(60), record_at(120)];
+        assert_eq!(store.insert_history("dev", &first).unwrap(), 3);
+
+        // Re-sync reconstructs the same records 29 s earlier; they are still duplicates.
+        let resync = vec![record_at(-29), record_at(31), record_at(91)];
+        assert_eq!(store.insert_history("dev", &resync).unwrap(), 0);
+        assert_eq!(store.count_history(Some("dev")).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_import_history_csv_applies_dedup_window() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Three rows 20 s apart: the middle one is within 30 s of the first.
+        let csv_data = r#"timestamp,device_id,co2,temperature,pressure,humidity,radon
+2024-01-15T10:30:00Z,test-device,800,22.5,1013.25,45,
+2024-01-15T10:30:20Z,test-device,810,22.5,1013.25,45,
+2024-01-15T10:30:40Z,test-device,820,22.5,1013.25,45,
+"#;
+
+        let result = store.import_history_csv(csv_data).unwrap();
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.skipped, 1);
+        assert!(result.errors.is_empty());
     }
 
     #[test]
