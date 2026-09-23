@@ -1387,7 +1387,7 @@ impl Device {
 enum PacketProgress {
     /// More records remain; request the next packet starting at this index.
     Continue(u16),
-    /// Every index up to and including `end_idx` has been received.
+    /// The packet reached `end_idx`; there is nothing more to request.
     Done,
     /// The packet did not move the download forward (stale repeat, or a
     /// count with no payload). The caller should retry, then give up.
@@ -1420,6 +1420,11 @@ fn apply_v2_packet<T>(
         };
         if idx > end_idx {
             break;
+        }
+        // A stale packet can start below the index we asked for. Keep only the
+        // requested range: callers stamp element i as device index start_idx + i.
+        if idx < current_idx {
+            continue;
         }
         if let Some(value) = value_parser(data, i) {
             values.insert(idx, value);
@@ -1742,6 +1747,47 @@ mod tests {
         // We asked for index 50; the device repeated the packet for 1..=3.
         let progress = apply_v2_packet(&mut values, 50, 100, 1, 3, &payload, 2, &parse_u16);
         assert_eq!(progress, PacketProgress::Stalled);
+        // Values from below the requested range must not be kept: element i of
+        // the downloaded array is stamped as device index start_idx + i.
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_apply_v2_packet_same_packet_twice_is_stalled() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&[1, 2, 3]);
+        let progress = apply_v2_packet(&mut values, 1, 100, 1, 3, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Continue(4));
+        // Asked for index 4, the device sent the same packet (1..=3) again.
+        let progress = apply_v2_packet(&mut values, 4, 100, 1, 3, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Stalled);
+        assert_eq!(values.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_apply_v2_packet_drops_values_below_current_index() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&(1..=60).collect::<Vec<u16>>());
+        // Asked for index 50; a stale packet starting at 1 overlaps the range.
+        let progress = apply_v2_packet(&mut values, 50, 100, 1, 60, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Continue(61));
+        assert_eq!(
+            values.keys().copied().collect::<Vec<_>>(),
+            (50..=60).collect::<Vec<u16>>()
+        );
+        assert_eq!(values.get(&50), Some(&50));
+    }
+
+    #[test]
+    fn test_apply_v2_packet_stale_packet_past_end_keeps_only_requested_range() {
+        let mut values = BTreeMap::new();
+        let payload = u16_payload(&(1..=117).collect::<Vec<u16>>());
+        let progress = apply_v2_packet(&mut values, 50, 55, 1, 117, &payload, 2, &parse_u16);
+        assert_eq!(progress, PacketProgress::Done);
+        assert_eq!(
+            values.keys().copied().collect::<Vec<_>>(),
+            (50..=55).collect::<Vec<u16>>()
+        );
     }
 
     #[test]
