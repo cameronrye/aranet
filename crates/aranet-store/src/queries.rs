@@ -196,12 +196,14 @@ impl ReadingQuery {
             where_clause, order
         );
 
-        if let Some(limit) = self.limit {
-            sql.push_str(&format!(" LIMIT {}", limit));
-        }
-
-        if let Some(offset) = self.offset {
-            sql.push_str(&format!(" OFFSET {}", offset));
+        match (self.limit, self.offset) {
+            (Some(limit), Some(offset)) => {
+                sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
+            }
+            (Some(limit), None) => sql.push_str(&format!(" LIMIT {limit}")),
+            // SQLite only accepts OFFSET after a LIMIT; -1 means "no limit".
+            (None, Some(offset)) => sql.push_str(&format!(" LIMIT -1 OFFSET {offset}")),
+            (None, None) => {}
         }
 
         sql
@@ -357,12 +359,14 @@ impl HistoryQuery {
 
         let mut sql = format!("{select} {where_clause} ORDER BY timestamp {order}");
 
-        if let Some(limit) = self.limit {
-            sql.push_str(&format!(" LIMIT {}", limit));
-        }
-
-        if let Some(offset) = self.offset {
-            sql.push_str(&format!(" OFFSET {}", offset));
+        match (self.limit, self.offset) {
+            (Some(limit), Some(offset)) => {
+                sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
+            }
+            (Some(limit), None) => sql.push_str(&format!(" LIMIT {limit}")),
+            // SQLite only accepts OFFSET after a LIMIT; -1 means "no limit".
+            (None, Some(offset)) => sql.push_str(&format!(" LIMIT -1 OFFSET {offset}")),
+            (None, None) => {}
         }
 
         sql
@@ -535,7 +539,7 @@ mod tests {
         let query = ReadingQuery::new().offset(25);
         let sql = query.build_sql();
 
-        assert!(sql.contains("OFFSET 25"));
+        assert!(sql.contains("LIMIT -1 OFFSET 25"));
     }
 
     #[test]
