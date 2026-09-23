@@ -812,6 +812,14 @@ impl Store {
 
 // History operations
 impl Store {
+    /// Two history records for the same device closer together than this are the
+    /// same measurement. Device history timestamps are reconstructed from
+    /// "seconds since last update" on every download, so a re-sync can place a
+    /// record a second or two away from its stored copy. The shortest Aranet
+    /// measurement interval is 60 s, so genuine neighbouring records are never
+    /// within 30 s of each other.
+    const HISTORY_DEDUP_TOLERANCE_SECS: i64 = 30;
+
     /// Insert history records with automatic deduplication.
     ///
     /// Records are deduplicated by `(device_id, timestamp)` - if a record with
@@ -865,7 +873,11 @@ impl Store {
             let result = tx.execute(
                 "INSERT OR IGNORE INTO history (device_id, timestamp, synced_at, co2,
                  temperature, pressure, humidity, radon, radiation_rate, radiation_total)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM history
+                     WHERE device_id = ?1 AND timestamp BETWEEN ?2 - ?11 AND ?2 + ?11
+                 )",
                 rusqlite::params![
                     device_id,
                     record.timestamp.unix_timestamp(),
@@ -877,6 +889,7 @@ impl Store {
                     record.radon,
                     record.radiation_rate,
                     record.radiation_total,
+                    Self::HISTORY_DEDUP_TOLERANCE_SECS,
                 ],
             )?;
             inserted += result;
@@ -1989,6 +2002,54 @@ mod tests {
 
         let count = store.count_history(Some("test-device")).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_insert_history_skips_resynced_records_with_jittered_timestamps() {
+        let store = Store::open_in_memory().unwrap();
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let record_at = |offset_secs: i64| HistoryRecord {
+            timestamp: base + time::Duration::seconds(offset_secs),
+            co2: 800,
+            temperature: 22.0,
+            pressure: 1013.0,
+            humidity: 45,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        };
+
+        // First sync: three records one minute apart.
+        let first = vec![record_at(0), record_at(60), record_at(120)];
+        assert_eq!(store.insert_history("dev", &first).unwrap(), 3);
+
+        // Re-sync: the same three records reconstructed 2 s later, plus one new record.
+        let resync = vec![record_at(2), record_at(62), record_at(122), record_at(182)];
+        assert_eq!(store.insert_history("dev", &resync).unwrap(), 1);
+        assert_eq!(store.count_history(Some("dev")).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_insert_history_tolerance_is_per_device() {
+        let store = Store::open_in_memory().unwrap();
+        let t = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let record = HistoryRecord {
+            timestamp: t,
+            co2: 800,
+            temperature: 22.0,
+            pressure: 1013.0,
+            humidity: 45,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        };
+        assert_eq!(
+            store
+                .insert_history("a", std::slice::from_ref(&record))
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.insert_history("b", &[record]).unwrap(), 1);
     }
 
     #[test]
