@@ -175,8 +175,38 @@ impl ScanOptions {
     }
 }
 
+/// Adapter reused by [`get_adapter`] on macOS.
+///
+/// On CoreBluetooth every `Manager::adapters()` call starts a new
+/// `CBCentralManager` on its own OS thread that never exits, so creating an
+/// adapter per connection leaks a thread per poll. Other platforms create
+/// adapters cheaply and stay uncached, so a dead D-Bus connection can still
+/// be recovered by `reset_manager`.
+static ADAPTER: RwLock<Option<Adapter>> = RwLock::const_new(None);
+
 /// Get the first available Bluetooth adapter.
 pub async fn get_adapter() -> Result<Adapter> {
+    if cfg!(target_os = "macos") {
+        cached_adapter().await
+    } else {
+        create_adapter().await
+    }
+}
+
+async fn cached_adapter() -> Result<Adapter> {
+    if let Some(adapter) = ADAPTER.read().await.as_ref() {
+        return Ok(adapter.clone());
+    }
+    let mut guard = ADAPTER.write().await;
+    if let Some(adapter) = guard.as_ref() {
+        return Ok(adapter.clone());
+    }
+    let adapter = create_adapter().await?;
+    *guard = Some(adapter.clone());
+    Ok(adapter)
+}
+
+async fn create_adapter() -> Result<Adapter> {
     use crate::error::DeviceNotFoundReason;
 
     // On Linux, register a BlueZ agent to handle authentication during service

@@ -902,3 +902,36 @@ async fn test_connect_invalid_address() {
         }
     }
 }
+
+// =============================================================================
+// Adapter Reuse Tests (macOS)
+// =============================================================================
+
+/// Number of OS threads in this process (macOS `ps -M` prints a header plus one line per thread).
+#[cfg(target_os = "macos")]
+fn thread_count() -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-M", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("failed to run ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires Bluetooth permission (macOS)"]
+async fn test_get_adapter_does_not_spawn_a_thread_per_call() {
+    let _ = aranet_core::scan::get_adapter().await.expect("adapter");
+    let baseline = thread_count();
+    for _ in 0..5 {
+        let _ = aranet_core::scan::get_adapter().await.expect("adapter");
+    }
+    let after = thread_count();
+    assert!(
+        after <= baseline,
+        "get_adapter leaked threads: {baseline} -> {after}"
+    );
+}
