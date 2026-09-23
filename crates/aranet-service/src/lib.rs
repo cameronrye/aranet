@@ -259,16 +259,24 @@ const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug";
 
 /// Initialize the default tracing subscriber used by the service binaries.
 pub fn init_tracing() -> anyhow::Result<()> {
-    // `EnvFilter::add_directive` parses a single directive, not a comma-separated
-    // list (only `EnvFilter::new`/`from_str` split on commas), so
-    // `DEFAULT_LOG_DIRECTIVES` must be split and each directive added in turn.
-    let mut filter = tracing_subscriber::EnvFilter::from_default_env();
+    let filter = with_default_directives(tracing_subscriber::EnvFilter::from_default_env())?;
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    Ok(())
+}
+
+/// Add [`DEFAULT_LOG_DIRECTIVES`] to `filter`, which `init_tracing()` builds
+/// from `RUST_LOG`.
+///
+/// `EnvFilter::add_directive` parses a single directive, not a comma-separated
+/// list (only `EnvFilter::new`/`from_str` split on commas), so the defaults are
+/// split and each directive added in turn.
+fn with_default_directives(
+    mut filter: tracing_subscriber::EnvFilter,
+) -> anyhow::Result<tracing_subscriber::EnvFilter> {
     for directive in DEFAULT_LOG_DIRECTIVES.split(',') {
         filter = filter.add_directive(directive.parse()?);
     }
-
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-    Ok(())
+    Ok(filter)
 }
 
 /// Request span that records the path only. The default span records the full
@@ -521,9 +529,15 @@ mod tests {
         // Regression test for `DEFAULT_LOG_DIRECTIVES` being fed whole into
         // `EnvFilter::add_directive`, which parses a single directive and errors
         // on the comma-separated list, making every call fail at runtime.
+        // Tests the filter init_tracing() builds rather than calling it, which
+        // would install a process-wide subscriber printing to stdout for every
+        // later test in this binary (and would depend on RUST_LOG).
+        let filter = with_default_directives(tracing_subscriber::EnvFilter::default())
+            .expect("init_tracing() failed to build its EnvFilter");
+        let directives = filter.to_string();
         assert!(
-            init_tracing().is_ok(),
-            "init_tracing() failed to build its EnvFilter"
+            directives.contains("aranet_service=info") && directives.contains("tower_http=debug"),
+            "default directives missing from filter: {directives}"
         );
     }
 }
