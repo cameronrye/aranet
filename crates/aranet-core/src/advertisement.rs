@@ -311,33 +311,35 @@ fn parse_aranet_radon_advertisement_v2(data: &[u8]) -> Result<AdvertisementData>
     })
 }
 
-/// Parse Aranet Radiation advertisement data (v2 format - actual device format).
+/// Parse Aranet Radiation advertisement data.
 ///
-/// Format (after device type byte removed, 19+ bytes):
-/// - bytes 0-5: Basic info (flags, version, etc.)
-/// - bytes 6-9: Radiation total (u32 LE, nSv)
-/// - bytes 10-13: Radiation duration (u32 LE, seconds)
-/// - bytes 14-15: Radiation rate (u16 LE, *10 for nSv/h)
-/// - byte 16: Battery (u8)
-/// - byte 17: Status (u8)
-/// - bytes 18-19: Interval (u16 LE, seconds)
-/// - bytes 20-21: Age (u16 LE, seconds)
-/// - byte 22: Counter (u8)
+/// Layout after the device-type byte is removed (reference: Aranet4-Python
+/// `<xxxxxxIIHBBBHHB` applied to the full payload):
+/// - byte 0: flags
+/// - bytes 1-4: basic info
+/// - bytes 5-8: total dose (u32 LE, nSv)
+/// - bytes 9-12: measurement duration (u32 LE, s)
+/// - bytes 13-14: dose rate (u16 LE, nSv/h)
+/// - byte 15: unknown
+/// - byte 16: battery (%)
+/// - byte 17: status
+/// - bytes 18-19: interval (s)
+/// - bytes 20-21: age (s)
+/// - byte 22: counter (optional)
 fn parse_aranet_radiation_advertisement_v2(data: &[u8]) -> Result<AdvertisementData> {
-    // Need at least 21 bytes: 5 header + 4 total + 4 duration + 2 rate + 1 battery + 1 status + 2 interval + 2 age
-    if data.len() < 21 {
+    if data.len() < 22 {
         return Err(Error::InvalidData(format!(
-            "Aranet Radiation advertisement requires at least 21 bytes, got {}",
+            "Aranet Radiation advertisement requires at least 22 bytes, got {}",
             data.len()
         )));
     }
 
     let flags = data[0];
-    // Skip to sensor data at offset 5
     let mut buf = &data[5..];
     let _radiation_total = buf.get_u32_le(); // nSv total dose
     let _radiation_duration = buf.get_u32_le(); // seconds
-    let radiation_rate_raw = buf.get_u16_le(); // *10 for nSv/h
+    let radiation_rate_nsv = buf.get_u16_le(); // nSv/h
+    let _unknown = buf.get_u8();
     let battery = buf.get_u8();
     let status = Status::from(buf.get_u8());
     let interval = buf.get_u16_le();
@@ -348,8 +350,8 @@ fn parse_aranet_radiation_advertisement_v2(data: &[u8]) -> Result<AdvertisementD
         None
     };
 
-    // Convert from nSv/h * 10 to µSv/h
-    let dose_rate_usv = (radiation_rate_raw as f32 * 10.0) / 1000.0;
+    // Same unit handling as the GATT reading: nSv/h → µSv/h
+    let dose_rate_usv = radiation_rate_nsv as f32 / 1000.0;
 
     Ok(AdvertisementData {
         device_type: DeviceType::AranetRadiation,
@@ -524,18 +526,38 @@ mod tests {
         );
     }
 
+    /// Real Aranet Radiation advertisement (Home Assistant fixtures).
+    /// Total 11616 nSv over 366600 s ≈ 114 nSv/h average; current rate 110 nSv/h.
+    const RADIATION_CAPTURE: [u8; 24] = [
+        0x02, 0x21, 0x26, 0x04, 0x01, 0x00, 0x60, 0x2d, 0x00, 0x00, 0x08, 0x98, 0x05, 0x00, 0x6e,
+        0x00, 0x00, 0x64, 0x00, 0x2c, 0x01, 0xfd, 0x00, 0xc7,
+    ];
+
+    #[test]
+    fn test_parse_aranet_radiation_real_capture() {
+        let result = parse_advertisement(&RADIATION_CAPTURE).unwrap();
+        assert_eq!(result.device_type, DeviceType::AranetRadiation);
+        let rate = result.radiation_dose_rate.unwrap();
+        assert!((rate - 0.11).abs() < 0.001, "dose rate was {rate} µSv/h");
+        assert_eq!(result.battery, 100);
+        assert_eq!(result.interval, 300);
+        assert_eq!(result.age, 253);
+        assert_eq!(result.counter, Some(0xc7));
+    }
+
     #[test]
     fn test_parse_aranet_radiation_advertisement() {
         // Aranet Radiation v2 format: device type 0x02, then 19+ bytes
         // Flags byte has bit 5 set (0x20) for Smart Home integration
         // Note: Using 23 bytes to avoid triggering Aranet4 detection (which uses 7 or 22 bytes)
-        let data: [u8; 23] = [
+        let data: [u8; 24] = [
             0x02, // device type = Radiation
             0x20, // flags (bit 5 = integrations enabled)
             0x13, 0x04, 0x01, 0x00, // basic info (4 bytes)
-            0x00, 0x00, 0x00, 0x00, // radiation total (u32)
-            0x00, 0x00, 0x00, 0x00, // radiation duration (u32)
-            0x64, 0x00, // radiation rate = 100 (*10 = 1000 nSv/h = 1.0 µSv/h)
+            0x00, 0x00, 0x00, 0x00, // radiation total (u32, nSv)
+            0x00, 0x00, 0x00, 0x00, // radiation duration (u32, s)
+            0xE8, 0x03, // radiation rate = 1000 nSv/h = 1.0 µSv/h
+            0x00, // unknown
             85,   // battery
             1,    // status = Green
             0x2C, 0x01, // interval = 300
@@ -563,7 +585,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires at least 21 bytes"),
+            err_msg.contains("requires at least 22 bytes"),
             "Expected insufficient bytes error, got: {}",
             err_msg
         );
