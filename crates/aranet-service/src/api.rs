@@ -1936,7 +1936,7 @@ mod tests {
             let store = state.store.lock().await;
             let records = vec![
                 HistoryRecord {
-                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(60),
                     co2: 100,
                     temperature: 20.0,
                     pressure: 1000.0,
@@ -1946,7 +1946,7 @@ mod tests {
                     radiation_total: None,
                 },
                 HistoryRecord {
-                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(2),
+                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(120),
                     co2: 200,
                     temperature: 21.0,
                     pressure: 1001.0,
@@ -1956,7 +1956,7 @@ mod tests {
                     radiation_total: None,
                 },
                 HistoryRecord {
-                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(3),
+                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(180),
                     co2: 300,
                     temperature: 22.0,
                     pressure: 1002.0,
