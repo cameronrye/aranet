@@ -106,6 +106,27 @@ impl RateLimitState {
     }
 }
 
+/// Query parameters accepted on the WebSocket upgrade route.
+#[derive(serde::Deserialize)]
+struct WsAuthQuery {
+    token: Option<String>,
+}
+
+/// The percent-decoded `?token=` value on `/api/ws`, if present.
+///
+/// Browsers can't set headers on a WebSocket upgrade, so the dashboard sends
+/// `encodeURIComponent(key)`; comparing the raw query value would reject any
+/// key containing `+`, `/` or `=`.
+fn ws_query_token(uri: &axum::http::Uri) -> Option<String> {
+    if uri.path() != "/api/ws" {
+        return None;
+    }
+    axum::extract::Query::<WsAuthQuery>::try_from_uri(uri)
+        .ok()?
+        .0
+        .token
+}
+
 /// API key authentication middleware.
 ///
 /// Checks for the `X-API-Key` header and validates against the configured key.
@@ -130,33 +151,23 @@ pub async fn api_key_auth(
         return next.run(request).await;
     }
 
-    // Get the API key from header first
-    let mut provided_key = headers.get("X-API-Key").and_then(|v| v.to_str().ok());
-
-    // For WebSocket connections, also check query parameter
-    // (browsers cannot set custom headers during WebSocket upgrade).
-    //
     // SECURITY NOTE: Query parameters may be logged by reverse proxies,
     // appear in browser history, and leak via Referer headers. Prefer the
     // X-API-Key header for non-browser clients.
-    if provided_key.is_none()
-        && request.uri().path() == "/api/ws"
-        && let Some(query) = request.uri().query()
-    {
-        provided_key = query.split('&').find_map(|param| {
-            let mut parts = param.splitn(2, '=');
-            match (parts.next(), parts.next()) {
-                (Some("token"), Some(value)) => {
-                    debug!("WebSocket auth via query parameter (prefer X-API-Key header)");
-                    Some(value)
-                }
-                _ => None,
-            }
-        });
-    }
+    let header_key = headers
+        .get("X-API-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let provided_key = header_key.or_else(|| {
+        let token = ws_query_token(request.uri());
+        if token.is_some() {
+            debug!("WebSocket auth via query parameter (prefer X-API-Key header)");
+        }
+        token
+    });
 
     // Validate
-    let valid = match (&config.api_key, provided_key) {
+    let valid = match (&config.api_key, provided_key.as_deref()) {
         (Some(expected), Some(provided)) => {
             // Use constant-time comparison to prevent timing attacks
             constant_time_eq(expected.as_bytes(), provided.as_bytes())
@@ -491,24 +502,46 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_token_from_query() {
-        // Helper to extract token from query string (mirrors middleware logic)
-        fn extract_token(query: &str) -> Option<&str> {
-            query.split('&').find_map(|param| {
-                let mut parts = param.splitn(2, '=');
-                match (parts.next(), parts.next()) {
-                    (Some("token"), Some(value)) => Some(value),
-                    _ => None,
-                }
-            })
-        }
+    fn test_ws_query_token_decodes_percent_encoding() {
+        let uri: axum::http::Uri = "/api/ws?token=abc%2Bdef%2Fghi%3D".parse().unwrap();
+        assert_eq!(ws_query_token(&uri).as_deref(), Some("abc+def/ghi="));
+    }
 
-        assert_eq!(extract_token("token=abc123"), Some("abc123"));
-        assert_eq!(extract_token("foo=bar&token=abc123"), Some("abc123"));
-        assert_eq!(extract_token("token=abc123&foo=bar"), Some("abc123"));
-        assert_eq!(extract_token("foo=bar"), None);
-        assert_eq!(extract_token(""), None);
-        assert_eq!(extract_token("tokenx=abc123"), None);
+    #[test]
+    fn test_ws_query_token_only_on_ws_route() {
+        let uri: axum::http::Uri = "/api/devices?token=abc".parse().unwrap();
+        assert_eq!(ws_query_token(&uri), None);
+    }
+
+    #[test]
+    fn test_ws_query_token_ignores_other_params() {
+        let uri: axum::http::Uri = "/api/ws?tokenx=abc&foo=bar".parse().unwrap();
+        assert_eq!(ws_query_token(&uri), None);
+    }
+
+    #[tokio::test]
+    async fn test_api_key_query_token_accepts_percent_encoded_key() {
+        let config = Arc::new(SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("abc+def/ghi=0123456789abcdef0123".to_string()),
+            rate_limit_enabled: false,
+            ..Default::default()
+        });
+        let app = Router::new()
+            .route("/api/ws", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(config, api_key_auth));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ws?token=abc%2Bdef%2Fghi%3D0123456789abcdef0123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
