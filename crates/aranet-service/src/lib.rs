@@ -248,11 +248,15 @@ pub struct RunOptions {
     pub no_collector: bool,
 }
 
+/// Default log directives for the service binaries: request/response tracing at
+/// debug, everything else in this crate at info. Shared by `init_tracing()` and
+/// its tests so the tests exercise the same filter production runs under.
+const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug";
+
 /// Initialize the default tracing subscriber used by the service binaries.
 pub fn init_tracing() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("aranet_service=info".parse()?)
-        .add_directive("tower_http=debug".parse()?);
+        .add_directive(DEFAULT_LOG_DIRECTIVES.parse()?);
 
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     Ok(())
@@ -260,8 +264,16 @@ pub fn init_tracing() -> anyhow::Result<()> {
 
 /// Request span that records the path only. The default span records the full
 /// URI, which would write `/api/ws?token=<API key>` into the service logs.
+///
+/// The target is set to `tower_http::trace::make_span` — the target
+/// `TraceLayer`'s own default span uses — so the `tower_http=debug` directive in
+/// [`DEFAULT_LOG_DIRECTIVES`] still enables it. Without an explicit target this
+/// span's target would be `aranet_service` (this module's path), which
+/// `aranet_service=info` disables at DEBUG, silently dropping the method/path
+/// context from production request logs.
 fn request_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Span {
     tracing::debug_span!(
+        target: "tower_http::trace::make_span",
         "request",
         method = %request.method(),
         path = %request.uri().path(),
@@ -462,8 +474,12 @@ mod tests {
     async fn test_request_span_omits_query_string() {
         let captured = Captured::default();
         let writer = captured.clone();
+        // Use the same directives init_tracing() applies in production (rather
+        // than RUST_LOG or a blanket max level), so this test catches a span
+        // whose target the production filter would silently disable.
+        let filter = tracing_subscriber::EnvFilter::new(DEFAULT_LOG_DIRECTIVES);
         let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_env_filter(filter)
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
