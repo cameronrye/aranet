@@ -10,7 +10,13 @@
 //!
 //! This module registers a minimal `NoInputNoOutput` agent that allows BlueZ to complete
 //! "Just Works" pairing, unblocking service discovery and characteristic reads.
+//!
+//! The agent is registered as BlueZ's default agent, so it receives pairing and
+//! authorization requests for every device near the host. It approves them only
+//! for devices that `aranet-core` is connecting to and rejects everything else.
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use dbus::channel::MatchingReceiver;
@@ -32,6 +38,57 @@ static AGENT_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 static AGENT_ATTEMPTS: AtomicU8 = AtomicU8::new(0);
 static AGENT_PATH: &str = "/dev/rye/aranet/agent";
 const AGENT_CAPABILITY: &str = "NoInputNoOutput";
+
+/// Devices this process is connecting to, and may therefore pair with.
+///
+/// The agent is registered as BlueZ's default agent, so it receives pairing
+/// requests for *every* device near the host. Only addresses added through
+/// [`allow_pairing`] are approved; everything else is rejected.
+static PAIRING_ALLOWED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Allow the agent to complete pairing for `address` (e.g. `AA:BB:CC:DD:EE:FF`).
+pub(crate) fn allow_pairing(address: &str) {
+    PAIRING_ALLOWED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(address.to_ascii_uppercase());
+}
+
+/// `AA:BB:CC:DD:EE:FF` from a BlueZ device path such as
+/// `/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF`.
+fn device_path_to_address(path: &str) -> Option<String> {
+    let segment = path.rsplit('/').next()?.strip_prefix("dev_")?;
+    let octets: Vec<&str> = segment.split('_').collect();
+    let valid = octets.len() == 6
+        && octets
+            .iter()
+            .all(|o| o.len() == 2 && o.chars().all(|c| c.is_ascii_hexdigit()));
+    valid.then(|| octets.join(":").to_ascii_uppercase())
+}
+
+fn is_pairing_allowed(device_path: &str) -> bool {
+    let Some(address) = device_path_to_address(device_path) else {
+        return false;
+    };
+    PAIRING_ALLOWED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&address)
+}
+
+/// Reject agent requests for devices we didn't ask to pair with.
+fn check_allowed(device: &dbus::Path) -> Result<(), dbus_crossroads::MethodErr> {
+    if is_pairing_allowed(device) {
+        Ok(())
+    } else {
+        warn!("BlueZ agent: rejecting request for {device} (not a device aranet is connecting to)");
+        Err((
+            "org.bluez.Error.Rejected",
+            "Device is not managed by aranet",
+        )
+            .into())
+    }
+}
 
 /// Ensure a BlueZ agent is registered for this process.
 ///
@@ -104,6 +161,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ("passkey",),
             |_, _, (device,): (dbus::Path,)| {
                 debug!("BlueZ agent: RequestPasskey for {device}");
+                check_allowed(&device)?;
                 // Return 0 for "Just Works" pairing
                 Ok((0u32,))
             },
@@ -115,7 +173,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             (),
             |_, _, (device, passkey): (dbus::Path, u32)| {
                 debug!("BlueZ agent: RequestConfirmation for {device}, passkey {passkey}");
-                Ok(())
+                check_allowed(&device)
             },
         );
 
@@ -125,7 +183,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             (),
             |_, _, (device,): (dbus::Path,)| {
                 debug!("BlueZ agent: RequestAuthorization for {device}");
-                Ok(())
+                check_allowed(&device)
             },
         );
 
@@ -135,7 +193,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             (),
             |_, _, (device, uuid): (dbus::Path, String)| {
                 debug!("BlueZ agent: AuthorizeService {uuid} for {device}");
-                Ok(())
+                check_allowed(&device)
             },
         );
 
@@ -213,5 +271,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_device_path_to_address() {
+        assert_eq!(
+            device_path_to_address("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").as_deref(),
+            Some("AA:BB:CC:DD:EE:FF")
+        );
+        assert_eq!(
+            device_path_to_address("/org/bluez/hci1/dev_aa_bb_cc_dd_ee_0f").as_deref(),
+            Some("AA:BB:CC:DD:EE:0F")
+        );
+        assert_eq!(device_path_to_address("/org/bluez/hci0"), None);
+        assert_eq!(device_path_to_address("/org/bluez/hci0/dev_AA_BB"), None);
+        assert_eq!(
+            device_path_to_address("/org/bluez/hci0/dev_ZZ_BB_CC_DD_EE_FF"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_pairing_only_allowed_for_registered_devices() {
+        // Unique addresses: the allow-list is process-global.
+        allow_pairing("aa:bb:cc:dd:ee:01");
+        assert!(is_pairing_allowed("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01"));
+        assert!(!is_pairing_allowed("/org/bluez/hci0/dev_11_22_33_44_55_66"));
+        assert!(!is_pairing_allowed("/org/bluez/hci0"));
     }
 }

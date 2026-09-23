@@ -406,6 +406,10 @@ impl Device {
         peripheral: Peripheral,
         config: ConnectionConfig,
     ) -> Result<Self> {
+        // Let the BlueZ agent complete "Just Works" pairing for this device only.
+        #[cfg(target_os = "linux")]
+        crate::bluez_agent::allow_pairing(&peripheral.address().to_string());
+
         // Connect to the device with timeout
         info!("Connecting to device...");
         timeout(config.connection_timeout, peripheral.connect())
