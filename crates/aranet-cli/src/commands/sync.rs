@@ -140,13 +140,14 @@ pub async fn cmd_sync(args: SyncArgs, config: &Config) -> Result<()> {
         return sync_all_devices(&store, args.format, args.full, timeout_secs).await;
     }
 
-    // Resolve device address from args, env, or config
-    let device_input = args.device.device.clone().or_else(|| config.device.clone());
-    let device_address = require_device_interactive(device_input).await?;
+    // `main` has already applied aliases and the default/last-used device.
+    let requested = require_device_interactive(args.device.device.clone()).await?;
     let timeout = Duration::from_secs(timeout_secs);
 
-    // Connect to device
-    let device = crate::util::connect_device_with_progress(&device_address, timeout, true).await?;
+    let device = crate::util::connect_device_with_progress(&requested, timeout, true).await?;
+    // Store everything under the connected device's address, the same ID the
+    // other commands use, not whatever name or partial match the user typed.
+    let device_address = device.address().to_string();
     let sync_result: Result<SingleDeviceSyncSummary> = async {
         // Get device info for display
         let device_info = device.read_device_info().await?;
@@ -346,13 +347,15 @@ async fn sync_all_devices(
 /// Sync a single device and return (downloaded, inserted) counts.
 async fn sync_single_device(
     store: &Store,
-    device_address: &str,
+    device_id: &str,
     device_name: &str,
     full: bool,
     timeout: Duration,
 ) -> Result<(usize, usize)> {
-    // Connect to device
-    let device = crate::util::connect_device_with_progress(device_address, timeout, false).await?;
+    let device = crate::util::connect_device_with_progress(device_id, timeout, false).await?;
+    // Key stored data by the connected address (see cmd_sync).
+    let address = device.address().to_string();
+    let device_address = address.as_str();
     let sync_result: Result<(usize, usize)> = async {
         // Get device info and update store
         let device_info = device.read_device_info().await?;
