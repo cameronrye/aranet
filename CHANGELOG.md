@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Aranet2 and Aranet Radiation advertisements** are decoded at the offsets real devices use; Radiation dose rate is no longer reported 10× too high
+- **History download** no longer drops the newest record, and no longer spins forever if a device repeats a packet
+- **Duplicate history rows** — re-syncing a device no longer inserts copies of records already stored (timestamps are anchored when the device is queried and matched within 30 s)
+- **`aranet sync`** now honours aliases and the default device, and stores history under the device address like other commands
+- **`aranet status`** shows radon in pCi/L correctly (previously printed the Bq/m³ value with a pCi/L label); **`aranet report`** labels the radon threshold it actually counts
+- **`aranet set smart-home true|false`** is accepted
+- **Service API** — `offset` without `limit` no longer returns 500; a rejected device update no longer corrupts the running configuration
+- **Service WebSocket** — API keys containing `+`, `/` or `=` now work from the dashboard
+- **macOS** — no longer leaks an OS thread on every Bluetooth connection
+
+### Security
+
+- **Linux BlueZ agent** only approves pairing for devices aranet is connecting to (previously approved any device while running)
+- **Service logs** no longer record request query strings, which could include the API key
+
 ## [0.2.0] - 2026-03-28
 
 ### Added
