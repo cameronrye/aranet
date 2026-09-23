@@ -636,8 +636,8 @@ pub enum DeviceSetting {
 
     /// Enable or disable Smart Home integration
     SmartHome {
-        /// Enable Smart Home mode
-        #[arg(value_parser = parse_bool_arg)]
+        /// true/on/yes/1 to enable, false/off/no/0 to disable
+        #[arg(value_parser = parse_bool_arg, action = clap::ArgAction::Set)]
         enabled: bool,
     },
 }
@@ -730,4 +730,42 @@ pub enum ConfigAction {
 
     /// Initialize default configuration
     Init,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_cli_definition_is_valid() {
+        // Catches clap misconfigurations (e.g. a positional bool with no value)
+        // that otherwise only surface as runtime panics in debug builds.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_set_smart_home_parses_explicit_values() {
+        for (arg, expected) in [
+            ("true", true),
+            ("on", true),
+            ("false", false),
+            ("off", false),
+        ] {
+            let cli = Cli::try_parse_from(["aranet", "set", "--device", "x", "smart-home", arg])
+                .unwrap_or_else(|e| panic!("failed to parse {arg}: {e}"));
+            match cli.command {
+                Commands::Set {
+                    setting: DeviceSetting::SmartHome { enabled },
+                    ..
+                } => assert_eq!(enabled, expected, "for {arg}"),
+                _ => panic!("expected `set smart-home`"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_set_smart_home_requires_value() {
+        assert!(Cli::try_parse_from(["aranet", "set", "--device", "x", "smart-home"]).is_err());
+    }
 }
