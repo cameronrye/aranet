@@ -299,12 +299,17 @@ async fn main() -> Result<()> {
             cmd_doctor(cli.verbose, no_color).await?;
         }
         Commands::Sync {
-            device,
+            mut device,
             format,
             full,
             all,
         } => {
             let format = resolve_format_with_config(cli.json, format, config_format);
+            if !all {
+                // Apply aliases, the configured default and the last-used device,
+                // the same way read/status/watch do.
+                device.device = resolve_device_with_hint(device.device, &config, quiet);
+            }
             cmd_sync(
                 SyncArgs {
                     device,
