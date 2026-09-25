@@ -3,7 +3,8 @@
 # publishing (release-smoke-test.yml) or a published GitHub Release
 # (release-verify.yml):
 #   - sha256.sum and every <file>.sha256 match the files (`sha256sum -c`),
-#   - sha256.sum lists every archive,
+#   - every archive has a <archive>.sha256, and sha256.sum lists the archive
+#     with that checksum,
 #   - aranet-cli-installer.sh and aranet-gui-installer.sh offer every archive of
 #     their app, with the archive's current checksum,
 #   - the .ps1 installers offer every Windows archive (dist 0.31's PowerShell
@@ -32,6 +33,10 @@ for app in aranet-cli aranet-gui; do
     exit 1
   fi
   for archive in "${archives[@]}"; do
+    if [ ! -f "$archive.sha256" ]; then
+      echo "error: $archive has no $archive.sha256" >&2
+      exit 1
+    fi
     sum="$(cut -d' ' -f1 "$archive.sha256")"
     if ! grep -qxF "$sum *$archive" sha256.sum; then
       echo "error: sha256.sum does not list $archive" >&2

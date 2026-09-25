@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Check the macOS release archives that `dist build` wrote to target/distrib:
-#   - each archive has the layout the installers expect (<archive name>/<binary>),
+#   - each archive has the layout the installers expect (<archive name>/<binary>,
+#     with no ./ prefix),
 #   - its binary has a valid signature with the hardened runtime and the
 #     identifier it has always had ("aranet", "aranet-gui"),
 #   - when <authority> is given, the signature is from that certificate,
@@ -26,12 +27,16 @@ for pair in aranet-cli:aranet aranet-gui:aranet-gui; do
   bin="${pair##*:}"
   archive="$package-$target.tar.xz"
 
-  tar -xJf "$distrib/$archive" -C "$work"
-  binary="$work/$package-$target/$bin"
-  if [ ! -f "$binary" ]; then
-    echo "error: $archive does not contain $package-$target/$bin" >&2
+  # Check the entry names, not the unpacked tree: the installers unpack with
+  # `tar --strip-components 1`, so a ./ prefix (v0.2.0's re-packed archives)
+  # unpacks to the same files here but leaves the binary one level too deep there.
+  listing="$(tar -tJf "$distrib/$archive")"
+  if ! grep -qxF "$package-$target/$bin" <<<"$listing"; then
+    echo "error: $archive does not contain $package-$target/$bin (with no ./ prefix)" >&2
     exit 1
   fi
+  tar -xJf "$distrib/$archive" -C "$work"
+  binary="$work/$package-$target/$bin"
   codesign --verify --strict --verbose=2 "$binary"
   details="$(codesign -dv --verbose=2 "$binary" 2>&1)"
   if ! grep -q 'flags=.*runtime' <<<"$details"; then
