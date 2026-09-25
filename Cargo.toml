@@ -92,6 +92,10 @@ auto-includes = true
 # this, one workspace build unifies features and the `aranet` CLI gets the
 # `gui` feature that aranet-gui turns on, so the Linux CLI needs GTK.
 precise-builds = true
+# Our own job builds the per-target archives, so that the macOS binaries are
+# signed before dist archives and checksums them (release-build-local.yml).
+build-local-artifacts = false
+local-artifacts-jobs = ["./release-build-local"]
 
 # Pin every action dist writes into release.yml to a full commit SHA: the same
 # commits as the hand-written workflows, plus the actions dist 0.31.0 only uses
