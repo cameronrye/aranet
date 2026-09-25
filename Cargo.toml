@@ -97,6 +97,19 @@ precise-builds = true
 # release-macos-app.yml builds the signed, notarized Aranet.app DMGs.
 build-local-artifacts = false
 local-artifacts-jobs = ["./release-build-local", "./release-macos-app"]
+# Install test against this run's own files, before anything is published
+# (release-smoke-test.yml). It is a publish job because the announce job, which
+# creates the GitHub Release when github-release = "announce", waits for publish
+# jobs to succeed. It does not wait for host-jobs.
+publish-jobs = ["./release-smoke-test"]
+github-release = "announce"
+# Also run the install test for pre-release tags such as v0.2.1-rc.1.
+publish-prereleases = true
+
+# Permissions for the custom jobs. dist gives publish jobs `id-token: write` and
+# `packages: write` by default; none of these jobs needs more than read access.
+[workspace.metadata.dist.github-custom-job-permissions]
+release-smoke-test = { contents = "read" }
 
 # Pin every action dist writes into release.yml to a full commit SHA: the same
 # commits as the hand-written workflows, plus the actions dist 0.31.0 only uses
