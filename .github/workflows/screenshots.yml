@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,40 +16,30 @@ jobs:
   generate-screenshots:
     runs-on: macos-latest
     permissions:
-      contents: write
+      contents: write # push the screenshots to a `screenshots/<ref>` branch (main is protected)
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.ref_name }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: 1.90
+          toolchain: "1.90"
 
       - name: Install VHS
         run: |
           brew install vhs
           brew install optipng gifsicle
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-screenshots-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-screenshots-
-
+      # No actions/cache here: this job has a write token and runs once per release,
+      # so it builds from scratch rather than trusting a restored ~/.cargo/bin or target/.
       - name: Build aranet binaries
         run: |
-          cargo build -p aranet-cli --release
-          cargo build -p aranet-gui --release
+          cargo build --locked -p aranet-cli --release
+          cargo build --locked -p aranet-gui --release
 
       - name: Generate VHS recordings
         run: |
@@ -102,16 +95,26 @@ jobs:
         if: env.SCREENSHOTS_VALID == 'true'
         run: cp assets/screenshots/* website/public/screenshots/
 
-      - name: Commit screenshots
+      - name: Push screenshots branch
         if: env.SCREENSHOTS_VALID == 'true'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add assets/screenshots/ website/public/screenshots/
           if git diff --staged --quiet; then
             echo "No changes to commit"
-          else
-            git commit -m "docs: update screenshots for ${{ github.ref_name }}"
-            git push origin HEAD:main
+            exit 0
           fi
-
+          BRANCH="screenshots/${REF_NAME}"
+          git commit -m "docs: update screenshots for ${REF_NAME}"
+          # main is protected: push a branch and open a PR from it by hand.
+          git push --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${BRANCH}"
+          {
+            echo "Screenshots pushed to \`${BRANCH}\`."
+            echo "Open a PR: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${BRANCH}?expand=1"
+          } >> "$GITHUB_STEP_SUMMARY"
