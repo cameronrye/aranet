@@ -77,10 +77,19 @@ Feature requests are welcome! Please:
 4. **Write or update tests** for your changes
 5. **Run the full test suite**:
    ```bash
-   cargo test --workspace
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
    cargo fmt --all --check
+   cargo clippy --locked --workspace --all-targets -- -D warnings
+   cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+   RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features
+   cargo test --locked --workspace
+   cargo test --locked --workspace --all-features
    ```
+
+   CI runs clippy on Rust 1.90 and on the newest stable release, on Linux, macOS and Windows, and the
+   tests on Rust 1.90 on all three (with `--all-features` on Linux). It also checks every feature
+   combination with cargo-hack (the `features` job in `.github/workflows/ci.yml`). `--locked` fails if
+   `Cargo.lock` is out of date: after changing a `Cargo.toml`, run `cargo update --workspace` and commit
+   `Cargo.lock` with it.
 6. **Commit** with a clear message:
    ```bash
    git commit -m "Add feature: brief description"
