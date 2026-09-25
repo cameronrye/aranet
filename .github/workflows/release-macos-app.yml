@@ -126,7 +126,22 @@ jobs:
           mkdir -p "$stage" "$(dirname "$DMG")"
           cp -R "$APP" "$stage/"
           ln -s /Applications "$stage/Applications"
-          hdiutil create -volname Aranet -srcfolder "$stage" -ov -format UDZO "$DMG"
+          # Hosted macOS runners fail hdiutil now and then with "Resource busy"
+          # (actions/runner-images#7522). -ov overwrites a partial DMG from a failed
+          # attempt, and the `if` keeps set -e from ending the loop. Don't pipe
+          # hdiutil's output: a pipe can hang it.
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create -volname Aranet -srcfolder "$stage" -ov -format UDZO "$DMG"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::hdiutil create failed $attempt times"
+              exit 1
+            fi
+            echo "::warning::hdiutil create failed (attempt $attempt of 5); retrying"
+            sync
+            sleep $((attempt * 10))
+          done
       - name: Sign, notarize and staple DMG
         if: steps.signing.outputs.sign == 'true' && steps.signing.outputs.notarize == 'true'
         env:

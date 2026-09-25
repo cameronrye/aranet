@@ -148,12 +148,23 @@ jobs:
           # What a user gets after dragging the app out of the DMG: Gatekeeper
           # accepts it without a warning, and it can ask for Bluetooth access.
           mnt="$RUNNER_TEMP/aranet-dmg"
-          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"
+          # hdiutil fails now and then with "Resource busy" on hosted runners
+          # (actions/runner-images#7522).
+          for attempt in 1 2 3; do
+            if hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::hdiutil attach failed $attempt times"
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
           app="$mnt/Aranet.app"
           /usr/libexec/PlistBuddy -c 'Print :NSBluetoothAlwaysUsageDescription' "$app/Contents/Info.plist"
           codesign --verify --strict --verbose=2 "$app"
           spctl --assess --type execute --verbose=2 "$app"
-          hdiutil detach "$mnt"
+          hdiutil detach "$mnt" || { sleep 10; hdiutil detach -force "$mnt"; }
 
       # ---- Windows ----
       - name: Install the CLI and GUI (Windows)
