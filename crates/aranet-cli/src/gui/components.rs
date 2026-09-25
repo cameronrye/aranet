@@ -22,7 +22,7 @@ pub fn metric_card(
         .fill(theme.bg_card)
         .inner_margin(egui::Margin::same(theme.spacing.card_padding as i8))
         .corner_radius(egui::CornerRadius::same(theme.rounding.md as u8))
-        .stroke(egui::Stroke::new(1.0, theme.border_subtle))
+        .stroke(egui::Stroke::new(1.0_f32, theme.border_subtle))
         .show(ui, |ui| {
             ui.set_min_width(100.0);
             ui.vertical(|ui| {
@@ -161,7 +161,7 @@ pub fn themed_button(
     let stroke = if style.border == Color32::TRANSPARENT {
         egui::Stroke::NONE
     } else {
-        egui::Stroke::new(1.0, style.border)
+        egui::Stroke::new(1.0_f32, style.border)
     };
 
     ui.add(
@@ -204,7 +204,7 @@ pub fn toggle_chip(
                 .size(theme.typography.caption + 1.0),
         )
         .fill(fill)
-        .stroke(egui::Stroke::new(1.0, stroke))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
         .corner_radius(egui::CornerRadius::same(theme.rounding.full as u8))
         .min_size(egui::vec2(0.0, theme.spacing.lg + 2.0)),
     )
@@ -235,7 +235,7 @@ pub fn nav_tab(ui: &mut Ui, theme: &Theme, text: &str, selected: bool) -> egui::
                 .size(theme.typography.body),
         )
         .fill(fill)
-        .stroke(egui::Stroke::new(1.0, stroke))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
         .corner_radius(egui::CornerRadius::same(theme.rounding.md as u8))
         .min_size(egui::vec2(84.0, theme.spacing.xl)),
     )
@@ -300,7 +300,7 @@ pub fn co2_gauge(ui: &mut Ui, theme: &Theme, co2: u16) {
     painter.rect_stroke(
         bar_rect,
         egui::CornerRadius::same(theme.rounding.sm as u8),
-        egui::Stroke::new(1.0, theme.border),
+        egui::Stroke::new(1.0_f32, theme.border),
         egui::StrokeKind::Outside,
     );
 
@@ -351,7 +351,7 @@ pub fn co2_gauge(ui: &mut Ui, theme: &Theme, co2: u16) {
         let x = bar_rect.min.x + (ppm / max_ppm) * available_width;
         painter.line_segment(
             [egui::pos2(x, bar_rect.min.y), egui::pos2(x, bar_rect.max.y)],
-            egui::Stroke::new(1.0, theme.text_muted.gamma_multiply(0.4)),
+            egui::Stroke::new(1.0_f32, theme.text_muted.gamma_multiply(0.4)),
         );
         painter.text(
             egui::pos2(x, label_y),
@@ -407,7 +407,7 @@ pub fn cached_data_banner(
             theme.spacing.sm as i8,
         ))
         .corner_radius(egui::CornerRadius::same(theme.rounding.md as u8))
-        .stroke(egui::Stroke::new(2.0, border_color))
+        .stroke(egui::Stroke::new(2.0_f32, border_color))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let icon_color = if is_stale { theme.warning } else { theme.info };

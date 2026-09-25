@@ -700,21 +700,21 @@ impl Theme {
 
         // Selection
         visuals.selection.bg_fill = self.tint_bg(self.accent, self.opacity.strong);
-        visuals.selection.stroke = Stroke::new(1.0, self.accent);
+        visuals.selection.stroke = Stroke::new(1.0_f32, self.accent);
 
         // Text/foreground strokes
-        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, self.text_primary);
-        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, self.text_secondary);
-        visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, self.text_on_accent);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.5, self.text_on_accent);
-        visuals.widgets.open.fg_stroke = Stroke::new(1.0, self.text_primary);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, self.text_secondary);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, self.text_on_accent);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, self.text_on_accent);
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, self.text_primary);
 
         // Border strokes
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, self.border_subtle);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, self.border);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, self.accent);
-        visuals.widgets.active.bg_stroke = Stroke::new(1.5, self.accent);
-        visuals.widgets.open.bg_stroke = Stroke::new(1.0, self.border);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border_subtle);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, self.accent);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, self.accent);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, self.border);
 
         // Rounding
         let rounding = CornerRadius::same(self.rounding.md as u8);

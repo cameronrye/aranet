@@ -20,7 +20,7 @@ impl AranetApp {
             .fill(self.theme.bg_card)
             .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
             .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-            .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
+            .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle))
             .show(ui, |ui| {
                 let mut config_changed = false;
 

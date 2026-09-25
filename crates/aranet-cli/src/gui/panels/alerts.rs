@@ -101,7 +101,7 @@ impl AranetApp {
                                         self.theme.rounding.sm as u8,
                                     ))
                                     .stroke(egui::Stroke::new(
-                                        1.0,
+                                        1.0_f32,
                                         severity_color.gamma_multiply(0.3),
                                     ))
                                     .show(ui, |ui| {

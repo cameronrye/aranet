@@ -555,7 +555,7 @@ impl AranetApp {
             .fill(self.theme.bg_card)
             .inner_margin(egui::Margin::same(self.theme.spacing.md as i8))
             .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-            .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
+            .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle))
             .show(ui, |ui| {
                 // Header row with title, unit, data count indicator, and reset button
                 ui.horizontal(|ui| {
@@ -649,7 +649,7 @@ impl AranetApp {
                             );
                         }
                     }
-                    plot_ui.line(Line::new(title, points).color(line_color).width(2.0));
+                    plot_ui.line(Line::new(title, points).color(line_color).width(2.0_f32));
                 });
             });
         ui.add_space(self.theme.spacing.md);
@@ -679,7 +679,7 @@ impl AranetApp {
             .fill(self.theme.bg_card)
             .inner_margin(egui::Margin::same(self.theme.spacing.md as i8))
             .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-            .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
+            .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle))
             .show(ui, |ui| {
                 // Header row
                 ui.horizontal(|ui| {
@@ -765,12 +765,12 @@ impl AranetApp {
                     plot_ui.line(
                         Line::new(format!("Temp (°{})", temp_unit_label), temp_points)
                             .color(self.theme.chart_temperature)
-                            .width(2.0),
+                            .width(2.0_f32),
                     );
                     plot_ui.line(
                         Line::new("Humidity (%)", humidity_points)
                             .color(self.theme.chart_humidity)
-                            .width(2.0),
+                            .width(2.0_f32),
                     );
                 });
 

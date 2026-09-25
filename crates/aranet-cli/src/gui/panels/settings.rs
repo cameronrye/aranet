@@ -34,7 +34,7 @@ impl AranetApp {
             .fill(self.theme.bg_card)
             .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
             .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-            .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
+            .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle))
             .show(ui, |ui| {
                 // Check if we're editing this device's alias
                 let is_editing = self
@@ -160,7 +160,7 @@ impl AranetApp {
                     .fill(self.theme.bg_card)
                     .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
                     .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle))
                     .show(ui, |ui| {
                         let current_interval =
                             device.reading.as_ref().map(|r| r.interval).unwrap_or(0);
@@ -220,7 +220,7 @@ impl AranetApp {
                     .fill(self.theme.bg_card)
                     .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
                     .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle))
                     .show(ui, |ui| {
                         // Smart Home toggle
                         ui.horizontal(|ui| {
@@ -397,7 +397,7 @@ impl AranetApp {
                 .fill(self.theme.bg_card)
                 .inner_margin(egui::Margin::same(self.theme.spacing.lg as i8))
                 .corner_radius(egui::CornerRadius::same(self.theme.rounding.md as u8))
-                .stroke(egui::Stroke::new(1.0, self.theme.border_subtle))
+                .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle))
                 .show(ui, |ui| {
                     egui::Grid::new("device_info_grid")
                         .num_columns(2)
