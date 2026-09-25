@@ -18,13 +18,15 @@ brew install cameronrye/aranet/aranet
 ### Shell Script (macOS/Linux)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://github.com/cameronrye/aranet/releases/latest/download/aranet-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.sh | sh
 ```
+
+On a minimal Linux system, such as a container image, install `curl`, `ca-certificates` and `xz-utils` first (for example `apt-get install curl ca-certificates xz-utils`): the installer downloads with `curl` and unpacks a `.tar.xz` archive.
 
 ### PowerShell (Windows)
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-installer.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex"
 ```
 
 ### Debian/Ubuntu (apt)

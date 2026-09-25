@@ -43,13 +43,22 @@ The native desktop application with real-time monitoring, charts, and multi-devi
     </Card>
   </TabItem>
   <TabItem label="Linux">
-    <Card title="Linux (x86_64)" icon="linux">
-      **For x86_64 Linux distributions**
-      
-      [Download tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-x86_64-unknown-linux-gnu.tar.xz)
-      
-      <small>[checksum](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-x86_64-unknown-linux-gnu.tar.xz.sha256)</small>
-    </Card>
+    <CardGrid>
+      <Card title="Linux (x86_64)" icon="linux">
+        **For x86_64 Linux distributions**
+
+        [Download tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-x86_64-unknown-linux-gnu.tar.xz)
+
+        <small>[checksum](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-x86_64-unknown-linux-gnu.tar.xz.sha256)</small>
+      </Card>
+      <Card title="Linux (ARM64)" icon="linux">
+        **For 64-bit ARM Linux, such as Raspberry Pi OS (64-bit)**
+
+        [Download tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-aarch64-unknown-linux-gnu.tar.xz)
+
+        <small>[checksum](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-aarch64-unknown-linux-gnu.tar.xz.sha256)</small>
+      </Card>
+    </CardGrid>
   </TabItem>
 </Tabs>
 
@@ -80,11 +89,18 @@ The scriptable CLI for reading sensor data, downloading history, and device conf
     </Card>
   </TabItem>
   <TabItem label="Linux">
-    <Card title="Linux (x86_64)" icon="linux">
-      [Download tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-unknown-linux-gnu.tar.xz)
-      
-      <small>[checksum](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-unknown-linux-gnu.tar.xz.sha256)</small>
-    </Card>
+    <CardGrid>
+      <Card title="Linux (x86_64)" icon="linux">
+        [Download tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-unknown-linux-gnu.tar.xz)
+
+        <small>[checksum](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-unknown-linux-gnu.tar.xz.sha256)</small>
+      </Card>
+      <Card title="Linux (ARM64)" icon="linux">
+        [Download tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-aarch64-unknown-linux-gnu.tar.xz)
+
+        <small>[checksum](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-aarch64-unknown-linux-gnu.tar.xz.sha256)</small>
+      </Card>
+    </CardGrid>
   </TabItem>
 </Tabs>
 
@@ -111,6 +127,8 @@ brew install aranet
 ```
   </TabItem>
 </Tabs>
+
+On a minimal Linux system, such as a container image, install `curl`, `ca-certificates` and `xz-utils` first (for example `apt-get install curl ca-certificates xz-utils`): the installer downloads with `curl` and unpacks a `.tar.xz` archive.
 
 ## Checksums
 
