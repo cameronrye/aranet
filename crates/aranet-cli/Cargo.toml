@@ -136,3 +136,16 @@ suggests = "bluetooth"
 # conflicts = ""
 # Replaces other packages
 # replaces = ""
+
+# cargo-release: aranet-cli is the "representative" crate, so the steps that must
+# happen once per release (the vX.Y.Z tag and the CHANGELOG heading) happen here.
+# See release.toml for the workspace-wide settings.
+[package.metadata.release]
+tag = true
+tag-name = "v{{version}}"
+tag-message = "chore: release v{{version}}"
+# Turn "## [Unreleased]" into "## [X.Y.Z] - <date>" under a fresh "## [Unreleased]".
+# Skipped for pre-releases (cargo-release's `prerelease = false` default).
+pre-release-replacements = [
+  { file = "../../CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+]
