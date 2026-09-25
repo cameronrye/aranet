@@ -1,0 +1,179 @@
+# Pre-publication install test.
+#
+# Cargo.toml lists this workflow in `publish-jobs`, so the generated release.yml
+# runs it after every artifact is built. With `github-release = "announce"`, the
+# announce job creates the GitHub Release, and it runs only if this workflow
+# passes. Nothing is public yet, so the installers are pointed at this run's own
+# files, served on localhost, through ARANET_CLI_DOWNLOAD_URL and
+# ARANET_GUI_DOWNLOAD_URL. They are the exact files the announce job uploads.
+name: Release / install smoke test
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: install (${{ join(matrix.targets, ', ') }})
+    # A stuck leg must not hold the release gate for GitHub's default 360 minutes.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # One job per shipped target, on the runner that built it.
+      matrix: ${{ fromJson(inputs.plan).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ fromJson(inputs.plan).releases[0].app_version }}
+      PORT: "8765"
+      TARGET: ${{ join(matrix.targets, '') }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release
+      - name: Download this run's release files
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: artifacts-*
+          path: release
+          merge-multiple: true
+      - name: Serve them on localhost
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rm -f release/*-dist-manifest.json
+          ls -la release
+          nohup python3 -m http.server "$PORT" --bind 127.0.0.1 --directory release > "$RUNNER_TEMP/http.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS -o /dev/null "http://127.0.0.1:$PORT/sha256.sum" && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/http.log"
+          exit 1
+      # Windows: Start-Process without -NoNewWindow or -Redirect* goes through
+      # ShellExecute, so the server inherits none of this step's handles. A child that
+      # holds the step's output pipes is killed with the step's process tree once the
+      # step ends (actions/runner ProcessInvoker); this one lives until the job ends.
+      - name: Serve them on localhost (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item release/*-dist-manifest.json
+          Get-ChildItem release
+          $server = Start-Process -FilePath python -WindowStyle Hidden -PassThru `
+            -ArgumentList '-m', 'http.server', $env:PORT, '--bind', '127.0.0.1', '--directory', (Resolve-Path release).Path
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $null = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$env:PORT/sha256.sum"
+              exit 0
+            } catch {
+              Start-Sleep -Seconds 1
+            }
+          }
+          Write-Output "The HTTP server did not answer within 30 s (server exited: $($server.HasExited))"
+          exit 1
+      - name: Check checksums and installers
+        # Not on Windows: Git for Windows checks the script out with CRLF line
+        # endings (core.autocrlf), which bash cannot run. The files are the same
+        # on every leg.
+        if: runner.os != 'Windows'
+        run: scripts/release/check-release-files.sh release
+
+      # ---- Linux: clean ubuntu:22.04 containers ----
+      # No GTK and no libxdo, as on a headless server or Raspberry Pi OS Lite. curl
+      # pulls in libssl3, so the OpenSSL proof is the ldd check at the end.
+      - name: Install the CLI (Linux, no GUI libraries)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm --network host -e PORT -e VERSION ubuntu:22.04 bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends curl ca-certificates xz-utils libdbus-1-3 > /dev/null
+            export ARANET_CLI_DOWNLOAD_URL="http://127.0.0.1:$PORT"
+            curl --proto "=http" -LsSf "http://127.0.0.1:$PORT/aranet-cli-installer.sh" | sh
+            aranet="$HOME/.cargo/bin/aranet"
+            test "$("$aranet" --version)" = "aranet $VERSION"
+            help="$("$aranet" --help)"
+            grep -q "^  server " <<<"$help"
+            grep -q "^  tui " <<<"$help"
+            if grep -q "^  gui " <<<"$help"; then echo "the released CLI must not have the gui subcommand"; exit 1; fi
+            server_help="$("$aranet" server --help)"
+            grep -q "Start the HTTP API server" <<<"$server_help"
+            libs="$(ldd "$aranet")"
+            echo "$libs"
+            if grep -E "libssl|libcrypto|libgtk|libxdo|not found" <<<"$libs"; then
+              echo "the released CLI must not need OpenSSL, GTK or libxdo"
+              exit 1
+            fi
+          '
+      - name: Install the GUI (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm --network host -e PORT -e VERSION ubuntu:22.04 bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends curl ca-certificates xz-utils libdbus-1-3 libgtk-3-0 libxdo3 > /dev/null
+            export ARANET_GUI_DOWNLOAD_URL="http://127.0.0.1:$PORT"
+            curl --proto "=http" -LsSf "http://127.0.0.1:$PORT/aranet-gui-installer.sh" | sh
+            test "$("$HOME/.cargo/bin/aranet-gui" --version)" = "aranet-gui $VERSION"
+          '
+
+      # ---- macOS ----
+      - name: Install the CLI and GUI (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          export ARANET_CLI_DOWNLOAD_URL="http://127.0.0.1:$PORT" ARANET_GUI_DOWNLOAD_URL="http://127.0.0.1:$PORT"
+          export ARANET_CLI_NO_MODIFY_PATH=1 ARANET_GUI_NO_MODIFY_PATH=1
+          curl --proto '=http' -LsSf "http://127.0.0.1:$PORT/aranet-cli-installer.sh" | sh
+          curl --proto '=http' -LsSf "http://127.0.0.1:$PORT/aranet-gui-installer.sh" | sh
+          test "$("$CARGO_HOME/bin/aranet" --version)" = "aranet $VERSION"
+          test "$("$CARGO_HOME/bin/aranet-gui" --version)" = "aranet-gui $VERSION"
+          for bin in aranet aranet-gui; do
+            codesign --verify --strict --verbose=2 "$CARGO_HOME/bin/$bin"
+            codesign -dv --verbose=2 "$CARGO_HOME/bin/$bin" 2>&1 | grep -F 'Authority=Developer ID Application:'
+          done
+      - name: Check the DMG and the app in it (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          dmg="release/Aranet-$TARGET.dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          # What a user gets after dragging the app out of the DMG: Gatekeeper
+          # accepts it without a warning, and it can ask for Bluetooth access.
+          mnt="$RUNNER_TEMP/aranet-dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"
+          app="$mnt/Aranet.app"
+          /usr/libexec/PlistBuddy -c 'Print :NSBluetoothAlwaysUsageDescription' "$app/Contents/Info.plist"
+          codesign --verify --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          hdiutil detach "$mnt"
+
+      # ---- Windows ----
+      - name: Install the CLI and GUI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'cargo-home'
+          $env:ARANET_CLI_DOWNLOAD_URL = "http://127.0.0.1:$env:PORT"
+          $env:ARANET_GUI_DOWNLOAD_URL = "http://127.0.0.1:$env:PORT"
+          $env:ARANET_CLI_NO_MODIFY_PATH = '1'
+          $env:ARANET_GUI_NO_MODIFY_PATH = '1'
+          irm "http://127.0.0.1:$env:PORT/aranet-cli-installer.ps1" | iex
+          irm "http://127.0.0.1:$env:PORT/aranet-gui-installer.ps1" | iex
+          $version = & "$env:CARGO_HOME\bin\aranet.exe" --version
+          if ($version -ne "aranet $env:VERSION") { throw "aranet --version printed '$version'" }
+          if (-not (Test-Path "$env:CARGO_HOME\bin\aranet-gui.exe")) { throw 'aranet-gui.exe was not installed' }
+      - name: Check aranet-gui.exe opens no console window (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python scripts/release/check-pe-subsystem.py "$RUNNER_TEMP/cargo-home/bin/aranet-gui.exe" 2
+          python scripts/release/check-pe-subsystem.py "$RUNNER_TEMP/cargo-home/bin/aranet.exe" 3
