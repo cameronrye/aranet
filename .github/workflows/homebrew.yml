@@ -1,77 +1,172 @@
+# The only publisher of the Homebrew tap (cameronrye/homebrew-aranet).
+#
+# Renders .github/homebrew/aranet.rb.template (formula) and
+# .github/homebrew/aranet-gui.rb.template (cask) from the assets of a published
+# GitHub Release and pushes them to the tap.
+#
+# Runs after the release is published: the release workflow calls it (cargo-dist
+# `post-announce-jobs = ["./homebrew"]`, which passes `plan`), or run it by hand
+# for an existing tag from the Actions tab.
 name: Publish Homebrew Formula
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      plan:
+        description: cargo-dist plan JSON (dist passes it to every custom job)
+        required: false
+        type: string
+      tag:
+        description: Release tag, e.g. v0.2.1 (used when `plan` is not given)
+        required: false
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        description: Fine-grained PAT with Contents read/write on cameronrye/homebrew-aranet only
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, e.g. v0.2.1
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: read # download release assets; the tap is pushed with HOMEBREW_TAP_TOKEN
+
+# One tap update at a time; never cancel one half-way through a push.
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
 
 jobs:
   homebrew:
-    name: Update Homebrew Formula
+    name: Update Homebrew tap
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # HOMEBREW_TAP_TOKEN lives in this environment, which only v* tags and main may use.
+    environment: homebrew-tap
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Get release version
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Download release assets and compute checksums
-        id: checksums
+      - name: Resolve release tag
+        id: tag
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PLAN: ${{ inputs.plan }}
         run: |
-          ASSETS_DIR=$(mktemp -d)
-          cd "$ASSETS_DIR"
+          set -euo pipefail
+          tag="${INPUT_TAG}"
+          if [ -z "$tag" ] && [ -n "$PLAN" ]; then
+            tag=$(jq -r '.announcement_tag // empty' <<<"$PLAN")
+          fi
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::notice::${tag} is a prerelease; the Homebrew tap is not updated"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::expected a release tag like v1.2.3, got '${tag}'"
+            exit 1
+          fi
+          {
+            echo "publish=true"
+            echo "tag=${tag}"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
 
-          # Download all release tarballs
-          declare -A ASSETS=(
-            ["CLI_MACOS_ARM64"]="aranet-cli-aarch64-apple-darwin.tar.xz"
-            ["CLI_MACOS_X64"]="aranet-cli-x86_64-apple-darwin.tar.xz"
-            ["CLI_LINUX_X64"]="aranet-cli-x86_64-unknown-linux-gnu.tar.xz"
-            ["GUI_MACOS_ARM64"]="aranet-gui-aarch64-apple-darwin.tar.xz"
-            ["GUI_MACOS_X64"]="aranet-gui-x86_64-apple-darwin.tar.xz"
-            ["GUI_LINUX_X64"]="aranet-gui-x86_64-unknown-linux-gnu.tar.xz"
-          )
-
-          for key in "${!ASSETS[@]}"; do
-            file="${ASSETS[$key]}"
-            gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" --pattern "$file" || true
-            if [ -f "$file" ]; then
-              sha=$(sha256sum "$file" | awk '{print $1}')
-              echo "SHA256_${key}=${sha}" >> "$GITHUB_OUTPUT"
-            else
-              echo "::warning::Asset $file not found in release"
-              echo "SHA256_${key}=MISSING" >> "$GITHUB_OUTPUT"
-            fi
-          done
-
-      - name: Generate formula from template
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          sed \
-            -e "s/{{VERSION}}/$VERSION/g" \
-            -e "s/{{SHA256_CLI_MACOS_ARM64}}/${{ steps.checksums.outputs.SHA256_CLI_MACOS_ARM64 }}/g" \
-            -e "s/{{SHA256_CLI_MACOS_X64}}/${{ steps.checksums.outputs.SHA256_CLI_MACOS_X64 }}/g" \
-            -e "s/{{SHA256_CLI_LINUX_X64}}/${{ steps.checksums.outputs.SHA256_CLI_LINUX_X64 }}/g" \
-            -e "s/{{SHA256_GUI_MACOS_ARM64}}/${{ steps.checksums.outputs.SHA256_GUI_MACOS_ARM64 }}/g" \
-            -e "s/{{SHA256_GUI_MACOS_X64}}/${{ steps.checksums.outputs.SHA256_GUI_MACOS_X64 }}/g" \
-            -e "s/{{SHA256_GUI_LINUX_X64}}/${{ steps.checksums.outputs.SHA256_GUI_LINUX_X64 }}/g" \
-            .github/homebrew/aranet.rb.template > aranet.rb
-
-      - name: Push formula to tap
-        uses: dmnemec/copy_file_to_another_repo_action@main
-        env:
-          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Checkout templates at the release tag
+        if: steps.tag.outputs.publish == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          source_file: 'aranet.rb'
-          destination_repo: 'cameronrye/homebrew-aranet'
-          destination_folder: 'Formula'
-          user_email: 'cameronrye@users.noreply.github.com'
-          user_name: 'github-actions[bot]'
-          commit_message: 'Update aranet formula to ${{ steps.version.outputs.version }}'
+          ref: ${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Download release assets and verify published checksums
+        if: steps.tag.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/assets"
+          cd "$RUNNER_TEMP/assets"
+          for f in \
+            aranet-cli-aarch64-apple-darwin.tar.xz \
+            aranet-cli-x86_64-apple-darwin.tar.xz \
+            aranet-cli-x86_64-unknown-linux-gnu.tar.xz \
+            aranet-gui-aarch64-apple-darwin.tar.xz \
+            aranet-gui-x86_64-apple-darwin.tar.xz \
+            aranet-gui-x86_64-unknown-linux-gnu.tar.xz; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$f" --pattern "$f.sha256"
+            sha256sum -c "$f.sha256"
+          done
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'Aranet-aarch64-apple-darwin.dmg' \
+            --pattern 'Aranet-x86_64-apple-darwin.dmg'
+
+      - name: Render formula and cask
+        if: steps.tag.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          A="$RUNNER_TEMP/assets"
+          # Plain assignments, so a missing asset fails the step (a failing
+          # $(...) inside a command's arguments would not).
+          sha() { sha256sum "$A/$1" | cut -d' ' -f1; }
+          CLI_MACOS_ARM64=$(sha aranet-cli-aarch64-apple-darwin.tar.xz)
+          CLI_MACOS_X64=$(sha aranet-cli-x86_64-apple-darwin.tar.xz)
+          CLI_LINUX_X64=$(sha aranet-cli-x86_64-unknown-linux-gnu.tar.xz)
+          GUI_MACOS_ARM64=$(sha aranet-gui-aarch64-apple-darwin.tar.xz)
+          GUI_MACOS_X64=$(sha aranet-gui-x86_64-apple-darwin.tar.xz)
+          GUI_LINUX_X64=$(sha aranet-gui-x86_64-unknown-linux-gnu.tar.xz)
+          DMG_ARM64=$(sha Aranet-aarch64-apple-darwin.dmg)
+          DMG_X64=$(sha Aranet-x86_64-apple-darwin.dmg)
+          mkdir -p "$RUNNER_TEMP/tap/Formula" "$RUNNER_TEMP/tap/Casks"
+          sed \
+            -e "s/{{VERSION}}/${VERSION}/g" \
+            -e "s/{{SHA256_CLI_MACOS_ARM64}}/${CLI_MACOS_ARM64}/g" \
+            -e "s/{{SHA256_CLI_MACOS_X64}}/${CLI_MACOS_X64}/g" \
+            -e "s/{{SHA256_CLI_LINUX_X64}}/${CLI_LINUX_X64}/g" \
+            -e "s/{{SHA256_GUI_MACOS_ARM64}}/${GUI_MACOS_ARM64}/g" \
+            -e "s/{{SHA256_GUI_MACOS_X64}}/${GUI_MACOS_X64}/g" \
+            -e "s/{{SHA256_GUI_LINUX_X64}}/${GUI_LINUX_X64}/g" \
+            .github/homebrew/aranet.rb.template > "$RUNNER_TEMP/tap/Formula/aranet.rb"
+          sed \
+            -e "s/{{VERSION}}/${VERSION}/g" \
+            -e "s/{{SHA256_DMG_ARM64}}/${DMG_ARM64}/g" \
+            -e "s/{{SHA256_DMG_X64}}/${DMG_X64}/g" \
+            .github/homebrew/aranet-gui.rb.template > "$RUNNER_TEMP/tap/Casks/aranet-gui.rb"
+          if grep -n '{{' "$RUNNER_TEMP/tap/Formula/aranet.rb" "$RUNNER_TEMP/tap/Casks/aranet-gui.rb"; then
+            echo "::error::unrendered template placeholders"
+            exit 1
+          fi
+          ruby -c "$RUNNER_TEMP/tap/Formula/aranet.rb"
+          ruby -c "$RUNNER_TEMP/tap/Casks/aranet-gui.rb"
+
+      - name: Push to the tap
+        if: steps.tag.outputs.publish == 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set"
+            exit 1
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/cameronrye/homebrew-aranet.git" \
+            "$RUNNER_TEMP/homebrew-aranet"
+          cp "$RUNNER_TEMP/tap/Formula/aranet.rb" "$RUNNER_TEMP/homebrew-aranet/Formula/aranet.rb"
+          mkdir -p "$RUNNER_TEMP/homebrew-aranet/Casks"
+          cp "$RUNNER_TEMP/tap/Casks/aranet-gui.rb" "$RUNNER_TEMP/homebrew-aranet/Casks/aranet-gui.rb"
+          cd "$RUNNER_TEMP/homebrew-aranet"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/aranet.rb Casks/aranet-gui.rb
+          if git diff --staged --quiet; then
+            echo "Tap already up to date for ${TAG}"
+            exit 0
+          fi
+          git commit -m "Update aranet to ${TAG}"
+          git push origin HEAD:main
