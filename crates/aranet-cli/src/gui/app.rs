@@ -2039,8 +2039,10 @@ impl AranetApp {
                 let now = time::OffsetDateTime::now_local()
                     .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
                 now.format(
-                    &time::format_description::parse("[year][month][day]_[hour][minute][second]")
-                        .unwrap_or_default(),
+                    &time::format_description::parse_borrowed::<1>(
+                        "[year][month][day]_[hour][minute][second]",
+                    )
+                    .unwrap_or_default(),
                 )
                 .unwrap_or_default()
             };
@@ -2104,8 +2106,10 @@ impl AranetApp {
             let now = time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
             now.format(
-                &time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]")
-                    .unwrap_or_default(),
+                &time::format_description::parse_borrowed::<1>(
+                    "[year]-[month]-[day]T[hour]:[minute]:[second]",
+                )
+                .unwrap_or_default(),
             )
             .unwrap_or_default()
         };

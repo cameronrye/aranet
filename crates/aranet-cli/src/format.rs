@@ -1052,8 +1052,10 @@ pub fn format_history_text(history: &[HistoryRecord], opts: &FormatOptions) -> S
             record
                 .timestamp
                 .format(
-                    &time::format_description::parse("[year]-[month]-[day] [hour]:[minute]")
-                        .expect("valid format"),
+                    &time::format_description::parse_borrowed::<1>(
+                        "[year]-[month]-[day] [hour]:[minute]",
+                    )
+                    .expect("valid format"),
                 )
                 .unwrap_or_else(|_| "Unknown".to_string())
         } else {

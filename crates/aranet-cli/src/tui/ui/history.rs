@@ -54,7 +54,7 @@ fn draw_sparkline_x_axis(
     newest: time::OffsetDateTime,
     text_muted: Color,
 ) {
-    let format = time::format_description::parse("[month]/[day] [hour]:[minute]")
+    let format = time::format_description::parse_borrowed::<1>("[month]/[day] [hour]:[minute]")
         .unwrap_or_else(|_| Vec::new());
 
     let oldest_str = oldest.format(&format).unwrap_or_else(|_| "-".to_string());
@@ -307,7 +307,7 @@ pub(super) fn draw_history_panel(frame: &mut Frame, area: Rect, app: &App) {
             let time = record
                 .timestamp
                 .format(
-                    &time::format_description::parse("[month]/[day] [hour]:[minute]")
+                    &time::format_description::parse_borrowed::<1>("[month]/[day] [hour]:[minute]")
                         .expect("valid format"),
                 )
                 .unwrap_or_else(|_| "Unknown".to_string());

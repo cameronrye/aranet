@@ -195,7 +195,7 @@ fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
     }
 
     // Try date only (YYYY-MM-DD)
-    let format = time::format_description::parse("[year]-[month]-[day]")?;
+    let format = time::format_description::parse_borrowed::<1>("[year]-[month]-[day]")?;
     if let Ok(date) = time::Date::parse(s, &format) {
         return Ok(date.with_hms(0, 0, 0)?.assume_utc());
     }

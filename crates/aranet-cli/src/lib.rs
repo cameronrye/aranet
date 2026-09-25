@@ -99,7 +99,7 @@ pub use aranet_types;
 /// Falls back to UTC if the local timezone cannot be determined.
 pub fn local_now_fmt(fmt: &str) -> String {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let format = time::format_description::parse(fmt).unwrap_or_default();
+    let format = time::format_description::parse_borrowed::<1>(fmt).unwrap_or_default();
     now.format(&format).unwrap_or_default()
 }
 

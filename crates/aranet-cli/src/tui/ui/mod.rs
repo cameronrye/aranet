@@ -259,8 +259,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let time_str = {
         let now =
             time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-        now.format(&time::format_description::parse("[hour]:[minute]:[second]").unwrap_or_default())
-            .unwrap_or_default()
+        now.format(
+            &time::format_description::parse_borrowed::<1>("[hour]:[minute]:[second]")
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default()
     };
 
     // Build left content with context-sensitive hints
