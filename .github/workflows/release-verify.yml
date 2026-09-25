@@ -1,0 +1,60 @@
+# Post-release check: install with the documented one-liners from the live GitHub
+# Release on every shipped target, and check the published files.
+#
+# Cargo.toml lists this workflow in `post-announce-jobs`. The release is already
+# public when this runs, so a failure here means "fix forward";
+# release-smoke-test.yml is the gate that runs before publishing.
+name: Release / verify published release
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (${{ join(matrix.targets, ', ') }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.plan).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+      VERSION: ${{ fromJson(inputs.plan).releases[0].app_version }}
+      # README.md and the website use releases/latest, which never points at a
+      # pre-release, so pre-releases are checked through their tag's URL.
+      BASE_URL: ${{ fromJson(inputs.plan).announcement_is_prerelease && format('https://github.com/{0}/releases/download/{1}', github.repository, fromJson(inputs.plan).announcement_tag) || format('https://github.com/{0}/releases/latest/download', github.repository) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release
+      - name: Install the CLI with the documented one-liner (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          curl --proto '=https' --tlsv1.2 -LsSf "$BASE_URL/aranet-cli-installer.sh" | sh
+          test "$("$CARGO_HOME/bin/aranet" --version)" = "aranet $VERSION"
+      - name: Install the CLI with the documented one-liner (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'cargo-home'
+          irm "$env:BASE_URL/aranet-cli-installer.ps1" | iex
+          $version = & "$env:CARGO_HOME\bin\aranet.exe" --version
+          if ($version -ne "aranet $env:VERSION") { throw "aranet --version printed '$version'" }
+      - name: Check the published files
+        if: matrix.runner == 'ubuntu-22.04'
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release"
+          scripts/release/check-release-files.sh "$RUNNER_TEMP/release"

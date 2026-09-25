@@ -105,6 +105,9 @@ publish-jobs = ["./release-smoke-test"]
 github-release = "announce"
 # Also run the install test for pre-release tags such as v0.2.1-rc.1.
 publish-prereleases = true
+# Once the release is public, install with the documented one-liners from the
+# live release (release-verify.yml).
+post-announce-jobs = ["./release-verify"]
 
 # Permissions for the custom jobs. dist gives publish jobs `id-token: write` and
 # `packages: write` by default; none of these jobs needs more than read access.
