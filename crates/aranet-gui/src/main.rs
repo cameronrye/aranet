@@ -3,6 +3,10 @@
 //! This is a thin wrapper around aranet-cli's GUI functionality,
 //! providing a separate binary for users who only want the desktop app.
 
+// Release builds on Windows use the GUI subsystem, so launching the app does not
+// open a console window. Debug builds keep the console for log output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use anyhow::Result;
