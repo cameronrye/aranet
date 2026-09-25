@@ -152,6 +152,73 @@ jobs:
       - name: Build documentation
         run: cargo doc --locked --workspace --no-deps --all-features
 
+  features:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            libclang-dev \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxdo-dev \
+            libssl-dev
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with clippy
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-hack@0.6.45
+          fallback: none
+
+      # cargo-hack runs cargo once per package and feature set, so features are not
+      # unified across workspace members the way `cargo build --workspace` unifies them.
+      - name: Each feature of every package except aranet-cli
+        run: cargo hack clippy --locked --workspace --exclude aranet-cli --each-feature --all-targets -- -D warnings
+
+      # The `aranet` binary needs `cli` or `tui` (main.rs stops the build with
+      # compile_error! otherwise), so only feature sets containing one of them.
+      - name: aranet-cli feature sets that build the aranet binary
+        run: cargo hack clippy --locked -p aranet-cli --feature-powerset --at-least-one-of cli,tui --all-targets -- -D warnings
+
+      # The library on its own, including no features and `gui` only (what aranet-gui uses).
+      - name: aranet-cli library, each feature
+        run: cargo hack clippy --locked -p aranet-cli --lib --each-feature -- -D warnings
+
+      # Two commands on purpose: `cargo build -p aranet-tui -p aranet-gui` would
+      # unify aranet-cli's `tui` and `gui` features into a single build.
+      - name: Build aranet-tui on its own
+        run: cargo build --locked -p aranet-tui
+
+      - name: Build aranet-gui on its own
+        run: cargo build --locked -p aranet-gui
+
+      # Tests per package, so no other member's features are unified in: the
+      # feature set that ships (default = cli, tui), and tui only (Task 14 keeps
+      # cli_integration out of that one).
+      - name: Test aranet-cli with its default (released) features
+        run: cargo test --locked -p aranet-cli
+
+      - name: Test aranet-cli with only the tui feature
+        run: cargo test --locked -p aranet-cli --no-default-features --features tui
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
