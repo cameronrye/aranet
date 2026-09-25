@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Linux ARM64 builds** — prebuilt CLI and GUI for 64-bit ARM Linux (`aarch64-unknown-linux-gnu`), offered by the install scripts
+- **Linux ARM64 builds** — prebuilt CLI and GUI for 64-bit ARM Linux (`aarch64-unknown-linux-gnu`, glibc 2.35 or newer, such as Raspberry Pi OS Bookworm), offered by the install scripts
 - **Release install test** — every release is installed with its own install scripts on each platform before it is published, and the documented one-liners are checked again once it is live; each macOS DMG now has a `.sha256`
 
 ### Changed
@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Checksums** — the `.sha256` files and `sha256.sum` match the signed macOS archives, and `sha256.sum` lists every archive
 - **Linux CLI** no longer needs GTK or libxdo installed
 - **Windows GUI** no longer opens a console window; as a result, `aranet-gui --help` and `--version` print nothing in a Windows terminal (use `aranet` there)
-- **macOS app** has its icon, minimum macOS version and Bluetooth usage descriptions; the `aranet-gui` binary in the macOS tarballs is Developer ID signed and notarized like the CLI
+- **macOS app** has its icon, minimum macOS version (11.0) and Bluetooth usage descriptions; the `aranet-gui` binary in the macOS tarballs is Developer ID signed and notarized like the CLI
 - **`aranet-cli` with only the `tui` feature** (`cargo install aranet-cli --no-default-features --features tui`) compiles; the `aranet` binary now uses the library's TUI instead of compiling a second copy of it
 
 ### Security
