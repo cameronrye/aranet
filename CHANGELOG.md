@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Linux ARM64 builds** — prebuilt CLI and GUI for 64-bit ARM Linux (`aarch64-unknown-linux-gnu`), offered by the install scripts
+- **Release install test** — every release is installed with its own install scripts on each platform before it is published, and the documented one-liners are checked again once it is live; each macOS DMG now has a `.sha256`
+
+### Changed
+
+- **`aranet sync` with no device and no default device configured** now falls back to the last-used device, then (when `behavior.load_cache` is on, the default) the most recently seen device in the local database, as `read` and `status` do. It used to scan and prompt for a device, or fail with "No device specified" when not run interactively
+- **Where `aranet sync` stores history** — 0.2.1 stores history under the device address. History that 0.2.0 synced under any other identifier (a device name or part of one, a MAC address typed in lowercase or without colons, or part of a macOS device UUID) stays under that ID, and `report`, `history` and `cache` queries for the old ID stop receiving new records. The first sync after upgrading downloads the device's whole history buffer again under the address, and `aranet sync --all` syncs the sensor once for each ID it is stored under. The `device` field in single-device `aranet sync --format json` output is now also this address rather than the identifier given on the command line; `aranet sync --all` output is unchanged
+- **History deduplication window** — records within 30 s of a record already stored for the same device are skipped on every history write, including `aranet cache import` (so an import can now report skipped duplicates that are not exact timestamp matches). Aranet devices measure at most once a minute, so real records are never this close. Duplicate rows already in the database are not removed. Rows that 0.2.0 stored were shifted by the length of their download, which can exceed 30 s, so the first download after upgrading that overlaps them (such as `aranet history`, which saves the whole buffer) may still add a copy
+- **`aranet set smart-home` without a value** is now an error. 0.2.0 release builds read it as `false`, a request to turn Smart Home off
+- **Service WebSocket** — when the API key is sent as `?token=`, a request with more than one `token` parameter is now rejected. 0.2.0 used the first one
+- **The prebuilt `aranet` CLI no longer includes `aranet gui`** — install `aranet-gui` or the macOS app for the desktop GUI (`cargo install aranet-cli --features gui` still builds it in)
+- **Leaner `aranet-cli` builds** — `aranet-service` is compiled only with the `cli` feature (it runs `aranet server`), so `aranet-tui`, `aranet-gui` and TUI-only builds no longer compile the HTTP server; the unused `axum` and `tower-http` dependencies were removed
+- **HTTP clients** — outgoing requests (webhooks, InfluxDB, Prometheus push gateway, service client) use HTTP/1.1, and `aranet server` no longer accepts cleartext HTTP/2 (the standalone `aranet-service` never did). The CLI, TUI and GUI no longer read macOS/Windows system proxy settings; `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` still apply
+- **Releases** — all seven crates take their version from the workspace manifest and are released with cargo-release: one `chore: release vX.Y.Z` commit, one `vX.Y.Z` tag on exactly that commit, and crates published to crates.io from that tag after the release binaries are built (CONTRIBUTING.md, "Releasing")
+- **GitHub Release titles and notes** now come from this changelog
+- **Homebrew** — one workflow (`.github/workflows/homebrew.yml`) updates the `cameronrye/aranet` tap after each release, and refuses to publish if a release asset is missing or doesn't match its published `.sha256`; pre-releases no longer touch the tap
+- **Screenshots** — the screenshot workflow pushes its updates to a `screenshots/<tag>` branch for review instead of committing to `main`
+
+### Removed
+
+- Unused Homebrew formula sources (`distribution/homebrew/`) and the `aranet-cli.rb` / `aranet-gui.rb` release assets that no tap installed
+
 ### Fixed
 
 - **Aranet2 and Aranet Radiation advertisements** are decoded at the offsets real devices use; Radiation dose rate is no longer reported 10× too high
@@ -18,19 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Service API** — `offset` without `limit` no longer returns 500; a rejected device update no longer corrupts the running configuration
 - **Service WebSocket** — API keys containing `+`, `/` or `=` now work from the dashboard, which URL-encodes the `?token=` value. Clients that send the key unencoded keep working (see Changed)
 - **macOS** — no longer leaks an OS thread on every Bluetooth connection. The shared Bluetooth adapter runs on a background thread of its own, so it keeps working for programs that use more than one tokio runtime, and it is replaced if its CoreBluetooth thread stops
-
-### Changed
-
-- **`aranet sync` with no device and no default device configured** now falls back to the last-used device, then (when `behavior.load_cache` is on, the default) the most recently seen device in the local database, as `read` and `status` do. It used to scan and prompt for a device, or fail with "No device specified" when not run interactively
-- **Where `aranet sync` stores history** — 0.2.1 stores history under the device address. History that 0.2.0 synced under any other identifier (a device name or part of one, a MAC address typed in lowercase or without colons, or part of a macOS device UUID) stays under that ID, and `report`, `history` and `cache` queries for the old ID stop receiving new records. The first sync after upgrading downloads the device's whole history buffer again under the address, and `aranet sync --all` syncs the sensor once for each ID it is stored under. The `device` field in single-device `aranet sync --format json` output is now also this address rather than the identifier given on the command line; `aranet sync --all` output is unchanged
-- **History deduplication window** — records within 30 s of a record already stored for the same device are skipped on every history write, including `aranet cache import` (so an import can now report skipped duplicates that are not exact timestamp matches). Aranet devices measure at most once a minute, so real records are never this close. Duplicate rows already in the database are not removed. Rows that 0.2.0 stored were shifted by the length of their download, which can exceed 30 s, so the first download after upgrading that overlaps them (such as `aranet history`, which saves the whole buffer) may still add a copy
-- **`aranet set smart-home` without a value** is now an error. 0.2.0 release builds read it as `false`, a request to turn Smart Home off
-- **Service WebSocket** — when the API key is sent as `?token=`, a request with more than one `token` parameter is now rejected. 0.2.0 used the first one
+- **Install scripts** — `aranet-cli-installer.sh`/`.ps1` and `aranet-gui-installer.sh`/`.ps1` offer every published platform again, and the macOS installs no longer fail with a checksum mismatch
+- **Checksums** — the `.sha256` files and `sha256.sum` match the signed macOS archives, and `sha256.sum` lists every archive
+- **Linux CLI** no longer needs GTK or libxdo installed
+- **Windows GUI** no longer opens a console window; as a result, `aranet-gui --help` and `--version` print nothing in a Windows terminal (use `aranet` there)
+- **macOS app** has its icon, minimum macOS version and Bluetooth usage descriptions; the `aranet-gui` binary in the macOS tarballs is Developer ID signed and notarized like the CLI
+- **`aranet-cli` with only the `tui` feature** (`cargo install aranet-cli --no-default-features --features tui`) compiles; the `aranet` binary now uses the library's TUI instead of compiling a second copy of it
 
 ### Security
 
 - **Linux BlueZ agent** — aranet was already BlueZ's default agent while running, and 0.2.0 approved every pairing and authorization request from any device. It now approves pairing, confirmation and authorization only for devices aranet has connected to (or tried to) since it started, and always rejects `AuthorizeService`, which lets a remote device use the host's own Bluetooth profiles (such as HID input). As before, these requests don't reach the desktop's agent while aranet runs; pair other devices from the desktop's Bluetooth settings, or stop aranet first
 - **Service logs** no longer record request query strings, which could include the API key
+- **Dependencies updated** to clear the 11 RustSec advisories that affect 0.2.0's lockfile: `h2` (RUSTSEC-2026-0258), `quick-xml` (RUSTSEC-2026-0194, RUSTSEC-2026-0195), `quinn-proto` (RUSTSEC-2026-0185), `rustls` (RUSTSEC-2026-0285), `rustls-webpki` (RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104) and `webbrowser` (RUSTSEC-2026-0257). This also replaces the unsound `anyhow`, `event-listener`, `lru`, `memmap2` and `rand` releases and the yanked `spin` 0.9.8
+- **One TLS stack for HTTP**: webhooks, InfluxDB export, the Prometheus push gateway and the TUI/GUI service client now use rustls on every platform, trusting the OS certificate store plus the bundled Mozilla roots. The Linux `aranet` binary no longer links OpenSSL. MQTT over TLS (`mqtts://`, the `mqtt` feature of `aranet-service`) still uses the platform TLS library until `rumqttc` ships a patched `rustls-webpki`
+- **GitHub Actions** — every workflow gives its `GITHUB_TOKEN` only the permissions each job needs, pins every action to a full commit SHA, and no longer leaves the token in the checkout's git config
+- **Homebrew tap token** — no longer handed to a third-party action
 
 ## [0.2.0] - 2026-03-28
 
