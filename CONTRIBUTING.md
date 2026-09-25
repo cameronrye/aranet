@@ -32,8 +32,13 @@ cargo build --workspace
 cargo test --workspace
 
 # Run tests with hardware (requires Aranet device)
-cargo test --workspace -- --ignored
+ARANET_DEVICE="Aranet4 12345" cargo test --workspace -- --ignored
 ```
+
+The CLI integration tests (`crates/aranet-cli/tests/cli_integration.rs`) run the
+`aranet` binary against a temporary config and data directory, so they never read
+or change your own. For the hardware tests, set `ARANET_DEVICE` to a device address
+or name: aliases from your config are not visible to them.
 
 ## How to Contribute
 
