@@ -25,7 +25,6 @@ jobs:
       matrix: ${{ fromJson(inputs.plan).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ fromJson(inputs.plan).announcement_tag }}
       VERSION: ${{ fromJson(inputs.plan).releases[0].app_version }}
       # README.md and the website use releases/latest, which never points at a
@@ -55,6 +54,9 @@ jobs:
           if ($version -ne "aranet $env:VERSION") { throw "aranet --version printed '$version'" }
       - name: Check the published files
         if: matrix.runner == 'ubuntu-22.04'
+        # Only this step gets the token, not the installers downloaded above.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release"
           scripts/release/check-release-files.sh "$RUNNER_TEMP/release"
