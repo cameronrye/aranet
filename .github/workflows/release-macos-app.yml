@@ -20,6 +20,9 @@ permissions:
 jobs:
   macos-app:
     name: macos-app (${{ matrix.target }})
+    # A hung build or notarization fails the job instead of holding the release
+    # for GitHub's 6-hour default.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -98,10 +101,13 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" \
+          # The trap removes the certificate if a command fails before the rm below.
+          cert="$RUNNER_TEMP/certificate.p12"
+          trap 'rm -f "$cert"' EXIT
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$cert"
+          security import "$cert" -P "$APPLE_CERTIFICATE_PASSWORD" \
             -A -t cert -f pkcs12 -k "$keychain"
-          rm -f "$RUNNER_TEMP/certificate.p12"
+          rm -f "$cert"
           security list-keychains -d user -s "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain"
@@ -131,12 +137,23 @@ jobs:
           set -euo pipefail
           codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DMG"
           key="$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          trap 'rm -f "$key"' EXIT
           printf '%s\n' "$APP_STORE_CONNECT_KEY" > "$key"
-          xcrun notarytool submit "$DMG" --key "$key" \
-            --key-id "$APP_STORE_CONNECT_KEY_ID" --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
-            --wait --output-format json | tee "$RUNNER_TEMP/notarize.json"
-          rm -f "$key"
-          jq -e '.status == "Accepted"' "$RUNNER_TEMP/notarize.json"
+          auth=(--key "$key" --key-id "$APP_STORE_CONNECT_KEY_ID" --issuer "$APP_STORE_CONNECT_ISSUER_ID")
+          # The status decides, not notarytool's exit code. On anything but Accepted
+          # (Invalid, Rejected, a timeout), print Apple's log for the submission.
+          result="$RUNNER_TEMP/notarize.json"
+          xcrun notarytool submit "$DMG" "${auth[@]}" \
+            --wait --timeout 45m --output-format json > "$result" || true
+          cat "$result"
+          if ! jq -e '.status == "Accepted"' "$result" > /dev/null; then
+            id="$(jq -r '.id // empty' "$result" 2>/dev/null || true)"
+            if [ -n "$id" ]; then
+              xcrun notarytool log "$id" "${auth[@]}" || true
+            fi
+            echo "::error::Notarization did not report Accepted"
+            exit 1
+          fi
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
           spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
