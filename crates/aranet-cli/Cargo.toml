@@ -17,8 +17,10 @@ path = "src/main.rs"
 
 # These tests run `aranet <subcommand>`, and subcommands only exist with `cli`.
 # Without `cli` the binary starts the TUI whatever the arguments, so skip them.
+# The explicit path lets the manifest parse in the Docker builds, which don't copy tests/.
 [[test]]
 name = "cli_integration"
+path = "tests/cli_integration.rs"
 required-features = ["cli"]
 
 [features]
