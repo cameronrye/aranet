@@ -3,8 +3,8 @@
 # Cargo.toml lists this workflow in `local-artifacts-jobs`, so the generated
 # release.yml runs it next to release-build-local.yml. The DMG and its .sha256 are
 # uploaded as an `artifacts-*` artifact, so they are attached to the GitHub
-# Release with everything else. They are not in dist's sha256.sum; the Homebrew
-# cask hashes the DMG itself.
+# Release with everything else. They are not in dist's sha256.sum; homebrew.yml
+# checks each DMG against its .sha256 and hashes it for the cask.
 name: Release / macOS app
 
 on:

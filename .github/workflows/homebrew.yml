@@ -99,9 +99,17 @@ jobs:
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$f" --pattern "$f.sha256"
             sha256sum -c "$f.sha256"
           done
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'Aranet-aarch64-apple-darwin.dmg' \
-            --pattern 'Aranet-x86_64-apple-darwin.dmg'
+          for dmg in Aranet-aarch64-apple-darwin.dmg Aranet-x86_64-apple-darwin.dmg; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$dmg" --pattern "$dmg.sha256"
+            test -f "$dmg"
+            if [ -f "$dmg.sha256" ]; then
+              sha256sum -c "$dmg.sha256"
+            elif [ "$TAG" != v0.2.0 ]; then
+              # v0.2.0 is the only release with DMGs but no .dmg.sha256.
+              echo "::error::${TAG} has no ${dmg}.sha256"
+              exit 1
+            fi
+          done
 
       - name: Render formula and cask
         if: steps.tag.outputs.publish == 'true'
