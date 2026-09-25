@@ -4,7 +4,7 @@ Configuration files and templates for distributing Aranet binaries via package m
 
 ## Package Manager Installation
 
-### Homebrew (macOS/Linux)
+### Homebrew (macOS, Linux x86_64)
 
 ```bash
 # Add the tap and install
