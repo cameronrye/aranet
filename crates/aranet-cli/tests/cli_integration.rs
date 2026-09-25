@@ -1,15 +1,21 @@
 //! CLI Integration Tests
 //!
-//! These tests verify the CLI binary output formats and command behaviors.
-//! Some tests require actual hardware and are marked with #[ignore].
+//! These tests run the real `aranet` binary. Every run goes through [`TestEnv`],
+//! which gives the binary its own empty config and data directories and removes
+//! `ARANET_*` variables inherited from your shell. The tests therefore never read
+//! or write your real config or database, and behave the same on every machine.
 //!
-//! Run mock tests:
-//! ```
+//! Tests that need Bluetooth are `#[ignore]`d. A non-ignored test that takes more
+//! than [`COMMAND_TIMEOUT`] fails, because that almost always means it is scanning.
+//!
+//! Run the hermetic tests:
+//! ```text
 //! cargo test --package aranet-cli --test cli_integration
 //! ```
 //!
-//! Run hardware tests:
-//! ```
+//! Run the hardware tests. `ARANET_DEVICE` must be an address or device name:
+//! aliases from your own config are not visible to the tests.
+//! ```text
 //! ARANET_DEVICE="Aranet4 12345" cargo test --package aranet-cli --test cli_integration -- --ignored --nocapture
 //! ```
 
@@ -166,54 +172,6 @@ fn read_in_background(mut pipe: impl Read + Send + 'static) -> thread::JoinHandl
     })
 }
 
-/// Get path to the aranet binary
-fn get_binary_path() -> String {
-    if let Some(bin) = option_env!("CARGO_BIN_EXE_aranet") {
-        return bin.to_string();
-    }
-
-    // Try release first, then debug
-    let release_path = env!("CARGO_MANIFEST_DIR").to_string() + "/../../target/release/aranet";
-    let debug_path = env!("CARGO_MANIFEST_DIR").to_string() + "/../../target/debug/aranet";
-
-    if std::path::Path::new(&release_path).exists() {
-        release_path
-    } else if std::path::Path::new(&debug_path).exists() {
-        debug_path
-    } else {
-        // Fall back to cargo run
-        "cargo".to_string()
-    }
-}
-
-/// Run aranet command and return output
-fn run_aranet(args: &[&str]) -> Output {
-    run_aranet_with_env(args, &[])
-}
-
-/// Run aranet command with additional environment variables.
-fn run_aranet_with_env(args: &[&str], envs: &[(String, String)]) -> Output {
-    let binary = get_binary_path();
-
-    if binary == "cargo" {
-        let mut command = Command::new("cargo");
-        command
-            .args(["run", "--package", "aranet-cli", "--"])
-            .args(args);
-        for (key, value) in envs {
-            command.env(key, value);
-        }
-        command.output().expect("Failed to run aranet via cargo")
-    } else {
-        let mut command = Command::new(&binary);
-        command.args(args);
-        for (key, value) in envs {
-            command.env(key, value);
-        }
-        command.output().expect("Failed to run aranet binary")
-    }
-}
-
 fn seed_history_database(path: &Path, device_id: &str, alias: Option<&str>) {
     let store = Store::open(path).expect("open store");
     store
@@ -244,7 +202,7 @@ fn seed_history_database(path: &Path, device_id: &str, alias: Option<&str>) {
         .expect("insert history");
 }
 
-/// Get device from environment
+/// Device for the hardware tests, from the test process's own environment.
 fn get_device() -> Option<String> {
     env::var("ARANET_DEVICE").ok().filter(|s| !s.is_empty())
 }
@@ -539,7 +497,8 @@ fn test_sync_all_json_empty_is_machine_readable() {
 #[test]
 #[ignore = "requires BLE hardware"]
 fn test_scan_text_output() {
-    let output = run_aranet(&["scan", "--timeout", "5"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["scan", "--timeout", "5"]);
 
     // Scan may find no devices, but should complete
     assert!(output.status.success(), "Scan should complete");
@@ -548,7 +507,8 @@ fn test_scan_text_output() {
 #[test]
 #[ignore = "requires BLE hardware"]
 fn test_scan_json_output() {
-    let output = run_aranet(&["scan", "--timeout", "5", "--format", "json"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["scan", "--timeout", "5", "--format", "json"]);
 
     assert!(output.status.success(), "Scan JSON should complete");
 
@@ -568,7 +528,8 @@ fn test_scan_json_output() {
 #[test]
 #[ignore = "requires BLE hardware"]
 fn test_scan_csv_output() {
-    let output = run_aranet(&["scan", "--timeout", "5", "--format", "csv"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["scan", "--timeout", "5", "--format", "csv"]);
 
     assert!(output.status.success(), "Scan CSV should complete");
 
@@ -601,7 +562,8 @@ fn test_read_text_output() {
         }
     };
 
-    let output = run_aranet(&["read", "--device", &device]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["read", "--device", &device]);
 
     assert!(output.status.success(), "Read should succeed");
 
@@ -629,7 +591,8 @@ fn test_read_json_output() {
         }
     };
 
-    let output = run_aranet(&["read", "--device", &device, "--format", "json"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["read", "--device", &device, "--format", "json"]);
 
     assert!(output.status.success(), "Read JSON should succeed");
 
@@ -657,7 +620,8 @@ fn test_read_json_compact() {
         }
     };
 
-    let output = run_aranet(&["--compact", "read", "--device", &device, "--format", "json"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["--compact", "read", "--device", &device, "--format", "json"]);
 
     assert!(output.status.success(), "Read JSON compact should succeed");
 
@@ -684,7 +648,8 @@ fn test_read_csv_output() {
         }
     };
 
-    let output = run_aranet(&["read", "--device", &device, "--format", "csv"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["read", "--device", &device, "--format", "csv"]);
 
     assert!(output.status.success(), "Read CSV should succeed");
 
@@ -720,7 +685,8 @@ fn test_read_csv_no_header() {
         }
     };
 
-    let output = run_aranet(&[
+    let env = TestEnv::for_hardware();
+    let output = env.run(&[
         "read",
         "--device",
         &device,
@@ -760,7 +726,8 @@ fn test_read_fahrenheit() {
         }
     };
 
-    let output = run_aranet(&["read", "--device", &device, "--fahrenheit"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["read", "--device", &device, "--fahrenheit"]);
 
     assert!(
         output.status.success(),
@@ -787,7 +754,8 @@ fn test_read_quiet_mode() {
         }
     };
 
-    let output = run_aranet(&["--quiet", "read", "--device", &device, "--format", "json"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["--quiet", "read", "--device", &device, "--format", "json"]);
 
     assert!(output.status.success(), "Quiet read should succeed");
 
@@ -815,7 +783,8 @@ fn test_status_output() {
         }
     };
 
-    let output = run_aranet(&["status", "--device", &device]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["status", "--device", &device]);
 
     assert!(output.status.success(), "Status should succeed");
 
@@ -834,7 +803,8 @@ fn test_status_brief() {
         }
     };
 
-    let output = run_aranet(&["status", "--device", &device, "--brief"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["status", "--device", &device, "--brief"]);
 
     assert!(output.status.success(), "Brief status should succeed");
 
@@ -864,7 +834,8 @@ fn test_info_output() {
         }
     };
 
-    let output = run_aranet(&["info", "--device", &device]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["info", "--device", &device]);
 
     assert!(output.status.success(), "Info should succeed");
 
@@ -891,7 +862,8 @@ fn test_info_json() {
         }
     };
 
-    let output = run_aranet(&["info", "--device", &device, "--format", "json"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["info", "--device", &device, "--format", "json"]);
 
     assert!(output.status.success(), "Info JSON should succeed");
 
@@ -921,7 +893,8 @@ fn test_history_limited_count() {
         }
     };
 
-    let output = run_aranet(&["history", "--device", &device, "--count", "5"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["history", "--device", &device, "--count", "5"]);
 
     assert!(output.status.success(), "History should succeed");
 }
@@ -937,7 +910,8 @@ fn test_history_json() {
         }
     };
 
-    let output = run_aranet(&[
+    let env = TestEnv::for_hardware();
+    let output = env.run(&[
         "history", "--device", &device, "--count", "5", "--format", "json",
     ]);
 
@@ -969,8 +943,9 @@ fn test_watch_limited_count() {
         }
     };
 
+    let env = TestEnv::for_hardware();
     // Watch with 2 readings at 2-second interval
-    let output = run_aranet(&[
+    let output = env.run(&[
         "watch",
         "--device",
         &device,
@@ -999,7 +974,8 @@ fn test_watch_json() {
         }
     };
 
-    let output = run_aranet(&[
+    let env = TestEnv::for_hardware();
+    let output = env.run(&[
         "watch",
         "--device",
         &device,
@@ -1091,7 +1067,9 @@ fn test_missing_required_args() {
 #[test]
 #[ignore = "requires BLE hardware"]
 fn test_invalid_device() {
-    let output = run_aranet(&["read", "--device", "NonExistentDevice12345"]);
+    let env = TestEnv::for_hardware();
+    // -T 2 keeps the three lookup scans to 2 + 4 + 6 s.
+    let output = env.run(&["read", "--device", "NonExistentDevice12345", "-T", "2"]);
 
     // Should fail with a reasonable error
     assert!(
@@ -1125,10 +1103,10 @@ fn test_output_to_file() {
         }
     };
 
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let output_path = temp_dir.path().join("output.json");
+    let env = TestEnv::for_hardware();
+    let output_path = env.root.path().join("output.json");
 
-    let output = run_aranet(&[
+    let output = env.run(&[
         "--output",
         output_path.to_str().unwrap(),
         "read",
