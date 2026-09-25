@@ -187,7 +187,8 @@ dependencies.
 6. Update the website's release information (`website/src/site-config.mjs` and
    `website/src/content/docs/docs/changelog.mdx`) in a follow-up pull request.
 
-Release tags are protected: they can't be moved or deleted. If the Release workflow fails after the tag is
+Release tags (`v*`, except pre-release tags `v*-*`) are protected by the repository ruleset "Protect release tags"
+(Settings → Rules → Rulesets): they can't be moved or deleted. If the Release workflow fails after the tag is
 pushed, nothing has reached crates.io yet; fix the cause on `main` and release the next patch version.
 
 ### Pre-releases
