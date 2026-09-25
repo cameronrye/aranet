@@ -48,6 +48,9 @@ const HARDWARE_TIMEOUT: Duration = Duration::from_secs(300);
 const REMOVED_VARS: &[&str] = &["RUST_LOG", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE"];
 
 /// An isolated config directory, data directory and home directory for one test.
+///
+/// This is the only place that starts the `aranet` binary
+/// (see `test_binary_is_only_started_by_test_env`).
 struct TestEnv {
     root: TempDir,
     config_dir: PathBuf,
@@ -205,6 +208,49 @@ fn seed_history_database(path: &Path, device_id: &str, alias: Option<&str>) {
 /// Device for the hardware tests, from the test process's own environment.
 fn get_device() -> Option<String> {
     env::var("ARANET_DEVICE").ok().filter(|s| !s.is_empty())
+}
+
+// =============================================================================
+// Guard
+// =============================================================================
+
+/// Every `aranet` run must go through `TestEnv::command`. A second spawn site in
+/// this file, or any other test file that starts the binary, bypasses the isolation.
+#[test]
+fn test_binary_is_only_started_by_test_env() {
+    // `concat!` keeps these patterns from matching this test's own source.
+    let spawn = concat!("Command", "::new(");
+    let binary = concat!("CARGO_BIN_EXE", "_aranet");
+
+    let this_file = include_str!("cli_integration.rs");
+    assert_eq!(
+        this_file.matches(spawn).count(),
+        1,
+        "only TestEnv::command may create a Command; use TestEnv::run"
+    );
+    assert_eq!(
+        this_file.matches(binary).count(),
+        1,
+        "only TestEnv::command may refer to the aranet binary"
+    );
+
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    for entry in fs::read_dir(&tests_dir).expect("read tests dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_some_and(|ext| ext == "rs")
+            && path
+                .file_name()
+                .is_some_and(|name| name != "cli_integration.rs")
+        {
+            let source = fs::read_to_string(&path).expect("read test file");
+            assert!(
+                !source.contains(binary),
+                "{} starts the aranet binary directly; move TestEnv into tests/common \
+                 and use it there",
+                path.display()
+            );
+        }
+    }
 }
 
 // =============================================================================
