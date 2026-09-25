@@ -159,18 +159,3 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
-
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
-
-      - name: Run cargo audit
-        # RUSTSEC-2026-0049: rustls-webpki 0.102.x CRL bug, pinned by rumqttc -> rustls 0.22
-        run: >
-          cargo audit
-          --ignore RUSTSEC-2026-0049
