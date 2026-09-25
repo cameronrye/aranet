@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-cli"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 dependencies = [
  "anyhow",
  "aranet-core",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-core"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 dependencies = [
  "aranet-types",
  "btleplug",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-gui"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 dependencies = [
  "anyhow",
  "aranet-cli",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-service"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 dependencies = [
  "anyhow",
  "aranet-core",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-store"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 dependencies = [
  "aranet-types",
  "csv",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-tui"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 dependencies = [
  "anyhow",
  "aranet-cli",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "aranet-types"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 dependencies = [
  "bytes",
  "proptest",
