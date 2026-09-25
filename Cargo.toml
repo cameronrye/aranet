@@ -67,16 +67,16 @@ gui = []
 inherits = "release"
 lto = "thin"
 
-# Config for 'cargo dist'
+# Config for dist (cargo-dist), which generates .github/workflows/release.yml.
+# After changing anything in these tables, regenerate the workflow with the
+# pinned version (`dist generate`) and commit both. The workflow's plan job
+# fails on every pull request while the two disagree.
 [workspace.metadata.dist]
-# The preferred cargo-dist version to use in CI (Conditions to update this are the same
-# having issues/incremental improvements released.)
+# The release workflow downloads exactly this version.
 cargo-dist-version = "0.31.0"
-# CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
-# Target platforms to build for
+# Built once, in the build-global-artifacts job, from every target's archive.
+installers = ["shell", "powershell"]
 targets = [
     "aarch64-apple-darwin",
     "aarch64-unknown-linux-gnu",
@@ -84,22 +84,35 @@ targets = [
     "x86_64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
 ]
-# Path that installers should place binaries in
 install-path = "CARGO_HOME"
-# Whether to install an updater program
 install-updater = false
-# Publish jobs to run in CI
 pr-run-mode = "plan"
-# Whether to auto-include files like README/LICENSE
 auto-includes = true
-# Skip aranet-service in distributions (it's a separate deployment)
-# Only distribute aranet (CLI) and aranet-tui binaries
-allow-dirty = ["ci"]
+# Build each shipped package on its own (`cargo build --package ...`). Without
+# this, one workspace build unifies features and the `aranet` CLI gets the
+# `gui` feature that aranet-gui turns on, so the Linux CLI needs GTK.
+precise-builds = true
 
-# Homebrew tap configuration
-[workspace.metadata.dist.homebrew]
-# The GitHub repository to push the Homebrew formula to
-tap = "cameronrye/homebrew-aranet"
-# The formula name (defaults to package name)
-formula = "aranet"
+# Pin every action dist writes into release.yml to a full commit SHA: the same
+# commits as the hand-written workflows, plus the actions dist 0.31.0 only uses
+# when other features are turned on. dist copies each value verbatim after the
+# `@`, so the "# vX.Y.Z" suffix becomes the YAML comment that records the version.
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0"
+"actions/upload-artifact" = "b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0"
+"actions/download-artifact" = "37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0"
+"actions/attest-build-provenance" = "96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0"
+"swatinem/rust-cache" = "6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2"
+"actions/setup-node" = "249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0"
 
+# Linux build packages. aranet: dbus. aranet-gui: also gtk, xdo, xcb, xkbcommon.
+# No OpenSSL: the shipped packages use rustls (see `reqwest` above).
+[workspace.metadata.dist.dependencies.apt]
+pkg-config = "*"
+libdbus-1-dev = "*"
+libgtk-3-dev = "*"
+libxdo-dev = "*"
+libxcb-render0-dev = "*"
+libxcb-shape0-dev = "*"
+libxcb-xfixes0-dev = "*"
+libxkbcommon-dev = "*"
