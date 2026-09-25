@@ -26,9 +26,10 @@ mod util;
 #[cfg(feature = "cli")]
 use aranet_cli::config;
 
-// TUI module (conditionally compiled)
+// The TUI lives in the library (`aranet_cli::tui`, which aranet-tui also uses).
+// Import it from there instead of compiling `src/tui/` a second time as a bin module.
 #[cfg(feature = "tui")]
-mod tui;
+use aranet_cli::tui;
 
 use anyhow::Result;
 

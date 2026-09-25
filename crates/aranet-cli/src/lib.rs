@@ -106,7 +106,7 @@ pub fn local_now_fmt(fmt: &str) -> String {
 // Config module - needed by both TUI and GUI
 pub mod config;
 
-// TUI module - publicly exposed for aranet-tui crate to use
+// TUI module - used by the `aranet` binary and the aranet-tui crate
 #[cfg(feature = "tui")]
 pub mod tui;
 
