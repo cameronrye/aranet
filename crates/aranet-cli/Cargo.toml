@@ -1,6 +1,6 @@
 [package]
 name = "aranet-cli"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -32,9 +32,9 @@ tui = ["dep:ratatui", "dep:crossterm"]
 gui = ["dep:egui", "dep:eframe", "dep:egui_plot", "dep:image", "dep:tray-icon", "dep:notify-rust", "dep:open", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]
-aranet-core = { version = "0.2.0", path = "../aranet-core", features = ["service-client"] }
-aranet-store = { version = "0.2.0", path = "../aranet-store" }
-aranet-types = { version = "0.2.0", path = "../aranet-types" }
+aranet-core = { workspace = true, features = ["service-client"] }
+aranet-store.workspace = true
+aranet-types.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -51,7 +51,7 @@ terminal_size = "0.4"
 
 # CLI-only dependencies (optional)
 # `aranet server` runs the aranet-service HTTP API and collector in-process
-aranet-service = { version = "0.2.0", path = "../aranet-service", optional = true }
+aranet-service = { workspace = true, optional = true }
 clap = { workspace = true, features = ["env"], optional = true }
 clap_complete = { version = "4", optional = true }
 dialoguer = { version = "0.12.0", optional = true }
