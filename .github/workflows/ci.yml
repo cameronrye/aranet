@@ -121,6 +121,8 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -148,7 +150,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build documentation
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps --all-features
 
   coverage:
     name: Code Coverage
