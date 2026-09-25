@@ -37,7 +37,10 @@ futures = "0.3"
 rand = "0.9"
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.9"
-reqwest = { version = "0.12", features = ["json"] }
+# rustls only, so no binary links OpenSSL through reqwest. Trust the OS certificate store
+# (private CAs keep working) plus the bundled Mozilla roots (containers without ca-certificates).
+# No http2/charset/system-proxy: HTTP/1.1 only; proxies come from HTTP_PROXY/HTTPS_PROXY/NO_PROXY.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
 
 [workspace.metadata.features]
 default = ["cli"]

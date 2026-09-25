@@ -62,11 +62,13 @@ time.workspace = true
 dirs = "6"
 service-manager = "0.10.0"
 
-# MQTT support (optional)
+# MQTT support (optional). Stays on native-tls (OpenSSL on Linux): rumqttc 0.25.1's rustls
+# backend pins rustls-webpki 0.102, which has unpatched advisories (RUSTSEC-2026-0049/-0098/
+# -0099/-0104; bytebeamio/rumqtt#1067). Switch to rustls when a rumqttc release fixes that.
 rumqttc = { version = "0.25.1", optional = true, default-features = false, features = ["use-native-tls"] }
 
-# HTTP client for webhooks, InfluxDB, and Prometheus push gateway
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# HTTP client for webhooks, InfluxDB, and Prometheus push gateway (TLS: see root Cargo.toml)
+reqwest.workspace = true
 
 # Desktop notifications (optional)
 notify-rust = { version = "4", optional = true }
