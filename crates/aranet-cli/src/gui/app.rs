@@ -1663,7 +1663,7 @@ impl eframe::App for AranetApp {
                         self.theme.spacing.lg as i8,
                         self.theme.spacing.md as i8,
                     ))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle)),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1778,7 +1778,7 @@ impl eframe::App for AranetApp {
                         self.theme.spacing.lg as i8,
                         self.theme.spacing.sm as i8,
                     ))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle)),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {

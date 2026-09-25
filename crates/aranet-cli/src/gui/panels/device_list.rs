@@ -25,7 +25,7 @@ impl AranetApp {
                     egui::Frame::new()
                         .fill(self.theme.bg_secondary)
                         .inner_margin(egui::Margin::symmetric(4, 8))
-                        .stroke(egui::Stroke::new(1.0, self.theme.border_subtle)),
+                        .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle)),
                 )
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
@@ -83,7 +83,7 @@ impl AranetApp {
                 egui::Frame::new()
                     .fill(self.theme.bg_secondary)
                     .inner_margin(egui::Margin::same(self.theme.spacing.md as i8))
-                    .stroke(egui::Stroke::new(1.0, self.theme.border_subtle)),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.border_subtle)),
             )
             .show(ctx, |ui| {
                 // Header with collapse button
@@ -351,7 +351,7 @@ impl AranetApp {
                                     .corner_radius(egui::CornerRadius::same(
                                         self.theme.rounding.md as u8,
                                     ))
-                                    .stroke(egui::Stroke::new(1.0, border_color))
+                                    .stroke(egui::Stroke::new(1.0_f32, border_color))
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
                                         ui.vertical(|ui| {

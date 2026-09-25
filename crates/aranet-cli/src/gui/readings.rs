@@ -131,7 +131,7 @@ fn render_co2_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, co2: 
         .fill(bg_color)
         .inner_margin(egui::Margin::same(theme.spacing.lg as i8))
         .corner_radius(egui::CornerRadius::same(theme.rounding.lg as u8))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.4)))
         .shadow(theme.subtle_shadow())
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -242,7 +242,7 @@ fn render_radon_card(ui: &mut egui::Ui, theme: &Theme, device: &DeviceState, rad
         .fill(bg_color)
         .inner_margin(egui::Margin::same(theme.spacing.lg as i8))
         .corner_radius(egui::CornerRadius::same(theme.rounding.lg as u8))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.4)))
         .shadow(theme.subtle_shadow())
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -397,7 +397,7 @@ fn render_radiation_card(ui: &mut egui::Ui, theme: &Theme, rate: f32, total: Opt
         .fill(bg_color)
         .inner_margin(egui::Margin::same(theme.spacing.lg as i8))
         .corner_radius(egui::CornerRadius::same(theme.rounding.lg as u8))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.4)))
         .shadow(theme.subtle_shadow())
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
