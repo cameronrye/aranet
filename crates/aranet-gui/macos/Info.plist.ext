@@ -1,0 +1,4 @@
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors.</string>

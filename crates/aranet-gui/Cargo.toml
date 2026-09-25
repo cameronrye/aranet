@@ -26,17 +26,16 @@ clap.workspace = true
 [package.metadata.dist]
 dist = true
 
-# cargo-bundle configuration for native app bundles
+# cargo-bundle builds the macOS Aranet.app from these tables
+# (.github/workflows/release-macos-app.yml). The workflow pins cargo-bundle
+# 0.12.0 and runs it from this directory, so paths are relative to this file,
+# and a misspelt key fails the build instead of being ignored. The bundle
+# version is the package version.
 [package.metadata.bundle]
-# Human-readable name for the application
 name = "Aranet"
-# Bundle identifier (reverse DNS notation)
 identifier = "dev.rye.aranet"
-# Path to the icon file (relative to Cargo.toml)
 icon = ["../../assets/aranet-icon.png", "../../assets/aranet-icon.icns"]
-# Short description
 short_description = "Monitor Aranet environmental sensors"
-# Long description
 long_description = """
 Aranet is a native desktop application for monitoring Aranet environmental sensors
 including Aranet4 (CO2), Aranet2 (temperature/humidity), AranetRn+ (radon),
@@ -49,27 +48,11 @@ Features:
 - Multi-device support
 - System tray with quick access
 """
-# Copyright notice
 copyright = "Copyright (c) 2024-2026 Cameron Rye"
-# Application category (macOS)
 category = "public.app-category.utilities"
-# Resources to bundle (relative to Cargo.toml)
-resources = ["../../assets/aranet-icon.png"]
 
-# macOS-specific settings
-[package.metadata.bundle.macos]
-# Minimum macOS version
+[package.metadata.bundle.osx]
 minimum_system_version = "11.0"
-# Code signing identity (set via environment variable in CI)
-# signing_identity = "Developer ID Application: ..."
-# Entitlements file for hardened runtime (Bluetooth access, etc.)
-entitlements = "entitlements.plist"
-# High resolution capable
-high_resolution = true
-# Info.plist values for privacy permissions
-info_plist = { NSBluetoothAlwaysUsageDescription = "Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors.", NSBluetoothPeripheralUsageDescription = "Aranet uses Bluetooth to discover and connect to your Aranet environmental sensors." }
-
-# Windows-specific settings
-[package.metadata.bundle.windows]
-# Windows subsystem (windows = no console, console = with console)
-subsystem = "windows"
+# Bluetooth usage strings, appended to Info.plist. macOS does not let the app
+# use Bluetooth without them.
+info_plist_exts = ["macos/Info.plist.ext"]
