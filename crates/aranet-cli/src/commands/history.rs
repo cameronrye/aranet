@@ -61,8 +61,8 @@ fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
     }
 
     // Try YYYY-MM-DD format (treat as start of day in UTC)
-    let format =
-        time::format_description::parse("[year]-[month]-[day]").expect("valid format description");
+    let format = time::format_description::parse_borrowed::<1>("[year]-[month]-[day]")
+        .expect("valid format description");
     if let Ok(date) = time::Date::parse(s, &format) {
         return Ok(date.with_hms(0, 0, 0).expect("valid time").assume_utc());
     }

@@ -1572,8 +1572,10 @@ impl App {
                 let now = time::OffsetDateTime::now_local()
                     .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
                 now.format(
-                    &time::format_description::parse("[year][month][day]_[hour][minute][second]")
-                        .unwrap_or_default(),
+                    &time::format_description::parse_borrowed::<1>(
+                        "[year][month][day]_[hour][minute][second]",
+                    )
+                    .unwrap_or_default(),
                 )
                 .unwrap_or_default()
             };
@@ -1631,8 +1633,10 @@ impl App {
             let now = time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
             now.format(
-                &time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]")
-                    .unwrap_or_default(),
+                &time::format_description::parse_borrowed::<1>(
+                    "[year]-[month]-[day]T[hour]:[minute]:[second]",
+                )
+                .unwrap_or_default(),
             )
             .unwrap_or_default()
         };
@@ -1695,10 +1699,12 @@ impl App {
                 .as_deref()
                 .unwrap_or(&device.id)
                 .replace(' ', "_"),
-            time::format_description::parse("[year][month][day]_[hour][minute][second]")
-                .ok()
-                .and_then(|fmt| now.format(&fmt).ok())
-                .unwrap_or_else(|| "export".to_string()),
+            time::format_description::parse_borrowed::<1>(
+                "[year][month][day]_[hour][minute][second]"
+            )
+            .ok()
+            .and_then(|fmt| now.format(&fmt).ok())
+            .unwrap_or_else(|| "export".to_string()),
             self.export_format.extension()
         );
         let path = export_dir.join(&filename);
