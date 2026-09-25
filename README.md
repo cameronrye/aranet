@@ -97,7 +97,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex
 ```
 
-On a minimal Linux system, such as a container image, install `curl`, `ca-certificates` and `xz-utils` first (for example `apt-get install curl ca-certificates xz-utils`): the installer downloads with `curl` and unpacks a `.tar.xz` archive.
+On a minimal Linux system, such as a container image, first install `curl`, `ca-certificates`, `xz-utils` and the D-Bus library (for example `apt-get update && apt-get install -y curl ca-certificates xz-utils libdbus-1-3`, as root or with `sudo`): the installer downloads with `curl` and unpacks a `.tar.xz` archive, and `aranet` needs `libdbus-1.so.3` to talk to BlueZ.
 
 Or install from [crates.io](https://crates.io/crates/aranet-cli):
 

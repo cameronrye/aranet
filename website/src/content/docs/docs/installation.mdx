@@ -32,6 +32,8 @@ irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-ins
   </TabItem>
 </Tabs>
 
+On a minimal Linux system, such as a container image, first install `curl`, `ca-certificates`, `xz-utils` and the D-Bus library (for example `apt-get update && apt-get install -y curl ca-certificates xz-utils libdbus-1-3`, as root or with `sudo`): the installer downloads with `curl` and unpacks a `.tar.xz` archive, and `aranet` needs `libdbus-1.so.3` to talk to BlueZ.
+
 ## Download Direct
 
 Download binaries directly from GitHub Releases:
@@ -45,6 +47,9 @@ Download binaries directly from GitHub Releases:
   </Card>
   <Card title="Linux (x86_64)" icon="linux">
     [aranet-cli-x86_64-unknown-linux-gnu.tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-unknown-linux-gnu.tar.xz)
+  </Card>
+  <Card title="Linux (ARM64)" icon="linux">
+    [aranet-cli-aarch64-unknown-linux-gnu.tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-aarch64-unknown-linux-gnu.tar.xz)
   </Card>
   <Card title="Windows (x86_64)" icon="seti:windows">
     [aranet-cli-x86_64-pc-windows-msvc.zip](https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-x86_64-pc-windows-msvc.zip)
