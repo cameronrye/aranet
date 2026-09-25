@@ -10,6 +10,8 @@ import { CURRENT_RELEASE_TAG } from '../../../site-config.mjs';
 
 Download pre-built binaries for the Aranet CLI and Desktop GUI applications. The CLI release already includes the built-in `aranet tui` subcommand.
 
+The prebuilt Linux binaries (x86_64 and ARM64) need glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Raspberry Pi OS Bookworm, Fedora 36 or later (not RHEL 9 or its rebuilds, which have glibc 2.34). On an older system the install script stops with "no compatible downloads were found"; build from source there instead (see [Source Code](#source-code)). The macOS app needs macOS 11 (Big Sur) or later.
+
 ## Desktop Application (GUI)
 
 The native desktop application with real-time monitoring, charts, and multi-device support.
@@ -52,7 +54,7 @@ The native desktop application with real-time monitoring, charts, and multi-devi
         <small>[checksum](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-x86_64-unknown-linux-gnu.tar.xz.sha256)</small>
       </Card>
       <Card title="Linux (ARM64)" icon="linux">
-        **For 64-bit ARM Linux, such as Raspberry Pi OS (64-bit)**
+        **For 64-bit ARM Linux with glibc 2.35 or newer, such as Raspberry Pi OS (64-bit) Bookworm or later**
 
         [Download tar.xz](https://github.com/cameronrye/aranet/releases/latest/download/aranet-gui-aarch64-unknown-linux-gnu.tar.xz)
 

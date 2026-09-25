@@ -23,6 +23,8 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cameronrye/aranet/relea
 
 On a minimal Linux system, such as a container image, first install `curl`, `ca-certificates`, `xz-utils` and the D-Bus library (for example `apt-get update && apt-get install -y curl ca-certificates xz-utils libdbus-1-3`, as root or with `sudo`): the installer downloads with `curl` and unpacks a `.tar.xz` archive, and `aranet` needs `libdbus-1.so.3` to talk to BlueZ.
 
+The Linux builds need glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Raspberry Pi OS Bookworm, Fedora 36 or later (not RHEL 9 or its rebuilds, which have glibc 2.34).
+
 ### PowerShell (Windows)
 
 ```powershell
