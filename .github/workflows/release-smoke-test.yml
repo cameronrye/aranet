@@ -167,9 +167,11 @@ jobs:
           hdiutil detach "$mnt" || { sleep 10; hdiutil detach -force "$mnt"; }
 
       # ---- Windows ----
+      # Windows PowerShell 5.1: the only PowerShell on a fresh Windows install, and
+      # what distribution/README.md's `powershell -ExecutionPolicy ByPass -c` runs.
       - name: Install the CLI and GUI (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'cargo-home'

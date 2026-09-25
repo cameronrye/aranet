@@ -43,9 +43,11 @@ jobs:
           export CARGO_HOME="$RUNNER_TEMP/cargo-home"
           curl --proto '=https' --tlsv1.2 -LsSf "$BASE_URL/aranet-cli-installer.sh" | sh
           test "$("$CARGO_HOME/bin/aranet" --version)" = "aranet $VERSION"
+      # Windows PowerShell 5.1: the only PowerShell on a fresh Windows install, and
+      # what distribution/README.md's `powershell -ExecutionPolicy ByPass -c` runs.
       - name: Install the CLI with the documented one-liner (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'cargo-home'
