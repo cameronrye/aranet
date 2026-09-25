@@ -130,6 +130,82 @@ aranet/
 └── website/             # Documentation website
 ```
 
+## Releasing (maintainers)
+
+All seven crates share one version: `version` under `[workspace.package]` in the root `Cargo.toml`.
+Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release) 1.1.6; its settings are in
+`release.toml` and in `[package.metadata.release]` of `crates/aranet-cli/Cargo.toml`. A release is one
+`chore: release vX.Y.Z` commit on `main`, one `vX.Y.Z` tag on exactly that commit, and crates published
+from that tag.
+
+You need cargo-release 1.1.6 (`cargo install cargo-release --version 1.1.6 --locked`, or the binary from
+its GitHub release), `gh` logged in, and a crates.io token that can publish the seven crates (`cargo login`).
+Publishing builds every crate, including aranet-gui, so use a Mac or a Linux machine with the GUI build
+dependencies.
+
+1. Check that `CHANGELOG.md` lists every change under `## [Unreleased]`.
+2. On a release branch, bump the version and date the changelog, then open a pull request:
+   ```bash
+   git switch main && git pull --ff-only
+   git switch -c release/v0.2.1
+   cargo release 0.2.1 --no-publish --no-tag --no-push             # dry run: read what it would change
+   cargo release 0.2.1 --no-publish --no-tag --no-push --execute   # commits "chore: release v0.2.1"
+   git push -u origin release/v0.2.1
+   gh pr create --fill
+   ```
+3. When CI is green, merge the pull request (rebase or squash), and merge nothing else until step 4 is done.
+4. Tag the release commit and push the tag. This starts the Release workflow (binaries, installers,
+   GitHub Release, Homebrew tap):
+   ```bash
+   git switch main && git pull --ff-only
+   git log -1 --format=%s | grep -E '^chore: release v0\.2\.1( \(#[0-9]+\))?$'   # must print the subject
+   cargo release tag --execute
+   git push origin v0.2.1
+   ```
+   If the `grep` prints nothing, `main` has moved past the release commit: tag that commit instead with
+   `git tag -a v0.2.1 -m "chore: release v0.2.1" <release commit>` and push the tag.
+5. When the Release workflow for the tag has succeeded (`gh run list --workflow release.yml --branch v0.2.1`),
+   publish the crates from the tag. cargo-release publishes them in dependency order and skips any
+   version already on crates.io, so it is safe to re-run:
+   ```bash
+   git switch --detach v0.2.1
+   cargo release publish --allow-branch HEAD             # dry run
+   cargo release publish --allow-branch HEAD --execute
+   git switch main
+   ```
+6. Update the website's release information (`website/src/site-config.mjs` and
+   `website/src/content/docs/docs/changelog.mdx`) in a follow-up pull request.
+
+Release tags are protected: they can't be moved or deleted. If the Release workflow fails after the tag is
+pushed, nothing has reached crates.io yet; fix the cause on `main` and release the next patch version.
+
+### Pre-releases
+
+To run the whole release pipeline without publishing anything to crates.io or the Homebrew tap, cut a
+release candidate from `main` on a throwaway branch. Never merge that branch: the real release starts
+again from `main` at step 2, so its pull request holds only the `chore: release vX.Y.Z` commit.
+
+```bash
+git switch main && git pull --ff-only
+git switch -c release/v0.2.1-rc.1
+cargo release 0.2.1-rc.1 --no-publish --no-push             # dry run
+cargo release 0.2.1-rc.1 --no-publish --no-push --execute   # commit and tag v0.2.1-rc.1; CHANGELOG untouched
+git push origin release/v0.2.1-rc.1 v0.2.1-rc.1
+```
+
+The Release workflow publishes a GitHub pre-release; the Homebrew tap is not updated and nothing goes to
+crates.io. The tag also starts the screenshot workflow, which may push a `screenshots/v0.2.1-rc.1` branch.
+When you are done, remove all of it (pre-release tags, `v*-*`, are not protected):
+
+```bash
+gh release delete v0.2.1-rc.1 --cleanup-tag --yes
+git push origin --delete release/v0.2.1-rc.1
+git ls-remote --exit-code origin refs/heads/screenshots/v0.2.1-rc.1 && git push origin --delete screenshots/v0.2.1-rc.1
+git switch main && git branch -D release/v0.2.1-rc.1 && git tag -d v0.2.1-rc.1
+```
+
+Then start the real release at step 2, from `main`.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.

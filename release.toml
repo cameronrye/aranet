@@ -1,0 +1,10 @@
+# cargo-release 1.1.6 configuration (https://github.com/crate-ci/cargo-release).
+# All seven crates share `workspace.package.version` and are released together.
+# The release steps are in CONTRIBUTING.md, "Releasing".
+allow-branch = ["main", "release/*"]
+shared-version = true
+consolidate-commits = true
+pre-release-commit-message = "chore: release v{{version}}"
+# One tag per release, created by aranet-cli ([package.metadata.release] in
+# crates/aranet-cli/Cargo.toml). Pushing that tag starts the Release workflow.
+tag = false
