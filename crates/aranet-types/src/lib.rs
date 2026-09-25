@@ -610,6 +610,7 @@ mod tests {
 
     // --- Serialization tests ---
 
+    #[cfg(feature = "serde")]
     #[test]
     fn test_current_reading_serialization() {
         let reading = CurrentReading {
@@ -635,6 +636,7 @@ mod tests {
         assert!(json.contains("\"humidity\":45"));
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn test_current_reading_deserialization() {
         let json = r#"{"co2":800,"temperature":22.5,"pressure":1013.2,"humidity":45,"battery":85,"status":"Green","interval":300,"age":120,"radon":null,"radiation_rate":null,"radiation_total":null}"#;
@@ -644,6 +646,7 @@ mod tests {
         assert_eq!(reading.status, Status::Green);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn test_status_serialization() {
         assert_eq!(serde_json::to_string(&Status::Green).unwrap(), "\"Green\"");
@@ -655,6 +658,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Status::Error).unwrap(), "\"Error\"");
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn test_device_type_serialization() {
         assert_eq!(
@@ -667,6 +671,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn test_device_info_serialization_roundtrip() {
         let info = types::DeviceInfo {
@@ -1072,6 +1077,7 @@ mod proptests {
         }
 
         /// JSON serialization roundtrip should preserve all values.
+        #[cfg(feature = "serde")]
         #[test]
         fn current_reading_json_roundtrip(
             co2 in 0u16..10000u16,
