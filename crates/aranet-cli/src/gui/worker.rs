@@ -1718,11 +1718,9 @@ impl SensorWorker {
 
     /// Run an aranet-service CLI command.
     fn run_service_command(args: &[&str], user_level: bool) -> Result<(), String> {
-        use std::process::Command;
-
         let exe = Self::find_aranet_service_exe()?;
 
-        let mut cmd = Command::new(&exe);
+        let mut cmd = Self::aranet_service_command(&exe);
         cmd.args(args);
         if user_level {
             cmd.arg("--user");
@@ -1749,13 +1747,11 @@ impl SensorWorker {
 
     /// Check if the system service is installed and running.
     fn check_service_status(user_level: bool) -> (bool, bool) {
-        use std::process::Command;
-
         let Ok(exe) = Self::find_aranet_service_exe() else {
             return (false, false);
         };
 
-        let mut cmd = Command::new(&exe);
+        let mut cmd = Self::aranet_service_command(&exe);
         cmd.args(["service", "status"]);
         if user_level {
             cmd.arg("--user");
@@ -1771,6 +1767,23 @@ impl SensorWorker {
             }
             Err(_) => (false, false),
         }
+    }
+
+    /// Build a command that runs aranet-service. Release builds of the Windows
+    /// GUI have no console, and Windows gives a console child of such a process
+    /// its own console window unless it is started with `CREATE_NO_WINDOW`.
+    /// `CREATE_NO_WINDOW` (not `DETACHED_PROCESS`) gives the child a hidden console
+    /// that the `sc.exe` it runs shares, so no window appears for those either.
+    fn aranet_service_command(exe: &std::path::Path) -> std::process::Command {
+        #[allow(unused_mut)] // only mutated on Windows
+        let mut cmd = std::process::Command::new(exe);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd
     }
 
     /// Find the aranet-service executable.
