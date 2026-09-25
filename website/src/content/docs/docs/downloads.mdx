@@ -119,7 +119,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   </TabItem>
   <TabItem label="Windows">
 ```powershell
-irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex"
 ```
   </TabItem>
   <TabItem label="Homebrew">
