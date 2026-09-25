@@ -76,8 +76,8 @@ Feature requests are welcome! Please:
 5. **Run the full test suite**:
    ```bash
    cargo test --workspace
-   cargo clippy --workspace -- -D warnings
-   cargo fmt --check
+   cargo clippy --workspace --all-targets --all-features -- -D warnings
+   cargo fmt --all --check
    ```
 6. **Commit** with a clear message:
    ```bash
