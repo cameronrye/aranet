@@ -11,12 +11,26 @@ members = [
 resolver = "3"
 
 [workspace.package]
+# The one version of every crate in this workspace. Don't edit it by hand:
+# cargo-release bumps it, and the `aranet-*` entries below, together.
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/cameronrye/aranet"
 rust-version = "1.90"
 
 [workspace.dependencies]
+# Workspace crates. Published crates need a `version` next to `path`; keep it
+# equal to `workspace.package.version` (cargo-release does).
+aranet-types = { version = "0.2.0", path = "crates/aranet-types" }
+aranet-core = { version = "0.2.0", path = "crates/aranet-core" }
+aranet-store = { version = "0.2.0", path = "crates/aranet-store" }
+aranet-service = { version = "0.2.0", path = "crates/aranet-service" }
+# aranet-tui and aranet-gui each pick exactly one front end (`features = ["tui"]`
+# or `["gui"]`). Edition 2024 only lets a member turn default features off when the
+# workspace entry already does, so it is set here.
+aranet-cli = { version = "0.2.0", path = "crates/aranet-cli", default-features = false }
+
 btleplug = "0.11"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"

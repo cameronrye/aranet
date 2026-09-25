@@ -1,6 +1,6 @@
 [package]
 name = "aranet-service"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -26,9 +26,9 @@ notifications = ["dep:notify-rust"]
 full = ["prometheus", "mqtt", "notifications"]
 
 [dependencies]
-aranet-core = { version = "0.2.0", path = "../aranet-core" }
-aranet-store = { version = "0.2.0", path = "../aranet-store" }
-aranet-types = { version = "0.2.0", path = "../aranet-types" }
+aranet-core.workspace = true
+aranet-store.workspace = true
+aranet-types.workspace = true
 
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
