@@ -1,0 +1,154 @@
+# macOS Aranet.app in a signed, notarized DMG (Aranet-<target>.dmg).
+#
+# Cargo.toml lists this workflow in `local-artifacts-jobs`, so the generated
+# release.yml runs it next to release-build-local.yml. The DMG and its .sha256 are
+# uploaded as an `artifacts-*` artifact, so they are attached to the GitHub
+# Release with everything else. They are not in dist's sha256.sum; the Homebrew
+# cask hashes the DMG itself.
+name: Release / macOS app
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos-app:
+    name: macos-app (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The runners dist uses for these targets (the plan's artifacts_matrix).
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      # 0.12 reads [package.metadata.bundle.osx] and rejects unknown keys.
+      CARGO_BUNDLE_VERSION: "0.12.0"
+      TARGET: ${{ matrix.target }}
+      APP: target/${{ matrix.target }}/dist/bundle/osx/Aranet.app
+      DMG: target/distrib-app/Aranet-${{ matrix.target }}.dmg
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.90"
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
+      - name: Build Aranet.app
+        # The icon and Info.plist paths in [package.metadata.bundle] are relative to
+        # the crate directory, and cargo-bundle resolves them against the working
+        # directory, so it must run from there.
+        working-directory: crates/aranet-gui
+        run: cargo bundle --profile dist --format osx --target "$TARGET"
+      - name: Check Info.plist and icon
+        run: |
+          set -euo pipefail
+          plist="$APP/Contents/Info.plist"
+          plutil -lint "$plist"
+          for key in CFBundleIconFile LSMinimumSystemVersion NSBluetoothAlwaysUsageDescription NSBluetoothPeripheralUsageDescription; do
+            echo "$key = $(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")"
+          done
+          test -f "$APP/Contents/Resources/aranet-icon.icns"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+          expected="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "aranet-gui") | .version')"
+          test "$version" = "$expected"
+      - name: Check macOS signing credentials
+        id: signing
+        env:
+          HAS_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          HAS_NOTARY_KEY: ${{ secrets.APP_STORE_CONNECT_KEY != '' }}
+          PUBLISHING: ${{ !github.event.pull_request }}
+        run: |
+          if [ "$HAS_CERTIFICATE" != "true" ] || [ "$HAS_NOTARY_KEY" != "true" ]; then
+            if [ "$PUBLISHING" = "true" ]; then
+              echo "::error::APPLE_CERTIFICATE and APP_STORE_CONNECT_KEY must be set to publish the DMG"
+              exit 1
+            fi
+            echo "::warning::Apple signing secrets are not set; the DMG is not signed"
+          fi
+          echo "sign=$HAS_CERTIFICATE" >> "$GITHUB_OUTPUT"
+          echo "notarize=$HAS_NOTARY_KEY" >> "$GITHUB_OUTPUT"
+      - name: Sign Aranet.app
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/aranet-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security list-keychains -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain"
+          identity="Developer ID Application: Cameron Rye ($APPLE_TEAM_ID)"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "IDENTITY=$identity" >> "$GITHUB_ENV"
+          # The bundle has one executable, so signing the bundle signs it; no --deep.
+          codesign --force --options runtime --timestamp \
+            --entitlements crates/aranet-gui/entitlements.plist \
+            --keychain "$keychain" --sign "$identity" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+      - name: Build DMG
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/dmg"
+          mkdir -p "$stage" "$(dirname "$DMG")"
+          cp -R "$APP" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname Aranet -srcfolder "$stage" -ov -format UDZO "$DMG"
+      - name: Sign, notarize and staple DMG
+        if: steps.signing.outputs.sign == 'true' && steps.signing.outputs.notarize == 'true'
+        env:
+          APP_STORE_CONNECT_KEY: ${{ secrets.APP_STORE_CONNECT_KEY }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DMG"
+          key="$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          printf '%s\n' "$APP_STORE_CONNECT_KEY" > "$key"
+          xcrun notarytool submit "$DMG" --key "$key" \
+            --key-id "$APP_STORE_CONNECT_KEY_ID" --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            --wait --output-format json | tee "$RUNNER_TEMP/notarize.json"
+          rm -f "$key"
+          jq -e '.status == "Accepted"' "$RUNNER_TEMP/notarize.json"
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/aranet-signing.keychain-db" 2>/dev/null || true
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          cd "$(dirname "$DMG")"
+          name="$(basename "$DMG")"
+          echo "$(shasum -a 256 "$name" | cut -d' ' -f1) *$name" > "$name.sha256"
+          cat "$name.sha256"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: artifacts-macos-app-${{ matrix.target }}
+          path: |
+            ${{ env.DMG }}
+            ${{ env.DMG }}.sha256
