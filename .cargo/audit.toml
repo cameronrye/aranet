@@ -1,0 +1,28 @@
+# cargo-audit configuration.
+#
+# cargo-audit reads `.cargo/audit.toml` from the directory it runs in (then
+# `$CARGO_HOME/audit.toml`); a repository-root `audit.toml` is never read.
+# Run `cargo audit` from the workspace root.
+#
+# Policy:
+# - Vulnerabilities always fail. Fix them with `cargo update -p <crate>`, never with an ignore,
+#   unless no fixed version is reachable; then add an ignore below with a removal condition.
+# - Unsound and yanked crates also fail (`[output] deny`).
+# - Unmaintained crates are reported as warnings only.
+# - Every ignore says why aranet is not affected and when to remove it.
+#   cargo-audit does not report ignores that no longer match, so re-check this list whenever
+#   the named dependency changes.
+
+[advisories]
+ignore = [
+    # glib 0.18: unsound `VariantStrIter` iterator impls (informational = "unsound").
+    # Linux-only, GUI-only: tray-icon 0.21 -> libappindicator / muda -> gtk 0.18 -> glib 0.18.
+    # aranet never calls glib::VariantStrIter. Fixed in glib >= 0.20, which needs gtk-rs 0.20+
+    # (GTK4). Remove when tray-icon/muda stop depending on gtk 0.18.
+    "RUSTSEC-2024-0429",
+]
+
+[output]
+deny = ["unsound", "yanked"]
+# Required by cargo-audit whenever an [output] table is present.
+quiet = false
