@@ -58,8 +58,13 @@ jobs:
           plist="$APP/Contents/Info.plist"
           plutil -lint "$plist"
           for key in CFBundleIconFile LSMinimumSystemVersion NSBluetoothAlwaysUsageDescription NSBluetoothPeripheralUsageDescription; do
-            echo "$key = $(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")"
+            # Assign first: set -e ignores a failed substitution inside echo's
+            # arguments, so a missing key would otherwise print an empty value.
+            value="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")"
+            test -n "$value"
+            echo "$key = $value"
           done
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$plist")" = aranet-icon.icns
           test -f "$APP/Contents/Resources/aranet-icon.icns"
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
           expected="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "aranet-gui") | .version')"
