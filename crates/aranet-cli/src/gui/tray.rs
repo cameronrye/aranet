@@ -300,11 +300,12 @@ impl TrayManager {
                         commands.push(TrayCommand::ToggleWindow);
                     }
                 }
-                TrayIconEvent::DoubleClick { button, .. } => {
-                    if button == tray_icon::MouseButton::Left {
-                        debug!("Tray: Double click - show window");
-                        commands.push(TrayCommand::ShowWindow);
-                    }
+                TrayIconEvent::DoubleClick {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                } => {
+                    debug!("Tray: Double click - show window");
+                    commands.push(TrayCommand::ShowWindow);
                 }
                 _ => {}
             }
