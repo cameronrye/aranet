@@ -13,10 +13,12 @@
 //! cargo test --package aranet-cli --test cli_integration
 //! ```
 //!
-//! Run the hardware tests. `ARANET_DEVICE` must be an address or device name:
-//! aliases from your own config are not visible to the tests.
+//! Run the hardware tests one at a time: they all scan for and connect to the
+//! same sensor, and in parallel they fail with connection errors and timeouts.
+//! `ARANET_DEVICE` must be an address or device name: aliases from your own
+//! config are not visible to the tests.
 //! ```text
-//! ARANET_DEVICE="Aranet4 12345" cargo test --package aranet-cli --test cli_integration -- --ignored --nocapture
+//! ARANET_DEVICE="Aranet4 12345" cargo test --package aranet-cli --test cli_integration -- --ignored --test-threads=1 --nocapture
 //! ```
 
 use std::env;
