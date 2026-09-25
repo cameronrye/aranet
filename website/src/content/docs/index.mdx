@@ -126,7 +126,8 @@ import { Card, CardGrid, Badge, Tabs, TabItem, Aside } from '@astrojs/starlight/
   <TabItem label="Homebrew (Recommended)">
 ```bash
 # macOS and Linux x86_64 - Recommended
-# Linux ARM64 (e.g. Raspberry Pi): use the Shell Script tab
+# Linux ARM64 (e.g. Raspberry Pi OS Bookworm): use the Shell Script tab
+# Prebuilt Linux binaries need glibc 2.35+ (Ubuntu 22.04, Debian 12 or later)
 brew tap cameronrye/aranet
 brew install aranet
 
@@ -147,7 +148,7 @@ aranet --version
   <TabItem label="PowerShell">
 ```powershell
 # Windows
-irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/cameronrye/aranet/releases/latest/download/aranet-cli-installer.ps1 | iex"
 
 # Open a new PowerShell window, then verify
 aranet --version
