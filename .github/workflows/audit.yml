@@ -1,0 +1,40 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Mondays 06:17 UTC. New RustSec advisories arrive without any change to this
+    # repository, so push/PR runs alone would miss them. Off the hour because GitHub delays
+    # scheduled runs at the top of the hour.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: Run cargo audit
+        # Ignores and the unsound/yanked deny policy live in .cargo/audit.toml, which
+        # cargo-audit reads from the current directory (the repository root here).
+        run: cargo audit
