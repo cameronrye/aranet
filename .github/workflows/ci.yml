@@ -57,15 +57,40 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --locked --workspace --all-features
 
-  lint:
-    name: Lint
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
-      - name: Install system dependencies
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with rustfmt
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # msrv means env.RUST_TOOLCHAIN. stable is the newest Rust release, so new lints
+        # and future-incompatibility warnings fail CI before they become hard errors.
+        toolchain: [msrv, stable]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -79,22 +104,19 @@ jobs:
             libxdo-dev \
             libssl-dev
 
-      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} stable with components
+      - name: Install Rust ${{ matrix.toolchain }} with clippy
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy, rustfmt
+          toolchain: ${{ matrix.toolchain == 'msrv' && env.RUST_TOOLCHAIN || matrix.toolchain }}
+          components: clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Check formatting
-        run: cargo fmt --check
-
       - name: Clippy (default features)
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Clippy (all features)
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   docs:
     name: Documentation
