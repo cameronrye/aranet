@@ -15,13 +15,156 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use aranet_store::Store;
 use aranet_types::HistoryRecord;
 use tempfile::TempDir;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
+
+// =============================================================================
+// Test environment
+// =============================================================================
+
+/// Longest a hermetic `aranet` run may take. None of them touch Bluetooth, and a
+/// device lookup scans for up to 90 s, so hitting this means a test is scanning.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Longest an `#[ignore]`d hardware run may take (history downloads are slow).
+const HARDWARE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Inherited variables, other than `ARANET_*`, that change what `aranet` prints
+/// (the log filter, and colour settings that `aranet` and clap's `anstream` read).
+const REMOVED_VARS: &[&str] = &["RUST_LOG", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE"];
+
+/// An isolated config directory, data directory and home directory for one test.
+struct TestEnv {
+    root: TempDir,
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    timeout: Duration,
+}
+
+impl TestEnv {
+    /// Environment for tests that must not touch Bluetooth.
+    fn new() -> Self {
+        Self::with_timeout(COMMAND_TIMEOUT)
+    }
+
+    /// Environment for `#[ignore]`d tests that talk to a real device.
+    fn for_hardware() -> Self {
+        Self::with_timeout(HARDWARE_TIMEOUT)
+    }
+
+    fn with_timeout(timeout: Duration) -> Self {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config_dir = root.path().join("config").join("aranet");
+        let data_dir = root.path().join("data").join("aranet");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        fs::create_dir_all(root.path().join("home")).expect("home dir");
+        Self {
+            root,
+            config_dir,
+            data_dir,
+            timeout,
+        }
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.config_dir.join("config.toml")
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.data_dir.join("data.db")
+    }
+
+    fn write_config(&self, contents: &str) {
+        fs::write(self.config_path(), contents).expect("write config");
+    }
+
+    /// Build an `aranet` command that can only see this environment.
+    fn command(&self, args: &[&str]) -> Command {
+        let home = self.root.path().join("home");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aranet"));
+        command.args(args);
+
+        // ARANET_DEVICE (read by clap), ARANET_STYLE and any future ARANET_*
+        // setting in the developer's shell must not leak into the tests.
+        // Compare in upper case: Windows looks variables up case-insensitively.
+        for (key, _) in env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("ARANET_")
+            {
+                command.env_remove(&key);
+            }
+        }
+        for key in REMOVED_VARS {
+            command.env_remove(key);
+        }
+
+        command
+            .env("ARANET_CONFIG_DIR", &self.config_dir)
+            .env("ARANET_DATA_DIR", &self.data_dir)
+            // Anything that asks `dirs` directly lands in the temp dir too. This
+            // covers macOS and Linux; on Windows `dirs` ignores the environment,
+            // so the two ARANET_* variables above are what isolate the tests.
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local").join("share"))
+            // Never a terminal, so `aranet` can't fall back to an interactive scan.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Run `aranet` in this environment, failing the test if it runs too long.
+    fn run(&self, args: &[&str]) -> Output {
+        let mut child = self.command(args).spawn().expect("failed to start aranet");
+        let stdout = read_in_background(child.stdout.take().expect("stdout is piped"));
+        let stderr = read_in_background(child.stderr.take().expect("stderr is piped"));
+
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll aranet") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`aranet {}` did not exit within {:?}. If this test needs Bluetooth, \
+                     mark it #[ignore = \"requires BLE hardware\"] and use TestEnv::for_hardware().",
+                    args.join(" "),
+                    self.timeout
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        Output {
+            status,
+            stdout: stdout.join().expect("stdout reader"),
+            stderr: stderr.join().expect("stderr reader"),
+        }
+    }
+}
+
+/// Drain a pipe on its own thread so a chatty child can't block on a full pipe.
+fn read_in_background(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
 
 /// Get path to the aranet binary
 fn get_binary_path() -> String {
@@ -71,38 +214,7 @@ fn run_aranet_with_env(args: &[&str], envs: &[(String, String)]) -> Output {
     }
 }
 
-fn create_test_env() -> (TempDir, Vec<(String, String)>, PathBuf, PathBuf) {
-    let root = tempfile::tempdir().expect("tempdir");
-    let config_dir = root.path().join("config").join("aranet");
-    let data_dir = root.path().join("data").join("aranet");
-
-    fs::create_dir_all(&config_dir).expect("config dir");
-    fs::create_dir_all(&data_dir).expect("data dir");
-
-    let envs = vec![
-        (
-            "ARANET_CONFIG_DIR".to_string(),
-            config_dir.display().to_string(),
-        ),
-        (
-            "ARANET_DATA_DIR".to_string(),
-            data_dir.display().to_string(),
-        ),
-    ];
-
-    let config_path = config_dir.join("config.toml");
-    let db_path = data_dir.join("data.db");
-    (root, envs, config_path, db_path)
-}
-
-fn write_test_config(path: &Path, contents: &str) {
-    fs::create_dir_all(path.parent().expect("config parent")).expect("create config dir");
-    fs::write(path, contents).expect("write config");
-}
-
 fn seed_history_database(path: &Path, device_id: &str, alias: Option<&str>) {
-    fs::create_dir_all(path.parent().expect("db parent")).expect("create db dir");
-
     let store = Store::open(path).expect("open store");
     store
         .upsert_device(device_id, alias)
@@ -111,7 +223,7 @@ fn seed_history_database(path: &Path, device_id: &str, alias: Option<&str>) {
     let now = OffsetDateTime::now_utc();
     let records = vec![
         HistoryRecord {
-            timestamp: now - Duration::minutes(90),
+            timestamp: now - time::Duration::minutes(90),
             co2: 810,
             temperature: 21.4,
             pressure: 1012.4,
@@ -119,7 +231,7 @@ fn seed_history_database(path: &Path, device_id: &str, alias: Option<&str>) {
             ..Default::default()
         },
         HistoryRecord {
-            timestamp: now - Duration::minutes(30),
+            timestamp: now - time::Duration::minutes(30),
             co2: 920,
             temperature: 22.1,
             pressure: 1013.1,
@@ -143,7 +255,8 @@ fn get_device() -> Option<String> {
 
 #[test]
 fn test_help_command() {
-    let output = run_aranet(&["--help"]);
+    let env = TestEnv::new();
+    let output = env.run(&["--help"]);
 
     assert!(output.status.success(), "Help should succeed");
 
@@ -162,26 +275,28 @@ fn test_help_command() {
 
 #[test]
 fn test_version_command() {
-    let output = run_aranet(&["--version"]);
+    let env = TestEnv::new();
+    let output = env.run(&["--version"]);
 
     assert!(output.status.success(), "Version should succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Version output should contain the binary name
-    assert!(
-        stdout.contains("Aranet") || stdout.contains("aranet"),
-        "Version should contain aranet"
+    assert_eq!(
+        stdout.trim(),
+        format!("aranet {}", env!("CARGO_PKG_VERSION")),
+        "Version should be the crate version"
     );
 }
 
 #[test]
 fn test_subcommand_help() {
+    let env = TestEnv::new();
     let subcommands = [
         "scan", "read", "watch", "history", "info", "status", "sync", "cache", "doctor",
     ];
 
     for cmd in subcommands {
-        let output = run_aranet(&[cmd, "--help"]);
+        let output = env.run(&[cmd, "--help"]);
 
         assert!(output.status.success(), "{} --help should succeed", cmd);
 
@@ -191,12 +306,14 @@ fn test_subcommand_help() {
 }
 
 // =============================================================================
-// Doctor Command (no device required, tests BLE availability)
+// Doctor Command (checks the Bluetooth adapter and scans for 3 s)
 // =============================================================================
 
 #[test]
+#[ignore = "requires BLE hardware"]
 fn test_doctor_runs() {
-    let output = run_aranet(&["doctor"]);
+    let env = TestEnv::for_hardware();
+    let output = env.run(&["doctor"]);
 
     // Doctor may return non-zero if there are issues, but should not crash
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -220,38 +337,42 @@ fn test_doctor_runs() {
 
 #[test]
 fn test_config_path() {
-    let output = run_aranet(&["config", "path"]);
+    let env = TestEnv::new();
+    let output = env.run(&["config", "path"]);
 
     assert!(output.status.success(), "Config path should succeed");
 
+    // Also proves the binary honours ARANET_CONFIG_DIR, which every other test relies on.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("config") || stdout.contains(".toml"),
-        "Should show config path"
-    );
+    assert_eq!(stdout.trim(), env.config_path().display().to_string());
 }
 
 #[test]
 fn test_config_show() {
-    let output = run_aranet(&["config", "show"]);
+    let env = TestEnv::new();
+    let output = env.run(&["config", "show"]);
 
-    // May fail if no config exists, that's OK
-    let _stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Should not crash
     assert!(
-        output.status.success() || stderr.contains("not found") || stderr.contains("No config"),
-        "Config show should succeed or indicate no config"
+        output.status.success(),
+        "config show without a config file should print the defaults: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let shown: toml::Table = toml::from_str(&stdout).expect("config show should print TOML");
+    assert!(shown.get("device").is_none(), "no default device: {stdout}");
+    assert!(
+        shown.get("last_device").is_none(),
+        "no last device: {stdout}"
     );
 }
 
 #[test]
 fn test_config_show_fails_on_invalid_config() {
-    let (_root, envs, config_path, _db_path) = create_test_env();
-    write_test_config(&config_path, "device = [");
+    let env = TestEnv::new();
+    env.write_config("device = [");
 
-    let output = run_aranet_with_env(&["config", "show"], &envs);
+    let output = env.run(&["config", "show"]);
     assert!(!output.status.success(), "Invalid config should fail");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -267,27 +388,33 @@ fn test_config_show_fails_on_invalid_config() {
 
 #[test]
 fn test_cache_info() {
-    let output = run_aranet(&["cache", "info"]);
+    let env = TestEnv::new();
+    let output = env.run(&["cache", "info"]);
 
     assert!(output.status.success(), "Cache info should succeed");
 
+    // Also proves the binary honours ARANET_DATA_DIR.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should show database info
+    let expected = format!("Database path: {}", env.db_path().display());
     assert!(
-        stdout.contains("database")
-            || stdout.contains("path")
-            || stdout.contains("cache")
-            || stdout.contains("store"),
-        "Should show cache/database info"
+        stdout.contains(&expected),
+        "expected {expected:?} in {stdout:?}"
     );
 }
 
 #[test]
 fn test_cache_devices() {
-    let output = run_aranet(&["cache", "devices"]);
+    let env = TestEnv::new();
+    let output = env.run(&["cache", "devices"]);
 
-    // May have no devices, that's OK
-    assert!(output.status.success(), "Cache devices should succeed");
+    assert!(
+        output.status.success(),
+        "Cache devices should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No devices in cache"), "{stdout}");
 }
 
 // =============================================================================
@@ -296,13 +423,16 @@ fn test_cache_devices() {
 
 #[test]
 fn test_alias_list() {
-    let output = run_aranet(&["alias", "list"]);
+    let env = TestEnv::new();
+    let output = env.run(&["alias", "list"]);
 
-    // May have no aliases, that's OK
     assert!(
         output.status.success(),
         "Alias list should succeed (even if empty)"
     );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No aliases configured."), "{stdout}");
 }
 
 // =============================================================================
@@ -311,17 +441,16 @@ fn test_alias_list() {
 
 #[test]
 fn test_report_json_resolves_aliases() {
-    let (_root, envs, config_path, db_path) = create_test_env();
-    write_test_config(
-        &config_path,
+    let env = TestEnv::new();
+    env.write_config(
         r#"
 [aliases]
 office = "Aranet4 12345"
 "#,
     );
-    seed_history_database(&db_path, "Aranet4 12345", Some("Office"));
+    seed_history_database(&env.db_path(), "Aranet4 12345", Some("Office"));
 
-    let output = run_aranet_with_env(&["report", "--device", "office", "--format", "json"], &envs);
+    let output = env.run(&["report", "--device", "office", "--format", "json"]);
     assert!(
         output.status.success(),
         "report should succeed: {}",
@@ -340,16 +469,15 @@ office = "Aranet4 12345"
 
 #[test]
 fn test_report_uses_default_device_from_config() {
-    let (_root, envs, config_path, db_path) = create_test_env();
-    write_test_config(
-        &config_path,
+    let env = TestEnv::new();
+    env.write_config(
         r#"
 device = "Aranet4 12345"
 "#,
     );
-    seed_history_database(&db_path, "Aranet4 12345", Some("Office"));
+    seed_history_database(&env.db_path(), "Aranet4 12345", Some("Office"));
 
-    let output = run_aranet_with_env(&["report", "--format", "json"], &envs);
+    let output = env.run(&["report", "--format", "json"]);
     assert!(
         output.status.success(),
         "report should succeed: {}",
@@ -367,11 +495,11 @@ device = "Aranet4 12345"
 
 #[test]
 fn test_report_all_outputs_all_cached_devices() {
-    let (_root, envs, _config_path, db_path) = create_test_env();
-    seed_history_database(&db_path, "Aranet4 12345", Some("Office"));
-    seed_history_database(&db_path, "Aranet4 67890", Some("Bedroom"));
+    let env = TestEnv::new();
+    seed_history_database(&env.db_path(), "Aranet4 12345", Some("Office"));
+    seed_history_database(&env.db_path(), "Aranet4 67890", Some("Bedroom"));
 
-    let output = run_aranet_with_env(&["report", "--all", "--format", "json"], &envs);
+    let output = env.run(&["report", "--all", "--format", "json"]);
     assert!(
         output.status.success(),
         "report --all should succeed: {}",
@@ -387,9 +515,9 @@ fn test_report_all_outputs_all_cached_devices() {
 
 #[test]
 fn test_sync_all_json_empty_is_machine_readable() {
-    let (_root, envs, _config_path, _db_path) = create_test_env();
+    let env = TestEnv::new();
 
-    let output = run_aranet_with_env(&["sync", "--all", "--format", "json"], &envs);
+    let output = env.run(&["sync", "--all", "--format", "json"]);
     assert!(
         output.status.success(),
         "sync --all --format json should succeed: {}",
@@ -935,19 +1063,29 @@ fn test_watch_json() {
 
 #[test]
 fn test_invalid_subcommand() {
-    let output = run_aranet(&["notacommand"]);
+    let env = TestEnv::new();
+    let output = env.run(&["notacommand"]);
 
     assert!(!output.status.success(), "Invalid subcommand should fail");
 }
 
+/// `read` with no device, no configured or remembered device and an empty cache
+/// must fail straight away. It used to pick up the developer's last-used device
+/// from their real config and scan for it for 90 s.
 #[test]
 fn test_missing_required_args() {
-    // read without device should fail (unless default configured)
-    let output = run_aranet(&["read"]);
+    let env = TestEnv::new();
+    let output = env.run(&["read"]);
 
-    // May succeed if there's a default device, or fail if not
-    // Just ensure it doesn't crash
-    let _ = output.status;
+    assert!(
+        !output.status.success(),
+        "read without a device should fail when nothing is configured"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No device specified"),
+        "should explain that no device was given: {stderr}"
+    );
 }
 
 #[test]
