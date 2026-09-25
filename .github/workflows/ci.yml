@@ -40,7 +40,7 @@ jobs:
             libxdo-dev \
             libssl-dev
 
-      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} stable
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -142,7 +142,7 @@ jobs:
             libxdo-dev \
             libssl-dev
 
-      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} stable
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -211,8 +211,9 @@ jobs:
         run: cargo build --locked -p aranet-gui
 
       # Tests per package, so no other member's features are unified in: the
-      # feature set that ships (default = cli, tui), and tui only (Task 14 keeps
-      # cli_integration out of that one).
+      # feature set that ships (default = cli, tui), and tui only (cli_integration
+      # has required-features = ["cli"] in crates/aranet-cli/Cargo.toml, so it is
+      # skipped there).
       - name: Test aranet-cli with its default (released) features
         run: cargo test --locked -p aranet-cli
 
@@ -241,7 +242,7 @@ jobs:
             libxdo-dev \
             libssl-dev
 
-      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} stable with llvm-tools
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with llvm-tools
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
