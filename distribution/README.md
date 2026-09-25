@@ -64,11 +64,11 @@ cargo deb -p aranet-cli
 
 ## Homebrew Formula
 
-The Homebrew formula template is in `distribution/homebrew/aranet.rb`. To set up the tap:
-
-1. Create a GitHub repository: `cameronrye/homebrew-aranet`
-2. Copy the formula to `Formula/aranet.rb` in that repo
-3. Update SHA256 checksums after each release
+The tap, [cameronrye/homebrew-aranet](https://github.com/cameronrye/homebrew-aranet), is updated after
+every release by `.github/workflows/homebrew.yml`. It renders two templates from the release's assets:
+`.github/homebrew/aranet.rb.template` (the `aranet` formula) and `.github/homebrew/aranet-gui.rb.template`
+(the `aranet-gui` cask). Pre-releases are skipped. To publish an existing release again, run
+`gh workflow run homebrew.yml -f tag=vX.Y.Z` (or "Publish Homebrew Formula" in the Actions tab).
 
 ---
 
