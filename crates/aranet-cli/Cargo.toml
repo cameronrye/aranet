@@ -15,6 +15,12 @@ include = ["src/**/*", "Cargo.toml", "README.md", "assets/**/*"]
 name = "aranet"
 path = "src/main.rs"
 
+# These tests run `aranet <subcommand>`, and subcommands only exist with `cli`.
+# Without `cli` the binary starts the TUI whatever the arguments, so skip them.
+[[test]]
+name = "cli_integration"
+required-features = ["cli"]
+
 [features]
 default = ["cli", "tui"]
 # CLI feature - enables command-line interface with subcommands
