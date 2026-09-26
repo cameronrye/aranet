@@ -4,7 +4,6 @@ description: Configure authentication, rate limiting, and CORS for aranet-servic
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
-import { CURRENT_RELEASE_TAG } from '../../../../site-config.mjs';
 
 aranet-service includes optional API-key authentication plus enabled-by-default rate limiting and localhost-only CORS defaults.
 
@@ -18,7 +17,7 @@ aranet-service includes optional API-key authentication plus enabled-by-default 
 | CORS | `http://localhost`, `http://127.0.0.1` | Override with `security.cors_origins` |
 | Device ID sanitization | Always enabled | Used for API-facing identifiers and dashboard output |
 
-<Aside type="caution" title={`Breaking change in ${CURRENT_RELEASE_TAG}`}>
+<Aside type="caution" title="Breaking change in v0.2.0">
   `GET /api/devices/:id/current` now returns a `CurrentReadingResponse` wrapper with `age_seconds` and `stale` fields alongside the reading payload.
 </Aside>
 
