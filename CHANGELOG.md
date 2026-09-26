@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-26
+
 ### Added
 
 - **Linux ARM64 builds** — prebuilt CLI and GUI for 64-bit ARM Linux (`aarch64-unknown-linux-gnu`, glibc 2.35 or newer, such as Raspberry Pi OS Bookworm), offered by the install scripts
