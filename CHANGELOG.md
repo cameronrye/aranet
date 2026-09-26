@@ -58,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GitHub Actions** — every hand-written workflow gives its `GITHUB_TOKEN` only the permissions each job needs (dist's generated `release.yml` still sets `contents: write` for the whole workflow), every action is pinned to a full commit SHA, and no checkout leaves the token in its git config
 - **Homebrew tap token** — no longer handed to a third-party action
 
+### Known issues
+
+- **Aranet4 on Linux** — connecting to an Aranet4 can fail with "Service discovery timed out", most often the first time. On Linux, the Bluetooth library aranet uses gives BlueZ only 5 seconds to discover the sensor's services, and the Aranet4 can take longer. A failed attempt can also leave the sensor connected until BlueZ drops the link. 0.2.0 behaves the same; the next release fixes both
+
 ## [0.2.0] - 2026-03-28
 
 ### Added
