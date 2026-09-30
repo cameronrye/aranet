@@ -479,16 +479,15 @@ impl Device {
 
     /// Check if the device is connected (queries BLE stack state).
     ///
+    /// Returns `false` if the Bluetooth stack reports an error or doesn't answer
+    /// within the connection's `validation_timeout` (3 s by default, set with
+    /// [`ConnectionConfig::validation_timeout`]). On macOS the stack stops
+    /// answering once the sensor has dropped the connection.
+    ///
     /// Note: This only checks the BLE stack's connection state, which may be stale,
     /// especially on macOS. For a more reliable check, use [`Self::validate_connection`].
     pub async fn is_connected(&self) -> bool {
-        match self.peripheral.is_connected().await {
-            Ok(connected) => connected,
-            Err(e) => {
-                warn!("Failed to query connection state: {e}");
-                false
-            }
-        }
+        crate::link::is_connected(&self.peripheral, self.config.validation_timeout).await
     }
 
     /// Validate the connection by performing a lightweight read operation.
@@ -545,6 +544,11 @@ impl Device {
     /// 1. Abort all active notification handlers
     /// 2. Disconnect from the BLE peripheral
     ///
+    /// Returns [`Error::Timeout`] if the Bluetooth stack doesn't confirm the
+    /// disconnect within 5 s. The disconnect runs as a background task (on
+    /// aranet-core's runtime), so it completes even if this future is dropped,
+    /// for example by a caller's timeout.
+    ///
     /// **Important:** You MUST call this method before dropping the Device
     /// to ensure proper cleanup of BLE resources.
     #[tracing::instrument(level = "info", skip(self), fields(device_name = ?self.name))]
@@ -560,8 +564,15 @@ impl Device {
             }
         }
 
-        self.peripheral.disconnect().await?;
-        Ok(())
+        // `cleanup_runtime` is `None` only if aranet-core's runtime can't be
+        // started and this future isn't polled on a tokio runtime either.
+        // The time limit needs a tokio timer, so give up instead of panicking.
+        let runtime = crate::link::cleanup_runtime().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "no tokio runtime available to disconnect from the device",
+            ))
+        })?;
+        crate::link::disconnect_detached(&self.peripheral, &runtime).await
     }
 
     /// Get the device name.
@@ -586,8 +597,17 @@ impl Device {
     ///
     /// Returns the RSSI in dBm. More negative values indicate weaker signals.
     /// Typical values range from -30 (strong) to -90 (weak).
+    ///
+    /// Returns [`Error::Timeout`] if the Bluetooth stack doesn't answer within
+    /// the connection's `read_timeout` (10 s by default, set with
+    /// [`ConnectionConfig::read_timeout`]).
     pub async fn read_rssi(&self) -> Result<i16> {
-        let properties = self.peripheral.properties().await?;
+        let properties = crate::link::bounded(
+            "read device properties",
+            self.config.read_timeout,
+            self.peripheral.properties(),
+        )
+        .await?;
         properties
             .and_then(|p| p.rssi)
             .ok_or_else(|| Error::InvalidData("RSSI not available".to_string()))
@@ -933,13 +953,15 @@ impl Device {
 }
 
 // NOTE: Drop performs best-effort cleanup if disconnect() was not called.
-// The cleanup is spawned as a background task and may not complete during shutdown.
-// For reliable cleanup, callers SHOULD explicitly call `device.disconnect().await`
-// before dropping the Device.
+// The disconnect is spawned on aranet-core's own runtime (`aranet-ble`) when it
+// can be started, so it runs even if the caller's runtime is shutting down, and
+// it gives up after 5 s if the Bluetooth stack never confirms. It can still be
+// cut short when the process exits. For reliable cleanup, callers SHOULD
+// explicitly call `device.disconnect().await` before dropping the Device.
 //
 // The cleanup behavior:
 // 1. Aborts all notification handlers (sync operation)
-// 2. Spawns an async task to disconnect the peripheral (best-effort)
+// 2. Spawns a time-limited disconnect of the peripheral on aranet-core's runtime (best-effort)
 // 3. Logs a warning about the implicit cleanup
 //
 // For automatic cleanup, consider using `ReconnectingDevice` which manages the lifecycle.
@@ -966,25 +988,23 @@ impl Drop for Device {
                 }
             }
 
-            // Spawn a best-effort cleanup task for the BLE disconnect
-            // This uses try_runtime to handle the case where the runtime is shutting down
+            // Spawn a best-effort, time-limited disconnect, on aranet-core's own
+            // runtime when it can be started, so it outlives the caller's runtime
             let peripheral = self.peripheral.clone();
             let address = self.address.clone();
 
-            // Try to spawn cleanup task - this may fail if runtime is shutting down
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if let Err(e) = peripheral.disconnect().await {
-                        debug!(
+            if let Some(runtime) = crate::link::cleanup_runtime() {
+                runtime.spawn(async move {
+                    match crate::link::disconnect(&peripheral).await {
+                        Ok(()) => debug!(
+                            device_address = %address,
+                            "Best-effort disconnect completed"
+                        ),
+                        Err(e) => debug!(
                             device_address = %address,
                             error = %e,
                             "Best-effort disconnect failed (device may already be disconnected)"
-                        );
-                    } else {
-                        debug!(
-                            device_address = %address,
-                            "Best-effort disconnect completed"
-                        );
+                        ),
                     }
                 });
             }

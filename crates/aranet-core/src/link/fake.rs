@@ -23,6 +23,10 @@ pub(super) enum Outcome {
     /// the services of a connected device: after `BLUEZ_ASYNC_WAIT`, with
     /// `btleplug::Error::Other("Service discovery timed out")`.
     DiscoveryTimedOut,
+    /// Wait this long on the tokio clock, then succeed like `Ok`. A
+    /// `disconnect` that ends this way notifies `disconnected()` at the end
+    /// of the wait.
+    After(std::time::Duration),
 }
 
 /// How long bluez-async's `connect` waits for BlueZ's `ServicesResolved`
@@ -36,6 +40,7 @@ pub(super) enum Call {
     Connect,
     Discover,
     Disconnect,
+    IsConnected,
 }
 
 /// A peripheral whose calls follow a script. Clones share the script and the
@@ -51,9 +56,12 @@ struct State {
     discover: VecDeque<Outcome>,
     disconnect: VecDeque<Outcome>,
     properties: VecDeque<Outcome>,
+    is_connected: VecDeque<Outcome>,
     service_rounds: VecDeque<BTreeSet<Service>>,
     services: BTreeSet<Service>,
     calls: Vec<Call>,
+    /// What a successful `is_connected` answers.
+    connected: bool,
 }
 
 impl FakeGatt {
@@ -66,9 +74,11 @@ impl FakeGatt {
                 discover: VecDeque::new(),
                 disconnect: VecDeque::new(),
                 properties: VecDeque::new(),
+                is_connected: VecDeque::new(),
                 service_rounds: VecDeque::new(),
                 services: BTreeSet::new(),
                 calls: Vec::new(),
+                connected: true,
             })),
             disconnected: Arc::new(Notify::new()),
         }
@@ -93,6 +103,16 @@ impl FakeGatt {
     /// Script the next `properties` calls. Calls past the script succeed.
     pub(super) fn script_properties(&self, outcomes: impl IntoIterator<Item = Outcome>) {
         self.lock().properties.extend(outcomes);
+    }
+
+    /// Script the next `is_connected` calls. Calls past the script succeed.
+    pub(super) fn script_is_connected(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock().is_connected.extend(outcomes);
+    }
+
+    /// Set what a successful `is_connected` answers (`true` until set).
+    pub(super) fn set_connected(&self, connected: bool) {
+        self.lock().connected = connected;
     }
 
     /// Script what the next discoveries find. Discoveries past the script find
@@ -130,6 +150,10 @@ async fn run(outcome: Option<Outcome>) -> btleplug::Result<()> {
             // (`src/lib.rs:90-92`), which btleplug wraps in `Error::Other`
             // (`src/bluez/adapter.rs:125-129`).
             Err(btleplug::Error::Other("Service discovery timed out".into()))
+        }
+        Outcome::After(delay) => {
+            tokio::time::sleep(delay).await;
+            Ok(())
         }
     }
 }
@@ -179,6 +203,16 @@ impl GattLink for FakeGatt {
             local_name: Some("Aranet4 12345".to_string()),
             ..Default::default()
         }))
+    }
+
+    async fn is_connected(&self) -> btleplug::Result<bool> {
+        let outcome = {
+            let mut state = self.lock();
+            state.calls.push(Call::IsConnected);
+            state.is_connected.pop_front()
+        };
+        run(outcome).await?;
+        Ok(self.lock().connected)
     }
 }
 

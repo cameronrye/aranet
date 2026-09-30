@@ -44,6 +44,11 @@ pub(crate) trait GattLink: Clone + Send + Sync + 'static {
     fn properties(
         &self,
     ) -> impl Future<Output = btleplug::Result<Option<PeripheralProperties>>> + Send;
+
+    /// Whether the Bluetooth stack reports the link as up. On macOS nobody
+    /// answers this once CoreBluetooth has dropped the peripheral, so callers
+    /// use this module's time-limited `is_connected` function instead.
+    fn is_connected(&self) -> impl Future<Output = btleplug::Result<bool>> + Send;
 }
 
 // Every call names btleplug's trait: `GattLink` is the trait in scope here, so
@@ -67,6 +72,10 @@ impl GattLink for btleplug::platform::Peripheral {
 
     async fn properties(&self) -> btleplug::Result<Option<PeripheralProperties>> {
         btleplug::api::Peripheral::properties(self).await
+    }
+
+    async fn is_connected(&self) -> btleplug::Result<bool> {
+        btleplug::api::Peripheral::is_connected(self).await
     }
 }
 
@@ -98,6 +107,35 @@ pub(crate) async fn disconnect<L: GattLink>(link: &L) -> Result<()> {
         link.disconnect(),
     )
     .await
+}
+
+/// Run `disconnect(link)` as a task on `runtime` and wait for its result.
+///
+/// The task is spawned when this future is first polled and keeps running if
+/// this future is dropped, so a caller that times out or is cancelled still
+/// releases the sensor. Like `disconnect`, it gives up after
+/// `DISCONNECT_TIMEOUT`.
+pub(crate) async fn disconnect_detached<L: GattLink>(
+    link: &L,
+    runtime: &tokio::runtime::Handle,
+) -> Result<()> {
+    let link = link.clone();
+    runtime
+        .spawn(async move { disconnect(&link).await })
+        .await
+        .map_err(std::io::Error::from)?
+}
+
+/// The connection state that the Bluetooth stack reports, or `false`, with a
+/// warning, if the stack fails or doesn't answer within `limit`.
+pub(crate) async fn is_connected<L: GattLink>(link: &L, limit: Duration) -> bool {
+    match bounded("query connection state", limit, link.is_connected()).await {
+        Ok(connected) => connected,
+        Err(e) => {
+            warn!("Failed to query connection state: {e}");
+            false
+        }
+    }
 }
 
 /// Where cleanup that must outlive its caller runs: aranet-core's `aranet-ble`
@@ -357,7 +395,7 @@ mod tests {
     use tokio::time::Instant;
 
     use super::fake::{Call, FakeGatt, Outcome, aranet_services};
-    use super::{DISCONNECT_TIMEOUT, connect};
+    use super::{DISCONNECT_TIMEOUT, connect, disconnect_detached, is_connected};
     use crate::device::ConnectionConfig;
     use crate::error::{ConnectionFailureReason, Error};
     use crate::test_support::within;
@@ -691,6 +729,110 @@ mod tests {
                     Call::Discover,
                 ]
             );
+        })
+        .await;
+    }
+
+    /// A detached disconnect that the stack never confirms gives up after
+    /// `DISCONNECT_TIMEOUT`, with the operation name that `disconnect` uses.
+    #[tokio::test(start_paused = true)]
+    async fn detached_disconnect_gives_up_after_disconnect_timeout() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.script_disconnect([Outcome::Hang]);
+            let rt = Handle::current();
+            let start = Instant::now();
+
+            match disconnect_detached(&fake, &rt).await {
+                Err(Error::Timeout {
+                    operation,
+                    duration,
+                }) => {
+                    assert_eq!(operation, "disconnect from device");
+                    assert_eq!(duration, DISCONNECT_TIMEOUT);
+                }
+                other => panic!("expected a disconnect timeout, got {other:?}"),
+            }
+            assert_eq!(start.elapsed(), Duration::from_secs(5));
+            assert_eq!(fake.calls(), [Call::Disconnect]);
+        })
+        .await;
+    }
+
+    /// A caller that stops waiting doesn't cancel a detached disconnect: it
+    /// still reaches the stack and completes.
+    #[tokio::test(start_paused = true)]
+    async fn detached_disconnect_finishes_after_the_caller_is_dropped() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.script_disconnect([Outcome::After(Duration::from_secs(2))]);
+            let rt = Handle::current();
+            let start = Instant::now();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), disconnect_detached(&fake, &rt))
+                    .await
+                    .is_err()
+            );
+
+            within(Duration::from_secs(10), fake.disconnected().notified()).await;
+            assert_eq!(start.elapsed(), Duration::from_secs(2));
+            assert_eq!(fake.calls(), [Call::Disconnect]);
+        })
+        .await;
+    }
+
+    /// A connection-state query that the stack never answers (CoreBluetooth
+    /// after the sensor has gone) reports `false` after `validation_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn is_connected_reports_false_when_the_stack_never_answers() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.script_is_connected([Outcome::Hang]);
+            let cfg = ConnectionConfig::default();
+            let start = Instant::now();
+
+            assert!(!is_connected(&fake, cfg.validation_timeout).await);
+            assert_eq!(start.elapsed(), Duration::from_secs(3));
+            assert_eq!(fake.calls(), [Call::IsConnected]);
+        })
+        .await;
+    }
+
+    /// A connection-state query that fails reports `false` at once.
+    #[tokio::test(start_paused = true)]
+    async fn is_connected_reports_false_on_error() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.script_is_connected([Outcome::Fail]);
+            let cfg = ConnectionConfig::default();
+            let start = Instant::now();
+
+            assert!(!is_connected(&fake, cfg.validation_timeout).await);
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert_eq!(fake.calls(), [Call::IsConnected]);
+        })
+        .await;
+    }
+
+    /// A connection-state query that the stack answers returns that answer,
+    /// `true` or `false`, at once.
+    #[tokio::test(start_paused = true)]
+    async fn is_connected_passes_the_answer_through() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            let cfg = ConnectionConfig::default();
+            let start = Instant::now();
+
+            fake.script_is_connected([Outcome::Ok]);
+            assert!(is_connected(&fake, cfg.validation_timeout).await);
+
+            fake.set_connected(false);
+            fake.script_is_connected([Outcome::Ok]);
+            assert!(!is_connected(&fake, cfg.validation_timeout).await);
+
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert_eq!(fake.calls(), [Call::IsConnected, Call::IsConnected]);
         })
         .await;
     }
