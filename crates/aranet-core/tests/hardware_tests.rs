@@ -323,6 +323,36 @@ async fn test_concurrent_finds_share_one_scan() {
     );
 }
 
+/// A cancelled passive monitor must stop at once, even while it waits for its
+/// next scan cycle. Before the fix it finished its current wait first, which
+/// could be up to 300 s.
+#[tokio::test]
+#[ignore = "requires BLE hardware: a Bluetooth adapter"]
+async fn test_cancelled_passive_monitor_stops_during_its_wait() {
+    use aranet_core::{PassiveMonitor, PassiveMonitorOptions};
+    use tokio_util::sync::CancellationToken;
+
+    // Fail here rather than let the monitor wait for an adapter, a wait that
+    // already honours cancel.
+    aranet_core::scan::get_adapter().await.expect("adapter");
+
+    let options = PassiveMonitorOptions::default()
+        .scan_duration(Duration::from_millis(500))
+        .scan_interval(Duration::from_secs(300));
+    let monitor = std::sync::Arc::new(PassiveMonitor::new(options));
+    let cancel = CancellationToken::new();
+    let handle = monitor.start(cancel.clone());
+
+    // After one 0.5 s scan cycle the monitor waits 300 s for the next one.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!handle.is_finished(), "the monitor stopped on its own");
+    cancel.cancel();
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("the passive monitor was still running 2 s after it was cancelled")
+        .expect("the passive monitor task panicked");
+}
+
 // =============================================================================
 // Connection Tests
 // =============================================================================
