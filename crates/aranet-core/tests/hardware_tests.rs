@@ -1142,6 +1142,17 @@ async fn test_connect_invalid_address() {
     for addr in invalid_addresses {
         let result = timeout(Duration::from_secs(5), Device::connect(addr)).await;
 
+        if addr.is_empty() {
+            // Rejected before Bluetooth is used, so it can neither time out nor
+            // connect to whichever device the adapter lists first.
+            assert!(
+                matches!(result, Ok(Err(aranet_core::Error::InvalidConfig(_)))),
+                "the empty identifier was not rejected: {result:?}"
+            );
+            println!("Rejected the empty identifier");
+            continue;
+        }
+
         match result {
             Ok(Ok(_)) => {
                 println!("Unexpected success for address: {}", addr);

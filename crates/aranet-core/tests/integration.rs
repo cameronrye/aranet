@@ -3,10 +3,11 @@
 //! These tests require actual BLE hardware and should be run with:
 //! `cargo test --package aranet-core -- --ignored --nocapture`
 //!
-//! Set the ARANET_DEVICE environment variable to specify which device to test:
+//! Set the ARANET_DEVICE environment variable to the device to test: its MAC
+//! address, macOS UUID or full name (exact, any case):
 //! `ARANET_DEVICE="Aranet4 12345" cargo test --package aranet-core -- --ignored`
 //!
-//! If not set, tests will use "Aranet4" as the default device name.
+//! Tests that connect to a device print `SKIP` and pass when it is not set.
 
 use std::env;
 use std::time::Duration;
@@ -22,9 +23,14 @@ use tokio::time::timeout;
 /// Default timeout for BLE operations.
 const BLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Get the device name from environment or use default.
-fn get_device_name() -> String {
-    env::var("ARANET_DEVICE").unwrap_or_else(|_| "Aranet4".to_string())
+/// The device to test against, from `ARANET_DEVICE`.
+///
+/// There is no default: a device is named by its address, UUID or full name,
+/// and no fixed value would match a real sensor.
+fn get_device_name() -> Option<String> {
+    env::var("ARANET_DEVICE")
+        .ok()
+        .filter(|name| !name.is_empty())
 }
 
 #[tokio::test]
@@ -60,7 +66,10 @@ async fn test_scan_for_devices() {
 #[tokio::test]
 #[ignore = "requires BLE hardware"]
 async fn test_connect_and_read() {
-    let device_name = get_device_name();
+    let Some(device_name) = get_device_name() else {
+        println!("SKIP: ARANET_DEVICE not set");
+        return;
+    };
     println!("Connecting to device: {}", device_name);
 
     // Connect with timeout
@@ -101,7 +110,10 @@ async fn test_connect_and_read() {
 #[tokio::test]
 #[ignore = "requires BLE hardware"]
 async fn test_download_history() {
-    let device_name = get_device_name();
+    let Some(device_name) = get_device_name() else {
+        println!("SKIP: ARANET_DEVICE not set");
+        return;
+    };
     println!("Connecting to device: {}", device_name);
 
     // Connect with timeout

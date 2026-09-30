@@ -289,7 +289,27 @@ pub enum DeviceNotFoundReason {
     ScanTimeout { duration: Duration },
     /// No Bluetooth adapter available.
     NoAdapter,
+    /// The identifier matches more than one nearby device.
+    Ambiguous {
+        /// The identifier that was looked up, trimmed.
+        identifier: String,
+        /// The matching devices, each as `"<name> (<identifier>)"`, sorted.
+        candidates: Vec<String>,
+    },
+    /// No device matches exactly; `similar` lists Aranet device names that
+    /// contain the identifier.
+    NoExactMatch {
+        /// The identifier that was looked up, trimmed.
+        identifier: String,
+        /// Names of Aranet devices the adapter knows (names containing
+        /// `aranet`) that contain the identifier, sorted. The error message
+        /// shows the first five.
+        similar: Vec<String>,
+    },
 }
+
+/// How many of `NoExactMatch`'s names its message shows.
+const SIMILAR_NAMES_SHOWN: usize = 5;
 
 impl std::fmt::Display for DeviceNotFoundReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -298,6 +318,39 @@ impl std::fmt::Display for DeviceNotFoundReason {
             Self::NotFound { identifier } => write!(f, "device '{}' not found", identifier),
             Self::ScanTimeout { duration } => write!(f, "scan timed out after {:?}", duration),
             Self::NoAdapter => write!(f, "no Bluetooth adapter available"),
+            Self::Ambiguous {
+                identifier,
+                candidates,
+            } => write!(
+                f,
+                "'{identifier}' matches {} devices: {}; use the address or UUID instead",
+                candidates.len(),
+                candidates.join(", ")
+            ),
+            Self::NoExactMatch {
+                identifier,
+                similar,
+            } => {
+                write!(
+                    f,
+                    "device '{identifier}' not found; names must match exactly"
+                )?;
+                if !similar.is_empty() {
+                    let shown = similar.len().min(SIMILAR_NAMES_SHOWN);
+                    let quoted: Vec<String> = similar[..shown]
+                        .iter()
+                        .map(|name| format!("'{name}'"))
+                        .collect();
+                    write!(f, " (did you mean {}?", quoted.join(" or "))?;
+                    match similar.len() - shown {
+                        0 => {}
+                        1 => write!(f, " 1 more name contains '{identifier}'")?,
+                        more => write!(f, " {more} more names contain '{identifier}'")?,
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -411,6 +464,78 @@ mod tests {
             duration: Duration::from_secs(30),
         });
         assert!(err.to_string().contains("30s"));
+    }
+
+    #[test]
+    fn device_not_found_reason_display_lists_candidates() {
+        let ambiguous = Error::DeviceNotFound(DeviceNotFoundReason::Ambiguous {
+            identifier: "Aranet4 12345".to_string(),
+            candidates: vec![
+                "Aranet4 12345 (1f8893bf-9f7e-02b4-ef4a-7718f4f5d4be)".to_string(),
+                "Aranet4 12345 (387c18c7-299f-cc32-d01c-6cf29a8d3ca5)".to_string(),
+            ],
+        });
+        assert_eq!(
+            ambiguous.to_string(),
+            "Device not found: 'Aranet4 12345' matches 2 devices: \
+             Aranet4 12345 (1f8893bf-9f7e-02b4-ef4a-7718f4f5d4be), \
+             Aranet4 12345 (387c18c7-299f-cc32-d01c-6cf29a8d3ca5); \
+             use the address or UUID instead"
+        );
+
+        let one = Error::DeviceNotFound(DeviceNotFoundReason::NoExactMatch {
+            identifier: "2751B".to_string(),
+            similar: vec!["Aranet2 2751B".to_string()],
+        });
+        assert_eq!(
+            one.to_string(),
+            "Device not found: device '2751B' not found; names must match exactly \
+             (did you mean 'Aranet2 2751B'?)"
+        );
+
+        let two = DeviceNotFoundReason::NoExactMatch {
+            identifier: "Aranet".to_string(),
+            similar: vec!["Aranet2 2751B".to_string(), "AranetRn+ 306B8".to_string()],
+        };
+        assert_eq!(
+            two.to_string(),
+            "device 'Aranet' not found; names must match exactly \
+             (did you mean 'Aranet2 2751B' or 'AranetRn+ 306B8'?)"
+        );
+
+        let none = DeviceNotFoundReason::NoExactMatch {
+            identifier: "x".to_string(),
+            similar: Vec::new(),
+        };
+        assert_eq!(
+            none.to_string(),
+            "device 'x' not found; names must match exactly"
+        );
+
+        // Only the first five names are shown, then how many more there are.
+        let names = |count: usize| -> Vec<String> {
+            (1..=count).map(|n| format!("Aranet4 1000{n}")).collect()
+        };
+        let six = DeviceNotFoundReason::NoExactMatch {
+            identifier: "Aranet4".to_string(),
+            similar: names(6),
+        };
+        assert_eq!(
+            six.to_string(),
+            "device 'Aranet4' not found; names must match exactly \
+             (did you mean 'Aranet4 10001' or 'Aranet4 10002' or 'Aranet4 10003' \
+             or 'Aranet4 10004' or 'Aranet4 10005'? 1 more name contains 'Aranet4')"
+        );
+        let eight = DeviceNotFoundReason::NoExactMatch {
+            identifier: "Aranet4".to_string(),
+            similar: names(8),
+        };
+        assert!(
+            eight
+                .to_string()
+                .ends_with("or 'Aranet4 10005'? 3 more names contain 'Aranet4')"),
+            "{eight}"
+        );
     }
 
     #[test]

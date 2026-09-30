@@ -36,7 +36,7 @@ pub enum StyleMode {
 /// Reusable device connection arguments
 #[derive(Debug, Clone, Args)]
 pub struct DeviceArgs {
-    /// Device address (MAC address or UUID), or use ARANET_DEVICE env var
+    /// Device: MAC address, macOS UUID or full name (exact, any case), or an alias; or set ARANET_DEVICE
     #[arg(short, long, env = "ARANET_DEVICE")]
     pub device: Option<String>,
 
@@ -48,7 +48,7 @@ pub struct DeviceArgs {
 /// Device arguments that support multiple devices
 #[derive(Debug, Clone, Args)]
 pub struct MultiDeviceArgs {
-    /// Device address(es) - can be specified multiple times, or comma-separated
+    /// Device(s): MAC address, macOS UUID or full name (exact), or an alias; repeat or comma-separate
     #[arg(short, long, value_delimiter = ',', env = "ARANET_DEVICE")]
     pub device: Vec<String>,
 
@@ -605,7 +605,7 @@ pub enum AliasSubcommand {
         /// Friendly name for the device (e.g., "living-room", "office")
         name: String,
 
-        /// Device address (MAC address or UUID)
+        /// Device: MAC address, macOS UUID or full name (exact)
         address: String,
     },
 

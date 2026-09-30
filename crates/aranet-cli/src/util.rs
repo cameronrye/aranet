@@ -22,9 +22,23 @@ pub async fn disconnect_device(device: &aranet_core::Device) {
 }
 
 /// Build a user-friendly device error with suggestions and timestamp.
-fn device_error(operation: &str, identifier: &str, cause: impl std::fmt::Display) -> anyhow::Error {
-    let timestamp = aranet_cli::local_now_fmt("[year]-[month]-[day] [hour]:[minute]:[second]");
+///
+/// An identifier that is empty, ambiguous or only part of a name gets no
+/// suggestions: the fix is to type it exactly, which the cause already says.
+fn device_error(operation: &str, identifier: &str, cause: aranet_core::Error) -> anyhow::Error {
+    use aranet_core::{DeviceNotFoundReason, Error};
+
     let base_msg = format!("Failed to {} device: {}", operation, identifier);
+    if matches!(
+        cause,
+        Error::InvalidConfig(_)
+            | Error::DeviceNotFound(
+                DeviceNotFoundReason::Ambiguous { .. } | DeviceNotFoundReason::NoExactMatch { .. }
+            )
+    ) {
+        return anyhow::anyhow!("{}\n\nCause: {}", base_msg, cause);
+    }
+    let timestamp = aranet_cli::local_now_fmt("[year]-[month]-[day] [hour]:[minute]:[second]");
     let suggestion = format!(
         "\n\nPossible causes:\n  \
         - Bluetooth may be disabled -- check system settings\n  \
@@ -309,5 +323,33 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "header\nrow1\nrow2\n");
+    }
+
+    #[test]
+    fn test_identifier_mistakes_get_no_bluetooth_suggestions() {
+        use aranet_core::{DeviceNotFoundReason, Error};
+
+        let mistakes = [
+            Error::invalid_config("device identifier is empty"),
+            Error::DeviceNotFound(DeviceNotFoundReason::NoExactMatch {
+                identifier: "2751B".to_string(),
+                similar: vec!["Aranet2 2751B".to_string()],
+            }),
+            Error::DeviceNotFound(DeviceNotFoundReason::Ambiguous {
+                identifier: "Aranet4 12345".to_string(),
+                candidates: vec![
+                    "Aranet4 12345 (AA:BB:CC:DD:EE:01)".to_string(),
+                    "Aranet4 12345 (AA:BB:CC:DD:EE:02)".to_string(),
+                ],
+            }),
+        ];
+        for cause in mistakes {
+            let expected = format!("Failed to find device: x\n\nCause: {cause}");
+            assert_eq!(device_error("find", "x", cause).to_string(), expected);
+        }
+
+        // A device that isn't heard at all keeps the troubleshooting list.
+        let absent = device_error("find", "x", Error::device_not_found("x")).to_string();
+        assert!(absent.contains("Bluetooth may be disabled"), "{absent}");
     }
 }
