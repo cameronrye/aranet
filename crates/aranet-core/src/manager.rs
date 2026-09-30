@@ -1227,6 +1227,11 @@ impl DeviceManager {
     ///
     /// This performs a quick scan to check if the device is broadcasting
     /// advertisement data with sensor readings.
+    ///
+    /// Scans in one process run one at a time, so the check's 5 s scan first
+    /// waits for any scan that is already running. It returns `false` if no
+    /// reading arrives within 15 s, so a scan window of more than 10 s that is
+    /// already running can make it miss a device that does advertise.
     pub async fn supports_passive_monitoring(&self, identifier: &str) -> bool {
         // Create a short-lived passive monitor to check for advertisements
         let options = PassiveMonitorOptions::default()
@@ -1239,8 +1244,9 @@ impl DeviceManager {
 
         let _handle = monitor.start(cancel.clone());
 
-        // Wait for a reading or timeout
-        let result = tokio::time::timeout(Duration::from_secs(6), rx.recv()).await;
+        // Wait for a reading or timeout: 5 s of scanning, after up to 10 s of
+        // waiting for a scan window that is already running.
+        let result = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
         cancel.cancel();
 
         matches!(result, Ok(Ok(_)))
