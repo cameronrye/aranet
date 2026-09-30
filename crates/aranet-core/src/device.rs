@@ -410,53 +410,10 @@ impl Device {
         #[cfg(target_os = "linux")]
         crate::bluez_agent::allow_pairing(&peripheral.address().to_string());
 
-        // Connect to the device with timeout
-        info!("Connecting to device...");
-        timeout(config.connection_timeout, peripheral.connect())
-            .await
-            .map_err(|_| Error::Timeout {
-                operation: "connect to device".to_string(),
-                duration: config.connection_timeout,
-            })??;
-        info!("Connected!");
-
-        // Discover services with timeout
-        info!("Discovering services...");
-        timeout(config.discovery_timeout, peripheral.discover_services())
-            .await
-            .map_err(|_| Error::Timeout {
-                operation: "discover services".to_string(),
-                duration: config.discovery_timeout,
-            })??;
-
-        let mut services = peripheral.services();
-
-        // If service discovery returned nothing, BlueZ may have stale state
-        // from a previous failed connection (e.g., auth failure during GATT
-        // discovery). Disconnect, wait, and retry once with a clean connection.
-        if services.is_empty() {
-            warn!("Service discovery returned 0 services — retrying with fresh connection");
-            let _ = peripheral.disconnect().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-
-            timeout(config.connection_timeout, peripheral.connect())
-                .await
-                .map_err(|_| Error::Timeout {
-                    operation: "reconnect to device".to_string(),
-                    duration: config.connection_timeout,
-                })??;
-
-            timeout(config.discovery_timeout, peripheral.discover_services())
-                .await
-                .map_err(|_| Error::Timeout {
-                    operation: "rediscover services".to_string(),
-                    duration: config.discovery_timeout,
-                })??;
-
-            services = peripheral.services();
-        }
-
-        debug!("Found {} services", services.len());
+        let crate::link::OpenLink {
+            services,
+            properties,
+        } = crate::link::connect(&peripheral, &config).await?;
 
         // Build characteristics cache for O(1) lookups
         let mut characteristics_cache = HashMap::new();
@@ -472,8 +429,6 @@ impl Device {
             characteristics_cache.len()
         );
 
-        // Get device properties
-        let properties = peripheral.properties().await?;
         let name = properties.as_ref().and_then(|p| p.local_name.clone());
 
         // Get address - on macOS this may be 00:00:00:00:00:00, so we use peripheral ID as fallback
