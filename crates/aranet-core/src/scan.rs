@@ -33,7 +33,11 @@ async fn shared_manager() -> Result<Manager> {
     if let Some(m) = guard.as_ref() {
         return Ok(m.clone());
     }
-    let m = Manager::new().await?;
+    // bluez-async spawns the D-Bus connection's only I/O task on the runtime
+    // that creates the manager. On the caller's runtime that task would die when
+    // the runtime shuts down, and every later call on the cached manager would
+    // wait out the 30 s D-Bus timeout and fail.
+    let m = crate::runtime::run(Manager::new()).await??;
     *guard = Some(m.clone());
     Ok(m)
 }
@@ -193,15 +197,15 @@ static ADAPTER: RwLock<Option<Adapter>> = RwLock::const_new(None);
 
 /// Get the first available Bluetooth adapter.
 ///
-/// On macOS the adapter is created once and shared by every caller in the
-/// process, whichever tokio runtime they use. Its background tasks run on a
-/// dedicated one-thread runtime that lives as long as the process, and a new
-/// adapter replaces it if its CoreBluetooth thread stops.
+/// The adapter, and the Bluetooth manager behind it, are created on aranet-core's
+/// background runtime (thread `aranet-ble`), so they keep working after the caller's
+/// tokio runtime shuts down. On macOS the adapter is also created once, shared by
+/// every caller in the process, and replaced if its CoreBluetooth thread stops.
 pub async fn get_adapter() -> Result<Adapter> {
     if cfg!(target_os = "macos") {
         cached_adapter().await
     } else {
-        create_adapter().await
+        crate::runtime::run(create_adapter()).await?
     }
 }
 
@@ -776,6 +780,43 @@ mod tests {
                 },
             )
         ));
+    }
+
+    // ==================== Bluetooth Manager Tests ====================
+
+    /// bluez-async spawns the D-Bus connection's only I/O task on the runtime
+    /// that creates the manager, and `shared_manager` caches the manager for the
+    /// whole process, so that task has to outlive the runtime that created it.
+    /// Needs a system bus but not BlueZ: an error reply (no `org.bluez` on the
+    /// bus) still proves the connection works; only a missing reply fails.
+    ///
+    /// To run it on a Linux host:
+    /// `cargo test --locked -p aranet-core --lib manager_still_answers -- --ignored`.
+    /// In a Debian container, start a throwaway system bus first:
+    /// `apt-get install dbus; mkdir -p /run/dbus; dbus-daemon --system --fork`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a system D-Bus (BlueZ not required)"]
+    fn manager_still_answers_after_its_first_runtime_shuts_down() {
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+
+        let first = runtime();
+        let manager = first.block_on(shared_manager()).expect("manager");
+        drop(first);
+
+        let second = runtime();
+        let answered = second.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), manager.adapters()).await
+        });
+        assert!(
+            answered.is_ok(),
+            "the manager's D-Bus connection died with the runtime that created it"
+        );
     }
 
     // ==================== DiscoveredDevice Tests ====================
