@@ -62,6 +62,8 @@ struct State {
     calls: Vec<Call>,
     /// What a successful `is_connected` answers.
     connected: bool,
+    /// What `is_bluez` answers.
+    bluez: bool,
 }
 
 impl FakeGatt {
@@ -79,6 +81,7 @@ impl FakeGatt {
                 services: BTreeSet::new(),
                 calls: Vec::new(),
                 connected: true,
+                bluez: false,
             })),
             disconnected: Arc::new(Notify::new()),
         }
@@ -113,6 +116,12 @@ impl FakeGatt {
     /// Set what a successful `is_connected` answers (`true` until set).
     pub(super) fn set_connected(&self, connected: bool) {
         self.lock().connected = connected;
+    }
+
+    /// Set whether the fake is a BlueZ link (`is_bluez`): `false`, as on
+    /// macOS and Windows, until set.
+    pub(super) fn set_bluez(&self, bluez: bool) {
+        self.lock().bluez = bluez;
     }
 
     /// Script what the next discoveries find. Discoveries past the script find
@@ -213,6 +222,10 @@ impl GattLink for FakeGatt {
         };
         run(outcome).await?;
         Ok(self.lock().connected)
+    }
+
+    fn is_bluez(&self) -> bool {
+        self.lock().bluez
     }
 }
 
