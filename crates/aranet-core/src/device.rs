@@ -400,20 +400,34 @@ impl Device {
     }
 
     /// Create a Device from an already-discovered peripheral with full configuration.
+    ///
+    /// If the connect fails or times out, the peripheral is disconnected before
+    /// the error is returned. If this future is dropped before it finishes (a
+    /// caller's timeout, a cancelled task), the peripheral is disconnected in
+    /// the background; that is best effort if the process is exiting. Either
+    /// way the disconnect waits at most 5 s for the Bluetooth stack to confirm
+    /// it.
     #[tracing::instrument(level = "info", skip_all, fields(connect_timeout = ?config.connection_timeout))]
     pub async fn from_peripheral_with_config(
         adapter: Adapter,
         peripheral: Peripheral,
         config: ConnectionConfig,
     ) -> Result<Self> {
+        let cleanup = crate::link::cleanup_runtime().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "no tokio runtime available for Bluetooth cleanup",
+            ))
+        })?;
+
         // Let the BlueZ agent complete "Just Works" pairing for this device only.
         #[cfg(target_os = "linux")]
         crate::bluez_agent::allow_pairing(&peripheral.address().to_string());
 
         let crate::link::OpenLink {
+            pending,
             services,
             properties,
-        } = crate::link::connect(&peripheral, &config).await?;
+        } = crate::link::connect(&peripheral, &config, &cleanup).await?;
 
         // Build characteristics cache for O(1) lookups
         let mut characteristics_cache = HashMap::new();
@@ -440,7 +454,7 @@ impl Device {
         // Determine device type from name
         let device_type = name.as_ref().and_then(|n| DeviceType::from_name(n));
 
-        Ok(Self {
+        let device = Self {
             adapter,
             peripheral,
             name,
@@ -451,7 +465,11 @@ impl Device {
             notification_handles: tokio::sync::Mutex::new(Vec::new()),
             disconnected: AtomicBool::new(false),
             config,
-        })
+        };
+        // Nothing between `connect` returning and here awaits, so the link is
+        // never left without an owner.
+        pending.disarm();
+        Ok(device)
     }
 
     /// Check if the device is connected (queries BLE stack state).

@@ -1168,6 +1168,112 @@ async fn test_connect_invalid_address() {
 }
 
 // =============================================================================
+// Connect Cleanup Tests (BR-3)
+// =============================================================================
+
+/// Finds `device` and fails the test if the Bluetooth stack already reports it
+/// connected: an earlier connection would make the cleanup check meaningless.
+async fn find_disconnected_sensor(
+    device: &str,
+) -> (btleplug::platform::Adapter, btleplug::platform::Peripheral) {
+    let (adapter, peripheral) = aranet_core::scan::find_device(device).await.expect("find");
+    let state = timeout(
+        Duration::from_secs(5),
+        btleplug::api::Peripheral::is_connected(&peripheral),
+    )
+    .await;
+    assert!(
+        !matches!(state, Ok(Ok(true))),
+        "{device} is already connected to this computer; wait for that connection to end and run the test again"
+    );
+    (adapter, peripheral)
+}
+
+/// Waits long enough for CoreBluetooth to finish a connect nobody cancelled,
+/// finds `device` again and asks the Bluetooth stack whether it is connected.
+///
+/// The search scans for up to 30 s: after a disconnect, CoreBluetooth forgets
+/// the peripheral, and the sensor can take a while to advertise again.
+async fn connection_state_after_settling(
+    device: &str,
+) -> Result<btleplug::Result<bool>, tokio::time::error::Elapsed> {
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let options = aranet_core::scan::ScanOptions::default().duration_secs(10);
+    let (_adapter, peripheral) = aranet_core::scan::find_device_with_options(device, options)
+        .await
+        .expect("find the sensor again");
+    timeout(
+        Duration::from_secs(5),
+        btleplug::api::Peripheral::is_connected(&peripheral),
+    )
+    .await
+}
+
+/// A connect that times out must release the sensor (BR-3). Dropping a
+/// btleplug connect future doesn't cancel CoreBluetooth's `connectPeripheral`,
+/// so before the fix the abandoned connect completed a few seconds later and
+/// the sensor stayed connected to this computer.
+#[tokio::test]
+#[ignore = "requires BLE hardware and an Aranet2 device"]
+async fn test_timed_out_connect_leaves_sensor_disconnected() {
+    let Some(device_name) = get_device("aranet2") else {
+        println!("SKIP: ARANET2_DEVICE not set");
+        return;
+    };
+    let (adapter, peripheral) = find_disconnected_sensor(&device_name).await;
+
+    let config =
+        aranet_core::ConnectionConfig::default().connection_timeout(Duration::from_millis(50));
+    match Device::from_peripheral_with_config(adapter, peripheral, config).await {
+        Err(aranet_core::Error::Timeout { .. }) => {}
+        Err(e) => panic!("expected the 50 ms connect to time out, got: {e}"),
+        Ok(device) => {
+            let _ = device.disconnect().await;
+            panic!("connected within 50 ms, so the timeout path wasn't tested");
+        }
+    }
+
+    let state = connection_state_after_settling(&device_name).await;
+    assert!(
+        matches!(state, Ok(Ok(false))),
+        "the timed-out connect should have released {device_name}, got {state:?}"
+    );
+}
+
+/// A connect whose caller gives up must release the sensor too (BR-3): here
+/// the caller's own `timeout` drops the connect future, as the GUI's connect
+/// timeout, Esc in the TUI and the service's poll time limit do.
+#[tokio::test]
+#[ignore = "requires BLE hardware and an Aranet2 device"]
+async fn test_cancelled_connect_leaves_sensor_disconnected() {
+    let Some(device_name) = get_device("aranet2") else {
+        println!("SKIP: ARANET2_DEVICE not set");
+        return;
+    };
+    let (adapter, peripheral) = find_disconnected_sensor(&device_name).await;
+
+    let connect = Device::from_peripheral_with_config(
+        adapter,
+        peripheral,
+        aranet_core::ConnectionConfig::default(),
+    );
+    match timeout(Duration::from_millis(50), connect).await {
+        Err(_elapsed) => {}
+        Ok(Err(e)) => panic!("expected the connect to be cancelled after 50 ms, got: {e}"),
+        Ok(Ok(device)) => {
+            let _ = device.disconnect().await;
+            panic!("connected within 50 ms, so the cancel path wasn't tested");
+        }
+    }
+
+    let state = connection_state_after_settling(&device_name).await;
+    assert!(
+        matches!(state, Ok(Ok(false))),
+        "the cancelled connect should have released {device_name}, got {state:?}"
+    );
+}
+
+// =============================================================================
 // Adapter Reuse Tests (macOS)
 // =============================================================================
 
