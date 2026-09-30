@@ -253,6 +253,15 @@ async fn connect_and_discover<L: GattLink>(
         .await?;
 
         services = link.services();
+        if services.is_empty() {
+            // Retrying on this link again won't help. Fail with a retryable
+            // error instead of returning a device whose every read would fail
+            // with "characteristic not found".
+            return Err(Error::connection_failed_str(
+                None,
+                "the device reported no GATT services",
+            ));
+        }
     }
 
     debug!("Found {} services", services.len());
@@ -279,7 +288,7 @@ mod tests {
     use super::fake::{Call, FakeGatt, Outcome, aranet_services};
     use super::{DISCONNECT_TIMEOUT, connect};
     use crate::device::ConnectionConfig;
-    use crate::error::Error;
+    use crate::error::{ConnectionFailureReason, Error};
     use crate::test_support::within;
 
     /// Run a connect on `fake` that must fail, with the default config and the
@@ -546,6 +555,39 @@ mod tests {
                 ]
             );
             assert_eq!(start.elapsed(), Duration::from_secs(17));
+        })
+        .await;
+    }
+
+    /// Discovery that finds no services even after the retry fails the connect
+    /// with a retryable error, and disconnects, instead of returning a device
+    /// whose every read fails.
+    #[tokio::test(start_paused = true)]
+    async fn zero_services_after_retry_fails_and_disconnects() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.service_rounds([BTreeSet::new(), BTreeSet::new()]);
+
+            let error = failed_connect(&fake).await;
+
+            match &error {
+                Error::ConnectionFailed {
+                    reason: ConnectionFailureReason::Other(reason),
+                    ..
+                } => assert!(reason.contains("no GATT services"), "reason: {reason}"),
+                other => panic!("expected a connection failure, got {other:?}"),
+            }
+            assert_eq!(
+                fake.calls(),
+                [
+                    Call::Connect,
+                    Call::Discover,
+                    Call::Disconnect,
+                    Call::Connect,
+                    Call::Discover,
+                    Call::Disconnect,
+                ]
+            );
         })
         .await;
     }
