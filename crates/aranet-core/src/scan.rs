@@ -265,12 +265,6 @@ async fn adapter_thread_is_running(adapter: &Adapter) -> bool {
 async fn create_adapter() -> Result<Adapter> {
     use crate::error::DeviceNotFoundReason;
 
-    // On Linux, register a BlueZ agent to handle authentication during service
-    // discovery. Without this, BlueZ hangs when it encounters characteristics
-    // that require authentication (e.g., Battery Level on Aranet devices).
-    #[cfg(target_os = "linux")]
-    crate::bluez_agent::ensure_agent();
-
     let manager = shared_manager().await?;
     let adapters = match manager.adapters().await {
         Ok(a) => a,

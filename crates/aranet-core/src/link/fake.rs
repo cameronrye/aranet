@@ -51,6 +51,8 @@ pub(super) enum Call {
     IsConnected,
     Subscribe(Uuid),
     Unsubscribe(Uuid),
+    /// The Linux pairing step. Recorded only once `script_pair` has been called.
+    Pair,
 }
 
 /// A peripheral whose calls follow a script. Clones share the script and the
@@ -80,6 +82,10 @@ struct State {
     streams: Vec<mpsc::UnboundedSender<ValueNotification>>,
     /// What each `subscribe` sends to the open streams before it answers.
     emit_on_subscribe: Option<Vec<u8>>,
+    /// The pairing step's script. `None` until `script_pair` is called: until
+    /// then the fake has no pairing step, so the call logs of the other link
+    /// tests stay as they are.
+    pair: Option<VecDeque<Outcome>>,
 }
 
 impl State {
@@ -115,6 +121,7 @@ impl FakeGatt {
                 unsubscribe: VecDeque::new(),
                 streams: Vec::new(),
                 emit_on_subscribe: None,
+                pair: None,
             })),
             disconnected: Arc::new(Notify::new()),
         }
@@ -155,6 +162,16 @@ impl FakeGatt {
     /// macOS and Windows, until set.
     pub(super) fn set_bluez(&self, bluez: bool) {
         self.lock().bluez = bluez;
+    }
+
+    /// Give the fake a pairing step and script its next runs. Runs past the
+    /// script return at once. Pairing never fails a connect, so a `Fail` is
+    /// ignored; `Hang` never returns.
+    pub(super) fn script_pair(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock()
+            .pair
+            .get_or_insert_with(VecDeque::new)
+            .extend(outcomes);
     }
 
     /// Script what the next discoveries find. Discoveries past the script find
@@ -320,6 +337,20 @@ impl GattLink for FakeGatt {
         let (sender, receiver) = mpsc::unbounded();
         self.lock().streams.push(sender);
         Ok(Box::pin(receiver))
+    }
+
+    async fn pair_if_needed(&self, _budget: std::time::Duration) {
+        let outcome = {
+            let mut state = self.lock();
+            let Some(script) = state.pair.as_mut() else {
+                return;
+            };
+            let outcome = script.pop_front();
+            state.calls.push(Call::Pair);
+            outcome
+        };
+        // Pairing never fails a connect, so the result is ignored.
+        let _ = run(outcome).await;
     }
 }
 
