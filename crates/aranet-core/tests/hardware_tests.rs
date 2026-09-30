@@ -471,6 +471,61 @@ async fn test_reconnect_after_disconnect() {
     let _ = device2.disconnect().await;
 }
 
+/// BR-15: a connection check must pass on an unpaired sensor whose current
+/// readings work, and must not start pairing. It used to read Battery Level
+/// (0x2A19), which needs pairing.
+#[tokio::test]
+#[ignore = "requires BLE hardware (unpaired Aranet2 / AranetRn+)"]
+async fn test_validate_connection_without_pairing() {
+    let mut devices: Vec<String> = [get_device("aranet2"), get_device("aranet_radon")]
+        .into_iter()
+        .flatten()
+        .collect();
+    // Both lookups fall back to ARANET_DEVICE, so they can name the same sensor.
+    devices.dedup();
+    if devices.is_empty() {
+        println!("SKIP: ARANET2_DEVICE / ARANET_RADON_DEVICE not set");
+        return;
+    }
+
+    let mut failed = Vec::new();
+    for dev in devices {
+        // A failed connect says nothing about the check: record it and go on
+        // with the next sensor.
+        let device = match timeout(BLE_TIMEOUT, Device::connect(&dev)).await {
+            Ok(Ok(device)) => device,
+            Ok(Err(e)) => {
+                println!("{dev}: connect failed: {e}");
+                failed.push(format!("{dev} (connect failed)"));
+                continue;
+            }
+            Err(_) => {
+                println!("{dev}: connect timed out after {BLE_TIMEOUT:?}");
+                failed.push(format!("{dev} (connect timed out)"));
+                continue;
+            }
+        };
+        let valid = device.validate_connection().await;
+        println!("{dev}: validate_connection = {valid}");
+        if !valid {
+            // Why it failed: a read that works unpaired, then the battery read.
+            let current = timeout(Duration::from_secs(10), device.read_current())
+                .await
+                .map(|r| r.map(|_| ()));
+            let battery = timeout(Duration::from_secs(5), device.read_battery())
+                .await
+                .map(|r| r.map(|_| ()));
+            println!("{dev}: read_current = {current:?}, read_battery = {battery:?}");
+            failed.push(dev);
+        }
+        let _ = device.disconnect().await;
+    }
+    assert!(
+        failed.is_empty(),
+        "no passing connection check for {failed:?}"
+    );
+}
+
 // =============================================================================
 // Read Tests - Aranet4
 // =============================================================================

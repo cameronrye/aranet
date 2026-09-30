@@ -290,9 +290,10 @@ pub struct ManagerConfig {
     pub default_priority: DevicePriority,
     /// Whether to use connection validation (keepalive checks).
     ///
-    /// When enabled, health checks will use `device.validate_connection()`
-    /// which performs an actual BLE read to verify the connection is alive.
-    /// This catches "zombie connections" but uses more power.
+    /// When enabled, health checks use `device.validate_connection()`, which
+    /// reads the current measurements to verify the connection is alive. That
+    /// read needs no pairing that reading the sensor doesn't. This catches
+    /// "zombie connections" but uses more power.
     pub use_connection_validation: bool,
 }
 
@@ -914,9 +915,10 @@ impl DeviceManager {
     ///
     /// # Connection Validation
     ///
-    /// If `use_connection_validation` is enabled, health checks will perform
-    /// an actual BLE read (`device.validate_connection()`) to catch "zombie connections"
-    /// where the BLE stack thinks it's connected but the device is out of range.
+    /// If `use_connection_validation` is enabled, health checks read the current
+    /// measurements (`device.validate_connection()`, which needs no pairing that
+    /// a reading doesn't) to catch "zombie connections" where the BLE stack
+    /// thinks it's connected but the device is out of range.
     ///
     /// # Example
     ///
