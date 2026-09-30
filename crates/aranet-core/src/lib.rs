@@ -41,6 +41,14 @@
 //! - Cross-platform applications should store both the device name and identifier
 //! - The [`Device::address()`] method returns the appropriate identifier for the platform
 //!
+//! # Runtime and concurrency
+//!
+//! aranet-core runs Bluetooth background work on its own one-thread tokio runtime
+//! (thread `aranet-ble`): the Bluetooth manager and adapter, scans, the cleanup of
+//! connections that fail or are cancelled and, on Linux, the pairing of sensors that
+//! aren't paired yet. It can be used from any number of tokio runtimes. Scans in one process run one at a time; a search that needs a scan while
+//! another is running waits for it, then reuses what it found.
+//!
 //! # Quick Start
 //!
 //! ```no_run
@@ -99,6 +107,8 @@ pub mod service_client;
 
 // Crate-private modules.
 mod runtime;
+#[cfg(test)]
+mod test_support;
 
 // Re-export types and uuid modules from aranet-types for backwards compatibility
 pub use aranet_types::types;

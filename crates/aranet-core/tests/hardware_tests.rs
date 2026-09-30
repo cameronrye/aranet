@@ -23,6 +23,8 @@ use std::time::Duration;
 use aranet_core::Device;
 use aranet_core::scan::{ScanOptions, scan_with_options};
 use aranet_core::settings::MeasurementInterval;
+use btleplug::api::Central as _;
+use futures::{FutureExt, StreamExt};
 use tokio::time::timeout;
 
 /// Default timeout for BLE operations
@@ -134,6 +136,191 @@ async fn test_scan_unfiltered() {
             panic!("Unfiltered scan timed out");
         }
     }
+}
+
+/// A scan whose caller gives up must stop the radio at once, and the process
+/// must be able to scan again. Before the fix, a dropped scan never called
+/// `stop_scan`: CoreBluetooth kept scanning (with duplicates) and events kept
+/// arriving, and on Linux every later scan in the process failed with
+/// `org.bluez.Error.InProgress`.
+#[tokio::test]
+#[ignore = "requires BLE hardware: Aranet devices advertising nearby"]
+async fn test_cancelled_scan_stops_scanning() {
+    if get_any_device().is_none() {
+        println!("SKIP: No device configured (set ARANET_DEVICE env var)");
+        return;
+    }
+    let adapter = aranet_core::scan::get_adapter().await.expect("adapter");
+    let mut events = adapter.events().await.expect("event stream");
+
+    let options = ScanOptions::default().duration_secs(30);
+    let scan = timeout(
+        Duration::from_secs(3),
+        aranet_core::scan::scan_with_adapter(&adapter, options),
+    )
+    .await;
+    assert!(
+        scan.is_err(),
+        "the 30 s scan should still be running after 3 s"
+    );
+
+    let mut while_scanning = 0;
+    while let Some(Some(_)) = events.next().now_or_never() {
+        while_scanning += 1;
+    }
+    assert!(
+        while_scanning > 0,
+        "no Bluetooth events while scanning; are sensors advertising nearby?"
+    );
+
+    // Give the stop a moment to take effect, then drop what arrived meanwhile.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    while let Some(Some(_)) = events.next().now_or_never() {}
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut after_cancel = 0;
+    while let Ok(Some(_)) = tokio::time::timeout_at(deadline, events.next()).await {
+        after_cancel += 1;
+    }
+
+    // Scan again in the same process: on Linux, a scan left running makes this
+    // fail with org.bluez.Error.InProgress, and a scan permit that is never
+    // released would make it wait forever. 40 s covers a stop that BlueZ
+    // answers only at bluez-async's 30 s D-Bus call timeout.
+    let options = ScanOptions::default().duration_secs(2);
+    let rescan = timeout(
+        Duration::from_secs(40),
+        aranet_core::scan::scan_with_adapter(&adapter, options),
+    )
+    .await;
+    let rescan_result = match &rescan {
+        Ok(Ok(devices)) => format!("found {} devices", devices.len()),
+        Ok(Err(e)) => format!("failed: {e}"),
+        Err(_) => "did not finish within 40 s".to_string(),
+    };
+    println!(
+        "{while_scanning} events while scanning, {after_cancel} in the 5 s after the cancel; \
+         the next scan {rescan_result}"
+    );
+    assert_eq!(
+        after_cancel, 0,
+        "Bluetooth events kept arriving after the scan was cancelled: it is still scanning"
+    );
+    rescan
+        .expect("the scan after the cancelled one never finished: the permit is still held")
+        .expect("a scan after the cancelled one failed");
+}
+
+/// Two scans in one process must run one after the other. Before the fix, the
+/// second scan's stop also ended the first on macOS (`get_adapter` gives every
+/// caller the same `CBCentralManager`), and on Linux the second failed with
+/// `org.bluez.Error.InProgress`.
+#[tokio::test]
+#[ignore = "requires BLE hardware"]
+async fn test_concurrent_scans_are_serialised() {
+    // Create the adapter first: creating it can take over a second, and the
+    // second scan must not start before the first has the permit.
+    aranet_core::scan::get_adapter().await.expect("adapter");
+    let started = std::time::Instant::now();
+    let first = scan_with_options(ScanOptions::default().duration_secs(10));
+    let second = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let devices = scan_with_options(ScanOptions::default().duration_secs(2)).await;
+        (devices, started.elapsed())
+    };
+    let (first, (second, second_done_at)) = timeout(Duration::from_secs(60), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("scans did not finish within 60 s");
+    let first = first.expect("first scan failed");
+    let second = second.expect("second scan failed");
+    println!(
+        "first scan found {}, second found {} and finished after {second_done_at:?}",
+        first.len(),
+        second.len()
+    );
+
+    assert!(
+        second_done_at >= Duration::from_secs(11),
+        "the second scan ended after {second_done_at:?}, so it ran during the first"
+    );
+    if get_any_device().is_some() {
+        assert!(
+            !first.is_empty() && !second.is_empty(),
+            "both scans should find the configured sensors"
+        );
+    } else {
+        println!("No device configured: not checking that both scans found sensors");
+    }
+}
+
+/// Two searches that need a scan at the same time share it: the one that waits
+/// for the scan permit looks at what the running scan found before scanning
+/// itself (CL-25). Before the fix both searches scanned. Both look for the same
+/// sensor, so it doesn't matter which scan first sees it. Run the test on its
+/// own: in a process that has scanned already, the sensor is known before
+/// either search starts, and the test skips.
+///
+/// When a scan ends, the scanning search's post-scan check and the waiting
+/// search's re-check run at the same moment. Rarely, CoreBluetooth reports the
+/// sensor just after the stop, and only one of the two checks sees it. If the
+/// scanning search misses it, it finds the sensor in its next attempt's
+/// re-check, both searches end with `CacheHit`, and the test passes. If the
+/// waiting search misses it, it scans for itself and the test fails: rerun it
+/// once. Without the re-check the test fails on every run.
+#[tokio::test]
+#[ignore = "requires BLE hardware: Aranet devices advertising nearby"]
+async fn test_concurrent_finds_share_one_scan() {
+    use std::sync::{Arc, Mutex};
+
+    use aranet_core::scan::{FindProgress, ProgressCallback, find_device_with_progress};
+
+    let Some(device) = get_any_device() else {
+        println!("SKIP: No device configured (set ARANET_DEVICE env var)");
+        return;
+    };
+    let adapter = aranet_core::scan::get_adapter().await.expect("adapter");
+    let known = adapter.peripherals().await.expect("known devices").len();
+    if known > 0 {
+        println!("SKIP: this process knows {known} devices already; run this test on its own");
+        return;
+    }
+
+    let search = |identifier: String| async move {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let progress: ProgressCallback = Box::new({
+            let events = Arc::clone(&events);
+            move |event| events.lock().unwrap().push(event)
+        });
+        let options = ScanOptions::default().duration_secs(10);
+        if let Err(e) = find_device_with_progress(&identifier, options, Some(progress)).await {
+            panic!("could not find {identifier}: {e}");
+        }
+        events.lock().unwrap().clone()
+    };
+    let started = std::time::Instant::now();
+    let (a, b) = timeout(Duration::from_secs(90), async {
+        tokio::join!(search(device.clone()), search(device))
+    })
+    .await
+    .expect("the searches did not finish within 90 s");
+    println!(
+        "the searches reported {a:?} and {b:?}, and finished after {:?}",
+        started.elapsed()
+    );
+
+    // The device list was empty when both searches began, so a `CacheHit` can
+    // only come from the check made after waiting for the permit. Two are fine:
+    // see the rare case in the doc comment.
+    let reused = [&a, &b]
+        .into_iter()
+        .filter(|events| matches!(events.last(), Some(FindProgress::CacheHit)))
+        .count();
+    assert!(
+        reused >= 1,
+        "neither search found the sensor in the other's scan: each scanned for it itself"
+    );
 }
 
 // =============================================================================

@@ -261,10 +261,16 @@ impl PassiveMonitor {
 
     /// Perform a single scan cycle using a pre-existing adapter.
     async fn scan_cycle_with_adapter(&self, adapter: &btleplug::platform::Adapter) -> Result<()> {
-        // Start scanning
-        adapter.start_scan(ScanFilter::default()).await?;
-        sleep(self.options.scan_duration).await;
-        adapter.stop_scan().await?;
+        // Scan under the process-wide permit. The scan stops even if this cycle
+        // is cancelled part-way through.
+        let permit = crate::scan::scan_lock().acquire().await;
+        crate::scan::run_scan(
+            adapter,
+            permit,
+            ScanFilter::default(),
+            self.options.scan_duration,
+        )
+        .await?;
 
         // Process discovered peripherals
         let peripherals = adapter.peripherals().await?;

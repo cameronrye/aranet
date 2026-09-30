@@ -2,13 +2,21 @@
 //!
 //! This module provides functionality to scan for Aranet devices
 //! using Bluetooth Low Energy.
+//!
+//! Scans in one process run one at a time: each scan window takes a
+//! process-wide permit and releases it only after the scan has stopped. A
+//! window runs on aranet-core's background runtime and stops as soon as its
+//! caller is dropped.
 
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Cached BLE manager — avoids creating a new D-Bus connection on every call.
@@ -61,7 +69,9 @@ use aranet_types::DeviceType;
 /// Progress update for device finding operations.
 #[derive(Debug, Clone)]
 pub enum FindProgress {
-    /// Found device in cache, no scan needed.
+    /// Found the device among the devices the adapter already knows, without
+    /// scanning for it: before the first scan, or after waiting for another
+    /// search's scan.
     CacheHit,
     /// Starting scan attempt.
     ScanAttempt {
@@ -278,6 +288,121 @@ async fn create_adapter() -> Result<Adapter> {
         .ok_or(Error::DeviceNotFound(DeviceNotFoundReason::NoAdapter))
 }
 
+/// Starts and stops a Bluetooth scan: btleplug's [`Adapter`] in production, a
+/// fake in the tests.
+pub(crate) trait ScanControl: Clone + Send + Sync + 'static {
+    /// Start scanning. BlueZ fails with `org.bluez.Error.InProgress` if this
+    /// process is already scanning.
+    fn start(&self, filter: ScanFilter) -> impl Future<Output = Result<()>> + Send;
+
+    /// Stop scanning.
+    fn stop(&self) -> impl Future<Output = Result<()>> + Send;
+}
+
+impl ScanControl for Adapter {
+    async fn start(&self, filter: ScanFilter) -> Result<()> {
+        Central::start_scan(self, filter).await?;
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        Central::stop_scan(self).await?;
+        Ok(())
+    }
+}
+
+/// Lets one scan window run at a time. Whoever holds its [`ScanPermit`] may scan.
+///
+/// A scan is process-wide: BlueZ gives each D-Bus client (this whole process)
+/// one discovery session, and on macOS the adapter from `get_adapter` is one
+/// `CBCentralManager` shared by the whole process, so one caller's stop ends
+/// every caller's scan. tokio's mutex hands the permit out in the order it was
+/// asked for.
+#[derive(Clone, Default)]
+pub(crate) struct ScanLock(Arc<tokio::sync::Mutex<()>>);
+
+impl ScanLock {
+    /// Wait for the permit.
+    pub(crate) async fn acquire(&self) -> ScanPermit {
+        ScanPermit {
+            _guard: Arc::clone(&self.0).lock_owned().await,
+        }
+    }
+}
+
+/// Permission to scan, from [`ScanLock::acquire`]. The next caller can scan once
+/// it is dropped, so it must be held until the scan has stopped.
+///
+/// While holding a permit, never wait for another lock or another scan: only
+/// start, stop, sleep and read the adapter's known peripherals. Callers may hold
+/// their own locks while they wait for the permit, because its holder never
+/// waits for them.
+pub(crate) struct ScanPermit {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+static SCAN_LOCK: LazyLock<ScanLock> = LazyLock::new(ScanLock::default);
+
+/// The [`ScanLock`] that every scan in this process takes. See [`ScanPermit`]
+/// for what its holder may wait for.
+pub(crate) fn scan_lock() -> &'static ScanLock {
+    &SCAN_LOCK
+}
+
+/// One scan window: start, wait `duration`, stop.
+///
+/// The window runs as a task on `runtime`, so it finishes even if this future is
+/// dropped (a timeout, an aborted task, or a caller whose runtime shuts down).
+/// Dropping the future ends the wait early, but the scan is still stopped, and
+/// `permit` is released only once `stop` has returned, so the next window can't
+/// start while this one is still stopping.
+async fn scan_window<S: ScanControl>(
+    runtime: &Handle,
+    scanner: &S,
+    permit: ScanPermit,
+    filter: ScanFilter,
+    duration: Duration,
+) -> Result<()> {
+    let scanner = scanner.clone();
+    let cancel = CancellationToken::new();
+    // Dropping the caller's future drops this guard, which ends the window early.
+    let _end_early_on_drop = cancel.clone().drop_guard();
+    let window = runtime.spawn(async move {
+        let _permit = permit; // released only after stop has returned
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        scanner.start(filter).await?; // a failed start has nothing to stop
+        let _ = cancel.run_until_cancelled(sleep(duration)).await;
+        let stopped = scanner.stop().await;
+        if let Err(e) = &stopped {
+            // Nobody may be awaiting this task any more.
+            warn!("Failed to stop the Bluetooth scan: {e}");
+        }
+        stopped
+    });
+    window.await.map_err(std::io::Error::from)?
+}
+
+/// Scan with `scanner` (the adapter, in production) for `duration`, holding
+/// `permit` (from [`scan_lock`]) until the scan has stopped. The window runs on
+/// aranet-core's runtime.
+pub(crate) async fn run_scan<S: ScanControl>(
+    scanner: &S,
+    permit: ScanPermit,
+    filter: ScanFilter,
+    duration: Duration,
+) -> Result<()> {
+    scan_window(
+        &crate::runtime::handle()?,
+        scanner,
+        permit,
+        filter,
+        duration,
+    )
+    .await
+}
+
 /// Scan for Aranet devices in range.
 ///
 /// Returns a list of discovered devices, or an error if the scan failed.
@@ -375,14 +500,8 @@ pub async fn scan_with_adapter(
         ScanFilter::default()
     };
 
-    // Start scanning
-    adapter.start_scan(scan_filter).await?;
-
-    // Wait for the scan duration
-    sleep(options.duration).await;
-
-    // Stop scanning
-    adapter.stop_scan().await?;
+    let permit = scan_lock().acquire().await;
+    run_scan(adapter, permit, scan_filter, options.duration).await?;
 
     // Get discovered peripherals
     let peripherals = adapter.peripherals().await?;
@@ -543,6 +662,16 @@ pub async fn find_device_with_adapter_progress(
         let scan_duration = base_duration * attempt;
         let duration_secs = scan_duration.as_secs();
 
+        let permit = scan_lock().acquire().await;
+        // Another search may have scanned while this one waited for the permit.
+        if let Some(peripheral) = find_peripheral_by_identifier(adapter, &identifier_lower).await? {
+            info!("Found device while waiting to scan");
+            if let Some(ref cb) = progress {
+                cb(FindProgress::CacheHit);
+            }
+            return Ok(peripheral);
+        }
+
         info!(
             "Scan attempt {}/{} ({}s)...",
             attempt, max_attempts, duration_secs
@@ -556,9 +685,7 @@ pub async fn find_device_with_adapter_progress(
             });
         }
 
-        adapter.start_scan(ScanFilter::default()).await?;
-        sleep(scan_duration).await;
-        adapter.stop_scan().await?;
+        run_scan(adapter, permit, ScanFilter::default(), scan_duration).await?;
 
         if let Some(peripheral) = find_peripheral_by_identifier(adapter, &identifier_lower).await? {
             info!("Found device on attempt {}", attempt);
@@ -641,6 +768,12 @@ async fn find_peripheral_by_identifier(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::FutureExt;
+
+    use crate::test_support::within;
 
     // ==================== ScanOptions Tests ====================
 
@@ -817,6 +950,306 @@ mod tests {
             answered.is_ok(),
             "the manager's D-Bus connection died with the runtime that created it"
         );
+    }
+
+    // ==================== Scan Window Tests ====================
+
+    /// Longest any scan-window test may take on the paused clock.
+    const TEST_LIMIT: Duration = Duration::from_secs(600);
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// A scanner that behaves like BlueZ: one discovery session per D-Bus
+    /// client, so a second `start` before `stop` fails with InProgress. It logs
+    /// when each start and stop happened, measured from its creation.
+    #[derive(Clone)]
+    struct FakeScanner {
+        started_at: tokio::time::Instant,
+        log: Arc<std::sync::Mutex<Vec<(Duration, &'static str)>>>,
+        scanning: Arc<AtomicBool>,
+        fail_start: bool,
+        /// How long `stop` takes to end the session: StopDiscovery is a D-Bus
+        /// round trip on BlueZ.
+        stop_latency: Duration,
+        on_stop: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl FakeScanner {
+        fn new() -> Self {
+            Self {
+                started_at: tokio::time::Instant::now(),
+                log: Arc::default(),
+                scanning: Arc::default(),
+                fail_start: false,
+                stop_latency: Duration::ZERO,
+                on_stop: None,
+            }
+        }
+
+        fn record(&self, event: &'static str) {
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.started_at.elapsed(), event));
+        }
+
+        fn log(&self) -> Vec<(Duration, &'static str)> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn is_scanning(&self) -> bool {
+            self.scanning.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ScanControl for FakeScanner {
+        async fn start(&self, _filter: ScanFilter) -> Result<()> {
+            if self.fail_start {
+                return Err(Error::InvalidData("start failed".into()));
+            }
+            if self.scanning.swap(true, Ordering::SeqCst) {
+                return Err(Error::InvalidData("org.bluez.Error.InProgress".into()));
+            }
+            self.record("start");
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<()> {
+            self.record("stop");
+            sleep(self.stop_latency).await;
+            self.scanning.store(false, Ordering::SeqCst);
+            if let Some(on_stop) = &self.on_stop {
+                let _ = on_stop.send(());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_window_stops_the_scan_when_the_window_ends() {
+        within(TEST_LIMIT, async {
+            let rt = tokio::runtime::Handle::current();
+            let lock = ScanLock::default();
+            let scanner = FakeScanner::new();
+
+            let permit = lock.acquire().await;
+            scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(5))
+                .await
+                .unwrap();
+
+            assert_eq!(scanner.log(), [(secs(0), "start"), (secs(5), "stop")]);
+            assert!(!scanner.is_scanning());
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_caller_stops_the_scan_immediately() {
+        within(TEST_LIMIT, async {
+            let rt = tokio::runtime::Handle::current();
+            let lock = ScanLock::default();
+            let scanner = FakeScanner::new();
+
+            let permit = lock.acquire().await;
+            let window = scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(5));
+            assert!(tokio::time::timeout(secs(1), window).await.is_err());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            assert_eq!(scanner.log(), [(secs(0), "start"), (secs(1), "stop")]);
+            assert!(!scanner.is_scanning());
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborting_the_task_stops_the_scan() {
+        within(TEST_LIMIT, async {
+            let rt = tokio::runtime::Handle::current();
+            let lock = ScanLock::default();
+            let scanner = FakeScanner::new();
+
+            // A service reload or stop aborts its tasks like this (`abort_all`).
+            let task = tokio::spawn({
+                let scanner = scanner.clone();
+                let lock = lock.clone();
+                async move {
+                    let permit = lock.acquire().await;
+                    scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(5)).await
+                }
+            });
+            tokio::time::sleep(secs(1)).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            assert_eq!(scanner.log(), [(secs(0), "start"), (secs(1), "stop")]);
+            assert!(!scanner.is_scanning());
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_start_releases_the_permit_without_stopping() {
+        within(TEST_LIMIT, async {
+            let rt = tokio::runtime::Handle::current();
+            let lock = ScanLock::default();
+            let scanner = FakeScanner {
+                fail_start: true,
+                ..FakeScanner::new()
+            };
+
+            let permit = lock.acquire().await;
+            let result = scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(5)).await;
+
+            assert!(matches!(result, Err(Error::InvalidData(ref m)) if m == "start failed"));
+            assert!(
+                scanner.log().is_empty(),
+                "a scan that never started must not be stopped"
+            );
+            within(secs(1), lock.acquire()).await;
+        })
+        .await;
+    }
+
+    #[test]
+    fn scan_stops_after_the_callers_runtime_shuts_down() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        caller.block_on(async {
+            let lock = ScanLock::default();
+            let scanner = FakeScanner {
+                on_stop: Some(tx),
+                ..FakeScanner::new()
+            };
+            let permit = lock.acquire().await;
+            // Through `run_scan`, which picks the runtime the window runs on.
+            let window = run_scan(&scanner, permit, ScanFilter::default(), secs(10));
+            let started = async {
+                while !scanner.is_scanning() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            // Give up on the window once its scan is running, however late the
+            // aranet-ble thread gets to it.
+            tokio::select! {
+                result = window => panic!("the 10 s window ended early: {result:?}"),
+                started = tokio::time::timeout(secs(5), started) => {
+                    started.expect("the scan never started");
+                }
+            }
+        });
+        drop(caller);
+
+        rx.recv_timeout(secs(5))
+            .expect("scan never stopped after the caller's runtime shut down");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_scans_run_one_after_another() {
+        within(TEST_LIMIT, async {
+            let rt = tokio::runtime::Handle::current();
+            let lock = ScanLock::default();
+            let scanner = FakeScanner {
+                stop_latency: Duration::from_millis(100),
+                ..FakeScanner::new()
+            };
+            let scan = || async {
+                let permit = lock.acquire().await;
+                scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(2)).await
+            };
+
+            let (first, second) = tokio::join!(scan(), scan());
+
+            first.expect("first scan");
+            second.expect("second scan should wait for the first instead of failing");
+            assert_eq!(
+                scanner.log(),
+                [
+                    (secs(0), "start"),
+                    (secs(2), "stop"),
+                    (Duration::from_millis(2100), "start"),
+                    (Duration::from_millis(4100), "stop"),
+                ]
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_scan_waits_until_a_cancelled_scan_has_stopped() {
+        within(TEST_LIMIT, async {
+            let rt = tokio::runtime::Handle::current();
+            let lock = ScanLock::default();
+            let scanner = FakeScanner::new();
+
+            let first = tokio::time::timeout(secs(1), async {
+                let permit = lock.acquire().await;
+                scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(5)).await
+            });
+            let second = async {
+                tokio::task::yield_now().await;
+                let permit = lock.acquire().await;
+                scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(2)).await
+            };
+            let (first, second) = tokio::join!(first, second);
+
+            assert!(first.is_err(), "the first scan should have been cancelled");
+            second.expect("the second scan should start after the first has stopped");
+            assert_eq!(
+                scanner.log(),
+                [
+                    (secs(0), "start"),
+                    (secs(1), "stop"),
+                    (secs(1), "start"),
+                    (secs(3), "stop"),
+                ]
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_while_waiting_for_the_permit_never_starts_a_scan() {
+        within(TEST_LIMIT, async {
+            let rt = tokio::runtime::Handle::current();
+            let lock = ScanLock::default();
+            let scanner = FakeScanner::new();
+
+            let permit = lock.acquire().await;
+            let first = tokio::spawn({
+                let (rt, scanner) = (rt.clone(), scanner.clone());
+                async move {
+                    scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(5)).await
+                }
+            });
+            let second = tokio::time::timeout(secs(1), async {
+                let permit = lock.acquire().await;
+                scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(1)).await
+            });
+            assert!(
+                second.await.is_err(),
+                "the second scan should still be waiting for the permit"
+            );
+            tokio::time::sleep(secs(6)).await;
+            first.await.unwrap().unwrap();
+            assert_eq!(scanner.log(), [(secs(0), "start"), (secs(5), "stop")]);
+
+            // A caller dropped after taking the permit, before its window task
+            // first ran: `now_or_never` polls the window once, then drops it.
+            let permit = lock.acquire().await;
+            let window = scan_window(&rt, &scanner, permit, ScanFilter::default(), secs(1));
+            assert!(window.now_or_never().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(scanner.log(), [(secs(0), "start"), (secs(5), "stop")]);
+            within(secs(1), lock.acquire()).await;
+        })
+        .await;
     }
 
     // ==================== DiscoveredDevice Tests ====================
