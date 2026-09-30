@@ -106,6 +106,7 @@ pub mod validation;
 pub mod service_client;
 
 // Crate-private modules.
+mod link;
 mod runtime;
 #[cfg(test)]
 mod test_support;
