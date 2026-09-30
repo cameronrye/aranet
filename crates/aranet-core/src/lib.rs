@@ -106,6 +106,7 @@ pub mod validation;
 pub mod service_client;
 
 // Crate-private modules.
+mod connector;
 mod link;
 // The explicit BlueZ pairing sequence, which the Linux pairing session in
 // bluez_agent.rs runs. Tests build it on every OS.

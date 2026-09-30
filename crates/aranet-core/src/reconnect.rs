@@ -6,16 +6,18 @@
 //! [`ReconnectingDevice`] implements the [`AranetDevice`] trait,
 //! allowing it to be used interchangeably with regular devices in generic code.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord};
 
+use crate::connector::{ConnectFn, SensorLink, ble_connector, release_link};
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::events::{DeviceEvent, DeviceId, EventSender};
@@ -164,210 +166,143 @@ pub enum ConnectionState {
     Failed,
 }
 
-/// A device wrapper that automatically handles reconnection.
-///
-/// This wrapper caches the device name and type upon initial connection so they
-/// can be accessed synchronously via the [`AranetDevice`] trait, even while
-/// reconnecting.
-pub struct ReconnectingDevice {
+/// The reconnect logic behind [`ReconnectingDevice`], generic over the link so
+/// its races can be tested without Bluetooth (`FakeRadio` in `test_support.rs`).
+pub(crate) struct ReconnectCore<L: SensorLink> {
     identifier: String,
-    /// The connected device, wrapped in Arc to allow concurrent access.
-    device: RwLock<Option<Arc<Device>>>,
-    options: ReconnectOptions,
+    connect: ConnectFn<L>,
+    link: RwLock<Option<Arc<L>>>,
+    /// The sticky flag set by `cancel_reconnect()`.
+    cancelled: AtomicBool,
     state: RwLock<ConnectionState>,
-    event_sender: Option<EventSender>,
-    attempt_count: RwLock<u32>,
-    /// Cancellation flag for stopping reconnection attempts.
-    cancelled: Arc<AtomicBool>,
-    /// Cached device name (populated on first connection).
-    cached_name: std::sync::OnceLock<String>,
-    /// Cached device type (populated on first connection).
-    cached_device_type: std::sync::OnceLock<DeviceType>,
+    attempt_count: AtomicU32,
+    options: ReconnectOptions,
+    events: Option<EventSender>,
 }
 
-impl ReconnectingDevice {
-    /// Create a new reconnecting device wrapper.
-    pub async fn connect(identifier: &str, options: ReconnectOptions) -> Result<Self> {
-        options.validate()?;
-        let device = Arc::new(Device::connect(identifier).await?);
-
-        // Cache the name and device type for synchronous access
-        let cached_name = std::sync::OnceLock::new();
-        if let Some(name) = device.name() {
-            let _ = cached_name.set(name.to_string());
-        }
-
-        let cached_device_type = std::sync::OnceLock::new();
-        if let Some(device_type) = device.device_type() {
-            let _ = cached_device_type.set(device_type);
-        }
-
-        Ok(Self {
-            identifier: identifier.to_string(),
-            device: RwLock::new(Some(device)),
-            options,
-            state: RwLock::new(ConnectionState::Connected),
-            event_sender: None,
-            attempt_count: RwLock::new(0),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            cached_name,
-            cached_device_type,
-        })
-    }
-
-    /// Create with an event sender for notifications.
-    pub async fn connect_with_events(
-        identifier: &str,
+impl<L: SensorLink> ReconnectCore<L> {
+    pub(crate) fn new(
+        identifier: impl Into<String>,
+        connect: ConnectFn<L>,
+        link: Arc<L>,
         options: ReconnectOptions,
-        event_sender: EventSender,
-    ) -> Result<Self> {
-        let mut this = Self::connect(identifier, options).await?;
-        this.event_sender = Some(event_sender);
-        Ok(this)
+    ) -> Self {
+        Self {
+            identifier: identifier.into(),
+            connect,
+            link: RwLock::new(Some(link)),
+            cancelled: AtomicBool::new(false),
+            state: RwLock::new(ConnectionState::Connected),
+            attempt_count: AtomicU32::new(0),
+            options,
+            events: None,
+        }
     }
 
-    /// Cancel any ongoing reconnection attempts.
-    ///
-    /// This will cause the reconnect loop to exit on its next iteration.
-    pub fn cancel_reconnect(&self) {
+    pub(crate) fn set_events(&mut self, events: EventSender) {
+        self.events = Some(events);
+    }
+
+    pub(crate) fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
-    /// Check if reconnection has been cancelled.
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Reset the cancellation flag.
-    ///
-    /// Call this before starting a new reconnection attempt if you want to clear
-    /// a previous cancellation. The `reconnect()` method will check if cancelled
-    /// at the start of each iteration, so this allows re-using a previously
-    /// cancelled `ReconnectingDevice`.
-    pub fn reset_cancellation(&self) {
+    pub(crate) fn reset_cancellation(&self) {
         self.cancelled.store(false, Ordering::SeqCst);
     }
 
-    /// Get the current connection state.
-    pub async fn state(&self) -> ConnectionState {
+    pub(crate) async fn state(&self) -> ConnectionState {
         *self.state.read().await
     }
 
-    /// Check if currently connected.
-    pub async fn is_connected(&self) -> bool {
-        let guard = self.device.read().await;
-        if let Some(device) = guard.as_ref() {
-            device.is_connected().await
+    pub(crate) fn attempt_count(&self) -> u32 {
+        self.attempt_count.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn link(&self) -> Option<Arc<L>> {
+        self.link.read().await.clone()
+    }
+
+    pub(crate) async fn is_connected(&self) -> bool {
+        let guard = self.link.read().await;
+        if let Some(link) = guard.as_ref() {
+            link.is_connected().await
         } else {
             false
         }
     }
 
-    /// Get the identifier.
-    pub fn identifier(&self) -> &str {
-        &self.identifier
-    }
+    // `run` and `run_owned` can't be one method because their closure bounds
+    // differ. `run`'s operations return a `Send` `BoxFuture` that borrows the
+    // link (the `AranetDevice` impl), and its closure is `Send + Sync`;
+    // `with_device`'s public signature has none of these bounds, and its
+    // future can't borrow the link. Neither form fits the other without
+    // changing `with_device`'s public signature.
 
-    /// Execute an operation, reconnecting if necessary.
-    ///
-    /// The closure is called with a reference to the device. If the operation
-    /// fails due to a connection issue, the device will attempt to reconnect
-    /// and retry the operation.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let reading = device.with_device(|d| async { d.read_current().await }).await?;
-    /// ```
-    pub async fn with_device<F, Fut, T>(&self, f: F) -> Result<T>
+    /// Run `op` on the link, reconnecting and running it again if it fails.
+    pub(crate) async fn run<T, F>(&self, op: F) -> Result<T>
     where
-        F: Fn(&Device) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        // Try the operation if already connected
-        {
-            let guard = self.device.read().await;
-            if let Some(device) = guard.as_ref()
-                && device.is_connected().await
-            {
-                match f(device).await {
-                    Ok(result) => return Ok(result),
-                    Err(e) => {
-                        warn!("Operation failed: {}", e);
-                        // Fall through to reconnect
-                    }
-                }
-            }
-        }
-
-        // Need to reconnect
-        self.reconnect().await?;
-
-        // Retry the operation after reconnection
-        let guard = self.device.read().await;
-        if let Some(device) = guard.as_ref() {
-            f(device).await
-        } else {
-            Err(Error::NotConnected)
-        }
-    }
-
-    /// Internal helper that executes an operation with automatic reconnection using boxed futures.
-    ///
-    /// This method uses explicit HRTB (Higher-Rank Trait Bounds) to handle the complex
-    /// lifetime requirements when returning futures from closures. It's used internally
-    /// by the `AranetDevice` trait implementation.
-    ///
-    /// Note: We cannot consolidate this with `with_device` due to Rust's async closure
-    /// lifetime limitations. The `with_device` method provides a more ergonomic API for
-    /// callers, while this method handles the trait implementation requirements.
-    async fn run_with_reconnect<'a, T, F>(&'a self, f: F) -> Result<T>
-    where
-        F: for<'b> Fn(
-                &'b Device,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<T>> + Send + 'b>,
-            > + Send
-            + Sync,
+        F: for<'b> Fn(&'b L) -> BoxFuture<'b, Result<T>> + Send + Sync,
         T: Send,
     {
-        // Try the operation if already connected
         {
-            let guard = self.device.read().await;
-            if let Some(device) = guard.as_ref()
-                && device.is_connected().await
+            let guard = self.link.read().await;
+            if let Some(link) = guard.as_ref()
+                && link.is_connected().await
             {
-                match f(device).await {
-                    Ok(result) => return Ok(result),
-                    Err(e) => {
-                        warn!("Operation failed: {}", e);
-                        // Fall through to reconnect
-                    }
+                match op(link).await {
+                    Ok(value) => return Ok(value),
+                    Err(e) => warn!("Operation failed: {}", e),
                 }
             }
         }
 
-        // Need to reconnect
         self.reconnect().await?;
 
-        // Retry the operation after reconnection
-        let guard = self.device.read().await;
-        if let Some(device) = guard.as_ref() {
-            f(device).await
-        } else {
-            Err(Error::NotConnected)
+        let guard = self.link.read().await;
+        match guard.as_ref() {
+            Some(link) => op(link).await,
+            None => Err(Error::NotConnected),
         }
     }
 
-    /// Attempt to reconnect to the device.
-    ///
-    /// This loop can be cancelled by calling `cancel_reconnect()` from another task.
-    /// When cancelled, returns `Error::Cancelled`.
-    ///
-    /// Note: If `cancel_reconnect()` was called before this method, reconnection
-    /// will still proceed. Call `reset_cancellation()` explicitly if you want to
-    /// clear a previous cancellation before starting a new reconnection attempt.
-    pub async fn reconnect(&self) -> Result<()> {
+    /// Same algorithm as `run`, for closures whose future doesn't borrow the
+    /// link (`ReconnectingDevice::with_device`).
+    pub(crate) async fn run_owned<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: Fn(&L) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        {
+            let guard = self.link.read().await;
+            if let Some(link) = guard.as_ref()
+                && link.is_connected().await
+            {
+                match op(link).await {
+                    Ok(value) => return Ok(value),
+                    Err(e) => warn!("Operation failed: {}", e),
+                }
+            }
+        }
+
+        self.reconnect().await?;
+
+        let guard = self.link.read().await;
+        match guard.as_ref() {
+            Some(link) => op(link).await,
+            None => Err(Error::NotConnected),
+        }
+    }
+
+    pub(crate) async fn reconnect(&self) -> Result<()> {
         // Do not reset cancellation here — callers must explicitly call
         // reset_cancellation() before reconnect() if they want to clear
         // a previous cancellation. This avoids a race where
@@ -375,7 +310,7 @@ impl ReconnectingDevice {
         // reset_cancellation(), silently discarding the cancel request.
 
         *self.state.write().await = ConnectionState::Reconnecting;
-        *self.attempt_count.write().await = 0;
+        self.attempt_count.store(0, Ordering::SeqCst);
 
         loop {
             // Check for cancellation at the start of each iteration
@@ -385,11 +320,7 @@ impl ReconnectingDevice {
                 return Err(Error::Cancelled);
             }
 
-            let attempt = {
-                let mut count = self.attempt_count.write().await;
-                *count += 1;
-                *count
-            };
+            let attempt = self.attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
 
             // Check if we've exceeded max attempts
             if let Some(max) = self.options.max_attempts
@@ -403,7 +334,7 @@ impl ReconnectingDevice {
             }
 
             // Send reconnect started event
-            if let Some(sender) = &self.event_sender {
+            if let Some(sender) = &self.events {
                 let _ = sender.send(DeviceEvent::ReconnectStarted {
                     device: DeviceId::new(&self.identifier),
                     attempt,
@@ -424,13 +355,13 @@ impl ReconnectingDevice {
             }
 
             // Try to connect
-            match Device::connect(&self.identifier).await {
-                Ok(new_device) => {
-                    *self.device.write().await = Some(Arc::new(new_device));
+            match (self.connect)(&self.identifier).await {
+                Ok(new_link) => {
+                    *self.link.write().await = Some(Arc::new(new_link));
                     *self.state.write().await = ConnectionState::Connected;
 
                     // Send reconnect succeeded event
-                    if let Some(sender) = &self.event_sender {
+                    if let Some(sender) = &self.events {
                         let _ = sender.send(DeviceEvent::ReconnectSucceeded {
                             device: DeviceId::new(&self.identifier),
                             attempts: attempt,
@@ -447,40 +378,160 @@ impl ReconnectingDevice {
         }
     }
 
-    /// Disconnect from the device.
-    pub async fn disconnect(&self) -> Result<()> {
-        let mut guard = self.device.write().await;
-        if let Some(device) = guard.take() {
-            device.disconnect().await?;
+    pub(crate) async fn disconnect(&self) -> Result<()> {
+        let mut guard = self.link.write().await;
+        if let Some(link) = guard.take() {
+            release_link(link, ()).await?;
         }
         *self.state.write().await = ConnectionState::Disconnected;
         Ok(())
     }
+}
+
+/// A device wrapper that automatically handles reconnection.
+///
+/// This wrapper caches the device name and type upon initial connection so they
+/// can be accessed synchronously via the [`AranetDevice`] trait, even while
+/// reconnecting.
+pub struct ReconnectingDevice {
+    core: ReconnectCore<Device>,
+    /// Cached device name (populated on first connection).
+    cached_name: OnceLock<String>,
+    /// Cached device type (populated on first connection).
+    cached_device_type: OnceLock<DeviceType>,
+}
+
+impl ReconnectingDevice {
+    /// Create a new reconnecting device wrapper.
+    pub async fn connect(identifier: &str, options: ReconnectOptions) -> Result<Self> {
+        options.validate()?;
+        let connect = ble_connector();
+        let device = Arc::new(connect(identifier).await?);
+
+        // Cache the name and device type for synchronous access
+        let cached_name = OnceLock::new();
+        if let Some(name) = device.name() {
+            let _ = cached_name.set(name.to_string());
+        }
+
+        let cached_device_type = OnceLock::new();
+        if let Some(device_type) = device.device_type() {
+            let _ = cached_device_type.set(device_type);
+        }
+
+        Ok(Self {
+            core: ReconnectCore::new(identifier, connect, device, options),
+            cached_name,
+            cached_device_type,
+        })
+    }
+
+    /// Create with an event sender for notifications.
+    pub async fn connect_with_events(
+        identifier: &str,
+        options: ReconnectOptions,
+        event_sender: EventSender,
+    ) -> Result<Self> {
+        let mut this = Self::connect(identifier, options).await?;
+        this.core.set_events(event_sender);
+        Ok(this)
+    }
+
+    /// Cancel any ongoing reconnection attempts.
+    ///
+    /// This will cause the reconnect loop to exit on its next iteration.
+    pub fn cancel_reconnect(&self) {
+        self.core.cancel();
+    }
+
+    /// Check if reconnection has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.core.is_cancelled()
+    }
+
+    /// Reset the cancellation flag.
+    ///
+    /// Call this before starting a new reconnection attempt if you want to clear
+    /// a previous cancellation. The `reconnect()` method will check if cancelled
+    /// at the start of each iteration, so this allows re-using a previously
+    /// cancelled `ReconnectingDevice`.
+    pub fn reset_cancellation(&self) {
+        self.core.reset_cancellation();
+    }
+
+    /// Get the current connection state.
+    pub async fn state(&self) -> ConnectionState {
+        self.core.state().await
+    }
+
+    /// Check if currently connected.
+    pub async fn is_connected(&self) -> bool {
+        self.core.is_connected().await
+    }
+
+    /// Get the identifier.
+    pub fn identifier(&self) -> &str {
+        self.core.identifier()
+    }
+
+    /// Execute an operation, reconnecting if necessary.
+    ///
+    /// The closure is called with a reference to the device. If the operation
+    /// fails due to a connection issue, the device will attempt to reconnect
+    /// and retry the operation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let reading = device.with_device(|d| async { d.read_current().await }).await?;
+    /// ```
+    pub async fn with_device<F, Fut, T>(&self, f: F) -> Result<T>
+    where
+        F: Fn(&Device) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.core.run_owned(f).await
+    }
+
+    /// Attempt to reconnect to the device.
+    ///
+    /// This loop can be cancelled by calling `cancel_reconnect()` from another task.
+    /// When cancelled, returns `Error::Cancelled`.
+    ///
+    /// Note: If `cancel_reconnect()` was called before this method, reconnection
+    /// will still proceed. Call `reset_cancellation()` explicitly if you want to
+    /// clear a previous cancellation before starting a new reconnection attempt.
+    pub async fn reconnect(&self) -> Result<()> {
+        self.core.reconnect().await
+    }
+
+    /// Disconnect from the device.
+    pub async fn disconnect(&self) -> Result<()> {
+        self.core.disconnect().await
+    }
 
     /// Get the number of reconnection attempts made.
     pub async fn attempt_count(&self) -> u32 {
-        *self.attempt_count.read().await
+        self.core.attempt_count()
     }
 
     /// Get the device name, if available and connected.
     pub async fn name(&self) -> Option<String> {
-        let guard = self.device.read().await;
-        guard.as_ref().and_then(|d| d.name().map(|s| s.to_string()))
+        let device = self.core.link().await?;
+        device.name().map(str::to_string)
     }
 
     /// Get the device address (returns identifier if not connected).
     pub async fn address(&self) -> String {
-        let guard = self.device.read().await;
-        guard
-            .as_ref()
-            .map(|d| d.address().to_string())
-            .unwrap_or_else(|| self.identifier.clone())
+        match self.core.link().await {
+            Some(device) => device.address().to_string(),
+            None => self.core.identifier().to_string(),
+        }
     }
 
     /// Get the detected device type, if available.
     pub async fn device_type(&self) -> Option<DeviceType> {
-        let guard = self.device.read().await;
-        guard.as_ref().and_then(|d| d.device_type())
+        self.core.link().await?.device_type()
     }
 }
 
@@ -508,7 +559,7 @@ impl AranetDevice for ReconnectingDevice {
     }
 
     fn address(&self) -> &str {
-        &self.identifier
+        self.core.identifier()
     }
 
     fn device_type(&self) -> Option<DeviceType> {
@@ -516,32 +567,27 @@ impl AranetDevice for ReconnectingDevice {
     }
 
     async fn read_current(&self) -> Result<CurrentReading> {
-        self.run_with_reconnect(|d| Box::pin(d.read_current()))
-            .await
+        self.core.run(|d| Box::pin(d.read_current())).await
     }
 
     async fn read_device_info(&self) -> Result<DeviceInfo> {
-        self.run_with_reconnect(|d| Box::pin(d.read_device_info()))
-            .await
+        self.core.run(|d| Box::pin(d.read_device_info())).await
     }
 
     async fn read_rssi(&self) -> Result<i16> {
-        self.run_with_reconnect(|d| Box::pin(d.read_rssi())).await
+        self.core.run(|d| Box::pin(d.read_rssi())).await
     }
 
     async fn read_battery(&self) -> Result<u8> {
-        self.run_with_reconnect(|d| Box::pin(d.read_battery()))
-            .await
+        self.core.run(|d| Box::pin(d.read_battery())).await
     }
 
     async fn get_history_info(&self) -> Result<HistoryInfo> {
-        self.run_with_reconnect(|d| Box::pin(d.get_history_info()))
-            .await
+        self.core.run(|d| Box::pin(d.get_history_info())).await
     }
 
     async fn download_history(&self) -> Result<Vec<HistoryRecord>> {
-        self.run_with_reconnect(|d| Box::pin(d.download_history()))
-            .await
+        self.core.run(|d| Box::pin(d.download_history())).await
     }
 
     async fn download_history_with_options(
@@ -549,26 +595,26 @@ impl AranetDevice for ReconnectingDevice {
         options: HistoryOptions,
     ) -> Result<Vec<HistoryRecord>> {
         let opts = options.clone();
-        self.run_with_reconnect(move |d| {
-            let opts = opts.clone();
-            Box::pin(async move { d.download_history_with_options(opts).await })
-        })
-        .await
-    }
-
-    async fn get_interval(&self) -> Result<MeasurementInterval> {
-        self.run_with_reconnect(|d| Box::pin(d.get_interval()))
+        self.core
+            .run(move |d| {
+                let opts = opts.clone();
+                Box::pin(async move { d.download_history_with_options(opts).await })
+            })
             .await
     }
 
+    async fn get_interval(&self) -> Result<MeasurementInterval> {
+        self.core.run(|d| Box::pin(d.get_interval())).await
+    }
+
     async fn set_interval(&self, interval: MeasurementInterval) -> Result<()> {
-        self.run_with_reconnect(move |d| Box::pin(d.set_interval(interval)))
+        self.core
+            .run(move |d| Box::pin(d.set_interval(interval)))
             .await
     }
 
     async fn get_calibration(&self) -> Result<CalibrationData> {
-        self.run_with_reconnect(|d| Box::pin(d.get_calibration()))
-            .await
+        self.core.run(|d| Box::pin(d.get_calibration())).await
     }
 }
 
@@ -624,5 +670,49 @@ mod tests {
         let opts = ReconnectOptions::fixed_delay(Duration::from_secs(5));
         assert_eq!(opts.delay_for_attempt(0), Duration::from_secs(5));
         assert_eq!(opts.delay_for_attempt(5), Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::test_support::{FakeConn, FakeRadio, within};
+
+    const LIMIT: Duration = Duration::from_secs(600);
+
+    /// The operation every test runs unless it needs a scripted result.
+    fn run_op(link: &FakeConn) -> BoxFuture<'_, Result<()>> {
+        Box::pin(link.op())
+    }
+
+    /// A core for sensor "A" whose first link came from the fake radio.
+    async fn connected_core(
+        radio: &FakeRadio,
+        options: ReconnectOptions,
+    ) -> ReconnectCore<FakeConn> {
+        let connect = radio.connector();
+        let first = connect("A").await.expect("first connect");
+        ReconnectCore::new("A", connect, Arc::new(first), options)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_max_attempts() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default().max_attempts(2)).await;
+            radio.script_connects("A", [false; 3]);
+            radio.lose_link("A");
+
+            let result = core.run(run_op).await;
+
+            assert!(
+                matches!(&result, Err(Error::Timeout { operation, .. }) if operation.contains("reconnect to 'A'")),
+                "{result:?}"
+            );
+            assert_eq!(core.state().await, ConnectionState::Failed);
+            assert_eq!(radio.connect_count("A"), 3, "the first link and two attempts");
+            radio.assert_no_drop_teardown();
+        })
+        .await;
     }
 }
