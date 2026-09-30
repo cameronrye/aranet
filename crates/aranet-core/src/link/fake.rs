@@ -19,7 +19,16 @@ pub(super) enum Outcome {
     /// Never answer, as btleplug does on macOS once CoreBluetooth has dropped
     /// the peripheral.
     Hang,
+    /// Fail as bluez-async's `connect` does while BlueZ is still discovering
+    /// the services of a connected device: after `BLUEZ_ASYNC_WAIT`, with
+    /// `btleplug::Error::Other("Service discovery timed out")`.
+    DiscoveryTimedOut,
 }
+
+/// How long bluez-async's `connect` waits for BlueZ's `ServicesResolved`
+/// before it fails (`SERVICE_DISCOVERY_TIMEOUT`, bluez-async 0.8.2
+/// `src/lib.rs:61`).
+pub(super) const BLUEZ_ASYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A call made on a `FakeGatt`, in the order it was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +124,13 @@ async fn run(outcome: Option<Outcome>) -> btleplug::Result<()> {
         Outcome::Ok => Ok(()),
         Outcome::Fail => Err(btleplug::Error::RuntimeError("scripted failure".into())),
         Outcome::Hang => std::future::pending().await,
+        Outcome::DiscoveryTimedOut => {
+            tokio::time::sleep(BLUEZ_ASYNC_WAIT).await;
+            // bluez-async's `BluetoothError::ServiceDiscoveryTimedOut`
+            // (`src/lib.rs:90-92`), which btleplug wraps in `Error::Other`
+            // (`src/bluez/adapter.rs:125-129`).
+            Err(btleplug::Error::Other("Service discovery timed out".into()))
+        }
     }
 }
 

@@ -125,6 +125,11 @@ pub struct ConnectionConfig {
     /// Timeout for BLE write operations.
     pub write_timeout: Duration,
     /// Timeout for service discovery after connection.
+    ///
+    /// On Linux, when BlueZ is still discovering the services of a device it
+    /// has just connected (a first connection to a sensor with many
+    /// characteristics, such as an Aranet4), a connect waits for BlueZ to
+    /// finish for up to this long, but at least 20 s.
     pub discovery_timeout: Duration,
     /// Timeout for connection validation (keepalive) checks.
     pub validation_timeout: Duration,
