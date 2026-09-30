@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use btleplug::api::{CharPropFlags, Characteristic, PeripheralProperties, Service};
+use tokio::sync::Notify;
 
 use super::GattLink;
 use crate::uuid::{CURRENT_READINGS_DETAIL, SAF_TEHNIKA_SERVICE_NEW};
@@ -12,6 +13,9 @@ use crate::uuid::{CURRENT_READINGS_DETAIL, SAF_TEHNIKA_SERVICE_NEW};
 pub(super) enum Outcome {
     /// Succeed at once.
     Ok,
+    /// Fail at once with a Bluetooth error, as a refused connection or a
+    /// failed discovery does.
+    Fail,
     /// Never answer, as btleplug does on macOS once CoreBluetooth has dropped
     /// the peripheral.
     Hang,
@@ -26,10 +30,11 @@ pub(super) enum Call {
 }
 
 /// A peripheral whose calls follow a script. Clones share the script and the
-/// call log, as clones of a btleplug `Peripheral` share one device.
+/// call log, like clones of a btleplug `Peripheral` share one device.
 #[derive(Clone)]
 pub(super) struct FakeGatt {
     state: Arc<Mutex<State>>,
+    disconnected: Arc<Notify>,
 }
 
 struct State {
@@ -56,6 +61,7 @@ impl FakeGatt {
                 services: BTreeSet::new(),
                 calls: Vec::new(),
             })),
+            disconnected: Arc::new(Notify::new()),
         }
     }
 
@@ -64,9 +70,24 @@ impl FakeGatt {
         self.lock().connect.extend(outcomes);
     }
 
-    /// Script what the next discoveries find. Each discovery takes its round
-    /// when it is called, whatever its outcome; discoveries past the script
-    /// find `aranet_services()`.
+    /// Script the next `discover_services` calls. Calls past the script
+    /// succeed. A discovery takes its service round whatever its outcome.
+    pub(super) fn script_discover(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock().discover.extend(outcomes);
+    }
+
+    /// Script the next `disconnect` calls. Calls past the script succeed.
+    pub(super) fn script_disconnect(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock().disconnect.extend(outcomes);
+    }
+
+    /// Script the next `properties` calls. Calls past the script succeed.
+    pub(super) fn script_properties(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock().properties.extend(outcomes);
+    }
+
+    /// Script what the next discoveries find. Discoveries past the script find
+    /// `aranet_services()`.
     pub(super) fn service_rounds(&self, rounds: impl IntoIterator<Item = BTreeSet<Service>>) {
         self.lock().service_rounds.extend(rounds);
     }
@@ -76,7 +97,13 @@ impl FakeGatt {
         self.lock().calls.clone()
     }
 
-    /// The state, even if a test panicked while holding the lock.
+    /// Notified each time a `disconnect` succeeds. `notify_one` stores a
+    /// permit when nobody is waiting yet, so a `notified().await` that starts
+    /// after the disconnect still completes.
+    pub(super) fn disconnected(&self) -> Arc<Notify> {
+        Arc::clone(&self.disconnected)
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -86,12 +113,11 @@ impl FakeGatt {
 async fn run(outcome: Option<Outcome>) -> btleplug::Result<()> {
     match outcome.unwrap_or(Outcome::Ok) {
         Outcome::Ok => Ok(()),
+        Outcome::Fail => Err(btleplug::Error::RuntimeError("scripted failure".into())),
         Outcome::Hang => std::future::pending().await,
     }
 }
 
-// Each call records itself and takes its outcome under the lock, then awaits
-// the outcome with the lock released.
 impl GattLink for FakeGatt {
     async fn connect(&self) -> btleplug::Result<()> {
         let outcome = {
@@ -108,7 +134,9 @@ impl GattLink for FakeGatt {
             state.calls.push(Call::Disconnect);
             state.disconnect.pop_front()
         };
-        run(outcome).await
+        run(outcome).await?;
+        self.disconnected.notify_one();
+        Ok(())
     }
 
     async fn discover_services(&self) -> btleplug::Result<()> {
@@ -132,14 +160,14 @@ impl GattLink for FakeGatt {
         let outcome = self.lock().properties.pop_front();
         run(outcome).await?;
         Ok(Some(PeripheralProperties {
-            local_name: Some("Aranet4 12345".into()),
+            local_name: Some("Aranet4 12345".to_string()),
             ..Default::default()
         }))
     }
 }
 
-/// A sensor's services, cut down to one: the primary Aranet service with its
-/// readable current-readings characteristic.
+/// The services of a sensor, cut down to one: the primary Aranet service with
+/// its readable current-readings characteristic.
 pub(super) fn aranet_services() -> BTreeSet<Service> {
     let current_readings = Characteristic {
         uuid: CURRENT_READINGS_DETAIL,
