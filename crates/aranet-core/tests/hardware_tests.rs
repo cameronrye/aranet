@@ -1133,6 +1133,29 @@ async fn test_connect_nonexistent_device() {
     }
 }
 
+/// An absent device costs one search (scans of 5, 10 and 15 s), not a second
+/// search sized by the connect timeout (BR-10).
+#[tokio::test]
+#[ignore = "requires BLE hardware (a Bluetooth adapter; no sensor needed)"]
+async fn test_connect_to_missing_device_gives_up_within_scan_budget() {
+    let started = std::time::Instant::now();
+    let result = timeout(
+        Duration::from_secs(120),
+        Device::connect("NonExistent12345"),
+    )
+    .await
+    .expect("Device::connect did not return within 120 s");
+    assert!(
+        matches!(result, Err(aranet_core::Error::DeviceNotFound(_))),
+        "{result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(45),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires BLE hardware"]
 async fn test_connect_invalid_address() {
