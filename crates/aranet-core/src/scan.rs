@@ -62,7 +62,7 @@ async fn reset_manager() {
 }
 
 use crate::error::{Error, Result};
-use crate::util::{create_identifier, format_peripheral_id};
+use crate::util::create_identifier;
 use crate::uuid::{MANUFACTURER_ID, SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD};
 use aranet_types::DeviceType;
 
@@ -603,12 +603,39 @@ fn is_aranet_device(properties: &btleplug::api::PeripheralProperties) -> bool {
     false
 }
 
-/// Find a specific device by name or address.
+/// Find a device by its address, identifier or full name.
+///
+/// `identifier` is trimmed and case is ignored, but otherwise it must match one
+/// of these exactly:
+/// - the device's [`DiscoveredDevice::identifier`]: the MAC address on Linux
+///   and Windows, the CoreBluetooth UUID on macOS;
+/// - btleplug's device ID as [`DiscoveredDevice::id`] displays it
+///   (`hci0/dev_AA_BB_CC_DD_EE_FF` on Linux);
+/// - the MAC address, with or without colons;
+/// - the whole advertised name. On macOS a name shown as
+///   `"Kitchen [Aranet4 1A2B3]"` also matches `Kitchen` or `Aranet4 1A2B3`.
+///
+/// An address or identifier match wins over a name match.
+///
+/// # Errors
+///
+/// - [`Error::InvalidConfig`] if `identifier` is empty or blank, before
+///   Bluetooth is used.
+/// - [`Error::DeviceNotFound`] with
+///   [`DeviceNotFoundReason::Ambiguous`](crate::error::DeviceNotFoundReason::Ambiguous)
+///   at once if several nearby devices match;
+///   [`DeviceNotFoundReason::NoExactMatch`](crate::error::DeviceNotFoundReason::NoExactMatch)
+///   if none matches but some Aranet device names contain `identifier`; and
+///   [`DeviceNotFoundReason::NotFound`](crate::error::DeviceNotFoundReason::NotFound)
+///   otherwise.
+/// - [`Error::Bluetooth`] if the adapter fails.
 pub async fn find_device(identifier: &str) -> Result<(Adapter, Peripheral)> {
     find_device_with_options(identifier, ScanOptions::default()).await
 }
 
 /// Find a specific device by name or address with custom options.
+///
+/// `identifier` must match exactly, as [`find_device`] describes.
 ///
 /// This function uses a retry strategy to improve reliability:
 /// 1. First checks if the device is already known (cached from previous scans)
@@ -625,6 +652,8 @@ pub async fn find_device_with_options(
 
 /// Find a specific device using a pre-existing adapter.
 ///
+/// `identifier` must match exactly, as [`find_device`] describes.
+///
 /// This avoids creating a new btleplug `Manager` (and D-Bus connection) on
 /// every call.  The caller is responsible for keeping the `Adapter` alive.
 pub async fn find_device_with_adapter(
@@ -636,17 +665,21 @@ pub async fn find_device_with_adapter(
 }
 
 /// Find a specific device using a pre-existing adapter, with progress callback.
+///
+/// `identifier` must match exactly, as [`find_device`] describes.
 pub async fn find_device_with_adapter_progress(
     adapter: &Adapter,
     identifier: &str,
     options: ScanOptions,
     progress: Option<ProgressCallback>,
 ) -> Result<Peripheral> {
-    let identifier_lower = identifier.to_lowercase();
+    use crate::error::DeviceNotFoundReason;
+
+    let query = parse_query(identifier)?;
 
     info!("Looking for device: {}", identifier);
 
-    if let Some(peripheral) = find_peripheral_by_identifier(adapter, &identifier_lower).await? {
+    if let Search::Found(peripheral) = search_known_peripherals(adapter, query).await? {
         info!("Found device in cache (no scan needed)");
         if let Some(ref cb) = progress {
             cb(FindProgress::CacheHit);
@@ -654,6 +687,8 @@ pub async fn find_device_with_adapter_progress(
         return Ok(peripheral);
     }
 
+    // Names that contain the query, from the latest search after a scan.
+    let mut similar = Vec::new();
     let max_attempts: u32 = 3;
     let base_duration = options.duration.as_millis() as u64 / 2;
     let base_duration = Duration::from_millis(base_duration.max(2000));
@@ -664,7 +699,7 @@ pub async fn find_device_with_adapter_progress(
 
         let permit = scan_lock().acquire().await;
         // Another search may have scanned while this one waited for the permit.
-        if let Some(peripheral) = find_peripheral_by_identifier(adapter, &identifier_lower).await? {
+        if let Search::Found(peripheral) = search_known_peripherals(adapter, query).await? {
             info!("Found device while waiting to scan");
             if let Some(ref cb) = progress {
                 cb(FindProgress::CacheHit);
@@ -687,12 +722,15 @@ pub async fn find_device_with_adapter_progress(
 
         run_scan(adapter, permit, ScanFilter::default(), scan_duration).await?;
 
-        if let Some(peripheral) = find_peripheral_by_identifier(adapter, &identifier_lower).await? {
-            info!("Found device on attempt {}", attempt);
-            if let Some(ref cb) = progress {
-                cb(FindProgress::Found { attempt });
+        match search_known_peripherals(adapter, query).await? {
+            Search::Found(peripheral) => {
+                info!("Found device on attempt {}", attempt);
+                if let Some(ref cb) = progress {
+                    cb(FindProgress::Found { attempt });
+                }
+                return Ok(peripheral);
             }
-            return Ok(peripheral);
+            Search::Missing { similar: names } => similar = names,
         }
 
         if attempt < max_attempts {
@@ -707,10 +745,18 @@ pub async fn find_device_with_adapter_progress(
         "Device not found after {} attempts: {}",
         max_attempts, identifier
     );
-    Err(Error::device_not_found(identifier))
+    if similar.is_empty() {
+        return Err(Error::device_not_found(query));
+    }
+    Err(Error::DeviceNotFound(DeviceNotFoundReason::NoExactMatch {
+        identifier: query.to_string(),
+        similar,
+    }))
 }
 
 /// Find a specific device with progress callback for UI feedback.
+///
+/// `identifier` must match exactly, as [`find_device`] describes.
 ///
 /// The progress callback is called with updates about the search progress,
 /// including cache hits, scan attempts, and retry information.
@@ -719,50 +765,211 @@ pub async fn find_device_with_progress(
     options: ScanOptions,
     progress: Option<ProgressCallback>,
 ) -> Result<(Adapter, Peripheral)> {
+    // Reject an empty identifier before Bluetooth is touched.
+    parse_query(identifier)?;
     let adapter = get_adapter().await?;
     let peripheral =
         find_device_with_adapter_progress(&adapter, identifier, options, progress).await?;
     Ok((adapter, peripheral))
 }
 
-/// Search through known peripherals to find one matching the identifier.
-async fn find_peripheral_by_identifier(
-    adapter: &Adapter,
-    identifier_lower: &str,
-) -> Result<Option<Peripheral>> {
-    let peripherals = adapter.peripherals().await?;
+/// The address CoreBluetooth reports for every peripheral. It identifies
+/// nothing, so a query never matches it.
+const UNKNOWN_ADDRESS: &str = "00:00:00:00:00:00";
 
-    for peripheral in peripherals {
+/// What a device lookup knows about one peripheral the adapter has seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnownPeripheral {
+    /// What `aranet scan` prints (`create_identifier`): the MAC address on
+    /// Linux and Windows, the CoreBluetooth UUID on macOS.
+    identifier: String,
+    /// btleplug's device ID in the form the TUI and GUI store
+    /// (`peripheral.id().to_string()`): `hci0/dev_AA_BB_CC_DD_EE_FF` on Linux,
+    /// the UUID on macOS, the MAC address on Windows.
+    peripheral_id: String,
+    /// The Bluetooth address; `00:00:00:00:00:00` on macOS.
+    address: String,
+    /// The advertised name.
+    name: Option<String>,
+}
+
+/// The peripherals a query picks, as indices into the slice given to `lookup`.
+#[derive(Debug, PartialEq, Eq)]
+enum Lookup {
+    /// Exactly one peripheral matches.
+    Found(usize),
+    /// Several peripherals match, in ascending order.
+    Ambiguous(Vec<usize>),
+    /// Nothing matches. `similar` are the peripherals whose name contains both
+    /// the query and `aranet`, ordered by name and then identifier.
+    NotFound { similar: Vec<usize> },
+}
+
+/// Trims `identifier`. An identifier that is empty after trimming is
+/// `Error::InvalidConfig("device identifier is empty")`.
+fn parse_query(identifier: &str) -> Result<&str> {
+    let query = identifier.trim();
+    if query.is_empty() {
+        return Err(Error::invalid_config("device identifier is empty"));
+    }
+    Ok(query)
+}
+
+/// Pick the peripheral that `query` names, ignoring case. `query` comes from
+/// `parse_query`, so it is trimmed and not empty.
+///
+/// The rules, in order. A later rule is used only when the earlier ones match
+/// nothing, so a device's own address beats a device named like it:
+/// 1. an identifier: the one `aranet scan` prints, btleplug's device ID (the
+///    `hci0/dev_…` form on Linux), or the Bluetooth address with or without
+///    colons, never `00:00:00:00:00:00`;
+/// 2. the whole advertised name, or either half of CoreBluetooth's combined
+///    `"<GAP name> [<advertised name>]"` (btleplug 0.11.8,
+///    `corebluetooth/internal.rs:577-585`).
+///
+/// One match is `Found` and several are `Ambiguous`. With no match, `NotFound`
+/// lists the peripherals whose name contains both `query` and `aranet`, so a
+/// short query never lists every phone and headset nearby. The answer depends
+/// only on which peripherals are known, never on their order.
+fn lookup(query: &str, known: &[KnownPeripheral]) -> Lookup {
+    let query = query.to_lowercase();
+    let bare_query = query.replace(':', "");
+
+    let by_identifier = matching(known, |peripheral| {
+        peripheral.identifier.to_lowercase() == query
+            || peripheral.peripheral_id.to_lowercase() == query
+            || (peripheral.address != UNKNOWN_ADDRESS
+                && peripheral.address.to_lowercase().replace(':', "") == bare_query)
+    });
+    if let Some(found) = decide(by_identifier) {
+        return found;
+    }
+
+    let by_name = matching(known, |peripheral| {
+        peripheral
+            .name
+            .as_deref()
+            .is_some_and(|name| name_matches(name, &query))
+    });
+    if let Some(found) = decide(by_name) {
+        return found;
+    }
+
+    let mut similar = matching(known, |peripheral| {
+        peripheral.name.as_deref().is_some_and(|name| {
+            let name = name.to_lowercase();
+            name.contains("aranet") && name.contains(&query)
+        })
+    });
+    similar.sort_by_key(|&index| (&known[index].name, &known[index].identifier));
+    Lookup::NotFound { similar }
+}
+
+/// Indices of the peripherals that satisfy `predicate`, in ascending order.
+fn matching(known: &[KnownPeripheral], predicate: impl Fn(&KnownPeripheral) -> bool) -> Vec<usize> {
+    known
+        .iter()
+        .enumerate()
+        .filter_map(|(index, peripheral)| predicate(peripheral).then_some(index))
+        .collect()
+}
+
+/// `Found` for one index, `Ambiguous` for several, `None` for none.
+fn decide(indices: Vec<usize>) -> Option<Lookup> {
+    match indices.len() {
+        0 => None,
+        1 => Some(Lookup::Found(indices[0])),
+        _ => Some(Lookup::Ambiguous(indices)),
+    }
+}
+
+/// Whether the advertised `name` is `query` (lower case): the whole name, or
+/// either half of CoreBluetooth's `"<GAP name> [<advertised name>]"`.
+fn name_matches(name: &str, query: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    name == query
+        || name
+            .strip_suffix(']')
+            .and_then(|combined| combined.rsplit_once(" ["))
+            .is_some_and(|(gap, advertised)| gap.trim() == query || advertised.trim() == query)
+}
+
+/// What a search of the known peripherals found.
+#[derive(Debug, PartialEq, Eq)]
+enum Search<T> {
+    /// The one peripheral the query names.
+    Found(T),
+    /// Nothing matches; `similar` are the names that contain the query,
+    /// trimmed, sorted and without duplicates.
+    Missing { similar: Vec<String> },
+}
+
+/// `lookup`'s answer for `query`, with `Found` holding an index into `known`.
+///
+/// An ambiguous query is an error,
+/// `Error::DeviceNotFound(DeviceNotFoundReason::Ambiguous { .. })`, whose
+/// candidates are `"<name or 'unnamed'> (<identifier>)"`, sorted: scanning
+/// again can't make it less ambiguous, so the find loop returns it at once.
+fn resolve(query: &str, known: &[KnownPeripheral]) -> Result<Search<usize>> {
+    use crate::error::DeviceNotFoundReason;
+
+    match lookup(query, known) {
+        Lookup::Found(index) => Ok(Search::Found(index)),
+        Lookup::Ambiguous(indices) => {
+            let mut candidates: Vec<String> = indices
+                .iter()
+                .map(|&index| {
+                    let device = &known[index];
+                    let name = device.name.as_deref().unwrap_or("unnamed");
+                    format!("{name} ({})", device.identifier)
+                })
+                .collect();
+            candidates.sort();
+            Err(Error::DeviceNotFound(DeviceNotFoundReason::Ambiguous {
+                identifier: query.to_string(),
+                candidates,
+            }))
+        }
+        Lookup::NotFound { similar } => {
+            let mut names: Vec<String> = similar
+                .iter()
+                .filter_map(|&index| known[index].name.as_deref())
+                .map(|name| name.trim().to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            Ok(Search::Missing { similar: names })
+        }
+    }
+}
+
+/// Look `query` up among the peripherals that `adapter` already knows, as
+/// `resolve` decides.
+async fn search_known_peripherals(adapter: &Adapter, query: &str) -> Result<Search<Peripheral>> {
+    let mut peripherals = Vec::new();
+    let mut known = Vec::new();
+    for peripheral in adapter.peripherals().await? {
         if let Ok(Some(props)) = peripheral.properties().await {
-            let address = props.address.to_string().to_lowercase();
-            let peripheral_id = format_peripheral_id(&peripheral.id()).to_lowercase();
-
-            // Check peripheral ID match (macOS uses UUIDs)
-            if peripheral_id.contains(identifier_lower) {
-                debug!("Matched by peripheral ID: {}", peripheral_id);
-                return Ok(Some(peripheral));
-            }
-
-            // Check address match (Linux/Windows use MAC addresses)
-            if address != "00:00:00:00:00:00"
-                && (address == identifier_lower
-                    || address.replace(':', "") == identifier_lower.replace(':', ""))
-            {
-                debug!("Matched by address: {}", address);
-                return Ok(Some(peripheral));
-            }
-
-            // Check name match (partial match supported)
-            if let Some(name) = &props.local_name
-                && name.to_lowercase().contains(identifier_lower)
-            {
-                debug!("Matched by name: {}", name);
-                return Ok(Some(peripheral));
-            }
+            let id = peripheral.id();
+            let address = props.address.to_string();
+            known.push(KnownPeripheral {
+                identifier: create_identifier(&address, &id),
+                peripheral_id: id.to_string(),
+                address,
+                name: props.local_name,
+            });
+            peripherals.push(peripheral);
         }
     }
 
-    Ok(None)
+    match resolve(query, &known)? {
+        Search::Found(index) => {
+            let device = &known[index];
+            debug!("Matched {:?} ({})", device.name, device.identifier);
+            Ok(Search::Found(peripherals.swap_remove(index)))
+        }
+        Search::Missing { similar } => Ok(Search::Missing { similar }),
+    }
 }
 
 #[cfg(test)]
@@ -1250,6 +1457,332 @@ mod tests {
             within(secs(1), lock.acquire()).await;
         })
         .await;
+    }
+
+    // ==================== Device Lookup Tests ====================
+
+    /// CoreBluetooth UUIDs as `aranet scan` prints them on macOS. The first two
+    /// are the Aranet2 and the AranetRn+ in the Phase 1 hardware log.
+    const UUID_1: &str = "1f8893bf-9f7e-02b4-ef4a-7718f4f5d4be";
+    const UUID_2: &str = "387c18c7-299f-cc32-d01c-6cf29a8d3ca5";
+    const UUID_3: &str = "5b0e4c1d-7a3f-4e2b-9c6d-8f1a2b3c4d5e";
+
+    fn known(
+        identifier: &str,
+        peripheral_id: &str,
+        address: &str,
+        name: Option<&str>,
+    ) -> KnownPeripheral {
+        KnownPeripheral {
+            identifier: identifier.to_string(),
+            peripheral_id: peripheral_id.to_string(),
+            address: address.to_string(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    /// A peripheral as CoreBluetooth reports it: a UUID and no address.
+    fn on_macos(uuid: &str, name: &str) -> KnownPeripheral {
+        known(uuid, uuid, UNKNOWN_ADDRESS, Some(name))
+    }
+
+    /// A peripheral as BlueZ reports it: its address, and the device ID
+    /// `hci0/dev_AA_BB_…` that btleplug's `PeripheralId` displays.
+    fn on_linux(address: &str, name: &str) -> KnownPeripheral {
+        let device_id = format!("hci0/dev_{}", address.replace(':', "_"));
+        known(address, &device_id, address, Some(name))
+    }
+
+    /// `lookup`'s answer as its kind and the identifiers it picked, so answers
+    /// for the same peripherals in different orders can be compared.
+    fn outcome(query: &str, known: &[KnownPeripheral]) -> (&'static str, Vec<String>) {
+        let (kind, indices) = match lookup(query, known) {
+            Lookup::Found(index) => ("found", vec![index]),
+            Lookup::Ambiguous(indices) => ("ambiguous", indices),
+            Lookup::NotFound { similar } => ("not found", similar),
+        };
+        let mut identifiers: Vec<String> = indices
+            .iter()
+            .map(|&index| known[index].identifier.clone())
+            .collect();
+        if kind == "ambiguous" {
+            // In slice order, which depends on the shuffle.
+            identifiers.sort();
+        }
+        (kind, identifiers)
+    }
+
+    /// The candidates of the `Ambiguous` error that `resolve` returns.
+    fn candidates(query: &str, known: &[KnownPeripheral]) -> Vec<String> {
+        match resolve(query, known) {
+            Err(Error::DeviceNotFound(crate::error::DeviceNotFoundReason::Ambiguous {
+                identifier,
+                candidates,
+            })) => {
+                assert_eq!(identifier, query);
+                candidates
+            }
+            other => panic!("{query:?} is not ambiguous: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_does_not_match_part_of_a_name() {
+        let devices = [
+            on_macos(UUID_1, "Aranet4 12345"),
+            on_macos(UUID_2, "Aranet4 1ABCD"),
+        ];
+        assert_eq!(
+            lookup("Aranet4 1", &devices),
+            Lookup::NotFound {
+                similar: vec![0, 1]
+            }
+        );
+    }
+
+    #[test]
+    fn lookup_does_not_match_part_of_a_uuid() {
+        let devices = [on_macos(UUID_1, "Aranet2 2751B")];
+        for query in ["4", "1f8893bf"] {
+            assert_eq!(
+                lookup(query, &devices),
+                Lookup::NotFound { similar: vec![] },
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_ignores_linux_object_path_fragments() {
+        let devices = [on_linux("AA:BB:CC:DD:EE:FF", "Aranet4 12345")];
+        for query in ["hci0", "dev"] {
+            assert_eq!(
+                lookup(query, &devices),
+                Lookup::NotFound { similar: vec![] },
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_matches_the_bluez_device_id_display_form() {
+        // The TUI and GUI keep `DiscoveredDevice::id.to_string()` as a device's
+        // ID, store it in the database and connect with it later.
+        let devices = [
+            on_linux("11:22:33:44:55:66", "Aranet2 2751B"),
+            on_linux("AA:BB:CC:DD:EE:FF", "Aranet4 12345"),
+        ];
+        for query in ["hci0/dev_AA_BB_CC_DD_EE_FF", "hci0/dev_aa_bb_cc_dd_ee_ff"] {
+            assert_eq!(lookup(query, &devices), Lookup::Found(1), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn lookup_matches_the_full_name_ignoring_case_and_whitespace() {
+        let devices = [
+            on_macos(UUID_2, "AranetRn+ 306B8"),
+            on_macos(UUID_1, "Aranet2 2751B"),
+        ];
+        let query = parse_query(" aranet2 2751b ").unwrap();
+        assert_eq!(lookup(query, &devices), Lookup::Found(1));
+    }
+
+    #[test]
+    fn lookup_matches_a_uuid_in_any_case() {
+        let devices = [
+            on_macos(UUID_2, "AranetRn+ 306B8"),
+            on_macos(UUID_1, "Aranet2 2751B"),
+        ];
+        assert_eq!(
+            lookup("1F8893BF-9F7E-02B4-EF4A-7718F4F5D4BE", &devices),
+            Lookup::Found(1)
+        );
+    }
+
+    #[test]
+    fn lookup_matches_an_address_with_or_without_colons() {
+        let devices = [
+            on_linux("11:22:33:44:55:66", "Aranet2 2751B"),
+            on_linux("AA:BB:CC:DD:EE:FF", "Aranet4 12345"),
+        ];
+        for query in ["aa:bb:cc:dd:ee:ff", "AABBCCDDEEFF"] {
+            assert_eq!(lookup(query, &devices), Lookup::Found(1), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn lookup_never_matches_the_all_zero_address() {
+        let devices = [on_macos(UUID_1, "Aranet2 2751B")];
+        for query in ["00:00:00:00:00:00", "000000000000"] {
+            assert_eq!(
+                lookup(query, &devices),
+                Lookup::NotFound { similar: vec![] },
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_matches_either_half_of_a_corebluetooth_combined_name() {
+        let devices = [
+            on_macos(UUID_2, "AranetRn+ 306B8"),
+            on_macos(UUID_1, "Kitchen [Aranet4 1A2B3]"),
+        ];
+        for query in ["Aranet4 1A2B3", "kitchen", "Kitchen [Aranet4 1A2B3]"] {
+            assert_eq!(lookup(query, &devices), Lookup::Found(1), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn lookup_prefers_an_identifier_match_over_a_name_match() {
+        let devices = [
+            on_macos(UUID_1, "AA:BB:CC:DD:EE:FF"),
+            on_linux("AA:BB:CC:DD:EE:FF", "Aranet4 12345"),
+        ];
+        assert_eq!(lookup("aa:bb:cc:dd:ee:ff", &devices), Lookup::Found(1));
+    }
+
+    #[test]
+    fn lookup_reports_duplicate_names_as_ambiguous() {
+        let devices = [
+            on_macos(UUID_1, "Aranet4 12345"),
+            on_macos(UUID_2, "Aranet4 12345"),
+        ];
+        assert_eq!(
+            lookup("Aranet4 12345", &devices),
+            Lookup::Ambiguous(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn lookup_suggests_only_aranet_names() {
+        // "Standing desk" contains the query too, but it isn't an Aranet.
+        let devices = [
+            on_macos(UUID_1, "Aranet4 12345"),
+            on_macos(UUID_2, "Standing desk"),
+            on_macos(UUID_3, "Aranet2 2751B"),
+        ];
+        assert_eq!(
+            lookup("an", &devices),
+            Lookup::NotFound {
+                similar: vec![2, 0]
+            }
+        );
+    }
+
+    #[test]
+    fn lookup_result_is_independent_of_order() {
+        let devices = [
+            on_macos(UUID_1, "Aranet4 12345"),
+            on_macos(UUID_2, "Aranet4 1ABCD"),
+            on_macos(UUID_3, "Aranet2 2751B"),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let cases = [
+            ("Aranet4 1", "not found", vec![UUID_1, UUID_2]),
+            ("aranet2 2751b", "found", vec![UUID_3]),
+            ("Aranet4", "not found", vec![UUID_1, UUID_2]),
+        ];
+        for (query, kind, identifiers) in cases {
+            let outcomes: Vec<(&str, Vec<String>)> = orders
+                .iter()
+                .map(|order| {
+                    let shuffled: Vec<KnownPeripheral> =
+                        order.iter().map(|&index| devices[index].clone()).collect();
+                    outcome(query, &shuffled)
+                })
+                .collect();
+            assert!(
+                outcomes.iter().all(|answer| *answer == outcomes[0]),
+                "the answer for {query:?} depends on the order: {outcomes:?}"
+            );
+            assert_eq!(outcomes[0].0, kind, "{query:?}");
+            assert_eq!(outcomes[0].1, identifiers, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_lists_candidates_and_similar_names_sorted() {
+        // Two sensors share a name; the one listed second sorts first.
+        let same_name = [
+            on_macos(UUID_2, "Aranet4 12345"),
+            on_macos(UUID_1, "Aranet4 12345"),
+        ];
+        assert_eq!(
+            candidates("Aranet4 12345", &same_name),
+            [
+                format!("Aranet4 12345 ({UUID_1})"),
+                format!("Aranet4 12345 ({UUID_2})"),
+            ]
+        );
+
+        // Two entries with one address, the first without a name.
+        let one_address = [
+            known(
+                "AA:BB:CC:DD:EE:FF",
+                "hci1/dev_AA_BB_CC_DD_EE_FF",
+                "AA:BB:CC:DD:EE:FF",
+                None,
+            ),
+            on_linux("AA:BB:CC:DD:EE:FF", "Aranet4 12345"),
+        ];
+        assert_eq!(
+            candidates("aa:bb:cc:dd:ee:ff", &one_address),
+            [
+                "Aranet4 12345 (AA:BB:CC:DD:EE:FF)",
+                "unnamed (AA:BB:CC:DD:EE:FF)",
+            ]
+        );
+
+        // Similar names come back trimmed, sorted and without duplicates.
+        let similar = [
+            on_macos(UUID_1, "Aranet4 1ABCD "),
+            on_macos(UUID_2, "Aranet4 12345"),
+            on_macos(UUID_3, "Aranet4 1ABCD"),
+        ];
+        assert_eq!(
+            resolve("aranet4 1", &similar).unwrap(),
+            Search::Missing {
+                similar: vec!["Aranet4 12345".to_string(), "Aranet4 1ABCD".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_query_rejects_empty_and_blank_identifiers() {
+        for identifier in ["", "   ", "\t\n"] {
+            assert!(
+                matches!(parse_query(identifier), Err(Error::InvalidConfig(_))),
+                "{identifier:?}"
+            );
+        }
+        assert_eq!(parse_query(" x ").unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn find_device_rejects_an_empty_identifier_without_bluetooth() {
+        // Real clock and a 5 s limit (Global Constraints exception): before the
+        // fix this reaches the Bluetooth stack.
+        let found = within(Duration::from_secs(5), find_device("")).await;
+        assert!(
+            matches!(found, Err(Error::InvalidConfig(_))),
+            "{:?}",
+            found.err()
+        );
+
+        let connected = within(Duration::from_secs(5), crate::device::Device::connect("  ")).await;
+        assert!(
+            matches!(connected, Err(Error::InvalidConfig(_))),
+            "{:?}",
+            connected.err()
+        );
     }
 
     // ==================== DiscoveredDevice Tests ====================
