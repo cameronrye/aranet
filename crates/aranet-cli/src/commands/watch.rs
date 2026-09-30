@@ -82,8 +82,11 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
 
         if !is_connected {
             // Need to connect (or reconnect)
-            if current_device.is_some() {
+            // Close the lost connection first: dropping it later would disconnect the
+            // sensor again and tear down the connection made below.
+            if let Some(old) = current_device.take() {
                 eprintln!("Connection lost. Reconnecting...");
+                crate::util::disconnect_device(&old).await;
             }
             match Device::connect_with_timeout(&identifier, timeout).await {
                 Ok(d) => {
