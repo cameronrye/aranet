@@ -23,6 +23,10 @@ pub(super) enum Outcome {
     /// the services of a connected device: after `BLUEZ_ASYNC_WAIT`, with
     /// `btleplug::Error::Other("Service discovery timed out")`.
     DiscoveryTimedOut,
+    /// Fail at once as BlueZ refuses a `Device1.Connect` while an earlier one
+    /// to the same device is still pending (`org.bluez.Error.InProgress`),
+    /// with `btleplug::Error::Other("In Progress")`.
+    InProgress,
     /// Wait this long on the tokio clock, then succeed like `Ok`. A
     /// `disconnect` that ends this way notifies `disconnected()` at the end
     /// of the wait.
@@ -160,6 +164,9 @@ async fn run(outcome: Option<Outcome>) -> btleplug::Result<()> {
             // (`src/bluez/adapter.rs:125-129`).
             Err(btleplug::Error::Other("Service discovery timed out".into()))
         }
+        // bluez-async's `BluetoothError::DbusError`, whose text is the D-Bus
+        // error's message, wrapped in `Error::Other` by btleplug.
+        Outcome::InProgress => Err(btleplug::Error::Other("In Progress".into())),
         Outcome::After(delay) => {
             tokio::time::sleep(delay).await;
             Ok(())
