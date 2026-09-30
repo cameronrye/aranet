@@ -61,6 +61,12 @@ use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
 /// search can also wait for another scan in the same process to finish. Use
 /// [`Device::connect_with_scan_options`] to change the scan time and
 /// [`ConnectionConfig`] to change the connect timeouts.
+///
+/// On Linux, a connection to a sensor that BlueZ doesn't list as paired pairs
+/// it first, which can add up to `connection_timeout` plus the wait for
+/// BlueZ's service discovery (`discovery_timeout`, but at least 20 s), plus
+/// 5 s: 40 s by default. A sensor that refused to pair is connected without
+/// pairing for 10 minutes.
 pub struct Device {
     /// The BLE adapter used for connection.
     ///
@@ -520,6 +526,17 @@ impl Device {
     /// the background; that is best effort if the process is exiting. Either
     /// way the disconnect waits at most 5 s for the Bluetooth stack to confirm
     /// it.
+    ///
+    /// On Linux, if BlueZ doesn't list the sensor as paired, this pairs it first
+    /// (BlueZ's `Device1.Pair`, through an agent that exists only for that
+    /// pairing and approves only this sensor), which takes at most
+    /// `connection_timeout` plus the wait for BlueZ's service discovery
+    /// (`discovery_timeout`, but at least 20 s), plus 5 s. If pairing fails, a
+    /// warning with the `bluetoothctl` commands that fix it is logged and the
+    /// connection goes ahead unpaired. BlueZ then asks for pairing itself, so on
+    /// a host without a Bluetooth agent this connection's reads can time out. A
+    /// sensor that refused to pair isn't asked again for 10 minutes; after any
+    /// other failure, the next connection pairs again.
     #[tracing::instrument(level = "info", skip_all, fields(connect_timeout = ?config.connection_timeout))]
     pub async fn from_peripheral_with_config(
         adapter: Adapter,
@@ -531,10 +548,6 @@ impl Device {
                 "no tokio runtime available for Bluetooth cleanup",
             ))
         })?;
-
-        // Let the BlueZ agent complete "Just Works" pairing for this device only.
-        #[cfg(target_os = "linux")]
-        crate::bluez_agent::allow_pairing(&peripheral.address().to_string());
 
         let crate::link::OpenLink {
             pending,

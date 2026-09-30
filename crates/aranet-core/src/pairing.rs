@@ -33,14 +33,25 @@
 //!   cached, that wait can outlast the budget, and `CancelPairing` with no
 //!   bonding request unpairs and disconnects the sensor (device.c:3549-3566,
 //!   `btd_adapter_remove_bonding` at adapter.c:8334-8350).
+//! - That `Paired` session still has BlueZ's answer to `Pair` coming, and
+//!   closing the connection before it arrives cancels BlueZ's service
+//!   discovery (the browse request's disconnect watch, device.c:6755-6763 and
+//!   :2011-2018). So `run_pairing` reports `Paired` at once, unregisters the
+//!   agent, and waits up to one more budget for that answer.
 //! - Errors from `CancelPairing` and `UnregisterAgent` are ignored: closing the
 //!   connection removes its agent (the disconnect watch that `agent_create`
 //!   sets, agent.c:274-276, calls `agent_disconnect`, agent.c:174-188), and
 //!   ends a bonding it started and disconnects the sensor (device.c:3346-3361).
+//! - Only a sensor that refused to pair is left alone for 10 minutes. Until a
+//!   sensor is paired, BlueZ asks for pairing itself at every connection (its
+//!   battery plugin reads the Battery Level, which needs encryption) and finds
+//!   no agent on a headless host, so after a timeout or a lost link the next
+//!   connect pairs again.
 //! - btleplug 0.11.8 has no pairing call.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -48,6 +59,20 @@ use tokio::time::Instant;
 /// The D-Bus error that `Device1.Pair` answers with when the device is
 /// already bonded.
 pub(crate) const ALREADY_EXISTS: &str = "org.bluez.Error.AlreadyExists";
+
+/// The `Device1.Pair` errors that mean the sensor refused to pair (BlueZ's
+/// `new_authentication_return`, device.c:3491-3525): the pairing itself failed,
+/// as when a sensor wants a PIN that a `NoInputNoOutput` agent can't give, or
+/// was rejected. Pairing again won't help until someone pairs it by hand.
+/// Other errors say nothing about the sensor: `AuthenticationCanceled` is also
+/// what a lost link gives, and `ConnectionAttemptFailed`, `InProgress` or a bus
+/// error can pass. `AuthenticationRejected` also covers a busy local controller
+/// (BlueZ maps the kernel's `MGMT_STATUS_BUSY` to it), so a pairing that
+/// collides with other Bluetooth work can start the cooldown too.
+const REFUSED_BY_SENSOR: [&str; 2] = [
+    "org.bluez.Error.AuthenticationFailed",
+    "org.bluez.Error.AuthenticationRejected",
+];
 
 /// A D-Bus error reply, such as `org.bluez.Error.AuthenticationFailed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,13 +110,22 @@ pub(crate) enum PairOutcome {
     Unavailable(BluezError),
 }
 
+impl PairOutcome {
+    /// Whether the sensor refused to pair: `Pair` failed with one of
+    /// `REFUSED_BY_SENSOR`.
+    pub(crate) fn refused_by_sensor(&self) -> bool {
+        matches!(self, PairOutcome::Failed(e) if REFUSED_BY_SENSOR.contains(&e.name.as_str()))
+    }
+}
+
 /// The BlueZ calls that pairing one device makes, all on one D-Bus connection.
 ///
-/// `run_pairing` puts a time limit on `pair` only, so every other call must
+/// `run_pairing` puts time limits on `pair` only, so every other call must
 /// return within the implementation's own limit; `is_paired` is called again
-/// when `pair` runs out of time. `Sync` makes `&Self` `Send`, which keeps
-/// `run_pairing`'s future `Send`: the collector and the TUI spawn their
-/// connects.
+/// when `pair` runs out of time. `pair`'s own reply timeout must outlast
+/// `run_pairing`'s waits for it: up to twice the budget, plus two other calls.
+/// `Sync` makes `&Self` `Send`, which keeps `run_pairing`'s future `Send`: the
+/// collector and the TUI spawn their connects.
 pub(crate) trait PairingBus: Sync {
     /// Reads the device's `org.bluez.Device1.Paired` property: before pairing,
     /// and again when `pair` runs out of time.
@@ -111,85 +145,127 @@ pub(crate) trait PairingBus: Sync {
 
     /// Unregisters the agent (`org.bluez.AgentManager1.UnregisterAgent`).
     fn unregister_agent(&self) -> impl Future<Output = Result<(), BluezError>> + Send;
+
+    /// Hands the outcome on as soon as it is known, before `unregister_agent`
+    /// and before any wait for a `Pair` reply that BlueZ holds back.
+    /// `run_pairing` calls it once. Does nothing by default.
+    fn report(&self, _outcome: &PairOutcome) {}
 }
 
 /// Pair once: skip if paired; otherwise register the agent, `Pair` within
-/// `budget`, then unregister. When `budget` runs out, a sensor whose `Paired`
-/// has turned true counts as paired, and any other gets `CancelPairing`.
-/// Errors from `CancelPairing` and `UnregisterAgent` are ignored: closing the
-/// connection removes the agent anyway.
+/// what is left of `budget`, then unregister.
+///
+/// When `budget` runs out, `Paired` is read again. If it is true, BlueZ has
+/// bonded and holds `Pair`'s reply until its service discovery ends: the
+/// outcome is `Paired`, nothing is cancelled, and after unregistering the
+/// agent this waits up to `budget` more for that reply, so that the caller's
+/// connection stays open meanwhile. Otherwise `CancelPairing` stops it. The
+/// outcome is reported (`PairingBus::report`) as soon as it is known, before
+/// the cleanup and that wait. Errors from `CancelPairing` and
+/// `UnregisterAgent` are ignored: closing the connection removes the agent
+/// anyway.
 pub(crate) async fn run_pairing<B: PairingBus>(bus: &B, budget: Duration) -> PairOutcome {
-    match bus.is_paired().await {
-        Ok(true) => return PairOutcome::AlreadyPaired,
-        Ok(false) => {}
-        Err(e) => return PairOutcome::Unavailable(e),
+    let start = Instant::now();
+    let before_pair = match bus.is_paired().await {
+        Ok(true) => Some(PairOutcome::AlreadyPaired),
+        Ok(false) => bus
+            .register_agent()
+            .await
+            .err()
+            .map(PairOutcome::Unavailable),
+        Err(e) => Some(PairOutcome::Unavailable(e)),
+    };
+    if let Some(outcome) = before_pair {
+        bus.report(&outcome);
+        return outcome;
     }
-    if let Err(e) = bus.register_agent().await {
-        return PairOutcome::Unavailable(e);
-    }
-    let outcome = match tokio::time::timeout(budget, bus.pair()).await {
+    let mut pair = std::pin::pin!(bus.pair());
+    let answer = tokio::time::timeout(budget.saturating_sub(start.elapsed()), &mut pair).await;
+    let outcome = match answer {
         Ok(Ok(())) => PairOutcome::Paired,
         Ok(Err(e)) if e.name == ALREADY_EXISTS => PairOutcome::AlreadyPaired,
         Ok(Err(e)) => PairOutcome::Failed(e),
         // BlueZ answers `Pair` only after service discovery, so time can run
         // out after the bond is made. `CancelPairing` would then unpair and
         // disconnect the sensor, so it is sent only while `Paired` is false.
-        Err(_) => match bus.is_paired().await {
-            Ok(true) => PairOutcome::Paired,
-            Ok(false) | Err(_) => {
-                let _ = bus.cancel_pairing().await;
-                PairOutcome::TimedOut
+        Err(_) => {
+            if matches!(bus.is_paired().await, Ok(true)) {
+                bus.report(&PairOutcome::Paired);
+                let _ = bus.unregister_agent().await;
+                let _ = tokio::time::timeout(budget, &mut pair).await;
+                return PairOutcome::Paired;
             }
-        },
+            let _ = bus.cancel_pairing().await;
+            PairOutcome::TimedOut
+        }
     };
+    bus.report(&outcome);
     let _ = bus.unregister_agent().await;
     outcome
 }
 
-/// How long a sensor whose pairing failed or timed out is left unpaired before
-/// aranet tries again.
+/// How long a sensor that refused to pair is left unpaired before aranet tries
+/// again.
 pub(crate) const PAIRING_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 /// Per-device memory of failed pairings, keyed by the device's BlueZ object
 /// path.
 ///
 /// A sensor that rejects Just Works pairing (possibly an Aranet4 that wants its
-/// PIN) would otherwise cost up to the whole pairing budget and a warning on
-/// every connect, which for the service is every poll.
+/// PIN) would otherwise cost a pairing attempt and a warning on every connect,
+/// which for the service is every poll.
 #[derive(Debug, Default)]
 pub(crate) struct PairingCooldown {
     until: HashMap<String, Instant>,
 }
 
 impl PairingCooldown {
-    /// True while `device`'s last pairing failed or timed out less than
-    /// `PAIRING_RETRY_AFTER` before `now`.
+    /// True while `device` refused to pair less than `PAIRING_RETRY_AFTER`
+    /// before `now`.
     pub(crate) fn blocks(&self, device: &str, now: Instant) -> bool {
         self.until.get(device).is_some_and(|until| now < *until)
     }
 
     /// Remembers how pairing `device` ended.
     ///
-    /// `Failed` or `TimedOut` blocks it until `now + PAIRING_RETRY_AFTER`. Any
-    /// error reply to `Pair` counts, including bus errors such as `NoReply`
-    /// after a `bluetoothd` restart and BlueZ's `InProgress` while another
-    /// client connects the sensor: the connect goes ahead unpaired either way,
-    /// and only the next pairing attempt waits. `AlreadyPaired` or `Paired`
-    /// forgets it. `Unavailable` changes nothing: `Pair` was never sent, so
-    /// nothing was learned about the sensor. Entries whose time has passed stay
-    /// in the map: there is one per sensor at most.
+    /// A sensor that refused (`PairOutcome::refused_by_sensor`) is blocked
+    /// until `now + PAIRING_RETRY_AFTER`. `AlreadyPaired` or `Paired` forgets
+    /// it. Anything else changes nothing: a timeout, a lost link, a bus error
+    /// or another client's pairing say nothing about the sensor, and the next
+    /// connect should pair it. Entries whose time has passed stay in the map:
+    /// there is one per sensor at most.
     pub(crate) fn record(&mut self, device: &str, outcome: &PairOutcome, now: Instant) {
-        match outcome {
-            PairOutcome::Failed(_) | PairOutcome::TimedOut => {
-                self.until
-                    .insert(device.to_owned(), now + PAIRING_RETRY_AFTER);
-            }
-            PairOutcome::AlreadyPaired | PairOutcome::Paired => {
-                self.until.remove(device);
-            }
-            PairOutcome::Unavailable(_) => {}
+        if outcome.refused_by_sensor() {
+            self.until
+                .insert(device.to_owned(), now + PAIRING_RETRY_AFTER);
+        } else if matches!(outcome, PairOutcome::AlreadyPaired | PairOutcome::Paired) {
+            self.until.remove(device);
         }
     }
+}
+
+/// Runs `session` for `device` unless the sensor refused to pair less than
+/// `PAIRING_RETRY_AFTER` ago, and records how it went. `None` when the
+/// cooldown skipped it. The lock is taken only to check and to record, never
+/// across the session.
+pub(crate) async fn pair_with_cooldown(
+    cooldown: &Mutex<PairingCooldown>,
+    device: &str,
+    session: impl Future<Output = PairOutcome>,
+) -> Option<PairOutcome> {
+    if cooldown
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .blocks(device, Instant::now())
+    {
+        return None;
+    }
+    let outcome = session.await;
+    cooldown
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .record(device, &outcome, Instant::now());
+    Some(outcome)
 }
 
 #[cfg(test)]
@@ -200,8 +276,8 @@ mod tests {
     use crate::test_support::within;
 
     /// The default pairing budget: `connection_timeout` (15 s) plus
-    /// `discovery_timeout` (10 s).
-    const BUDGET: Duration = Duration::from_secs(25);
+    /// `link::bluez_discovery_limit` (20 s).
+    const BUDGET: Duration = Duration::from_secs(35);
 
     /// The calls of a pairing whose `Pair` answered in time.
     const FULL_SEQUENCE: [&str; 4] = ["IsPaired", "RegisterAgent", "Pair", "UnregisterAgent"];
@@ -216,7 +292,13 @@ mod tests {
         Err(BluezError),
         /// Never answers, like a `Pair` whose sensor stopped responding.
         Hang,
+        /// Answers after this long, like BlueZ holding `Pair`'s reply until
+        /// its service discovery ends.
+        After(Duration),
     }
+
+    /// One `report` call: the outcome, the calls made before it, and when.
+    type Report = (PairOutcome, Vec<&'static str>, Instant);
 
     /// A scripted BlueZ connection that records every call it gets.
     struct FakeBus {
@@ -229,6 +311,9 @@ mod tests {
         pair: PairScript,
         /// What `cancel_pairing` and `unregister_agent` return.
         cleanup: Result<(), BluezError>,
+        /// How long `is_paired` and `register_agent` take.
+        delay: Duration,
+        reports: Mutex<Vec<Report>>,
     }
 
     impl FakeBus {
@@ -244,6 +329,8 @@ mod tests {
                 register,
                 pair,
                 cleanup: Ok(()),
+                delay: Duration::ZERO,
+                reports: Mutex::new(Vec::new()),
             }
         }
 
@@ -259,12 +346,23 @@ mod tests {
         fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
         }
+
+        fn reports(&self) -> Vec<Report> {
+            self.reports.lock().unwrap().clone()
+        }
+
+        async fn take_time(&self) {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+        }
     }
 
     impl PairingBus for FakeBus {
         async fn is_paired(&self) -> Result<bool, BluezError> {
             let pair_sent = self.calls().contains(&"Pair");
             self.record("IsPaired");
+            self.take_time().await;
             if pair_sent {
                 self.paired_after_timeout.clone()
             } else {
@@ -274,6 +372,7 @@ mod tests {
 
         async fn register_agent(&self) -> Result<(), BluezError> {
             self.record("RegisterAgent");
+            self.take_time().await;
             self.register.clone()
         }
 
@@ -283,6 +382,10 @@ mod tests {
                 PairScript::Ok => Ok(()),
                 PairScript::Err(e) => Err(e.clone()),
                 PairScript::Hang => std::future::pending().await,
+                PairScript::After(delay) => {
+                    tokio::time::sleep(*delay).await;
+                    Ok(())
+                }
             }
         }
 
@@ -294,6 +397,11 @@ mod tests {
         async fn unregister_agent(&self) -> Result<(), BluezError> {
             self.record("UnregisterAgent");
             self.cleanup.clone()
+        }
+
+        fn report(&self, outcome: &PairOutcome) {
+            let report = (outcome.clone(), self.calls(), Instant::now());
+            self.reports.lock().unwrap().push(report);
         }
     }
 
@@ -396,7 +504,19 @@ mod tests {
         let outcome = within(Duration::from_secs(600), run_pairing(&bus, budget)).await;
 
         assert_eq!(outcome, PairOutcome::Paired);
-        assert_eq!(start.elapsed(), budget);
+        // Reported when the budget ran out, so the connect can go ahead. The
+        // session then waits one more budget for BlueZ's answer to `Pair`
+        // (none comes here): closing its connection earlier would cancel
+        // BlueZ's service discovery (device.c:6755-6763 and :2011-2018).
+        assert_eq!(
+            bus.reports(),
+            [(
+                PairOutcome::Paired,
+                vec!["IsPaired", "RegisterAgent", "Pair", "IsPaired"],
+                start + budget
+            )]
+        );
+        assert_eq!(start.elapsed(), budget * 2);
         assert_eq!(
             bus.calls(),
             [
@@ -407,6 +527,100 @@ mod tests {
                 "UnregisterAgent"
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bonded_pair_waits_for_bluez_to_answer() {
+        // The usual end of a first Aranet4 pairing that outlasts its budget:
+        // BlueZ answers once its service discovery is done.
+        let bus = FakeBus {
+            paired_after_timeout: Ok(true),
+            ..FakeBus::unpaired(PairScript::After(Duration::from_secs(10)))
+        };
+        let budget = Duration::from_secs(7);
+        let start = Instant::now();
+
+        let outcome = within(Duration::from_secs(600), run_pairing(&bus, budget)).await;
+
+        assert_eq!(outcome, PairOutcome::Paired);
+        assert_eq!(bus.reports()[0].2, start + budget);
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        assert!(!bus.calls().contains(&"CancelPairing"), "{:?}", bus.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_outcome_is_reported_once_before_the_cleanup() {
+        let failed = err("org.bluez.Error.AuthenticationFailed");
+        let unknown = err("org.freedesktop.DBus.Error.ServiceUnknown");
+        let cases = [
+            (
+                FakeBus::new(Ok(true), Ok(()), PairScript::Ok),
+                PairOutcome::AlreadyPaired,
+                &["IsPaired"][..],
+            ),
+            (
+                FakeBus::new(Err(unknown.clone()), Ok(()), PairScript::Ok),
+                PairOutcome::Unavailable(unknown.clone()),
+                &["IsPaired"],
+            ),
+            (
+                FakeBus::new(Ok(false), Err(unknown.clone()), PairScript::Ok),
+                PairOutcome::Unavailable(unknown),
+                &["IsPaired", "RegisterAgent"],
+            ),
+            (
+                FakeBus::unpaired(PairScript::Ok),
+                PairOutcome::Paired,
+                &["IsPaired", "RegisterAgent", "Pair"],
+            ),
+            (
+                FakeBus::unpaired(PairScript::Err(failed.clone())),
+                PairOutcome::Failed(failed),
+                &["IsPaired", "RegisterAgent", "Pair"],
+            ),
+            (
+                FakeBus::unpaired(PairScript::Hang),
+                PairOutcome::TimedOut,
+                &[
+                    "IsPaired",
+                    "RegisterAgent",
+                    "Pair",
+                    "IsPaired",
+                    "CancelPairing",
+                ],
+            ),
+        ];
+        for (bus, expected, before) in cases {
+            let outcome = within(Duration::from_secs(600), run_pairing(&bus, BUDGET)).await;
+
+            assert_eq!(outcome, expected);
+            let reports = bus.reports();
+            assert_eq!(reports.len(), 1, "{expected:?}: {reports:?}");
+            assert_eq!(reports[0].0, expected);
+            assert_eq!(reports[0].1, before, "{expected:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pair_gets_what_is_left_of_the_budget() {
+        // The calls before `Pair` count against the budget, so a session
+        // reports within a few call limits of it (Task 11's `PAIRING_GRACE`).
+        let bus = FakeBus {
+            delay: Duration::from_secs(2),
+            ..FakeBus::unpaired(PairScript::Hang)
+        };
+        let start = Instant::now();
+
+        let outcome = within(
+            Duration::from_secs(600),
+            run_pairing(&bus, Duration::from_secs(7)),
+        )
+        .await;
+
+        assert_eq!(outcome, PairOutcome::TimedOut);
+        // IsPaired and RegisterAgent (2 s each), `Pair` until the 7 s budget
+        // runs out, then IsPaired again (2 s).
+        assert_eq!(start.elapsed(), Duration::from_secs(9));
     }
 
     #[tokio::test]
@@ -474,7 +688,7 @@ mod tests {
     async fn cooldown_blocks_a_sensor_after_a_failed_pairing() {
         let failures = [
             PairOutcome::Failed(err("org.bluez.Error.AuthenticationFailed")),
-            PairOutcome::TimedOut,
+            PairOutcome::Failed(err("org.bluez.Error.AuthenticationRejected")),
         ];
         for outcome in failures {
             let mut cooldown = PairingCooldown::default();
@@ -539,5 +753,67 @@ mod tests {
         cooldown.record(SENSOR_A, &failed, t0);
         cooldown.record(SENSOR_A, &unreachable, later);
         assert!(cooldown.blocks(SENSOR_A, later));
+    }
+
+    #[test]
+    fn cooldown_ignores_failures_that_do_not_blame_the_sensor() {
+        // Until the sensor is paired, BlueZ asks for pairing itself at every
+        // connect, and finds no agent on a headless host, so the next connect
+        // must try again.
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(1);
+        let refused = PairOutcome::Failed(err("org.bluez.Error.AuthenticationFailed"));
+        for outcome in [
+            PairOutcome::TimedOut,
+            PairOutcome::Failed(err("org.bluez.Error.AuthenticationCanceled")),
+            PairOutcome::Failed(err("org.bluez.Error.ConnectionAttemptFailed")),
+            PairOutcome::Failed(err("org.bluez.Error.InProgress")),
+            PairOutcome::Failed(err("org.freedesktop.DBus.Error.NoReply")),
+        ] {
+            let mut cooldown = PairingCooldown::default();
+            cooldown.record(SENSOR_A, &outcome, t0);
+            assert!(!cooldown.blocks(SENSOR_A, t0), "{outcome:?}");
+
+            // Nor does it lift a cooldown the sensor earned.
+            cooldown.record(SENSOR_A, &refused, t0);
+            cooldown.record(SENSOR_A, &outcome, later);
+            assert!(cooldown.blocks(SENSOR_A, later), "{outcome:?}");
+        }
+    }
+
+    /// A session that the cooldown must skip.
+    async fn must_not_run() -> PairOutcome {
+        panic!("the cooldown should have skipped this session")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pair_with_cooldown_skips_a_sensor_that_refused_for_10_minutes() {
+        let cooldown = Mutex::new(PairingCooldown::default());
+        let refused = PairOutcome::Failed(err("org.bluez.Error.AuthenticationRejected"));
+        let ready = std::future::ready;
+
+        let first = pair_with_cooldown(&cooldown, SENSOR_A, ready(refused.clone())).await;
+        assert_eq!(first, Some(refused.clone()));
+
+        // For 10 minutes the sensor's session doesn't run; other sensors' do.
+        tokio::time::advance(Duration::from_secs(599)).await;
+        assert_eq!(
+            pair_with_cooldown(&cooldown, SENSOR_A, must_not_run()).await,
+            None
+        );
+        let other = pair_with_cooldown(&cooldown, SENSOR_B, ready(PairOutcome::Paired)).await;
+        assert_eq!(other, Some(PairOutcome::Paired));
+
+        // Then it runs again. A timeout doesn't hold the sensor back...
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let timed_out = pair_with_cooldown(&cooldown, SENSOR_A, ready(PairOutcome::TimedOut)).await;
+        assert_eq!(timed_out, Some(PairOutcome::TimedOut));
+        // ...but refusing again does.
+        let again = pair_with_cooldown(&cooldown, SENSOR_A, ready(refused.clone())).await;
+        assert_eq!(again, Some(refused));
+        assert_eq!(
+            pair_with_cooldown(&cooldown, SENSOR_A, must_not_run()).await,
+            None
+        );
     }
 }

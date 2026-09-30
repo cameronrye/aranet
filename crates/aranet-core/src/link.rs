@@ -80,6 +80,14 @@ pub(crate) trait GattLink: Clone + Send + Sync + 'static {
     /// Open a stream of the notifications the peripheral sends from now on,
     /// from every characteristic.
     fn notifications(&self) -> impl Future<Output = btleplug::Result<NotificationStream>> + Send;
+
+    /// Pair with the device before connecting, if the platform needs that,
+    /// giving the pairing about `budget`. Only Linux pairs (the `bluez_agent`
+    /// module); everywhere else this does nothing. It never fails: a pairing
+    /// problem is logged and the connect goes ahead.
+    fn pair_if_needed(&self, _budget: Duration) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 // Every call names btleplug's trait: `GattLink` is the trait in scope here, so
@@ -125,6 +133,12 @@ impl GattLink for btleplug::platform::Peripheral {
 
     async fn notifications(&self) -> btleplug::Result<NotificationStream> {
         btleplug::api::Peripheral::notifications(self).await
+    }
+
+    /// Pairs the sensor through BlueZ first if BlueZ doesn't list it as paired.
+    #[cfg(target_os = "linux")]
+    async fn pair_if_needed(&self, budget: Duration) {
+        let _ = crate::bluez_agent::pair_if_needed(self, budget).await;
     }
 }
 
@@ -256,6 +270,11 @@ pub(crate) async fn bounded<T>(
 /// How long a disconnect may wait for the Bluetooth stack to confirm it: the
 /// 5 s that `DeviceGuard`'s drop has always allowed.
 pub(crate) const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much longer than its budget the pairing step may take before the
+/// connect goes ahead without it (see `connect_and_discover`). The Linux
+/// session reports its outcome within 3 s of its budget.
+const PAIRING_GRACE: Duration = Duration::from_secs(5);
 
 /// Disconnect `link`, giving up after `DISCONNECT_TIMEOUT` with
 /// `Error::Timeout` ("disconnect from device").
@@ -417,6 +436,25 @@ async fn connect_and_discover<L: GattLink>(
     link: &L,
     config: &ConnectionConfig,
 ) -> Result<(BTreeSet<Service>, Option<PeripheralProperties>)> {
+    // Pair first (Linux): BlueZ refuses `Pair` while a `Connect` is in flight,
+    // and `Pair` connects the device itself, so this runs inside the caller's
+    // `PendingLink` guard. When BlueZ connects the sensor for `Pair`, it answers
+    // only after its service discovery, so the budget covers the connect and
+    // that discovery (`bluez_discovery_limit`). A pairing problem never stops
+    // the connect; what an unpaired sensor does on Linux is described in
+    // `bluez_agent`. `saturating_add`, because callers may pass `Duration::MAX`
+    // to mean "no limit".
+    let pairing_budget = config
+        .connection_timeout
+        .saturating_add(bluez_discovery_limit(config));
+    let pairing_limit = pairing_budget.saturating_add(PAIRING_GRACE);
+    if tokio::time::timeout(pairing_limit, link.pair_if_needed(pairing_budget))
+        .await
+        .is_err()
+    {
+        warn!("Pairing did not finish within {pairing_limit:?}; connecting anyway");
+    }
+
     // Connect to the device with timeout
     info!("Connecting to device...");
     let bluez_wait = connect_link(link, "connect to device", config).await?;
@@ -1973,6 +2011,114 @@ mod bluez_discovery_tests {
             assert_in_progress(result);
             assert_eq!(start.elapsed(), Duration::ZERO);
             assert_eq!(fake.calls(), [Call::Connect, Call::Disconnect]);
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use std::time::Duration;
+
+    use tokio::runtime::Handle;
+    use tokio::time::Instant;
+
+    use super::connect;
+    use super::fake::{Call, FakeGatt, Outcome};
+    use crate::device::ConnectionConfig;
+    use crate::test_support::within;
+
+    /// The pairing step runs first and inside the guard: a connect that fails
+    /// after it still disconnects, because `Pair` may have connected the sensor.
+    #[tokio::test(start_paused = true)]
+    async fn pairing_runs_before_connect_inside_the_guard() {
+        within(Duration::from_secs(600), async {
+            let config = ConnectionConfig::default();
+            let runtime = Handle::current();
+
+            let link = FakeGatt::new();
+            link.script_pair([Outcome::Ok]);
+            let open = connect(&link, &config, &runtime)
+                .await
+                .expect("the connect should succeed after pairing");
+            open.pending.disarm();
+            assert_eq!(link.calls(), [Call::Pair, Call::Connect, Call::Discover]);
+
+            let refused = FakeGatt::new();
+            refused.script_pair([Outcome::Ok]);
+            refused.script_connect([Outcome::Fail]);
+            let result = connect(&refused, &config, &runtime).await;
+            assert!(result.is_err(), "a refused connect must fail");
+            assert_eq!(
+                refused.calls(),
+                [Call::Pair, Call::Connect, Call::Disconnect]
+            );
+        })
+        .await;
+    }
+
+    /// A pairing step that never returns is abandoned after its budget,
+    /// `connection_timeout` plus the wait for BlueZ's service discovery
+    /// (`bluez_discovery_limit`), and `PAIRING_GRACE`; the connect goes ahead.
+    #[tokio::test(start_paused = true)]
+    async fn a_pairing_step_that_never_returns_is_abandoned() {
+        within(Duration::from_secs(600), async {
+            let link = FakeGatt::new();
+            link.script_pair([Outcome::Hang]);
+            let start = Instant::now();
+
+            let open = connect(&link, &ConnectionConfig::default(), &Handle::current())
+                .await
+                .expect("the connect should go ahead without pairing");
+            open.pending.disarm();
+
+            // connection_timeout (15 s) + bluez_discovery_limit (20 s) + 5 s of grace.
+            assert_eq!(start.elapsed(), Duration::from_secs(40));
+            assert_eq!(link.calls(), [Call::Pair, Call::Connect, Call::Discover]);
+        })
+        .await;
+    }
+
+    /// A caller that drops the connect while it is still pairing gets the
+    /// sensor disconnected in the background.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_pairing_still_disconnects() {
+        within(Duration::from_secs(600), async {
+            let link = FakeGatt::new();
+            link.script_pair([Outcome::Hang]);
+            let config = ConnectionConfig::default();
+            let runtime = Handle::current();
+
+            let attempt =
+                tokio::time::timeout(Duration::from_secs(1), connect(&link, &config, &runtime))
+                    .await;
+            assert!(
+                attempt.is_err(),
+                "the connect should still be pairing after 1 s"
+            );
+
+            within(Duration::from_secs(10), link.disconnected().notified()).await;
+            assert_eq!(link.calls(), [Call::Pair, Call::Disconnect]);
+        })
+        .await;
+    }
+
+    /// `Duration::MAX` is how a caller says "no limit". Adding two of them
+    /// must not panic.
+    #[tokio::test(start_paused = true)]
+    async fn connect_with_unlimited_timeouts_does_not_panic() {
+        within(Duration::from_secs(600), async {
+            let link = FakeGatt::new();
+            link.script_pair([Outcome::Ok]);
+            let config = ConnectionConfig::default()
+                .connection_timeout(Duration::MAX)
+                .discovery_timeout(Duration::MAX);
+
+            let open = connect(&link, &config, &Handle::current())
+                .await
+                .expect("the connect should succeed");
+            open.pending.disarm();
+            assert_eq!(link.calls(), [Call::Pair, Call::Connect, Call::Discover]);
         })
         .await;
     }

@@ -107,9 +107,9 @@ pub mod service_client;
 
 // Crate-private modules.
 mod link;
-// The explicit BlueZ pairing sequence for the Linux pairing session in
-// `bluez_agent.rs`. Tests build it on every OS.
-#[cfg(test)]
+// The explicit BlueZ pairing sequence, which the Linux pairing session in
+// bluez_agent.rs runs. Tests build it on every OS.
+#[cfg(any(target_os = "linux", test))]
 mod pairing;
 mod runtime;
 #[cfg(test)]
