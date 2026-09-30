@@ -24,7 +24,7 @@ use aranet_core::Device;
 use aranet_core::scan::{ScanOptions, scan_with_options};
 use aranet_core::settings::MeasurementInterval;
 use btleplug::api::Central as _;
-use futures::{FutureExt, StreamExt};
+use futures::{Stream, StreamExt};
 use tokio::time::timeout;
 
 /// Default timeout for BLE operations
@@ -138,6 +138,29 @@ async fn test_scan_unfiltered() {
     }
 }
 
+/// Reads `events` until none arrives for `gap`. Returns how many it read, or
+/// `Err` with that count if events were still arriving after `limit`.
+///
+/// Each read waits up to `gap`: on BlueZ, btleplug makes a D-Bus call for each
+/// event before it yields it, so even an event that is already queued isn't
+/// ready at once, and a `now_or_never` drain would stop at the first one.
+async fn read_until_quiet<S: Stream + Unpin>(
+    events: &mut S,
+    gap: Duration,
+    limit: Duration,
+) -> Result<usize, usize> {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut count = 0;
+    while tokio::time::Instant::now() < deadline {
+        match timeout(gap, events.next()).await {
+            Ok(Some(_)) => count += 1,
+            Ok(None) => panic!("the Bluetooth event stream ended"),
+            Err(_) => return Ok(count),
+        }
+    }
+    Err(count)
+}
+
 /// A scan whose caller gives up must stop the radio at once, and the process
 /// must be able to scan again. Before the fix, a dropped scan never called
 /// `stop_scan`: CoreBluetooth kept scanning (with duplicates) and events kept
@@ -164,18 +187,23 @@ async fn test_cancelled_scan_stops_scanning() {
         "the 30 s scan should still be running after 3 s"
     );
 
-    let mut while_scanning = 0;
-    while let Some(Some(_)) = events.next().now_or_never() {
-        while_scanning += 1;
-    }
+    // The events the scan saw are queued in the stream. Count them for at most
+    // 1 s, or until 0.5 s passes without one.
+    let (Ok(while_scanning) | Err(while_scanning)) = read_until_quiet(
+        &mut events,
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+    )
+    .await;
     assert!(
         while_scanning > 0,
         "no Bluetooth events while scanning; are sensors advertising nearby?"
     );
 
-    // Give the stop a moment to take effect, then drop what arrived meanwhile.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    while let Some(Some(_)) = events.next().now_or_never() {}
+    // Read the rest of what the scan left until the stream goes quiet, which it
+    // never does while a scan runs.
+    let quiet =
+        read_until_quiet(&mut events, Duration::from_secs(1), Duration::from_secs(15)).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut after_cancel = 0;
@@ -198,9 +226,17 @@ async fn test_cancelled_scan_stops_scanning() {
         Ok(Err(e)) => format!("failed: {e}"),
         Err(_) => "did not finish within 40 s".to_string(),
     };
+    let drained = match quiet {
+        Ok(n) => format!("{n} more until the stream went quiet"),
+        Err(n) => format!("{n} more in 15 s without a quiet second"),
+    };
     println!(
-        "{while_scanning} events while scanning, {after_cancel} in the 5 s after the cancel; \
-         the next scan {rescan_result}"
+        "{while_scanning} events while scanning, {drained}, {after_cancel} in the 5 s after \
+         that; the next scan {rescan_result}"
+    );
+    assert!(
+        quiet.is_ok(),
+        "Bluetooth events were still arriving 15 s after the scan was cancelled: it is still scanning"
     );
     assert_eq!(
         after_cancel, 0,
