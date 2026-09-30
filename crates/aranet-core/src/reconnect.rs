@@ -5,15 +5,36 @@
 //!
 //! [`ReconnectingDevice`] implements the [`AranetDevice`] trait,
 //! allowing it to be used interchangeably with regular devices in generic code.
+//!
+//! # When it reconnects
+//!
+//! An operation reconnects when the device isn't connected, or when it fails
+//! with a connection error: not connected, a timeout, a failed connection or a
+//! Bluetooth link error. Other errors, such as a characteristic the device
+//! doesn't have, are returned at once. The old connection is closed before the
+//! new one is made, because on Linux and macOS closing it later would drop the
+//! new connection too.
+//!
+//! Operations that fail at the same time share one reconnect. Between attempts
+//! it waits with the backoff of [`ReconnectOptions`];
+//! [`ReconnectingDevice::cancel_reconnect`] and [`ReconnectingDevice::disconnect`]
+//! end that wait, or a connect in progress, at once. An operation that waited
+//! for a reconnect that gave up or was stopped returns an error instead of
+//! starting another one.
+//!
+//! While a reconnect runs, and after one has failed, there is no connection:
+//! `ReconnectingDevice::name()` returns `None` and
+//! `ReconnectingDevice::address()` returns the identifier.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, PoisonError};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord};
 
@@ -168,10 +189,40 @@ pub enum ConnectionState {
 
 /// The reconnect logic behind [`ReconnectingDevice`], generic over the link so
 /// its races can be tested without Bluetooth (`FakeRadio` in `test_support.rs`).
+///
+/// Lock order: `serial`, then `link`. Operations hold a `link` read guard while
+/// they run, so a recovery or a disconnect waits for them before it takes the
+/// link out.
+///
+/// The generation protocol (all `SeqCst`) keeps a recovery from undoing a
+/// `cancel()` or a `disconnect()`, and `disconnect()` from waiting for a whole
+/// recovery, whatever the interleaving:
+///
+/// - `disconnect()` bumps `generation` and counts itself in `disconnecting`,
+///   and `cancel()` sets `cancelled`, before either cancels the current `wake`
+///   token.
+/// - `recover` installs a fresh `wake` token before it checks `disconnecting`,
+///   `generation` and `cancelled`, so a call that those checks miss cancels its
+///   token.
+/// - `recover` installs a new link, under the `link` write lock, only if
+///   `generation` is still the value it set when it took the old link out and
+///   its token isn't cancelled.
+/// - A recovery that gives up bumps `generation` too, so the callers queued
+///   behind it share its failure instead of starting another one.
 pub(crate) struct ReconnectCore<L: SensorLink> {
     identifier: String,
     connect: ConnectFn<L>,
     link: RwLock<Option<Arc<L>>>,
+    /// Bumped by every install and removal of a link, by a recovery that gives
+    /// up, and by `disconnect()`.
+    generation: AtomicU64,
+    /// The number of `disconnect()` calls in progress.
+    disconnecting: AtomicU32,
+    /// One recovery or one disconnect at a time.
+    serial: Mutex<()>,
+    /// Cancelled by `cancel()` and `disconnect()` to end a backoff wait or a
+    /// connect at once. Each recovery starts with a new token.
+    wake: std::sync::Mutex<CancellationToken>,
     /// The sticky flag set by `cancel_reconnect()`.
     cancelled: AtomicBool,
     state: RwLock<ConnectionState>,
@@ -191,6 +242,10 @@ impl<L: SensorLink> ReconnectCore<L> {
             identifier: identifier.into(),
             connect,
             link: RwLock::new(Some(link)),
+            generation: AtomicU64::new(0),
+            disconnecting: AtomicU32::new(0),
+            serial: Mutex::new(()),
+            wake: std::sync::Mutex::new(CancellationToken::new()),
             cancelled: AtomicBool::new(false),
             state: RwLock::new(ConnectionState::Connected),
             attempt_count: AtomicU32::new(0),
@@ -207,8 +262,14 @@ impl<L: SensorLink> ReconnectCore<L> {
         &self.identifier
     }
 
+    /// Never held across an `.await`.
+    fn lock_wake(&self) -> std::sync::MutexGuard<'_, CancellationToken> {
+        self.wake.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.lock_wake().cancel();
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -232,11 +293,9 @@ impl<L: SensorLink> ReconnectCore<L> {
     }
 
     pub(crate) async fn is_connected(&self) -> bool {
-        let guard = self.link.read().await;
-        if let Some(link) = guard.as_ref() {
-            link.is_connected().await
-        } else {
-            false
+        match self.link().await {
+            Some(link) => link.is_connected().await,
+            None => false,
         }
     }
 
@@ -247,30 +306,35 @@ impl<L: SensorLink> ReconnectCore<L> {
     // future can't borrow the link. Neither form fits the other without
     // changing `with_device`'s public signature.
 
-    /// Run `op` on the link, reconnecting and running it again if it fails.
+    /// Run `op` on the link. After a connection error, or when there is no
+    /// live link, recover once and run `op` again; any other error is returned
+    /// as it is.
     pub(crate) async fn run<T, F>(&self, op: F) -> Result<T>
     where
         F: for<'b> Fn(&'b L) -> BoxFuture<'b, Result<T>> + Send + Sync,
         T: Send,
     {
-        {
+        let seen = {
             let guard = self.link.read().await;
+            let seen = self.generation.load(Ordering::SeqCst);
             if let Some(link) = guard.as_ref()
                 && link.is_connected().await
             {
                 match op(link).await {
                     Ok(value) => return Ok(value),
-                    Err(e) => warn!("Operation failed: {}", e),
+                    Err(e) if !e.is_connection_error() => return Err(e),
+                    Err(e) => warn!("Operation failed with a connection error: {e}; reconnecting"),
                 }
             }
-        }
+            seen
+        }; // The read guard is dropped before `recover` takes the write lock.
 
-        self.reconnect().await?;
+        self.recover(seen).await?;
 
         let guard = self.link.read().await;
         match guard.as_ref() {
             Some(link) => op(link).await,
-            None => Err(Error::NotConnected),
+            None => Err(self.stopped_error()),
         }
     }
 
@@ -281,110 +345,209 @@ impl<L: SensorLink> ReconnectCore<L> {
         F: Fn(&L) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        {
+        let seen = {
             let guard = self.link.read().await;
+            let seen = self.generation.load(Ordering::SeqCst);
             if let Some(link) = guard.as_ref()
                 && link.is_connected().await
             {
                 match op(link).await {
                     Ok(value) => return Ok(value),
-                    Err(e) => warn!("Operation failed: {}", e),
+                    Err(e) if !e.is_connection_error() => return Err(e),
+                    Err(e) => warn!("Operation failed with a connection error: {e}; reconnecting"),
                 }
             }
-        }
+            seen
+        };
 
-        self.reconnect().await?;
+        self.recover(seen).await?;
 
         let guard = self.link.read().await;
         match guard.as_ref() {
             Some(link) => op(link).await,
-            None => Err(Error::NotConnected),
+            None => Err(self.stopped_error()),
         }
     }
 
+    /// Close the current link and connect again, even if the link is up. A
+    /// call that waited for another recovery shares its result: `Ok` if that
+    /// one left a link, `stopped_error()` if it gave up or was stopped.
     pub(crate) async fn reconnect(&self) -> Result<()> {
-        // Do not reset cancellation here — callers must explicitly call
-        // reset_cancellation() before reconnect() if they want to clear
-        // a previous cancellation. This avoids a race where
-        // cancel_reconnect() fires between is_cancelled() and
-        // reset_cancellation(), silently discarding the cancel request.
+        self.recover(self.generation.load(Ordering::SeqCst)).await?;
+        if self.link.read().await.is_some() {
+            Ok(())
+        } else {
+            Err(self.stopped_error())
+        }
+    }
+
+    /// What a caller gets when the recovery it waited for left no link, because
+    /// it gave up or `cancel()` or `disconnect()` stopped it: `Error::Cancelled`
+    /// while the sticky flag is set, `Error::NotConnected` otherwise.
+    fn stopped_error(&self) -> Error {
+        if self.is_cancelled() {
+            Error::Cancelled
+        } else {
+            Error::NotConnected
+        }
+    }
+
+    pub(crate) async fn disconnect(&self) -> Result<()> {
+        // First the generation and the count, then the token: a recovery in
+        // progress either sees them or has its wait or connect cut short.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let _in_progress = DisconnectInProgress::start(&self.disconnecting);
+        self.lock_wake().cancel();
+
+        let _serial = self.serial.lock().await;
+        let link = {
+            let mut link = self.link.write().await;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            link.take()
+        };
+        // Disconnected even if closing the link fails.
+        *self.state.write().await = ConnectionState::Disconnected;
+        match link {
+            Some(link) => release_link(link, ()).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Replace the link that was current at generation `seen`: close it, then
+    /// connect with backoff until a connect succeeds, the attempts run out, or
+    /// `cancel()` or `disconnect()` stops it.
+    async fn recover(&self, seen: u64) -> Result<()> {
+        let _serial = self.serial.lock().await;
+        // A fresh token first, then the checks (see the protocol above).
+        let wake = {
+            let mut wake = self.lock_wake();
+            *wake = CancellationToken::new();
+            wake.clone()
+        };
+        if self.disconnecting.load(Ordering::SeqCst) > 0 {
+            // A `disconnect()` waits for `serial`: don't make it wait for a recovery.
+            return Err(self.stopped_error());
+        }
+        if self.generation.load(Ordering::SeqCst) != seen {
+            // While this caller waited, someone reconnected, the user
+            // disconnected, or the recovery it waited for gave up.
+            return Ok(());
+        }
+        if self.is_cancelled() {
+            return self.cancelled_reconnect().await;
+        }
 
         *self.state.write().await = ConnectionState::Reconnecting;
         self.attempt_count.store(0, Ordering::SeqCst);
 
+        // Close the old link before connecting. A disconnect acts on the sensor,
+        // not on the handle, so closing the old handle later (or dropping it
+        // unclosed) would take the new link down.
+        let (old, mine) = {
+            let mut link = self.link.write().await;
+            (
+                link.take(),
+                self.generation.fetch_add(1, Ordering::SeqCst) + 1,
+            )
+        };
+        if let Some(old) = old
+            && let Err(e) = release_link(old, ()).await
+        {
+            debug!("Closing the old link to {} failed: {e}", self.identifier);
+        }
+
         loop {
-            // Check for cancellation at the start of each iteration
-            if self.is_cancelled() {
-                *self.state.write().await = ConnectionState::Disconnected;
-                info!("Reconnection cancelled for {}", self.identifier);
-                return Err(Error::Cancelled);
+            // `disconnect()` sets no flag, only the token; it may have come in
+            // while the old link was closing.
+            if self.is_cancelled() || wake.is_cancelled() {
+                return self.cancelled_reconnect().await;
             }
 
             let attempt = self.attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
-
-            // Check if we've exceeded max attempts
             if let Some(max) = self.options.max_attempts
                 && attempt > max
             {
                 *self.state.write().await = ConnectionState::Failed;
+                // The callers queued behind this recovery share its failure.
+                self.generation.fetch_add(1, Ordering::SeqCst);
                 return Err(Error::Timeout {
                     operation: format!("reconnect to '{}'", self.identifier),
                     duration: self.options.max_delay * max,
                 });
             }
 
-            // Send reconnect started event
             if let Some(sender) = &self.events {
                 let _ = sender.send(DeviceEvent::ReconnectStarted {
                     device: DeviceId::new(&self.identifier),
                     attempt,
                 });
             }
-
             info!("Reconnection attempt {} for {}", attempt, self.identifier);
 
-            // Wait before attempting (check cancellation during sleep)
             let delay = self.options.delay_for_attempt(attempt - 1);
-            sleep(delay).await;
-
-            // Check for cancellation after sleep
-            if self.is_cancelled() {
-                *self.state.write().await = ConnectionState::Disconnected;
-                info!("Reconnection cancelled for {}", self.identifier);
-                return Err(Error::Cancelled);
+            if wake.run_until_cancelled(sleep(delay)).await.is_none() {
+                return self.cancelled_reconnect().await;
             }
 
-            // Try to connect
-            match (self.connect)(&self.identifier).await {
-                Ok(new_link) => {
-                    *self.link.write().await = Some(Arc::new(new_link));
-                    *self.state.write().await = ConnectionState::Connected;
-
-                    // Send reconnect succeeded event
-                    if let Some(sender) = &self.events {
-                        let _ = sender.send(DeviceEvent::ReconnectSucceeded {
-                            device: DeviceId::new(&self.identifier),
-                            attempts: attempt,
-                        });
-                    }
-
-                    info!("Reconnected successfully after {} attempts", attempt);
-                    return Ok(());
-                }
-                Err(e) => {
+            // Dropping a connect part-way is safe: `Device::connect` releases the sensor.
+            let new = match wake
+                .run_until_cancelled((self.connect)(&self.identifier))
+                .await
+            {
+                None => return self.cancelled_reconnect().await,
+                Some(Err(e)) => {
                     warn!("Reconnection attempt {} failed: {}", attempt, e);
+                    continue;
                 }
+                Some(Ok(new)) => Arc::new(new),
+            };
+
+            let mut link = self.link.write().await;
+            if self.generation.load(Ordering::SeqCst) != mine || wake.is_cancelled() {
+                // cancel() or disconnect() came in as the connect finished.
+                drop(link);
+                if let Err(e) = release_link(new, ()).await {
+                    debug!("Closing the new link to {} failed: {e}", self.identifier);
+                }
+                return self.cancelled_reconnect().await;
             }
+            *link = Some(new);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            drop(link);
+            *self.state.write().await = ConnectionState::Connected;
+
+            if let Some(sender) = &self.events {
+                let _ = sender.send(DeviceEvent::ReconnectSucceeded {
+                    device: DeviceId::new(&self.identifier),
+                    attempts: attempt,
+                });
+            }
+            info!("Reconnected successfully after {} attempts", attempt);
+            return Ok(());
         }
     }
 
-    pub(crate) async fn disconnect(&self) -> Result<()> {
-        let mut guard = self.link.write().await;
-        if let Some(link) = guard.take() {
-            release_link(link, ()).await?;
-        }
+    async fn cancelled_reconnect(&self) -> Result<()> {
         *self.state.write().await = ConnectionState::Disconnected;
-        Ok(())
+        info!("Reconnection cancelled for {}", self.identifier);
+        Err(Error::Cancelled)
+    }
+}
+
+/// Counts a `disconnect()` in `ReconnectCore::disconnecting` until it returns
+/// or its future is dropped.
+struct DisconnectInProgress<'a>(&'a AtomicU32);
+
+impl<'a> DisconnectInProgress<'a> {
+    fn start(count: &'a AtomicU32) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for DisconnectInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -439,7 +602,11 @@ impl ReconnectingDevice {
 
     /// Cancel any ongoing reconnection attempts.
     ///
-    /// This will cause the reconnect loop to exit on its next iteration.
+    /// A backoff wait or a connect in progress ends at once, and the reconnect
+    /// returns `Error::Cancelled`, as do the operations that were waiting for
+    /// it. The flag stays set until
+    /// [`reset_cancellation()`](Self::reset_cancellation): until then, an
+    /// operation that needs to reconnect also returns `Error::Cancelled`.
     pub fn cancel_reconnect(&self) {
         self.core.cancel();
     }
@@ -476,9 +643,12 @@ impl ReconnectingDevice {
 
     /// Execute an operation, reconnecting if necessary.
     ///
-    /// The closure is called with a reference to the device. If the operation
-    /// fails due to a connection issue, the device will attempt to reconnect
-    /// and retry the operation.
+    /// The closure is called with a reference to the device. If the device
+    /// isn't connected, this reconnects first. If the closure fails with a
+    /// connection error (not connected, a timeout, a failed connection or a
+    /// Bluetooth link error), this reconnects once and calls the closure again,
+    /// so `f` can run twice. Any other error is returned as it is, without
+    /// reconnecting.
     ///
     /// # Example
     ///
@@ -493,19 +663,43 @@ impl ReconnectingDevice {
         self.core.run_owned(f).await
     }
 
-    /// Attempt to reconnect to the device.
+    /// Close the connection and connect again, waiting between attempts with
+    /// the backoff of this device's [`ReconnectOptions`].
     ///
-    /// This loop can be cancelled by calling `cancel_reconnect()` from another task.
-    /// When cancelled, returns `Error::Cancelled`.
+    /// Operations that fail while this runs wait for it instead of starting
+    /// their own reconnect. A call made while another reconnect is running
+    /// waits for that one instead of starting its own, and shares its result:
+    /// `Ok` if it connected, `Error::Cancelled` if
+    /// [`cancel_reconnect()`](Self::cancel_reconnect) stopped it, and
+    /// `Error::NotConnected` if it gave up or [`disconnect()`](Self::disconnect)
+    /// stopped it.
     ///
-    /// Note: If `cancel_reconnect()` was called before this method, reconnection
-    /// will still proceed. Call `reset_cancellation()` explicitly if you want to
-    /// clear a previous cancellation before starting a new reconnection attempt.
+    /// `cancel_reconnect()` and `disconnect()` end a reconnect at once, and it
+    /// returns `Error::Cancelled`. After `max_attempts` failed attempts it
+    /// returns `Error::Timeout` and the state is [`ConnectionState::Failed`].
+    /// The old connection is closed first, so until a reconnect succeeds
+    /// [`name()`](Self::name) returns `None` and [`address()`](Self::address)
+    /// returns the identifier.
+    ///
+    /// If `cancel_reconnect()` was called before this method, it returns
+    /// `Error::Cancelled` without connecting. Call
+    /// [`reset_cancellation()`](Self::reset_cancellation) first to clear a
+    /// previous cancellation.
     pub async fn reconnect(&self) -> Result<()> {
         self.core.reconnect().await
     }
 
     /// Disconnect from the device.
+    ///
+    /// Stops a reconnect in progress, which then never installs a new
+    /// connection, and closes the connection. It never waits for a reconnect's
+    /// backoff or connect: it waits only for operations already running on the
+    /// connection to finish, and for a connection that is already being closed
+    /// (up to 5 s). The state is [`ConnectionState::Disconnected`] afterwards
+    /// even if closing fails; the error is still returned. An operation that
+    /// was waiting for the stopped reconnect returns `Error::NotConnected`
+    /// (`Error::Cancelled` while `cancel_reconnect()` is in effect). An
+    /// operation started after this returns connects again, as before.
     pub async fn disconnect(&self) -> Result<()> {
         self.core.disconnect().await
     }
@@ -675,14 +869,25 @@ mod tests {
 
 #[cfg(test)]
 mod lifecycle_tests {
+    use tokio::time::Instant;
+
     use super::*;
-    use crate::test_support::{FakeConn, FakeRadio, within};
+    use crate::test_support::{FakeConn, FakeEvent, FakeRadio, within};
 
     const LIMIT: Duration = Duration::from_secs(600);
 
     /// The operation every test runs unless it needs a scripted result.
     fn run_op(link: &FakeConn) -> BoxFuture<'_, Result<()>> {
         Box::pin(link.op())
+    }
+
+    fn position(events: &[(Duration, FakeEvent)], wanted: &FakeEvent) -> Option<usize> {
+        events.iter().position(|(_, event)| event == wanted)
+    }
+
+    fn spawn_run(core: &Arc<ReconnectCore<FakeConn>>) -> tokio::task::JoinHandle<Result<()>> {
+        let core = Arc::clone(core);
+        tokio::spawn(async move { core.run(run_op).await })
     }
 
     /// A core for sensor "A" whose first link came from the fake radio.
@@ -693,6 +898,271 @@ mod lifecycle_tests {
         let connect = radio.connector();
         let first = connect("A").await.expect("first connect");
         ReconnectCore::new("A", connect, Arc::new(first), options)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_disconnects_the_old_link_before_connecting() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            radio.lose_link("A");
+
+            let result = core.run(run_op).await;
+
+            let events = radio.events();
+            assert!(result.is_ok(), "{result:?} after {events:#?}");
+            let closed = position(
+                &events,
+                &FakeEvent::Disconnect {
+                    id: "A".into(),
+                    handle: 1,
+                },
+            );
+            let opened = position(
+                &events,
+                &FakeEvent::Connected {
+                    id: "A".into(),
+                    handle: 2,
+                },
+            );
+            assert!(
+                matches!((closed, opened), (Some(closed), Some(opened)) if closed < opened),
+                "handle 1 must be disconnected before handle 2 connects: {events:#?}"
+            );
+            assert_eq!(core.link().await.map(|link| link.handle()), Some(2));
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnected_link_survives_the_old_handle() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            radio.lose_link("A");
+
+            let first = core.run(run_op).await;
+            // A real `Device` tears its link down from a spawned task; let it land.
+            sleep(Duration::from_secs(1)).await;
+            let second = core.run(run_op).await;
+
+            assert_eq!(radio.connect_count("A"), 2, "{:#?}", radio.events());
+            assert!(first.is_ok() && second.is_ok(), "{first:?}, {second:?}");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_connection_error_is_returned_without_reconnecting() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            let calls = AtomicU32::new(0);
+            let start = Instant::now();
+
+            let missing = core
+                .run(|_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {
+                        Err::<(), _>(Error::CharacteristicNotFound {
+                            uuid: "f0cd1502".into(),
+                            service_count: 3,
+                        })
+                    })
+                })
+                .await;
+            let invalid = core
+                .run(|_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Err::<(), _>(Error::InvalidData("bad".into())) })
+                })
+                .await;
+
+            assert!(
+                matches!(&missing, Err(Error::CharacteristicNotFound { uuid, service_count: 3 }) if uuid == "f0cd1502"),
+                "{missing:?}"
+            );
+            assert!(matches!(&invalid, Err(Error::InvalidData(msg)) if msg == "bad"), "{invalid:?}");
+            assert_eq!(radio.connect_count("A"), 1, "{:#?}", radio.events());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert_eq!(core.link().await.map(|link| link.handle()), Some(1));
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_error_reruns_the_operation_once() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            let calls = AtomicU32::new(0);
+
+            let result = core
+                .run(|link| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Box::pin(async { Err(Error::NotConnected) })
+                    } else {
+                        Box::pin(link.op())
+                    }
+                })
+                .await;
+
+            assert!(result.is_ok(), "{result:?} after {:#?}", radio.events());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(radio.connect_count("A"), 2);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_failures_share_one_reconnect() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            radio.lose_link("A");
+
+            let (first, second) = tokio::join!(core.run(run_op), core.run(run_op));
+
+            assert_eq!(radio.connect_count("A"), 2, "{:#?}", radio.events());
+            assert!(first.is_ok() && second.is_ok(), "{first:?}, {second:?}");
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_during_backoff_stops_the_loop() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let options = ReconnectOptions::default().initial_delay(Duration::from_secs(30));
+            let core = Arc::new(connected_core(&radio, options).await);
+            radio.script_connects("A", [false, false, true]);
+            radio.lose_link("A");
+            let start = Instant::now();
+
+            let recovering = spawn_run(&core);
+            sleep(Duration::from_millis(500)).await;
+            // Both start during the backoff and wait for the recovery.
+            let waiting = spawn_run(&core);
+            let reconnecting = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move { core.reconnect().await }
+            });
+            sleep(Duration::from_millis(500)).await;
+            let disconnected = core.disconnect().await;
+
+            let recovering = recovering.await.expect("join");
+            let waiting = waiting.await.expect("join");
+            let reconnecting = reconnecting.await.expect("join");
+            assert!(
+                matches!(recovering, Err(Error::Cancelled)),
+                "{recovering:?}"
+            );
+            assert!(matches!(waiting, Err(Error::NotConnected)), "{waiting:?}");
+            assert!(
+                matches!(reconnecting, Err(Error::NotConnected)),
+                "{reconnecting:?}"
+            );
+            assert!(disconnected.is_ok(), "{disconnected:?}");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "{:?}",
+                start.elapsed()
+            );
+            assert_eq!(core.state().await, ConnectionState::Disconnected);
+
+            // Longer than a loop that ignored the disconnect needs (30 + 60 + 60 s of backoff).
+            sleep(Duration::from_secs(300)).await;
+            let events = radio.events();
+            assert!(!radio.link_up("A"), "{events:#?}");
+            assert!(
+                !events.iter().any(
+                    |(_, event)| matches!(event, FakeEvent::Connected { handle, .. } if *handle > 1)
+                ),
+                "reconnected after disconnect(): {events:#?}"
+            );
+            assert_eq!(radio.connect_count("A"), 1, "{events:#?}");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_reconnect_interrupts_the_backoff_sleep() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let options = ReconnectOptions::default().initial_delay(Duration::from_secs(30));
+            let core = Arc::new(connected_core(&radio, options).await);
+
+            // An operation is running when the link drops. It fails only after
+            // the recovery below has started, and queues behind it.
+            let in_flight = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move {
+                    core.run(|link| {
+                        Box::pin(async move {
+                            sleep(Duration::from_secs(1)).await;
+                            link.op().await
+                        })
+                    })
+                    .await
+                }
+            });
+            sleep(Duration::from_millis(500)).await;
+            radio.lose_link("A");
+
+            let start = Instant::now();
+            let recovering = spawn_run(&core);
+            sleep(Duration::from_secs(1)).await;
+            core.cancel();
+            let result = recovering.await.expect("join");
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "cancelled after {:?}",
+                start.elapsed()
+            );
+            let in_flight = in_flight.await.expect("join");
+            assert!(matches!(in_flight, Err(Error::Cancelled)), "{in_flight:?}");
+            assert_eq!(core.state().await, ConnectionState::Disconnected);
+
+            // After reset_cancellation(), a cancel also ends a connect in progress.
+            core.reset_cancellation();
+            radio.set_connect_delay("A", Duration::from_secs(60));
+            let start = Instant::now();
+            let recovering = spawn_run(&core);
+            sleep(Duration::from_secs(40)).await; // the 30 s backoff, then 10 s into the connect
+            core.cancel();
+            let result = recovering.await.expect("join");
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert_eq!(start.elapsed(), Duration::from_secs(40));
+            assert_eq!(
+                radio.connect_count("A"),
+                2,
+                "the first link and the cancelled connect"
+            );
+            sleep(Duration::from_secs(120)).await;
+            assert!(!radio.link_up("A"), "{:#?}", radio.events());
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_error_still_marks_state_disconnected() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            radio.fail_disconnects("A");
+
+            let result = core.disconnect().await;
+
+            assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+            assert_eq!(core.state().await, ConnectionState::Disconnected);
+            assert!(core.link().await.is_none());
+            assert!(!radio.link_up("A"));
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -712,6 +1182,86 @@ mod lifecycle_tests {
             assert_eq!(core.state().await, ConnectionState::Failed);
             assert_eq!(radio.connect_count("A"), 3, "the first link and two attempts");
             radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_callers_share_a_failed_recovery() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let options = ReconnectOptions::default().max_attempts(2);
+            let core = Arc::new(connected_core(&radio, options).await);
+            radio.script_connects("A", [false; 4]);
+            radio.lose_link("A");
+            let start = Instant::now();
+
+            let recovering = spawn_run(&core);
+            sleep(Duration::from_millis(500)).await;
+            // Both start during the first backoff and wait for the recovery.
+            let waiting = spawn_run(&core);
+            let reconnecting = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move { core.reconnect().await }
+            });
+
+            let recovering = recovering.await.expect("join");
+            let waiting = waiting.await.expect("join");
+            let reconnecting = reconnecting.await.expect("join");
+            assert!(
+                matches!(&recovering, Err(Error::Timeout { operation, .. }) if operation.contains("reconnect to 'A'")),
+                "{recovering:?}"
+            );
+            assert!(matches!(waiting, Err(Error::NotConnected)), "{waiting:?}");
+            assert!(
+                matches!(reconnecting, Err(Error::NotConnected)),
+                "{reconnecting:?}"
+            );
+            assert_eq!(
+                radio.connect_count("A"),
+                3,
+                "the first link and one recovery's two attempts: {:#?}",
+                radio.events()
+            );
+            assert_eq!(start.elapsed(), Duration::from_secs(3), "1 s + 2 s of backoff");
+
+            // An operation that starts after the failure recovers again.
+            let later = core.run(run_op).await;
+            assert!(matches!(later, Err(Error::Timeout { .. })), "{later:?}");
+            assert_eq!(radio.connect_count("A"), 5);
+            assert_eq!(core.state().await, ConnectionState::Failed);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_while_closing_the_old_link_starts_no_attempt() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = Arc::new(connected_core(&radio, ReconnectOptions::default()).await);
+            radio.lose_link("A");
+
+            // The test runtime polls tasks in the order they were spawned or
+            // woken. The recovery runs first, takes the old link out and waits
+            // for the task that closes it; `disconnect()` runs next, while it
+            // waits; then the closing task.
+            let recovering = spawn_run(&core);
+            let disconnecting = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move { core.disconnect().await }
+            });
+
+            let recovering = recovering.await.expect("join");
+            let disconnected = disconnecting.await.expect("join");
+            assert!(
+                matches!(recovering, Err(Error::Cancelled)),
+                "{recovering:?}"
+            );
+            assert!(disconnected.is_ok(), "{disconnected:?}");
+            assert_eq!(core.attempt_count(), 0, "{:#?}", radio.events());
+            assert_eq!(core.state().await, ConnectionState::Disconnected);
+            assert_eq!(radio.connect_count("A"), 1);
+            assert!(!radio.link_up("A"));
         })
         .await;
     }

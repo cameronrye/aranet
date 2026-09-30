@@ -1421,3 +1421,119 @@ fn test_get_adapter_still_discovers_after_its_runtime_shuts_down() {
         "no Aranet devices discovered after the adapter's first runtime shut down"
     );
 }
+
+// =============================================================================
+// Reconnect Tests
+// =============================================================================
+
+/// The adapter's peripheral for `device`: its scan identifier, its btleplug ID, or its
+/// name (either half of CoreBluetooth's "GAP [advertised]" form), any case.
+async fn find_peripheral(device: &str) -> btleplug::platform::Peripheral {
+    use btleplug::api::{Central as _, Peripheral as _};
+
+    let adapter = aranet_core::scan::get_adapter().await.expect("adapter");
+    for p in adapter.peripherals().await.expect("peripherals") {
+        let name = p
+            .properties()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|props| props.local_name);
+        let id = aranet_core::create_identifier(&p.address().to_string(), &p.id());
+        let is_device = |n: &str| {
+            n.eq_ignore_ascii_case(device)
+                || n.strip_suffix(']')
+                    .and_then(|n| n.split_once(" ["))
+                    .is_some_and(|(gap, adv)| {
+                        gap.trim().eq_ignore_ascii_case(device)
+                            || adv.trim().eq_ignore_ascii_case(device)
+                    })
+        };
+        if id.eq_ignore_ascii_case(device)
+            || p.id().to_string().eq_ignore_ascii_case(device)
+            || name.as_deref().is_some_and(is_device)
+        {
+            return p;
+        }
+    }
+    panic!("{device} is not known to the adapter");
+}
+
+/// Disconnect `device` behind aranet's back (same CBPeripheral / BlueZ object path), as if it went out of range.
+/// Panics if the stack doesn't confirm the disconnect, so a test never blames the code under test for a cut that didn't happen.
+async fn force_link_loss(device: &str) {
+    let p = find_peripheral(device).await;
+    timeout(
+        Duration::from_secs(10),
+        btleplug::api::Peripheral::disconnect(&p),
+    )
+    .await
+    .expect("the forced disconnect timed out")
+    .expect("the forced disconnect failed");
+}
+
+/// After the link drops behind its back, a `ReconnectingDevice` reconnects
+/// once and the new link survives: before the fix, the old handle's cleanup
+/// tore down each new link, so every read reconnected again.
+#[tokio::test]
+#[ignore = "requires BLE hardware and an Aranet2 device"]
+async fn test_reconnecting_device_recovers_from_link_loss() {
+    use aranet_core::events::{DeviceEvent, event_channel};
+    use aranet_core::{AranetDevice, ReconnectOptions, ReconnectingDevice};
+
+    let Some(dev) = get_device("aranet2") else {
+        println!("SKIP: ARANET2_DEVICE not set");
+        return;
+    };
+
+    let (tx, mut rx) = event_channel(16);
+    let device = timeout(
+        BLE_TIMEOUT,
+        ReconnectingDevice::connect_with_events(&dev, ReconnectOptions::unlimited(), tx),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("connect failed");
+    timeout(Duration::from_secs(10), device.read_current())
+        .await
+        .expect("first read timeout")
+        .expect("first read failed");
+
+    println!("Connected to {dev}; dropping the link behind its back");
+    force_link_loss(&dev).await;
+
+    // A read may have to notice the loss (up to 3 s), close the old link (up
+    // to 5 s), back off (1 s), then find the sensor and connect again.
+    let mut reads = Vec::new();
+    for i in 1..=3 {
+        if i > 1 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        let started = std::time::Instant::now();
+        let read = timeout(Duration::from_secs(90), device.read_current()).await;
+        let ok = matches!(read, Ok(Ok(_)));
+        println!("read {i}: ok={ok} after {:?}: {read:?}", started.elapsed());
+        reads.push(ok);
+    }
+
+    let (mut started, mut reconnects) = (0, 0);
+    while let Ok(event) = rx.try_recv() {
+        println!("event: {event:?}");
+        match event {
+            DeviceEvent::ReconnectStarted { .. } => started += 1,
+            DeviceEvent::ReconnectSucceeded { .. } => reconnects += 1,
+            _ => {}
+        }
+    }
+    let _ = device.disconnect().await;
+
+    assert_eq!(
+        reads, [true; 3],
+        "every read after the link loss should succeed"
+    );
+    assert!(
+        started > 0,
+        "the forced link loss should have made it reconnect"
+    );
+    assert_eq!(reconnects, 1, "the new link should survive the old one");
+}

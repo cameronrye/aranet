@@ -403,6 +403,28 @@ impl Error {
             reason: ConnectionFailureReason::Other(reason.into()),
         }
     }
+
+    /// Whether the link to the device is gone or unusable, so that reconnecting
+    /// can help. `ReconnectingDevice` reconnects only after these errors.
+    ///
+    /// btleplug reports every BlueZ D-Bus error as `btleplug::Error::Other`
+    /// (`bluez/adapter.rs`, `impl From<BluetoothError>`), so on Linux an
+    /// authentication failure counts too. A reconnect loop that can't fix it
+    /// still stops after `ReconnectOptions::max_attempts`.
+    pub(crate) fn is_connection_error(&self) -> bool {
+        match self {
+            Self::NotConnected | Self::Timeout { .. } | Self::ConnectionFailed { .. } => true,
+            Self::Bluetooth(e) => matches!(
+                e,
+                btleplug::Error::NotConnected
+                    | btleplug::Error::DeviceNotFound
+                    | btleplug::Error::TimedOut(_)
+                    | btleplug::Error::RuntimeError(_)
+                    | btleplug::Error::Other(_)
+            ),
+            _ => false,
+        }
+    }
 }
 
 impl From<aranet_types::ParseError> for Error {
@@ -551,6 +573,50 @@ mod tests {
         // but we can verify the From impl exists by checking the type compiles
         fn _assert_from_impl<T: From<btleplug::Error>>() {}
         _assert_from_impl::<Error>();
+    }
+
+    #[test]
+    fn is_connection_error_table() {
+        let bluetooth = |e: btleplug::Error| Error::Bluetooth(e);
+        let connection_errors = [
+            Error::NotConnected,
+            Error::timeout("read_current", Duration::from_secs(10)),
+            Error::connection_failed_str(None, "the device reported no GATT services"),
+            bluetooth(btleplug::Error::NotConnected),
+            bluetooth(btleplug::Error::DeviceNotFound),
+            bluetooth(btleplug::Error::TimedOut(Duration::from_secs(1))),
+            bluetooth(btleplug::Error::RuntimeError(
+                "Peripheral disconnected".into(),
+            )),
+            bluetooth(btleplug::Error::Other("x".into())),
+        ];
+        for error in &connection_errors {
+            assert!(error.is_connection_error(), "{error:?} should reconnect");
+        }
+
+        let other_errors = [
+            Error::characteristic_not_found("f0cd1502", 3),
+            Error::InvalidData("bad".into()),
+            Error::Unsupported("history".into()),
+            Error::invalid_reading(13, 7),
+            Error::device_not_found("Aranet4 12345"),
+            Error::Cancelled,
+            Error::invalid_config("interval"),
+            Error::Io(std::io::Error::other("disk")),
+            Error::WriteFailed {
+                uuid: "f0cd1402".into(),
+                reason: "rejected".into(),
+            },
+            bluetooth(btleplug::Error::PermissionDenied),
+            bluetooth(btleplug::Error::NoSuchCharacteristic),
+            bluetooth(btleplug::Error::NotSupported("x".into())),
+        ];
+        for error in &other_errors {
+            assert!(
+                !error.is_connection_error(),
+                "{error:?} should not reconnect"
+            );
+        }
     }
 
     #[test]

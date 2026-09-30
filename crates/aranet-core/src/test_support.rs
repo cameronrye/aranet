@@ -76,8 +76,10 @@ struct RadioState {
 struct FakeSensor {
     up: bool,
     connects: usize,
+    connect_delay: Duration,
     /// Outcomes of the next connects; `false` fails. Unscripted connects succeed.
     script: VecDeque<bool>,
+    fail_disconnects: bool,
 }
 
 impl RadioState {
@@ -114,10 +116,18 @@ impl FakeRadio {
         })
     }
 
+    /// Dropping this future part-way changes nothing, like Task 5's `Device::connect`.
     async fn connect(&self, id: String) -> Result<FakeConn> {
+        let delay = {
+            let mut state = self.state();
+            self.log(&mut state, FakeEvent::ConnectStarted { id: id.clone() });
+            let sensor = state.sensor(&id);
+            sensor.connects += 1;
+            sensor.connect_delay
+        };
+        tokio::time::sleep(delay).await;
+
         let mut state = self.state();
-        self.log(&mut state, FakeEvent::ConnectStarted { id: id.clone() });
-        state.sensor(&id).connects += 1;
         if !state.sensor(&id).script.pop_front().unwrap_or(true) {
             self.log(&mut state, FakeEvent::ConnectFailed { id: id.clone() });
             return Err(Error::Timeout {
@@ -143,9 +153,18 @@ impl FakeRadio {
         })
     }
 
+    pub(crate) fn set_connect_delay(&self, id: &str, delay: Duration) {
+        self.state().sensor(id).connect_delay = delay;
+    }
+
     /// Outcomes of the next connects to `id`: `false` fails with a connect timeout.
     pub(crate) fn script_connects(&self, id: &str, outcomes: impl IntoIterator<Item = bool>) {
         self.state().sensor(id).script.extend(outcomes);
+    }
+
+    /// Every later `disconnect()` of `id` returns an error, but still takes the link down.
+    pub(crate) fn fail_disconnects(&self, id: &str) {
+        self.state().sensor(id).fail_disconnects = true;
     }
 
     /// The sensor went out of range: its link is down, and no handle knows yet.
@@ -187,6 +206,10 @@ pub(crate) struct FakeConn {
 }
 
 impl FakeConn {
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle
+    }
+
     /// Any operation on the sensor: it works while the sensor's link is up.
     pub(crate) async fn op(&self) -> Result<()> {
         let mut state = self.radio.state();
@@ -211,7 +234,9 @@ impl SensorLink for FakeConn {
     async fn disconnect(&self) -> Result<()> {
         self.disconnected.store(true, Ordering::SeqCst);
         let mut state = self.radio.state();
-        state.sensor(&self.id).up = false;
+        let sensor = state.sensor(&self.id);
+        sensor.up = false;
+        let fail = sensor.fail_disconnects;
         self.radio.log(
             &mut state,
             FakeEvent::Disconnect {
@@ -219,7 +244,14 @@ impl SensorLink for FakeConn {
                 handle: self.handle,
             },
         );
-        Ok(())
+        if fail {
+            Err(Error::Timeout {
+                operation: "disconnect from device".into(),
+                duration: Duration::from_secs(5),
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 
