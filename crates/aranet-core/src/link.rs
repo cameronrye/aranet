@@ -1,17 +1,23 @@
-//! The BLE connect sequence, behind a crate-private seam.
+//! The BLE connect sequence and notification subscriptions, behind a
+//! crate-private seam.
 //!
-//! `GattLink` is the part of a btleplug peripheral that connecting uses.
-//! `Device` runs `connect` on btleplug's platform `Peripheral`, and the unit
-//! tests run it on a scripted fake (`fake::FakeGatt`), so the connect, timeout
-//! and cleanup paths can be tested without Bluetooth.
+//! `GattLink` is the part of a btleplug peripheral that connecting and
+//! notifications use. `Device` calls `connect` and the `NotificationTasks`
+//! methods with btleplug's platform `Peripheral`, and the unit tests call
+//! them with a scripted fake (`fake::FakeGatt`), so the connect,
+//! notification, timeout and cleanup paths can be tested without Bluetooth.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use btleplug::api::{PeripheralProperties, Service};
+use btleplug::api::{Characteristic, PeripheralProperties, Service};
+use futures::StreamExt;
 use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::device::ConnectionConfig;
 use crate::error::{Error, Result};
@@ -19,7 +25,7 @@ use crate::error::{Error, Result};
 #[cfg(test)]
 mod fake;
 
-/// The operations on a BLE peripheral that the connect sequence uses.
+/// The operations on a BLE peripheral that connecting and notifications use.
 ///
 /// btleplug's platform `Peripheral` implements it for real connections, and
 /// `fake::FakeGatt` implements it for tests.
@@ -58,6 +64,22 @@ pub(crate) trait GattLink: Clone + Send + Sync + 'static {
     /// can run out of time with the link already up and BlueZ still setting
     /// up the ATT channel or discovering.
     fn is_bluez(&self) -> bool;
+
+    /// Enable notifications on `characteristic` (the CCCD write).
+    fn subscribe(
+        &self,
+        characteristic: &Characteristic,
+    ) -> impl Future<Output = btleplug::Result<()>> + Send;
+
+    /// Disable notifications on `characteristic`.
+    fn unsubscribe(
+        &self,
+        characteristic: &Characteristic,
+    ) -> impl Future<Output = btleplug::Result<()>> + Send;
+
+    /// Open a stream of the notifications the peripheral sends from now on,
+    /// from every characteristic.
+    fn notifications(&self) -> impl Future<Output = btleplug::Result<NotificationStream>> + Send;
 }
 
 // Every call names btleplug's trait: `GattLink` is the trait in scope here, so
@@ -91,6 +113,128 @@ impl GattLink for btleplug::platform::Peripheral {
         // btleplug's Linux backend is bluez-async; macOS and Windows have
         // their own.
         cfg!(target_os = "linux")
+    }
+
+    async fn subscribe(&self, characteristic: &Characteristic) -> btleplug::Result<()> {
+        btleplug::api::Peripheral::subscribe(self, characteristic).await
+    }
+
+    async fn unsubscribe(&self, characteristic: &Characteristic) -> btleplug::Result<()> {
+        btleplug::api::Peripheral::unsubscribe(self, characteristic).await
+    }
+
+    async fn notifications(&self) -> btleplug::Result<NotificationStream> {
+        btleplug::api::Peripheral::notifications(self).await
+    }
+}
+
+/// The stream of every notification a peripheral sends, as btleplug's
+/// `Peripheral::notifications` returns it.
+pub(crate) type NotificationStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>;
+
+/// The notification tasks of one connection: at most one per characteristic.
+///
+/// Each task reads its own notification stream and passes the values from its
+/// characteristic to that characteristic's callback. The map's lock is never
+/// held across an `.await`, so `Drop for Device` can always take it.
+#[derive(Default)]
+pub(crate) struct NotificationTasks(Mutex<HashMap<Uuid, JoinHandle<()>>>);
+
+impl NotificationTasks {
+    /// Lock the task map. Never hold the guard across an `.await`.
+    fn tasks(&self) -> MutexGuard<'_, HashMap<Uuid, JoinHandle<()>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Call `callback` with the value of every notification from
+    /// `characteristic`, on a task of the current runtime.
+    ///
+    /// Opens the notification stream before enabling notifications, so nothing
+    /// the device sends straight after the CCCD write is missed. Replaces the
+    /// characteristic's previous task; if this fails, the previous task keeps
+    /// running. Each Bluetooth call gives up after `limit`.
+    pub(crate) async fn subscribe<L, F>(
+        &self,
+        link: &L,
+        characteristic: &Characteristic,
+        limit: Duration,
+        callback: F,
+    ) -> Result<()>
+    where
+        L: GattLink,
+        F: Fn(&[u8]) + Send + Sync + 'static,
+    {
+        let mut stream = bounded("open notification stream", limit, link.notifications()).await?;
+        bounded(
+            "subscribe to notifications",
+            limit,
+            link.subscribe(characteristic),
+        )
+        .await?;
+
+        let uuid = characteristic.uuid;
+        let task = tokio::spawn(async move {
+            while let Some(notification) = stream.next().await {
+                if notification.uuid == uuid {
+                    callback(&notification.value);
+                }
+            }
+        });
+        // The guard is dropped at the end of this statement.
+        let previous = self.tasks().insert(uuid, task);
+        if let Some(previous) = previous {
+            // An aborted task is never polled again.
+            previous.abort();
+        }
+        Ok(())
+    }
+
+    /// Stop the characteristic's callback, then disable its notifications.
+    ///
+    /// The callback is not called again once this returns, even if the device
+    /// call fails. Waiting for the task to end and the device call each give
+    /// up after `limit`.
+    pub(crate) async fn unsubscribe<L: GattLink>(
+        &self,
+        link: &L,
+        characteristic: &Characteristic,
+        limit: Duration,
+    ) -> Result<()> {
+        let task = self.tasks().remove(&characteristic.uuid);
+        if let Some(task) = task {
+            task.abort();
+            // Once aborted, the task is never polled again, so once it has
+            // ended, a callback that was running on another thread has
+            // returned. The wait is limited: an aborted task on a runtime that
+            // is alive but not being driven never reports back.
+            if tokio::time::timeout(limit, task).await.is_err() {
+                warn!(
+                    "Notification task for {} did not stop within {limit:?}",
+                    characteristic.uuid
+                );
+            }
+        }
+        bounded(
+            "unsubscribe from notifications",
+            limit,
+            link.unsubscribe(characteristic),
+        )
+        .await
+    }
+
+    /// Abort every task without waiting for it to end (`Device::disconnect`
+    /// and `Drop`).
+    pub(crate) fn abort_all(&self) {
+        for (_, task) in self.tasks().drain() {
+            task.abort();
+        }
+    }
+
+    /// How many notification tasks are kept.
+    #[cfg(test)]
+    pub(crate) fn task_count(&self) -> usize {
+        self.tasks().len()
     }
 }
 
@@ -998,6 +1142,303 @@ mod tests {
             assert_eq!(fake.calls(), [Call::IsConnected, Call::IsConnected]);
         })
         .await;
+    }
+
+    /// One notification task per characteristic (BR-13, BR-12).
+    mod notifications {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use futures::FutureExt;
+        use tokio::time::Instant;
+        use uuid::Uuid;
+
+        use crate::error::Error;
+        use crate::link::NotificationTasks;
+        use crate::link::fake::{Call, FakeGatt, Outcome, characteristic};
+        use crate::test_support::within;
+
+        /// The limit for every call, as `ConnectionConfig::default().write_timeout`.
+        const LIMIT: Duration = Duration::from_secs(10);
+        const C1: Uuid = Uuid::from_u128(0xc1);
+        const C2: Uuid = Uuid::from_u128(0xc2);
+
+        /// A callback that counts its calls in `count`.
+        fn counter(count: &Arc<AtomicUsize>) -> impl Fn(&[u8]) + Send + Sync + 'static {
+            let count = Arc::clone(count);
+            move |_: &[u8]| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// Wait until `count` reaches `n`, failing after 10 s of paused time.
+        ///
+        /// Each sleep lets every ready task run. A `yield_now` loop would keep
+        /// the paused clock from advancing, so a count that never arrived
+        /// would hang the test instead of failing it.
+        async fn wait_for(count: &AtomicUsize, n: usize) {
+            within(Duration::from_secs(10), async {
+                while count.load(Ordering::SeqCst) < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+        }
+
+        /// Check that `error` is a timeout of `operation` after `LIMIT`.
+        fn assert_limit_timeout(error: &Error, operation: &str) {
+            match error {
+                Error::Timeout {
+                    operation: op,
+                    duration,
+                } => {
+                    assert_eq!(op, operation);
+                    assert_eq!(*duration, LIMIT);
+                }
+                other => panic!("expected a '{operation}' timeout, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unsubscribe_stops_callbacks() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect("subscribe");
+                fake.emit(C1, &[1]);
+                wait_for(&count, 1).await;
+
+                tasks
+                    .unsubscribe(&fake, &characteristic(C1), LIMIT)
+                    .await
+                    .expect("unsubscribe");
+                fake.emit(C1, &[2]);
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    1,
+                    "the callback ran after unsubscribe returned"
+                );
+                assert_eq!(fake.open_streams(), 0, "the task outlived unsubscribe");
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unsubscribe_stops_the_task_even_when_the_device_call_fails() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect("subscribe");
+                fake.script_unsubscribe([Outcome::Fail]);
+
+                let error = tasks
+                    .unsubscribe(&fake, &characteristic(C1), LIMIT)
+                    .await
+                    .expect_err("the device call fails");
+
+                assert!(matches!(error, Error::Bluetooth(_)), "got {error:?}");
+                assert_eq!(
+                    fake.open_streams(),
+                    0,
+                    "the task outlived a failed unsubscribe"
+                );
+                assert_eq!(tasks.task_count(), 0);
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn resubscribing_replaces_the_previous_callback() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let replaced = Arc::new(AtomicUsize::new(0));
+                let current = Arc::new(AtomicUsize::new(0));
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&replaced))
+                    .await
+                    .expect("first subscribe");
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&current))
+                    .await
+                    .expect("second subscribe");
+
+                fake.emit(C1, &[1]);
+                wait_for(&current, 1).await;
+
+                assert_eq!(
+                    replaced.load(Ordering::SeqCst),
+                    0,
+                    "the replaced callback still ran"
+                );
+                assert_eq!(
+                    fake.open_streams(),
+                    1,
+                    "the replaced task still holds its stream"
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn abort_all_closes_every_stream() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect("subscribe C1");
+                tasks
+                    .subscribe(&fake, &characteristic(C2), LIMIT, counter(&count))
+                    .await
+                    .expect("subscribe C2");
+                assert_eq!(fake.open_streams(), 2);
+
+                tasks.abort_all();
+
+                assert_eq!(tasks.task_count(), 0);
+                // `abort` only schedules the cancellation; the runtime then
+                // drops each task's future, and with it its stream.
+                within(Duration::from_secs(10), async {
+                    while fake.open_streams() > 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn subscribe_gives_up_after_limit_and_leaves_no_task() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                fake.script_subscribe([Outcome::Hang]);
+                let start = Instant::now();
+
+                let error = tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect_err("the CCCD write never answers");
+
+                assert_limit_timeout(&error, "subscribe to notifications");
+                assert_eq!(start.elapsed(), LIMIT);
+                assert_eq!(tasks.task_count(), 0);
+                assert_eq!(
+                    fake.open_streams(),
+                    0,
+                    "the failed subscribe left its stream open"
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unsubscribe_gives_up_after_limit() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect("subscribe");
+                fake.script_unsubscribe([Outcome::Hang]);
+                let start = Instant::now();
+
+                let error = tasks
+                    .unsubscribe(&fake, &characteristic(C1), LIMIT)
+                    .await
+                    .expect_err("the CCCD write never answers");
+
+                assert_limit_timeout(&error, "unsubscribe from notifications");
+                assert_eq!(start.elapsed(), LIMIT);
+                assert_eq!(tasks.task_count(), 0);
+                // The CCCD write was sent.
+                assert_eq!(fake.calls().last(), Some(&Call::Unsubscribe(C1)));
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unsubscribe_gives_up_waiting_for_a_task_nobody_runs() {
+            // A runtime that nothing drives, like a current-thread runtime
+            // between two `block_on` calls. Dropping a runtime inside another
+            // one panics, so it lives outside `within` and is shut down at
+            // the end.
+            let idle = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                {
+                    // With `idle` entered, `tokio::spawn` puts the task there.
+                    // The fake answers at once, so one poll subscribes.
+                    let _idle = idle.enter();
+                    tasks
+                        .subscribe(&fake, &characteristic(C1), LIMIT, |_: &[u8]| {})
+                        .now_or_never()
+                        .expect("the fake answers at once")
+                        .expect("subscribe");
+                }
+                let start = Instant::now();
+
+                tasks
+                    .unsubscribe(&fake, &characteristic(C1), LIMIT)
+                    .await
+                    .expect("unsubscribe");
+
+                assert_eq!(
+                    start.elapsed(),
+                    LIMIT,
+                    "unsubscribe did not wait for the aborted task"
+                );
+                assert_eq!(tasks.task_count(), 0);
+                // The CCCD write was sent once the wait gave up.
+                assert_eq!(fake.calls().last(), Some(&Call::Unsubscribe(C1)));
+            })
+            .await;
+            idle.shutdown_background();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_is_open_before_the_cccd_write() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                fake.emit_on_subscribe(&[7]);
+
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect("subscribe");
+
+                // The device notified during the CCCD write; only a stream
+                // opened before the write can have received it.
+                wait_for(&count, 1).await;
+            })
+            .await;
+        }
     }
 }
 

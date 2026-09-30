@@ -1,12 +1,16 @@
-//! A scripted `GattLink` for the connect-sequence tests.
+//! A scripted `GattLink` for the connect-sequence and notification tests.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use btleplug::api::{CharPropFlags, Characteristic, PeripheralProperties, Service};
+use btleplug::api::{
+    CharPropFlags, Characteristic, PeripheralProperties, Service, ValueNotification,
+};
+use futures::channel::mpsc;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
-use super::GattLink;
+use super::{GattLink, NotificationStream};
 use crate::uuid::{CURRENT_READINGS_DETAIL, SAF_TEHNIKA_SERVICE_NEW};
 
 /// What a scripted call does when it is awaited.
@@ -45,6 +49,8 @@ pub(super) enum Call {
     Discover,
     Disconnect,
     IsConnected,
+    Subscribe(Uuid),
+    Unsubscribe(Uuid),
 }
 
 /// A peripheral whose calls follow a script. Clones share the script and the
@@ -68,6 +74,25 @@ struct State {
     connected: bool,
     /// What `is_bluez` answers.
     bluez: bool,
+    subscribe: VecDeque<Outcome>,
+    unsubscribe: VecDeque<Outcome>,
+    /// The sending half of every stream `notifications()` has returned.
+    streams: Vec<mpsc::UnboundedSender<ValueNotification>>,
+    /// What each `subscribe` sends to the open streams before it answers.
+    emit_on_subscribe: Option<Vec<u8>>,
+}
+
+impl State {
+    /// Send a notification from characteristic `uuid` to every open stream.
+    fn send(&self, uuid: Uuid, value: &[u8]) {
+        for stream in &self.streams {
+            // Sending fails only to a stream that has been dropped.
+            let _ = stream.unbounded_send(ValueNotification {
+                uuid,
+                value: value.to_vec(),
+            });
+        }
+    }
 }
 
 impl FakeGatt {
@@ -86,6 +111,10 @@ impl FakeGatt {
                 calls: Vec::new(),
                 connected: true,
                 bluez: false,
+                subscribe: VecDeque::new(),
+                unsubscribe: VecDeque::new(),
+                streams: Vec::new(),
+                emit_on_subscribe: None,
             })),
             disconnected: Arc::new(Notify::new()),
         }
@@ -132,6 +161,37 @@ impl FakeGatt {
     /// `aranet_services()`.
     pub(super) fn service_rounds(&self, rounds: impl IntoIterator<Item = BTreeSet<Service>>) {
         self.lock().service_rounds.extend(rounds);
+    }
+
+    /// Script the next `subscribe` calls. Calls past the script succeed.
+    pub(super) fn script_subscribe(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock().subscribe.extend(outcomes);
+    }
+
+    /// Script the next `unsubscribe` calls. Calls past the script succeed.
+    pub(super) fn script_unsubscribe(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock().unsubscribe.extend(outcomes);
+    }
+
+    /// Send a notification from characteristic `uuid` to every open stream.
+    pub(super) fn emit(&self, uuid: Uuid, value: &[u8]) {
+        self.lock().send(uuid, value);
+    }
+
+    /// Make every later `subscribe` send `value`, as a notification from the
+    /// characteristic being subscribed, to every open stream before it
+    /// answers: a device that notifies as soon as the CCCD is written.
+    pub(super) fn emit_on_subscribe(&self, value: &[u8]) {
+        self.lock().emit_on_subscribe = Some(value.to_vec());
+    }
+
+    /// How many of the streams `notifications()` returned are still open.
+    pub(super) fn open_streams(&self) -> usize {
+        self.lock()
+            .streams
+            .iter()
+            .filter(|stream| !stream.is_closed())
+            .count()
     }
 
     /// The calls made so far, in order.
@@ -234,6 +294,33 @@ impl GattLink for FakeGatt {
     fn is_bluez(&self) -> bool {
         self.lock().bluez
     }
+
+    async fn subscribe(&self, characteristic: &Characteristic) -> btleplug::Result<()> {
+        let outcome = {
+            let mut state = self.lock();
+            state.calls.push(Call::Subscribe(characteristic.uuid));
+            if let Some(value) = &state.emit_on_subscribe {
+                state.send(characteristic.uuid, value);
+            }
+            state.subscribe.pop_front()
+        };
+        run(outcome).await
+    }
+
+    async fn unsubscribe(&self, characteristic: &Characteristic) -> btleplug::Result<()> {
+        let outcome = {
+            let mut state = self.lock();
+            state.calls.push(Call::Unsubscribe(characteristic.uuid));
+            state.unsubscribe.pop_front()
+        };
+        run(outcome).await
+    }
+
+    async fn notifications(&self) -> btleplug::Result<NotificationStream> {
+        let (sender, receiver) = mpsc::unbounded();
+        self.lock().streams.push(sender);
+        Ok(Box::pin(receiver))
+    }
 }
 
 /// The services of a sensor, cut down to one: the primary Aranet service with
@@ -250,4 +337,14 @@ pub(super) fn aranet_services() -> BTreeSet<Service> {
         primary: true,
         characteristics: BTreeSet::from([current_readings]),
     }])
+}
+
+/// A characteristic that can notify, for the notification tests.
+pub(super) fn characteristic(uuid: Uuid) -> Characteristic {
+    Characteristic {
+        uuid,
+        service_uuid: SAF_TEHNIKA_SERVICE_NEW,
+        properties: CharPropFlags::NOTIFY,
+        descriptors: BTreeSet::new(),
+    }
 }

@@ -62,8 +62,8 @@ pub struct Device {
     /// Cache of discovered characteristics by UUID for O(1) lookup.
     /// Built after service discovery to avoid searching through services on each read.
     characteristics_cache: RwLock<HashMap<Uuid, Characteristic>>,
-    /// Handles for spawned notification tasks (for cleanup).
-    notification_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The notification task of each subscribed characteristic.
+    notification_tasks: crate::link::NotificationTasks,
     /// Whether disconnect has been called (for Drop warning).
     disconnected: AtomicBool,
     /// Connection configuration (timeouts, etc.).
@@ -73,7 +73,7 @@ pub struct Device {
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Provide a clean debug output that excludes internal BLE details
-        // (adapter, peripheral, notification_handles, characteristics_cache)
+        // (adapter, peripheral, notification_tasks, characteristics_cache)
         // which are not useful for debugging application logic.
         f.debug_struct("Device")
             .field("name", &self.name)
@@ -467,7 +467,7 @@ impl Device {
             device_type,
             services_discovered: true,
             characteristics_cache: RwLock::new(characteristics_cache),
-            notification_handles: tokio::sync::Mutex::new(Vec::new()),
+            notification_tasks: crate::link::NotificationTasks::default(),
             disconnected: AtomicBool::new(false),
             config,
         };
@@ -556,13 +556,8 @@ impl Device {
         info!("Disconnecting from device...");
         self.disconnected.store(true, Ordering::SeqCst);
 
-        // Abort all notification handlers
-        {
-            let mut handles = self.notification_handles.lock().await;
-            for handle in handles.drain(..) {
-                handle.abort();
-            }
-        }
+        // Stop every notification callback.
+        self.notification_tasks.abort_all();
 
         // `cleanup_runtime` is `None` only if aranet-core's runtime can't be
         // started and this future isn't polled on a tokio runtime either.
@@ -907,41 +902,47 @@ impl Device {
 
     /// Subscribe to notifications on a characteristic.
     ///
-    /// The callback will be invoked for each notification received.
-    /// The notification handler task is tracked and will be aborted when
-    /// `disconnect()` is called.
+    /// The callback is called on a background task with the value of each
+    /// notification the characteristic sends, until
+    /// [`unsubscribe_from_notifications`](Self::unsubscribe_from_notifications)
+    /// or [`disconnect`](Self::disconnect) is called or the device is dropped.
+    ///
+    /// Subscribing to the same characteristic again replaces its callback. If
+    /// subscribing fails, the previous callback keeps running.
+    ///
+    /// Opening the notification stream and enabling notifications on the
+    /// device each give up with [`Error::Timeout`] after the connection's
+    /// `write_timeout` (set with [`ConnectionConfig::write_timeout`]).
     pub async fn subscribe_to_notifications<F>(&self, uuid: Uuid, callback: F) -> Result<()>
     where
         F: Fn(&[u8]) + Send + Sync + 'static,
     {
         let characteristic = self.find_characteristic(uuid).await?;
-
-        self.peripheral.subscribe(&characteristic).await?;
-
-        // Set up notification handler
-        let mut stream = self.peripheral.notifications().await?;
-        let char_uuid = characteristic.uuid;
-
-        let handle = tokio::spawn(async move {
-            use futures::StreamExt;
-            while let Some(notification) = stream.next().await {
-                if notification.uuid == char_uuid {
-                    callback(&notification.value);
-                }
-            }
-        });
-
-        // Store the handle for cleanup on disconnect
-        self.notification_handles.lock().await.push(handle);
-
-        Ok(())
+        self.notification_tasks
+            .subscribe(
+                &self.peripheral,
+                &characteristic,
+                self.config.write_timeout,
+                callback,
+            )
+            .await
     }
 
     /// Unsubscribe from notifications on a characteristic.
+    ///
+    /// Stops the characteristic's callback first, then tells the device to
+    /// stop sending notifications. Once this returns, the callback is not
+    /// called again, even if the device call fails.
+    ///
+    /// Waiting for the callback to stop and the device call each give up
+    /// after the connection's `write_timeout` (set with
+    /// [`ConnectionConfig::write_timeout`]); the device call then fails with
+    /// [`Error::Timeout`].
     pub async fn unsubscribe_from_notifications(&self, uuid: Uuid) -> Result<()> {
         let characteristic = self.find_characteristic(uuid).await?;
-        self.peripheral.unsubscribe(&characteristic).await?;
-        Ok(())
+        self.notification_tasks
+            .unsubscribe(&self.peripheral, &characteristic, self.config.write_timeout)
+            .await
     }
 
     /// Get the number of cached characteristics.
@@ -980,13 +981,10 @@ impl Drop for Device {
                  For reliable cleanup, call device.disconnect().await before dropping."
             );
 
-            // Best-effort cleanup: abort notification handlers
-            // We can't use .await here, so we try_lock and abort synchronously
-            if let Ok(mut handles) = self.notification_handles.try_lock() {
-                for handle in handles.drain(..) {
-                    handle.abort();
-                }
-            }
+            // Abort every notification task. The task map's lock is never
+            // held across an await, so unlike the old `try_lock` this is
+            // never skipped.
+            self.notification_tasks.abort_all();
 
             // Spawn a best-effort, time-limited disconnect, on aranet-core's own
             // runtime when it can be started, so it outlives the caller's runtime

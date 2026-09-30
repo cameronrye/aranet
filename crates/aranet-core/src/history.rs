@@ -1259,7 +1259,13 @@ impl Device {
                 ((info.total_readings >> 8) & 0xFF) as u8,
             ];
 
-            self.write_characteristic(COMMAND, &cmd).await?;
+            if let Err(e) = self.write_characteristic(COMMAND, &cmd).await {
+                // The unsubscribe after the loop is skipped on this path; stop
+                // the notification task here. The write error is the one to
+                // report.
+                let _ = self.unsubscribe_from_notifications(HISTORY_V1).await;
+                return Err(e);
+            }
 
             // Collect notifications until we have all values
             let mut values = Vec::new();
