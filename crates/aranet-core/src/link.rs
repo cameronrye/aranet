@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use btleplug::api::{PeripheralProperties, Service};
 use tokio::runtime::Handle;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::device::ConnectionConfig;
@@ -261,19 +262,21 @@ pub(crate) async fn connect<L: GattLink>(
 /// for them 5 s after the link comes up, and a link that is slow to come up
 /// can use up `connection_timeout` first. Either way the discovery after it
 /// first waits for BlueZ to finish, and the wait and the discovery share
-/// `bluez_discovery_limit` (`connect_link`, `discover`).
+/// `bluez_discovery_limit` with the connection-state query that tells a
+/// connect timeout with the link up from one without it (`connect_link`,
+/// `discover`).
 async fn connect_and_discover<L: GattLink>(
     link: &L,
     config: &ConnectionConfig,
 ) -> Result<(BTreeSet<Service>, Option<PeripheralProperties>)> {
     // Connect to the device with timeout
     info!("Connecting to device...");
-    let bluez_discovering = connect_link(link, "connect to device", config).await?;
+    let bluez_wait = connect_link(link, "connect to device", config).await?;
     info!("Connected!");
 
     // Discover services with timeout
     info!("Discovering services...");
-    discover(link, "discover services", bluez_discovering, config).await?;
+    discover(link, "discover services", bluez_wait, config).await?;
 
     let mut services = link.services();
 
@@ -287,8 +290,8 @@ async fn connect_and_discover<L: GattLink>(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let bluez_discovering = connect_link(link, "reconnect to device", config).await?;
-        discover(link, "rediscover services", bluez_discovering, config).await?;
+        let bluez_wait = connect_link(link, "reconnect to device", config).await?;
+        discover(link, "rediscover services", bluez_wait, config).await?;
 
         services = link.services();
         if services.is_empty() {
@@ -344,61 +347,96 @@ fn is_bluez_discovery_timeout(error: &btleplug::Error) -> bool {
     matches!(error, btleplug::Error::Other(e) if e.to_string() == BLUEZ_DISCOVERY_TIMED_OUT)
 }
 
+/// A wait for BlueZ to finish discovering the services: `connect_link` starts
+/// it, and `discover` waits.
+struct BluezWait {
+    /// When the wait and the discovery after it run out of time:
+    /// `bluez_discovery_limit` after the wait started. The connection-state
+    /// query that `connect_link` makes before it starts a wait after a connect
+    /// timeout counts against it too.
+    deadline: Instant,
+}
+
+impl BluezWait {
+    fn start(config: &ConnectionConfig) -> Self {
+        Self {
+            deadline: Instant::now() + bluez_discovery_limit(config),
+        }
+    }
+
+    /// The time left until `deadline`.
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
 /// Connect, giving up after `connection_timeout` (reported as `operation`).
 ///
-/// Returns `true` when the link is up but BlueZ may still be discovering the
-/// services: bluez-async stopped waiting for them, or, on BlueZ, the connect
-/// ran out of time with the link already up.
+/// Returns a `BluezWait` when the link is up but BlueZ may still be
+/// discovering the services: bluez-async stopped waiting for them, or, on
+/// BlueZ, the connect ran out of time with the link already up.
 async fn connect_link<L: GattLink>(
     link: &L,
     operation: &str,
     config: &ConnectionConfig,
-) -> Result<bool> {
-    match bounded(operation, config.connection_timeout, link.connect()).await {
-        Ok(()) => return Ok(false),
-        Err(Error::Bluetooth(e)) if is_bluez_discovery_timeout(&e) => {}
+) -> Result<Option<BluezWait>> {
+    let wait = match bounded(operation, config.connection_timeout, link.connect()).await {
+        Ok(()) => return Ok(None),
+        Err(Error::Bluetooth(e)) if is_bluez_discovery_timeout(&e) => BluezWait::start(config),
         // bluez-async's `connect` waits up to 5 s for the services after the
         // link comes up, so a link that takes longer than
         // `connection_timeout` minus 5 s to come up runs out of time here
         // while BlueZ is discovering on it. Disconnecting would cancel that
         // discovery, and every retry would start it again.
         Err(timeout @ Error::Timeout { .. }) if link.is_bluez() => {
-            if !is_connected(link, config.validation_timeout).await {
+            // The query counts against the wait's limit, so the connect still
+            // takes at most `connection_timeout`, and the query and the wait
+            // together at most `bluez_discovery_limit`.
+            let wait = BluezWait::start(config);
+            let query_limit = config.validation_timeout.min(wait.remaining());
+            if !is_connected(link, query_limit).await {
                 return Err(timeout);
             }
             debug!("The connect ran out of time with the link up");
+            wait
         }
         Err(e) => return Err(e),
-    }
+    };
     info!(
         "BlueZ is still discovering services; waiting up to {:?}",
         bluez_discovery_limit(config)
     );
-    Ok(true)
+    Ok(Some(wait))
 }
 
 /// Discover the services, giving up after `discovery_timeout` (reported as
-/// `operation`). If `bluez_discovering`, first wait for BlueZ to finish; the
-/// wait and the discovery then share `bluez_discovery_limit`.
+/// `operation`).
+///
+/// With a `bluez_wait`, first wait for BlueZ to finish. The wait and the
+/// discovery then share the wait's deadline, and running out of it is
+/// reported as a timeout of `bluez_discovery_limit`.
 async fn discover<L: GattLink>(
     link: &L,
     operation: &str,
-    bluez_discovering: bool,
+    bluez_wait: Option<BluezWait>,
     config: &ConnectionConfig,
 ) -> Result<()> {
-    if !bluez_discovering {
+    let Some(wait) = bluez_wait else {
         return bounded(
             operation,
             config.discovery_timeout,
             link.discover_services(),
         )
         .await;
-    }
-    bounded(operation, bluez_discovery_limit(config), async {
+    };
+    let waited = tokio::time::timeout_at(wait.deadline, async {
         wait_for_bluez_discovery(link).await?;
         link.discover_services().await
-    })
-    .await
+    });
+    match waited.await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(Error::timeout(operation, bluez_discovery_limit(config))),
+    }
 }
 
 /// Call `connect` again until BlueZ has resolved the services.
@@ -1236,6 +1274,64 @@ mod bluez_discovery_tests {
             assert_eq!(calls.last(), Some(&Call::Disconnect), "calls: {calls:?}");
             let discoveries = calls.iter().filter(|call| **call == Call::Discover).count();
             assert_eq!(discoveries, 1, "calls: {calls:?}");
+        })
+        .await;
+    }
+
+    /// On BlueZ, the connection-state query after a connect timeout counts
+    /// against the wait's limit: a slow answer shortens the wait instead of
+    /// lengthening the connect.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_connection_state_query_counts_against_the_wait() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.set_bluez(true);
+            fake.script_is_connected([Outcome::After(Duration::from_secs(2))]);
+            fake.script_connect([Outcome::Hang]);
+            fake.script_connect(std::iter::repeat_with(|| Outcome::DiscoveryTimedOut).take(10));
+            let config = ConnectionConfig::default();
+            let start = Instant::now();
+
+            let result = connect_with(&fake, &config).await;
+
+            assert_discovery_timeout(result, MIN_WAIT);
+            assert_eq!(start.elapsed(), config.connection_timeout + MIN_WAIT);
+            let calls = fake.calls();
+            assert_eq!(
+                calls[..3],
+                [Call::Connect, Call::IsConnected, Call::Connect],
+                "calls: {calls:?}"
+            );
+            assert_eq!(calls.last(), Some(&Call::Disconnect), "calls: {calls:?}");
+        })
+        .await;
+    }
+
+    /// On BlueZ, a connection-state query that never answers ends within the
+    /// wait's limit too, even when `validation_timeout` is longer, so the
+    /// connect and the query together never take longer than the connect's
+    /// and the wait's limits. The link isn't known to be up, so the connect
+    /// fails with its own timeout and disconnects.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_connection_state_query_ends_within_the_wait() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.set_bluez(true);
+            fake.script_is_connected([Outcome::Hang]);
+            fake.script_connect([Outcome::Hang]);
+            let config = ConnectionConfig::default().validation_timeout(Duration::from_secs(60));
+            let start = Instant::now();
+
+            let error = connect_with(&fake, &config)
+                .await
+                .expect_err("the connect should fail");
+
+            assert_timeout(&error, "connect to device", config.connection_timeout);
+            assert_eq!(start.elapsed(), config.connection_timeout + MIN_WAIT);
+            assert_eq!(
+                fake.calls(),
+                [Call::Connect, Call::IsConnected, Call::Disconnect]
+            );
         })
         .await;
     }
