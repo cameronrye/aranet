@@ -97,6 +97,9 @@ pub mod validation;
 #[cfg(feature = "service-client")]
 pub mod service_client;
 
+// Crate-private modules.
+mod runtime;
+
 // Re-export types and uuid modules from aranet-types for backwards compatibility
 pub use aranet_types::types;
 pub use aranet_types::uuid;

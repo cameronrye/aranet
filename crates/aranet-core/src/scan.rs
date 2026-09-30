@@ -183,45 +183,13 @@ impl ScanOptions {
 /// adapters cheaply and stay uncached, so a dead D-Bus connection can still
 /// be recovered by `reset_manager`.
 ///
-/// The adapter is created on [`run_on_process_runtime`], because btleplug runs
-/// its event loop (device discovery, and each peripheral's notification task)
-/// on the runtime that creates it. Created on a caller's runtime, it would stop
-/// seeing devices, with no error, once that runtime shut down, which happens
-/// after every `#[tokio::test]` and in any program that builds a runtime per
-/// call.
+/// The adapter is created on aranet-core's background runtime (`crate::runtime`),
+/// because btleplug runs its event loop (device discovery, and each peripheral's
+/// notification task) on the runtime that creates it. Created on a caller's
+/// runtime, it would stop seeing devices, with no error, once that runtime shut
+/// down, which happens after every `#[tokio::test]` and in any program that
+/// builds a runtime per call.
 static ADAPTER: RwLock<Option<Adapter>> = RwLock::const_new(None);
-
-/// Runtime for tasks that must outlive the caller's runtime. It is created on
-/// first use and runs one worker thread for the rest of the process.
-static PROCESS_RUNTIME: std::sync::Mutex<Option<tokio::runtime::Runtime>> =
-    std::sync::Mutex::new(None);
-
-/// Run `future` to completion on [`PROCESS_RUNTIME`]. Tasks it spawns keep
-/// running after the caller's runtime shuts down.
-async fn run_on_process_runtime<F>(future: F) -> Result<F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let handle = {
-        let mut guard = PROCESS_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(runtime) => runtime.handle().clone(),
-            None => {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .thread_name("aranet-ble")
-                    .enable_all()
-                    .build()?;
-                let handle = runtime.handle().clone();
-                *guard = Some(runtime);
-                handle
-            }
-        }
-    };
-    let output = handle.spawn(future).await.map_err(std::io::Error::from)?;
-    Ok(output)
-}
 
 /// Get the first available Bluetooth adapter.
 ///
@@ -251,7 +219,7 @@ async fn cached_adapter() -> Result<Adapter> {
         }
         warn!("CoreBluetooth adapter thread has stopped; creating a new adapter");
     }
-    let adapter = run_on_process_runtime(create_adapter()).await??;
+    let adapter = crate::runtime::run(create_adapter()).await??;
     *guard = Some(adapter.clone());
     Ok(adapter)
 }
@@ -265,9 +233,9 @@ async fn cached_adapter() -> Result<Adapter> {
 /// thread is gone.
 async fn adapter_thread_is_running(adapter: &Adapter) -> bool {
     let adapter = adapter.clone();
-    // Run on the process runtime so the timeout works even if the caller's
+    // Run on aranet-core's runtime so the timeout works even if the caller's
     // runtime has no time driver.
-    let state = run_on_process_runtime(async move {
+    let state = crate::runtime::run(async move {
         tokio::time::timeout(Duration::from_secs(2), adapter.adapter_state()).await
     })
     .await;
@@ -808,31 +776,6 @@ mod tests {
                 },
             )
         ));
-    }
-
-    // ==================== Process Runtime Tests ====================
-
-    #[test]
-    fn test_tasks_spawned_on_process_runtime_outlive_the_caller_runtime() {
-        // btleplug spawns the adapter's event loop from inside adapter creation;
-        // that task must keep running after the caller's runtime shuts down.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let caller = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        caller
-            .block_on(run_on_process_runtime(async move {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    tx.send(()).unwrap();
-                });
-            }))
-            .unwrap();
-        drop(caller);
-
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("task spawned on the process runtime died with the caller's runtime");
     }
 
     // ==================== DiscoveredDevice Tests ====================
