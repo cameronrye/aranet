@@ -123,6 +123,48 @@ const DEFAULT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(3);
 /// `connect_with_config` and `connect_with_adapter` run: scans of 5, 10 and 15 s.
 const CONNECT_SCAN_DURATION: Duration = Duration::from_secs(10);
 
+/// Current-readings characteristics to try, in order, for a device type.
+///
+/// Connection checks read them too, instead of Battery Level (0x2A19), which
+/// needs pairing.
+fn readings_characteristics(device_type: Option<DeviceType>) -> &'static [Uuid] {
+    match device_type {
+        Some(DeviceType::Aranet4) => &[CURRENT_READINGS_DETAIL],
+        Some(DeviceType::Aranet2 | DeviceType::AranetRadon | DeviceType::AranetRadiation) => {
+            &[CURRENT_READINGS_DETAIL_ALT]
+        }
+        // Unknown, or a type newer than this crate (`DeviceType` is
+        // `#[non_exhaustive]`): try the Aranet4 characteristic first.
+        None | Some(_) => &[CURRENT_READINGS_DETAIL, CURRENT_READINGS_DETAIL_ALT],
+    }
+}
+
+/// Reads the first of `candidates` that the device has, using `read`.
+///
+/// Moves to the next candidate only when `read` returns `CharacteristicNotFound`.
+/// Any other error, such as a timeout or a lost link, is returned at once.
+async fn read_first_available<F, Fut>(candidates: &[Uuid], mut read: F) -> Result<Vec<u8>>
+where
+    F: FnMut(Uuid) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>>>,
+{
+    let Some((&last, earlier)) = candidates.split_last() else {
+        return Err(Error::Unsupported(
+            "no current-readings characteristic for this device type".into(),
+        ));
+    };
+    for &uuid in earlier {
+        match read(uuid).await {
+            Ok(data) => return Ok(data),
+            Err(Error::CharacteristicNotFound { .. }) => {
+                debug!("Reading characteristic {uuid} not found, trying the next one");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    read(last).await
+}
+
 /// Configuration for BLE connection timeouts and behavior.
 ///
 /// Use this to customize timeout values for different environments.
@@ -556,29 +598,35 @@ impl Device {
         crate::link::is_connected(&self.peripheral, self.config.validation_timeout).await
     }
 
-    /// Validate the connection by performing a lightweight read operation.
+    /// Validate the connection by reading the current measurements.
+    ///
+    /// This reads the characteristic that [`Self::read_current`] uses, so the
+    /// check needs no pairing that a reading doesn't need (unpaired Aranet2 and
+    /// AranetRn+ sensors answer it) and never starts a pairing that a reading
+    /// wouldn't. It fails only if the read fails or takes longer than the
+    /// connection's `validation_timeout` (3 s by default, set with
+    /// [`ConnectionConfig::validation_timeout`]).
     ///
     /// This is more reliable than `is_connected()` as it actively verifies
-    /// the connection is working. Uses battery level read as it's fast and
-    /// always available on Aranet devices.
-    ///
-    /// This method is useful for detecting "zombie connections" where the
+    /// the connection is working. It detects "zombie connections", where the
     /// BLE stack thinks it's connected but the device is actually out of range.
     ///
     /// # Returns
     ///
     /// `true` if the connection is active and responsive, `false` otherwise.
     pub async fn validate_connection(&self) -> bool {
-        timeout(self.config.validation_timeout, self.read_battery())
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false)
+        matches!(
+            timeout(self.config.validation_timeout, self.read_current_bytes()).await,
+            Ok(Ok(_))
+        )
     }
 
-    /// Check if the connection is alive by performing a lightweight keepalive check.
+    /// Check if the connection is alive by reading the current measurements.
     ///
     /// This is an alias for [`Self::validate_connection`] that better describes
-    /// the intent when used for connection health monitoring.
+    /// the intent when used for connection health monitoring. Like it, it needs
+    /// no pairing that a reading doesn't need, and fails only if the read fails
+    /// or takes longer than the connection's `validation_timeout`.
     ///
     /// # Example
     ///
@@ -821,34 +869,26 @@ impl Device {
         Ok(())
     }
 
+    /// Raw current-readings bytes; on CharacteristicNotFound tries the next candidate.
+    ///
+    /// Reads the characteristics from `readings_characteristics` in order, as
+    /// `read_first_available` describes.
+    async fn read_current_bytes(&self) -> Result<Vec<u8>> {
+        read_first_available(readings_characteristics(self.device_type), |uuid| {
+            self.read_characteristic(uuid)
+        })
+        .await
+    }
+
     /// Read current sensor measurements.
     ///
     /// Automatically selects the correct characteristic UUID based on device type:
     /// - Aranet4 uses `f0cd3001`
     /// - Aranet2, Radon, Radiation use `f0cd3003`
+    /// - an unknown type tries `f0cd3001`, then `f0cd3003` if the device doesn't have it
     #[tracing::instrument(level = "debug", skip(self), fields(device_name = ?self.name, device_type = ?self.device_type))]
     pub async fn read_current(&self) -> Result<CurrentReading> {
-        // Use the correct characteristic directly when device type is known,
-        // otherwise probe primary then fall back to alternative.
-        let data = match self.device_type {
-            Some(DeviceType::Aranet4) => self.read_characteristic(CURRENT_READINGS_DETAIL).await?,
-            Some(DeviceType::Aranet2 | DeviceType::AranetRadon | DeviceType::AranetRadiation) => {
-                self.read_characteristic(CURRENT_READINGS_DETAIL_ALT)
-                    .await?
-            }
-            None | Some(_) => {
-                // Unknown type: try primary first, fall back to alternative
-                match self.read_characteristic(CURRENT_READINGS_DETAIL).await {
-                    Ok(data) => data,
-                    Err(Error::CharacteristicNotFound { .. }) => {
-                        debug!("Primary reading characteristic not found, trying alternative");
-                        self.read_characteristic(CURRENT_READINGS_DETAIL_ALT)
-                            .await?
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        };
+        let data = self.read_current_bytes().await?;
 
         // Parse based on device type.
         let device_type = match self.device_type {
@@ -1150,5 +1190,125 @@ impl AranetDevice for Device {
 
     async fn get_calibration(&self) -> Result<crate::settings::CalibrationData> {
         Device::get_calibration(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures::FutureExt;
+
+    #[test]
+    fn readings_characteristics_follow_the_device_type() {
+        assert_eq!(
+            readings_characteristics(Some(DeviceType::Aranet4)),
+            &[CURRENT_READINGS_DETAIL]
+        );
+        for device_type in [
+            DeviceType::Aranet2,
+            DeviceType::AranetRadon,
+            DeviceType::AranetRadiation,
+        ] {
+            assert_eq!(
+                readings_characteristics(Some(device_type)),
+                &[CURRENT_READINGS_DETAIL_ALT],
+                "{device_type:?}"
+            );
+        }
+        // Unknown type: the Aranet4 characteristic first, as `read_current` always did.
+        assert_eq!(
+            readings_characteristics(None),
+            &[CURRENT_READINGS_DETAIL, CURRENT_READINGS_DETAIL_ALT]
+        );
+
+        // Battery Level (0x2A19) needs pairing, so a connection check must never read it.
+        for device_type in [
+            None,
+            Some(DeviceType::Aranet4),
+            Some(DeviceType::Aranet2),
+            Some(DeviceType::AranetRadon),
+            Some(DeviceType::AranetRadiation),
+        ] {
+            assert!(
+                !readings_characteristics(device_type).contains(&BATTERY_LEVEL),
+                "{device_type:?} reads Battery Level"
+            );
+        }
+    }
+
+    /// Runs `read_first_available` over `candidates` with a reader that gives
+    /// the scripted `answers` in order. Returns the result and the
+    /// characteristics the reader was asked for.
+    fn read_scripted(
+        candidates: &[Uuid],
+        answers: Vec<Result<Vec<u8>>>,
+    ) -> (Result<Vec<u8>>, Vec<Uuid>) {
+        let mut answers = answers.into_iter();
+        let mut asked = Vec::new();
+        let result = read_first_available(candidates, |uuid| {
+            asked.push(uuid);
+            std::future::ready(answers.next().expect("read more often than scripted"))
+        })
+        .now_or_never()
+        .expect("scripted reads finish at once");
+        (result, asked)
+    }
+
+    fn not_found(uuid: Uuid) -> Error {
+        Error::characteristic_not_found(uuid.to_string(), 6)
+    }
+
+    #[test]
+    fn a_missing_characteristic_moves_on_to_the_next_candidate() {
+        let both = [CURRENT_READINGS_DETAIL, CURRENT_READINGS_DETAIL_ALT];
+
+        let (result, asked) = read_scripted(&both, vec![Ok(vec![1])]);
+        assert_eq!(result.unwrap(), [1]);
+        assert_eq!(asked, [CURRENT_READINGS_DETAIL]);
+
+        let (result, asked) = read_scripted(
+            &both,
+            vec![Err(not_found(CURRENT_READINGS_DETAIL)), Ok(vec![2])],
+        );
+        assert_eq!(result.unwrap(), [2]);
+        assert_eq!(asked, both);
+    }
+
+    #[test]
+    fn any_other_error_ends_the_search() {
+        let (result, asked) = read_scripted(
+            &[CURRENT_READINGS_DETAIL, CURRENT_READINGS_DETAIL_ALT],
+            vec![Err(Error::timeout(
+                "read characteristic f0cd3001",
+                Duration::from_secs(10),
+            ))],
+        );
+        assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+        assert_eq!(asked, [CURRENT_READINGS_DETAIL]);
+    }
+
+    #[test]
+    fn the_readings_read_never_asks_for_battery_level() {
+        for device_type in [
+            None,
+            Some(DeviceType::Aranet4),
+            Some(DeviceType::Aranet2),
+            Some(DeviceType::AranetRadon),
+            Some(DeviceType::AranetRadiation),
+        ] {
+            let candidates = readings_characteristics(device_type);
+            let answers = candidates
+                .iter()
+                .map(|&uuid| Err(not_found(uuid)))
+                .collect();
+            let (result, asked) = read_scripted(candidates, answers);
+            assert!(
+                matches!(result, Err(Error::CharacteristicNotFound { .. })),
+                "{device_type:?}: {result:?}"
+            );
+            assert_eq!(asked, candidates, "{device_type:?}");
+            assert!(!asked.contains(&BATTERY_LEVEL), "{device_type:?}");
+        }
     }
 }
