@@ -182,7 +182,8 @@ impl PassiveMonitor {
     /// This spawns a background task that continuously scans for BLE
     /// advertisements and parses Aranet device data.
     ///
-    /// The task runs until the cancellation token is triggered.
+    /// The task stops as soon as the cancellation token is triggered, even
+    /// during a scan or a wait.
     pub fn start(self: &Arc<Self>, cancel_token: CancellationToken) -> tokio::task::JoinHandle<()> {
         let monitor = Arc::clone(self);
 
@@ -210,50 +211,64 @@ impl PassiveMonitor {
             let mut consecutive_errors: u32 = 0;
 
             loop {
+                // One cycle: a scan, its error handling and the wait before the
+                // next scan. The whole cycle, waits included, ends as soon as the
+                // monitor is cancelled.
+                let cycle = async {
+                    match monitor.scan_cycle_with_adapter(&adapter).await {
+                        Ok(()) => {
+                            consecutive_errors = 0;
+                        }
+                        Err(e) => {
+                            consecutive_errors += 1;
+                            warn!(
+                                "Passive monitor scan error ({consecutive_errors} consecutive): {e}"
+                            );
+                            // After several consecutive failures, try to
+                            // re-acquire the adapter — it may have been
+                            // reset or the D-Bus connection may have died.
+                            if consecutive_errors >= 5 {
+                                warn!(
+                                    "Passive monitor: re-acquiring adapter after {} consecutive errors",
+                                    consecutive_errors
+                                );
+                                match get_adapter().await {
+                                    Ok(a) => {
+                                        adapter = a;
+                                        info!("Passive monitor: adapter re-acquired");
+                                        consecutive_errors = 0;
+                                    }
+                                    Err(e2) => {
+                                        // Adapter re-acquisition failed — back off
+                                        // longer to avoid thrashing when the adapter
+                                        // is permanently unavailable.
+                                        warn!(
+                                            "Passive monitor: failed to re-acquire adapter: {}. Backing off.",
+                                            e2
+                                        );
+                                        let backoff = std::cmp::min(
+                                            monitor
+                                                .options
+                                                .scan_interval
+                                                .saturating_mul(consecutive_errors),
+                                            std::time::Duration::from_secs(300),
+                                        );
+                                        sleep(backoff).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Wait before next scan cycle
+                    sleep(monitor.options.scan_interval).await;
+                };
+
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
                         info!("Passive monitor cancelled");
                         break;
                     }
-                    result = monitor.scan_cycle_with_adapter(&adapter) => {
-                        match result {
-                            Ok(()) => {
-                                consecutive_errors = 0;
-                            }
-                            Err(e) => {
-                                consecutive_errors += 1;
-                                warn!(
-                                    "Passive monitor scan error ({consecutive_errors} consecutive): {e}"
-                                );
-                                // After several consecutive failures, try to
-                                // re-acquire the adapter — it may have been
-                                // reset or the D-Bus connection may have died.
-                                if consecutive_errors >= 5 {
-                                    warn!("Passive monitor: re-acquiring adapter after {} consecutive errors", consecutive_errors);
-                                    match get_adapter().await {
-                                        Ok(a) => {
-                                            adapter = a;
-                                            info!("Passive monitor: adapter re-acquired");
-                                            consecutive_errors = 0;
-                                        }
-                                        Err(e2) => {
-                                            // Adapter re-acquisition failed — back off
-                                            // longer to avoid thrashing when the adapter
-                                            // is permanently unavailable.
-                                            warn!("Passive monitor: failed to re-acquire adapter: {}. Backing off.", e2);
-                                            let backoff = std::cmp::min(
-                                                monitor.options.scan_interval.saturating_mul(consecutive_errors),
-                                                std::time::Duration::from_secs(300),
-                                            );
-                                            sleep(backoff).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Wait before next scan cycle
-                        sleep(monitor.options.scan_interval).await;
-                    }
+                    () = cycle => {}
                 }
             }
         })
