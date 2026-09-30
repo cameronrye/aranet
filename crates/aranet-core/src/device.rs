@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::scan::{ScanOptions, find_device};
+use crate::scan::ScanOptions;
 use crate::traits::AranetDevice;
 use crate::util::{create_identifier, format_peripheral_id};
 use crate::uuid::{
@@ -41,6 +41,26 @@ use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
 /// You MUST call [`Device::disconnect`] before dropping the device to properly
 /// release BLE resources. If a Device is dropped without calling disconnect,
 /// a warning will be logged.
+///
+/// # Timeouts
+///
+/// With default settings, [`Device::connect`] gives up after about 30 s of scanning
+/// on a device that the adapter doesn't already know and that isn't advertising. A
+/// device that the adapter still lists (on Linux a paired device, or one seen in the
+/// last 30 s or so; on macOS one that this process found in an earlier scan and
+/// hasn't disconnected from since) is connected to without scanning. If it has gone,
+/// the connect fails within about 20 s (15 s connecting, up to 5 s to confirm the
+/// disconnect). A device that is found by scanning but refuses the connection fails
+/// after about 50 s (30 s scanning, 15 s connecting, up to 5 s to confirm the
+/// disconnect). One that connects slowly and then stops answering fails after at
+/// most about 70 s (adding up to 10 s each for service discovery and for reading its
+/// properties), and the rare retry after an empty service discovery can take about
+/// 102 s. On Linux, service discovery can take up to 20 s instead of 10 s while BlueZ
+/// is still discovering a device it has just connected (a first connection to an
+/// Aranet4, for example), so those two cases can take about 80 s and 122 s there. A
+/// search can also wait for another scan in the same process to finish. Use
+/// [`Device::connect_with_scan_options`] to change the scan time and
+/// [`ConnectionConfig`] to change the connect timeouts.
 pub struct Device {
     /// The BLE adapter used for connection.
     ///
@@ -98,6 +118,10 @@ const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default timeout for connection validation (keepalive check).
 const DEFAULT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Scan duration of the one device search that `connect`, `connect_with_timeout`,
+/// `connect_with_config` and `connect_with_adapter` run: scans of 5, 10 and 15 s.
+const CONNECT_SCAN_DURATION: Duration = Duration::from_secs(10);
 
 /// Configuration for BLE connection timeouts and behavior.
 ///
@@ -169,6 +193,11 @@ impl ConnectionConfig {
     ///
     /// Uses longer timeouts to accommodate signal interference,
     /// thick walls, or long distances.
+    ///
+    /// These are the connection's timeouts only: [`Device::connect_with_config`]
+    /// still searches with scans of 5, 10 and 15 s (up to about 30 s).
+    /// To search longer for a weak sensor, use [`Device::connect_with_scan_options`]
+    /// with a longer `ScanOptions::duration`.
     pub fn challenging_environment() -> Self {
         Self {
             connection_timeout: Duration::from_secs(90),
@@ -293,6 +322,10 @@ impl SignalQuality {
 impl Device {
     /// Connect to an Aranet device by name or MAC address.
     ///
+    /// The device is searched for with scans of 5, 10 and 15 s (up to about 30 s) and
+    /// connected with the default [`ConnectionConfig`]. See the "Timeouts" section of
+    /// [`Device`] for how long that can take.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -310,17 +343,27 @@ impl Device {
         Self::connect_with_config(identifier, ConnectionConfig::default()).await
     }
 
-    /// Connect to an Aranet device with a custom scan timeout.
-    #[tracing::instrument(level = "info", skip_all, fields(identifier = %identifier, timeout_secs = scan_timeout.as_secs()))]
-    pub async fn connect_with_timeout(identifier: &str, scan_timeout: Duration) -> Result<Self> {
-        let config = ConnectionConfig::default().connection_timeout(scan_timeout);
-        Self::connect_with_config(identifier, config).await
+    /// Connect with a custom connection timeout.
+    ///
+    /// The device search uses scans of 5, 10 and 15 s (up to about 30 s).
+    /// `timeout` replaces only the connect timeout (`connection_timeout`); every other
+    /// timeout keeps its default. Use [`Device::connect_with_scan_options`] to change
+    /// the scan time as well.
+    #[tracing::instrument(level = "info", skip_all, fields(identifier = %identifier, timeout_secs = timeout.as_secs()))]
+    pub async fn connect_with_timeout(identifier: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_with_scan_options(
+            identifier,
+            ScanOptions::default().duration(CONNECT_SCAN_DURATION),
+            ConnectionConfig::default().connection_timeout(timeout),
+        )
+        .await
     }
 
     /// Connect to an Aranet device with full configuration.
     ///
-    /// This is the most flexible connection method, allowing customization
-    /// of all timeout values.
+    /// `config` sets every timeout of the connection itself. The device is searched for
+    /// with scans of 5, 10 and 15 s (up to about 30 s); use
+    /// [`Device::connect_with_scan_options`] to change the scan time too.
     ///
     /// # Example
     ///
@@ -330,7 +373,8 @@ impl Device {
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     // Use longer timeouts for challenging RF environment
+    ///     // Longer connect timeouts for a challenging RF environment. They don't
+    ///     // lengthen the search for the device.
     ///     let config = ConnectionConfig::challenging_environment();
     ///     let device = Device::connect_with_config("Aranet4 12345", config).await?;
     ///     Ok(())
@@ -338,18 +382,50 @@ impl Device {
     /// ```
     #[tracing::instrument(level = "info", skip_all, fields(identifier = %identifier))]
     pub async fn connect_with_config(identifier: &str, config: ConnectionConfig) -> Result<Self> {
-        let options = ScanOptions {
-            duration: config.connection_timeout,
-            filter_aranet_only: false, // We're looking for a specific device
-            use_service_filter: false,
-        };
+        Self::connect_with_scan_options(
+            identifier,
+            ScanOptions::default().duration(CONNECT_SCAN_DURATION),
+            config,
+        )
+        .await
+    }
 
-        // Try find_device first (uses default 5s scan), then with custom options
-        let (adapter, peripheral) = match find_device(identifier).await {
-            Ok(result) => result,
-            Err(_) => crate::scan::find_device_with_options(identifier, options).await?,
-        };
-
+    /// Find `identifier` with `scan`, then connect with `config`.
+    ///
+    /// The search makes up to three scans of `scan.duration / 2`, `scan.duration` and
+    /// `1.5 × scan.duration` (at least 2, 4 and 6 s), so it takes up to about
+    /// 3 × `scan.duration`, plus any wait for another scan in the same process.
+    /// Only `scan.duration` is used: as in
+    /// [`find_device_with_options`](crate::scan::find_device_with_options), the search
+    /// ignores `scan`'s filter flags and keeps its default filter.
+    /// A device that the adapter already knows from an earlier scan is used without
+    /// scanning. `config` sets the timeouts of the connection itself; see the
+    /// "Timeouts" section of [`Device`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use aranet_core::device::{ConnectionConfig, Device};
+    /// use aranet_core::scan::ScanOptions;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     // Scan for 5, 10 and 15 s (up to about 30 s), then allow 30 s to connect.
+    ///     let scan = ScanOptions::default().duration(Duration::from_secs(10));
+    ///     let config = ConnectionConfig::default().connection_timeout(Duration::from_secs(30));
+    ///     let device = Device::connect_with_scan_options("Aranet4 12345", scan, config).await?;
+    ///     device.disconnect().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[tracing::instrument(level = "info", skip_all, fields(identifier = %identifier, scan_secs = scan.duration.as_secs()))]
+    pub async fn connect_with_scan_options(
+        identifier: &str,
+        scan: ScanOptions,
+        config: ConnectionConfig,
+    ) -> Result<Self> {
+        let (adapter, peripheral) = crate::scan::find_device_with_options(identifier, scan).await?;
         Self::from_peripheral_with_config(adapter, peripheral, config).await
     }
 
@@ -358,32 +434,22 @@ impl Device {
     /// This avoids creating a new btleplug `Manager` (and D-Bus connection) on
     /// every call.  Prefer this over [`connect_with_config`](Self::connect_with_config)
     /// in long-running services that poll devices repeatedly.
+    ///
+    /// Like [`connect_with_config`](Self::connect_with_config), it searches once with
+    /// scans of 5, 10 and 15 s (up to about 30 s), and `config` sets the timeouts of
+    /// the connection itself.
     #[tracing::instrument(level = "info", skip_all, fields(identifier = %identifier))]
     pub async fn connect_with_adapter(
         adapter: Adapter,
         identifier: &str,
         config: ConnectionConfig,
     ) -> Result<Self> {
-        let options = ScanOptions {
-            duration: config.connection_timeout,
-            filter_aranet_only: false,
-            use_service_filter: false,
-        };
-
-        let peripheral = match crate::scan::find_device_with_adapter(
+        let peripheral = crate::scan::find_device_with_adapter(
             &adapter,
             identifier,
-            ScanOptions::default(),
+            ScanOptions::default().duration(CONNECT_SCAN_DURATION),
         )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                debug!("Fast scan failed ({e}), retrying with extended options");
-                crate::scan::find_device_with_adapter(&adapter, identifier, options).await?
-            }
-        };
-
+        .await?;
         Self::from_peripheral_with_config(adapter, peripheral, config).await
     }
 
