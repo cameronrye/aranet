@@ -1492,6 +1492,113 @@ mod tests {
             })
             .await;
         }
+
+        /// Opening the notification stream is limited too, and a stream that
+        /// never opens leaves the device's notifications off.
+        #[tokio::test(start_paused = true)]
+        async fn opening_the_stream_gives_up_after_limit_and_writes_no_cccd() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                fake.script_notifications([Outcome::Hang]);
+                let start = Instant::now();
+
+                let error = tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect_err("the stream never opens");
+
+                assert_limit_timeout(&error, "open notification stream");
+                assert_eq!(start.elapsed(), LIMIT);
+                assert_eq!(tasks.task_count(), 0);
+                let calls = fake.calls();
+                assert!(
+                    !calls.contains(&Call::Subscribe(C1)),
+                    "notifications were enabled with no stream to read them: {calls:?}"
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_resubscribe_keeps_the_previous_callback() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let previous = Arc::new(AtomicUsize::new(0));
+                let rejected = Arc::new(AtomicUsize::new(0));
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&previous))
+                    .await
+                    .expect("first subscribe");
+                fake.script_subscribe([Outcome::Fail]);
+
+                let error = tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&rejected))
+                    .await
+                    .expect_err("the CCCD write fails");
+                assert!(matches!(error, Error::Bluetooth(_)), "got {error:?}");
+
+                fake.emit(C1, &[1]);
+                wait_for(&previous, 1).await;
+                assert_eq!(
+                    rejected.load(Ordering::SeqCst),
+                    0,
+                    "the callback of the failed subscribe ran"
+                );
+                assert_eq!(tasks.task_count(), 1);
+                assert_eq!(
+                    fake.open_streams(),
+                    1,
+                    "the failed subscribe left its stream open"
+                );
+            })
+            .await;
+        }
+
+        /// `unsubscribe` stops the callback before it makes the device call,
+        /// so no callback runs while that call hangs.
+        #[tokio::test(start_paused = true)]
+        async fn unsubscribe_stops_the_callback_before_the_device_call() {
+            within(Duration::from_secs(600), async {
+                let fake = FakeGatt::new();
+                let tasks = NotificationTasks::default();
+                let count = Arc::new(AtomicUsize::new(0));
+                tasks
+                    .subscribe(&fake, &characteristic(C1), LIMIT, counter(&count))
+                    .await
+                    .expect("subscribe");
+                fake.emit(C1, &[1]);
+                wait_for(&count, 1).await;
+                fake.script_unsubscribe([Outcome::Hang]);
+                let c1 = characteristic(C1);
+
+                // The CCCD write hangs until `LIMIT`; the device notifies 1 s
+                // into it.
+                let notify_during_the_call = async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    assert_eq!(
+                        fake.calls().last(),
+                        Some(&Call::Unsubscribe(C1)),
+                        "the device call should be under way"
+                    );
+                    fake.emit(C1, &[2]);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    count.load(Ordering::SeqCst)
+                };
+                let (result, calls_during) =
+                    tokio::join!(tasks.unsubscribe(&fake, &c1, LIMIT), notify_during_the_call);
+
+                assert_eq!(
+                    calls_during, 1,
+                    "the callback ran while the device call hung"
+                );
+                let error = result.expect_err("the CCCD write never answers");
+                assert_limit_timeout(&error, "unsubscribe from notifications");
+            })
+            .await;
+        }
     }
 }
 
@@ -2045,6 +2152,10 @@ mod pairing_tests {
     use crate::device::ConnectionConfig;
     use crate::test_support::within;
 
+    /// The pairing budget at default settings: `connection_timeout` (15 s)
+    /// plus `bluez_discovery_limit` (20 s).
+    const DEFAULT_BUDGET: Duration = Duration::from_secs(35);
+
     /// The pairing step runs first and inside the guard: a connect that fails
     /// after it still disconnects, because `Pair` may have connected the sensor.
     #[tokio::test(start_paused = true)]
@@ -2059,7 +2170,10 @@ mod pairing_tests {
                 .await
                 .expect("the connect should succeed after pairing");
             open.pending.disarm();
-            assert_eq!(link.calls(), [Call::Pair, Call::Connect, Call::Discover]);
+            assert_eq!(
+                link.calls(),
+                [Call::Pair(DEFAULT_BUDGET), Call::Connect, Call::Discover]
+            );
 
             let refused = FakeGatt::new();
             refused.script_pair([Outcome::Ok]);
@@ -2068,7 +2182,7 @@ mod pairing_tests {
             assert!(result.is_err(), "a refused connect must fail");
             assert_eq!(
                 refused.calls(),
-                [Call::Pair, Call::Connect, Call::Disconnect]
+                [Call::Pair(DEFAULT_BUDGET), Call::Connect, Call::Disconnect]
             );
         })
         .await;
@@ -2091,7 +2205,10 @@ mod pairing_tests {
 
             // connection_timeout (15 s) + bluez_discovery_limit (20 s) + 5 s of grace.
             assert_eq!(start.elapsed(), Duration::from_secs(40));
-            assert_eq!(link.calls(), [Call::Pair, Call::Connect, Call::Discover]);
+            assert_eq!(
+                link.calls(),
+                [Call::Pair(DEFAULT_BUDGET), Call::Connect, Call::Discover]
+            );
         })
         .await;
     }
@@ -2115,7 +2232,7 @@ mod pairing_tests {
             );
 
             within(Duration::from_secs(10), link.disconnected().notified()).await;
-            assert_eq!(link.calls(), [Call::Pair, Call::Disconnect]);
+            assert_eq!(link.calls(), [Call::Pair(DEFAULT_BUDGET), Call::Disconnect]);
         })
         .await;
     }
@@ -2135,7 +2252,45 @@ mod pairing_tests {
                 .await
                 .expect("the connect should succeed");
             open.pending.disarm();
-            assert_eq!(link.calls(), [Call::Pair, Call::Connect, Call::Discover]);
+            assert_eq!(
+                link.calls(),
+                [Call::Pair(Duration::MAX), Call::Connect, Call::Discover]
+            );
+        })
+        .await;
+    }
+
+    /// The pairing step's budget is `connection_timeout` plus
+    /// `bluez_discovery_limit`, whose 20 s floor applies here too.
+    #[tokio::test(start_paused = true)]
+    async fn pairing_gets_the_connect_and_discovery_wait_budget() {
+        within(Duration::from_secs(600), async {
+            let cases = [
+                (ConnectionConfig::default(), DEFAULT_BUDGET),
+                (
+                    ConnectionConfig::default()
+                        .connection_timeout(Duration::from_secs(30))
+                        .discovery_timeout(Duration::from_secs(40)),
+                    Duration::from_secs(70),
+                ),
+                // 8 s to connect, and a 5 s `discovery_timeout` under the floor.
+                (ConnectionConfig::fast(), Duration::from_secs(28)),
+            ];
+            for (config, budget) in cases {
+                let link = FakeGatt::new();
+                link.script_pair([Outcome::Ok]);
+
+                let open = connect(&link, &config, &Handle::current())
+                    .await
+                    .expect("the connect should succeed");
+                open.pending.disarm();
+
+                assert_eq!(
+                    link.calls(),
+                    [Call::Pair(budget), Call::Connect, Call::Discover],
+                    "{config:?}"
+                );
+            }
         })
         .await;
     }

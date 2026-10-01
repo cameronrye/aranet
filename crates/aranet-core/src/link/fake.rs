@@ -51,8 +51,9 @@ pub(super) enum Call {
     IsConnected,
     Subscribe(Uuid),
     Unsubscribe(Uuid),
-    /// The Linux pairing step. Recorded only once `script_pair` has been called.
-    Pair,
+    /// The Linux pairing step, with the budget it was given. Recorded only
+    /// once `script_pair` has been called.
+    Pair(std::time::Duration),
 }
 
 /// A peripheral whose calls follow a script. Clones share the script and the
@@ -78,6 +79,7 @@ struct State {
     bluez: bool,
     subscribe: VecDeque<Outcome>,
     unsubscribe: VecDeque<Outcome>,
+    notifications: VecDeque<Outcome>,
     /// The sending half of every stream `notifications()` has returned.
     streams: Vec<mpsc::UnboundedSender<ValueNotification>>,
     /// What each `subscribe` sends to the open streams before it answers.
@@ -119,6 +121,7 @@ impl FakeGatt {
                 bluez: false,
                 subscribe: VecDeque::new(),
                 unsubscribe: VecDeque::new(),
+                notifications: VecDeque::new(),
                 streams: Vec::new(),
                 emit_on_subscribe: None,
                 pair: None,
@@ -188,6 +191,12 @@ impl FakeGatt {
     /// Script the next `unsubscribe` calls. Calls past the script succeed.
     pub(super) fn script_unsubscribe(&self, outcomes: impl IntoIterator<Item = Outcome>) {
         self.lock().unsubscribe.extend(outcomes);
+    }
+
+    /// Script the next `notifications` calls, which open a stream once their
+    /// outcome succeeds. Calls past the script open one at once.
+    pub(super) fn script_notifications(&self, outcomes: impl IntoIterator<Item = Outcome>) {
+        self.lock().notifications.extend(outcomes);
     }
 
     /// Send a notification from characteristic `uuid` to every open stream.
@@ -334,19 +343,21 @@ impl GattLink for FakeGatt {
     }
 
     async fn notifications(&self) -> btleplug::Result<NotificationStream> {
+        let outcome = self.lock().notifications.pop_front();
+        run(outcome).await?;
         let (sender, receiver) = mpsc::unbounded();
         self.lock().streams.push(sender);
         Ok(Box::pin(receiver))
     }
 
-    async fn pair_if_needed(&self, _budget: std::time::Duration) {
+    async fn pair_if_needed(&self, budget: std::time::Duration) {
         let outcome = {
             let mut state = self.lock();
             let Some(script) = state.pair.as_mut() else {
                 return;
             };
             let outcome = script.pop_front();
-            state.calls.push(Call::Pair);
+            state.calls.push(Call::Pair(budget));
             outcome
         };
         // Pairing never fails a connect, so the result is ignored.

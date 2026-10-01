@@ -1961,7 +1961,7 @@ mod lifecycle_tests {
 
     use tokio::time::timeout;
 
-    use super::{EntrySnapshot, ManagerConfig, ManagerCore};
+    use super::{EntrySnapshot, ManagerConfig, ManagerCore, TickOutcome};
     use crate::error::{ConnectionFailureReason, Error, Result};
     use crate::test_support::{FakeConn, FakeEvent, FakeRadio, within};
 
@@ -2422,6 +2422,40 @@ mod lifecycle_tests {
                     FakeEvent::Connected { id: a(), handle: 2 },
                 ]
             );
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// `remove_device` disconnects first. When that disconnect fails, the
+    /// device stays in the manager, withdrawn, and the error is returned.
+    #[tokio::test(start_paused = true)]
+    async fn remove_device_keeps_the_device_when_its_disconnect_fails() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default());
+            core.connect("A").await.expect("connect");
+            radio.fail_disconnects("A");
+
+            let result = core.remove_device("A").await;
+
+            assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+            assert_eq!(core.device_ids().await, ["A"]);
+            assert_eq!(
+                core.snapshot("A").await,
+                Some(EntrySnapshot {
+                    has_link: false,
+                    failures: 0,
+                    wanted: false,
+                    gave_up: false,
+                    retry_at: None,
+                })
+            );
+            // Withdrawn: the health monitor leaves it alone.
+            assert_eq!(core.health_tick().await, TickOutcome::default());
+            assert_eq!(radio.connect_count("A"), 1);
 
             assert_no_orphans(&core, &radio).await;
             radio.assert_no_drop_teardown();
@@ -3350,6 +3384,134 @@ mod lifecycle_tests {
                         "ReconnectSucceeded B 1"
                     ]
                 );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// A repair that succeeds starts the backoff over: the next lost link
+        /// is repaired at once, as attempt 1 again, with all of `max_attempts`.
+        #[tokio::test(start_paused = true)]
+        async fn successful_repair_starts_the_backoff_over() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.add_device_with_options(
+                    "A",
+                    ReconnectOptions::default()
+                        .max_attempts(2)
+                        .initial_delay(Duration::from_secs(60)),
+                )
+                .await
+                .unwrap();
+                core.connect("A").await.unwrap();
+                radio.lose_link("A");
+                // The first repair fails; the one 60 s later succeeds.
+                radio.script_connects("A", [false]);
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 0,
+                        failed: 1
+                    }
+                );
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 1,
+                        failed: 0
+                    }
+                );
+                assert_eq!(
+                    core.snapshot("A").await,
+                    Some(EntrySnapshot {
+                        has_link: true,
+                        failures: 0,
+                        wanted: true,
+                        gave_up: false,
+                        retry_at: None,
+                    })
+                );
+
+                // The next loss is repaired as attempt 1 again, and one more
+                // failure doesn't use up the two attempts.
+                radio.lose_link("A");
+                radio.script_connects("A", [false]);
+                let mut events = core.events.subscribe();
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 0,
+                        failed: 1
+                    }
+                );
+                assert_eq!(
+                    drain(&mut events),
+                    ["Disconnected A Unknown", "ReconnectStarted A 1"]
+                );
+                assert!(!core.snapshot("A").await.unwrap().gave_up);
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// A wait too long to add to an `Instant` is capped at
+        /// `MAX_RETRY_WAIT`. These options pass `validate()`; without the cap
+        /// the failed repair would panic and end the monitor for every device.
+        #[tokio::test(start_paused = true)]
+        async fn an_overlong_reconnect_wait_is_capped_and_the_monitor_keeps_running() {
+            within(LIMIT, async {
+                let start = Instant::now();
+                let radio = FakeRadio::new();
+                let core = core(
+                    &radio,
+                    ManagerConfig::default()
+                        .health_check_interval(Duration::from_secs(5))
+                        .adaptive_interval(false),
+                );
+                core.add_device_with_options(
+                    "A",
+                    ReconnectOptions::fixed_delay(Duration::MAX).max_delay(Duration::MAX),
+                )
+                .await
+                .unwrap();
+                core.connect("A").await.unwrap();
+                core.connect("B").await.unwrap();
+                radio.lose_link("A");
+                radio.script_connects("A", [false]);
+
+                let cancel = CancellationToken::new();
+                let monitor = Arc::clone(&core).spawn_health_monitor(cancel.clone());
+                // The tick at 5 s fails A's repair.
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                let failed_at = connect_starts(&radio, "A")[1];
+                assert_eq!(failed_at, Duration::from_secs(5));
+                let snapshot = core.snapshot("A").await.unwrap();
+                assert_eq!(snapshot.failures, 1);
+                assert_eq!(
+                    snapshot.retry_at,
+                    Some(start + failed_at + crate::manager::MAX_RETRY_WAIT)
+                );
+
+                // The monitor still runs: the tick at 10 s repairs B.
+                radio.lose_link("B");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert!(
+                    radio.link_up("B"),
+                    "the monitor stopped: {:#?}",
+                    radio.events()
+                );
+                assert!(!monitor.is_finished());
+                cancel.cancel();
+                monitor.await.expect("the health monitor panicked");
 
                 assert_no_orphans(&core, &radio).await;
                 radio.assert_no_drop_teardown();
