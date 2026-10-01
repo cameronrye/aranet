@@ -578,23 +578,34 @@ enum BluezWaitReason {
     ConnectTimedOut,
 }
 
+/// How far ahead a deadline is set when its limit is too long to add to the
+/// current time, such as `Duration::MAX`: about 30 years, as
+/// `tokio::time::timeout` does for such a limit.
+const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+
 /// A wait for BlueZ to finish discovering the services: `connect_link` starts
 /// it, and `discover` waits.
 struct BluezWait {
     /// Why the wait started.
     reason: BluezWaitReason,
     /// When the wait and the discovery after it run out of time:
-    /// `bluez_discovery_limit` after the wait started. The connection-state
-    /// query that `connect_link` makes before it starts a wait after a connect
-    /// timeout counts against it too.
+    /// `bluez_discovery_limit` after the wait started, or `FAR_FUTURE` after
+    /// it when that limit is too long to add. The connection-state query that
+    /// `connect_link` makes before it starts a wait after a connect timeout
+    /// counts against it too.
     deadline: Instant,
 }
 
 impl BluezWait {
     fn start(reason: BluezWaitReason, config: &ConnectionConfig) -> Self {
+        // `checked_add`, because callers may pass `Duration::MAX` to mean "no
+        // limit", and adding that to an `Instant` panics.
+        let now = Instant::now();
         Self {
             reason,
-            deadline: Instant::now() + bluez_discovery_limit(config),
+            deadline: now
+                .checked_add(bluez_discovery_limit(config))
+                .unwrap_or_else(|| now + FAR_FUTURE),
         }
     }
 
@@ -1635,7 +1646,7 @@ mod bluez_discovery_tests {
 
     /// Connect `fake` with `config` and the test's runtime for cleanup, and
     /// disarm the link if the connect succeeds.
-    async fn connect_with(fake: &FakeGatt, config: &ConnectionConfig) -> Result<()> {
+    pub(super) async fn connect_with(fake: &FakeGatt, config: &ConnectionConfig) -> Result<()> {
         let open = connect(fake, config, &Handle::current()).await?;
         open.pending.disarm();
         Ok(())
@@ -2147,8 +2158,10 @@ mod pairing_tests {
     use tokio::runtime::Handle;
     use tokio::time::Instant;
 
+    use super::bluez_discovery_tests::connect_with;
     use super::connect;
     use super::fake::{Call, FakeGatt, Outcome};
+    use super::tests::assert_timeout;
     use crate::device::ConnectionConfig;
     use crate::test_support::within;
 
@@ -2237,24 +2250,83 @@ mod pairing_tests {
         .await;
     }
 
-    /// `Duration::MAX` is how a caller says "no limit". Adding two of them
-    /// must not panic.
+    /// `Duration::MAX` is how a caller says "no limit". A connect must not
+    /// panic on it: not when the pairing budget adds two of them, and not on
+    /// BlueZ when the wait for BlueZ's service discovery starts with a
+    /// deadline `discovery_timeout` away, after bluez-async gave up waiting
+    /// for the services or after a connect timeout.
     #[tokio::test(start_paused = true)]
     async fn connect_with_unlimited_timeouts_does_not_panic() {
         within(Duration::from_secs(600), async {
-            let link = FakeGatt::new();
-            link.script_pair([Outcome::Ok]);
-            let config = ConnectionConfig::default()
+            let unlimited = ConnectionConfig::default()
                 .connection_timeout(Duration::MAX)
                 .discovery_timeout(Duration::MAX);
 
-            let open = connect(&link, &config, &Handle::current())
+            let link = FakeGatt::new();
+            link.script_pair([Outcome::Ok]);
+            connect_with(&link, &unlimited)
                 .await
                 .expect("the connect should succeed");
-            open.pending.disarm();
             assert_eq!(
                 link.calls(),
                 [Call::Pair(Duration::MAX), Call::Connect, Call::Discover]
+            );
+
+            // On BlueZ, bluez-async gives up waiting for the services, so the
+            // connect waits for BlueZ to finish.
+            let bluez = FakeGatt::new();
+            bluez.set_bluez(true);
+            bluez.script_pair([Outcome::Ok]);
+            bluez.script_connect([Outcome::DiscoveryTimedOut, Outcome::Ok]);
+            connect_with(&bluez, &unlimited)
+                .await
+                .expect("the connect should wait for BlueZ's service discovery");
+            assert_eq!(
+                bluez.calls(),
+                [
+                    Call::Pair(Duration::MAX),
+                    Call::Connect,
+                    Call::Connect,
+                    Call::Discover,
+                ]
+            );
+
+            // On BlueZ, a connect that runs out of its finite time starts the
+            // wait before it asks whether the link is up. With the link up it
+            // waits for BlueZ; with the link down it fails with its own
+            // timeout, as a sensor out of range does.
+            let finite_connect = ConnectionConfig::default().discovery_timeout(Duration::MAX);
+            let up = FakeGatt::new();
+            up.set_bluez(true);
+            up.script_connect([Outcome::Hang, Outcome::Ok]);
+            connect_with(&up, &finite_connect)
+                .await
+                .expect("the connect should wait for BlueZ's service discovery");
+            assert_eq!(
+                up.calls(),
+                [
+                    Call::Connect,
+                    Call::IsConnected,
+                    Call::Connect,
+                    Call::Discover,
+                ]
+            );
+
+            let down = FakeGatt::new();
+            down.set_bluez(true);
+            down.set_connected(false);
+            down.script_connect([Outcome::Hang]);
+            let error = connect_with(&down, &finite_connect)
+                .await
+                .expect_err("a connect timeout with the link down should fail");
+            assert_timeout(
+                &error,
+                "connect to device",
+                finite_connect.connection_timeout,
+            );
+            assert_eq!(
+                down.calls(),
+                [Call::Connect, Call::IsConnected, Call::Disconnect]
             );
         })
         .await;
