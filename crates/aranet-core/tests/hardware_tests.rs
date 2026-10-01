@@ -1215,18 +1215,24 @@ async fn test_connect_to_missing_device_gives_up_within_scan_budget() {
     );
 }
 
+/// Identifiers must match exactly, so none of these names a device: the empty
+/// one is rejected before Bluetooth is used, and each of the others fails its
+/// search with `NotFound`.
 #[tokio::test]
 #[ignore = "requires BLE hardware"]
 async fn test_connect_invalid_address() {
+    // Scans of 2, 4 and 6 s, so that each search ends well within LIMIT.
+    const LIMIT: Duration = Duration::from_secs(30);
+    let scan = ScanOptions::default().duration(Duration::from_secs(4));
+
     // Try various invalid address formats
     let invalid_addresses = ["", "invalid", "XX:XX:XX:XX:XX:XX", "not-a-uuid"];
 
     for addr in invalid_addresses {
-        let result = timeout(Duration::from_secs(5), Device::connect(addr)).await;
-
         if addr.is_empty() {
             // Rejected before Bluetooth is used, so it can neither time out nor
             // connect to whichever device the adapter lists first.
+            let result = timeout(Duration::from_secs(5), Device::connect(addr)).await;
             assert!(
                 matches!(result, Ok(Err(aranet_core::Error::InvalidConfig(_)))),
                 "the empty identifier was not rejected: {result:?}"
@@ -1235,16 +1241,24 @@ async fn test_connect_invalid_address() {
             continue;
         }
 
-        match result {
-            Ok(Ok(_)) => {
-                println!("Unexpected success for address: {}", addr);
+        let connect = Device::connect_with_scan_options(
+            addr,
+            scan.clone(),
+            aranet_core::ConnectionConfig::default(),
+        );
+        match timeout(LIMIT, connect).await {
+            Ok(Err(aranet_core::Error::DeviceNotFound(
+                aranet_core::DeviceNotFoundReason::NotFound { identifier },
+            ))) => {
+                assert_eq!(identifier, addr);
+                println!("Not found, as expected: '{addr}'");
             }
-            Ok(Err(e)) => {
-                println!("Expected error for '{}': {}", addr, e);
+            Ok(Err(e)) => panic!("expected '{addr}' not to be found, got: {e}"),
+            Ok(Ok(device)) => {
+                let _ = device.disconnect().await;
+                panic!("connected to a device for '{addr}', which names none");
             }
-            Err(_) => {
-                println!("Timeout for '{}' (acceptable)", addr);
-            }
+            Err(_) => panic!("the search for '{addr}' didn't end within {LIMIT:?}"),
         }
     }
 }
