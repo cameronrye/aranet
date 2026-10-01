@@ -15,8 +15,9 @@ use tracing::{debug, info, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
 
+use crate::connector::{ConnectFn, SensorLink, ble_connector};
 use crate::device::Device;
-use crate::error::{Error, Result};
+use crate::error::{ConnectionFailureReason, Error, Result};
 use crate::events::{DeviceEvent, DeviceId, DisconnectReason, EventDispatcher};
 use crate::passive::{PassiveMonitor, PassiveMonitorOptions, PassiveReading};
 use crate::reconnect::ReconnectOptions;
@@ -144,6 +145,10 @@ impl AdaptiveInterval {
 }
 
 /// Information about a managed device.
+///
+/// [`DeviceManager`] doesn't store `ManagedDevice` values, and none of its
+/// methods return one. The type is kept so that code which names it still
+/// compiles.
 #[derive(Debug)]
 pub struct ManagedDevice {
     /// Device identifier.
@@ -155,9 +160,6 @@ pub struct ManagedDevice {
     /// The connected device (if connected).
     /// Wrapped in Arc to allow concurrent access without holding the manager lock.
     device: Option<Arc<Device>>,
-    /// Whether a connection attempt is currently in progress.
-    /// This prevents race conditions where multiple tasks try to connect simultaneously.
-    connecting: AtomicBool,
     /// Whether auto-reconnect is enabled.
     pub auto_reconnect: bool,
     /// Last known reading.
@@ -182,7 +184,6 @@ impl ManagedDevice {
             name: None,
             device_type: None,
             device: None,
-            connecting: AtomicBool::new(false),
             auto_reconnect: true,
             last_reading: None,
             info: None,
@@ -355,81 +356,86 @@ impl ManagerConfig {
     }
 }
 
-/// Manager for multiple Aranet devices.
-pub struct DeviceManager {
-    /// Map of device ID to managed device.
-    devices: RwLock<HashMap<String, ManagedDevice>>,
-    /// Event dispatcher.
-    events: EventDispatcher,
-    /// Manager configuration.
-    config: ManagerConfig,
+/// A managed device's state inside `ManagerCore`.
+struct Entry<L> {
+    name: Option<String>,
+    device_type: Option<DeviceType>,
+    info: Option<DeviceInfo>,
+    last_reading: Option<CurrentReading>,
+    priority: DevicePriority,
+    #[expect(
+        dead_code,
+        reason = "read by the health monitor's per-device backoff (Phase 3a Task 14)"
+    )]
+    reconnect_options: ReconnectOptions,
+    auto_reconnect: bool,
+    /// Consecutive failed health-monitor reconnects.
+    failures: u32,
+    /// The connection, if connected.
+    link: Option<Arc<L>>,
+    /// Whether a connection attempt is currently in progress.
+    connecting: AtomicBool,
 }
 
-impl DeviceManager {
-    /// Create a new device manager.
-    pub fn new() -> Self {
-        Self::with_config(ManagerConfig::default())
+impl<L> Entry<L> {
+    fn new(reconnect_options: ReconnectOptions, priority: DevicePriority) -> Self {
+        Self {
+            name: None,
+            device_type: None,
+            info: None,
+            last_reading: None,
+            priority,
+            reconnect_options,
+            auto_reconnect: true,
+            failures: 0,
+            link: None,
+            connecting: AtomicBool::new(false),
+        }
     }
 
-    /// Create a manager with custom event capacity.
-    pub fn with_event_capacity(capacity: usize) -> Self {
-        Self::with_config(ManagerConfig {
-            event_capacity: capacity,
-            ..Default::default()
-        })
+    fn record_success(&mut self) {
+        self.failures = 0;
     }
 
-    /// Create a manager with full configuration.
-    pub fn with_config(config: ManagerConfig) -> Self {
+    fn record_failure(&mut self) {
+        self.failures += 1;
+    }
+}
+
+/// What the lifecycle tests can see of an entry.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EntrySnapshot {
+    pub(crate) has_link: bool,
+    pub(crate) failures: u32,
+}
+
+/// The device manager's logic, generic over the connection type so that the
+/// lifecycle tests can run it on `test_support::FakeRadio`. `DeviceManager` is
+/// this over `Device`.
+pub(crate) struct ManagerCore<L: SensorLink> {
+    devices: RwLock<HashMap<String, Entry<L>>>,
+    events: EventDispatcher,
+    config: ManagerConfig,
+    connect: ConnectFn<L>,
+}
+
+impl<L: SensorLink> ManagerCore<L> {
+    pub(crate) fn new(config: ManagerConfig, connect: ConnectFn<L>) -> Self {
         Self {
             devices: RwLock::new(HashMap::new()),
             events: EventDispatcher::new(config.event_capacity),
             config,
+            connect,
         }
     }
 
-    /// Get the event dispatcher for subscribing to events.
-    pub fn events(&self) -> &EventDispatcher {
-        &self.events
-    }
-
-    /// Get the manager configuration.
-    pub fn config(&self) -> &ManagerConfig {
-        &self.config
-    }
-
-    /// Scan for available devices.
-    pub async fn scan(&self) -> Result<Vec<DiscoveredDevice>> {
-        scan_with_options(self.config.scan_options.clone()).await
-    }
-
-    /// Scan with custom options.
-    pub async fn scan_with_options(&self, options: ScanOptions) -> Result<Vec<DiscoveredDevice>> {
-        let devices = scan_with_options(options).await?;
-
-        // Emit discovery events
-        for device in &devices {
-            self.events.send(DeviceEvent::Discovered {
-                device: DeviceId {
-                    id: device.identifier.clone(),
-                    name: device.name.clone(),
-                    device_type: device.device_type,
-                },
-                rssi: device.rssi,
-            });
-        }
-
-        Ok(devices)
-    }
-
-    /// Add a device to the manager by identifier.
-    pub async fn add_device(&self, identifier: &str) -> Result<()> {
+    pub(crate) async fn add_device(&self, identifier: &str) -> Result<()> {
         self.add_device_with_options(identifier, self.config.default_reconnect_options.clone())
             .await
     }
 
-    /// Add a device with custom reconnect options.
-    pub async fn add_device_with_options(
+    pub(crate) async fn add_device_with_options(
         &self,
         identifier: &str,
         reconnect_options: ReconnectOptions,
@@ -440,31 +446,18 @@ impl DeviceManager {
             return Ok(()); // Already exists
         }
 
-        let managed = ManagedDevice::with_reconnect_options(identifier, reconnect_options);
-        devices.insert(identifier.to_string(), managed);
+        devices.insert(
+            identifier.to_string(),
+            Entry::new(reconnect_options, DevicePriority::default()),
+        );
 
         info!("Added device to manager: {}", identifier);
         Ok(())
     }
 
-    /// Connect to a device.
-    ///
-    /// This method performs an atomic connect-or-skip operation:
-    /// - If the device doesn't exist, it's added and connected
-    /// - If the device exists but is not connected, it's connected
-    /// - If the device is already connected, this is a no-op
-    ///
-    /// # Connection Limits
-    ///
-    /// If `max_concurrent_connections` is set in the config and would be exceeded,
-    /// this method returns an error. Use `connected_count()` to check the current
-    /// number of connections before calling this method.
-    ///
-    /// The lock is held during the device entry update to prevent race conditions,
-    /// but released during the actual BLE connection to avoid blocking other operations.
-    pub async fn connect(&self, identifier: &str) -> Result<()> {
+    pub(crate) async fn connect(&self, identifier: &str) -> Result<()> {
         // Check if we need to connect (atomically check and mark as pending)
-        let reconnect_options = {
+        {
             let mut devices = self.devices.write().await;
 
             // Check connection limit before doing anything else
@@ -472,11 +465,13 @@ impl DeviceManager {
                 // Check if already connected (doesn't count toward limit)
                 let already_connected = devices
                     .get(identifier)
-                    .map(|m| m.has_device())
-                    .unwrap_or(false);
+                    .is_some_and(|entry| entry.link.is_some());
 
                 if !already_connected {
-                    let current_connections = devices.values().filter(|m| m.has_device()).count();
+                    let current_connections = devices
+                        .values()
+                        .filter(|entry| entry.link.is_some())
+                        .count();
                     if current_connections >= self.config.max_concurrent_connections {
                         warn!(
                             "Connection limit reached ({}/{}), cannot connect to {}",
@@ -484,7 +479,7 @@ impl DeviceManager {
                         );
                         return Err(Error::connection_failed(
                             Some(identifier.to_string()),
-                            crate::error::ConnectionFailureReason::Other(format!(
+                            ConnectionFailureReason::Other(format!(
                                 "Connection limit reached ({}/{})",
                                 current_connections, self.config.max_concurrent_connections
                             )),
@@ -493,17 +488,17 @@ impl DeviceManager {
                 }
             }
 
-            // Get or create the managed device entry
-            let managed = devices.entry(identifier.to_string()).or_insert_with(|| {
+            // Get or create the entry
+            let entry = devices.entry(identifier.to_string()).or_insert_with(|| {
                 info!("Adding device to manager: {}", identifier);
-                ManagedDevice::with_reconnect_options(
-                    identifier,
+                Entry::new(
                     self.config.default_reconnect_options.clone(),
+                    DevicePriority::default(),
                 )
             });
 
             // If already connected, nothing to do
-            if managed.device.is_some() {
+            if entry.link.is_some() {
                 debug!("Device {} already has a connection handle", identifier);
                 return Ok(());
             }
@@ -514,7 +509,7 @@ impl DeviceManager {
             // NOTE: The caller should verify `is_connected()` afterward if the
             // connection must be established before proceeding, since this early
             // return does not wait for the in-flight connection attempt to finish.
-            if managed
+            if entry
                 .connecting
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
@@ -525,66 +520,58 @@ impl DeviceManager {
                 );
                 return Ok(());
             }
-
-            // Clone the reconnect options for use after releasing lock
-            managed.reconnect_options.clone()
-        };
+        }
         // Lock is released here - other tasks can now access the device map
 
         // Perform BLE connection (this may take time)
-        // Use the cloned reconnect_options if needed in the future
-        let _ = reconnect_options;
-        let connect_result = Device::connect(identifier).await;
-
-        // Handle connection result
-        let device = match connect_result {
-            Ok(d) => Arc::new(d),
+        let link = match (self.connect)(identifier).await {
+            Ok(link) => Arc::new(link),
             Err(e) => {
                 // Clear the connecting flag on failure
                 let devices = self.devices.read().await;
-                if let Some(managed) = devices.get(identifier) {
-                    managed.connecting.store(false, Ordering::SeqCst);
+                if let Some(entry) = devices.get(identifier) {
+                    entry.connecting.store(false, Ordering::SeqCst);
                 }
                 return Err(e);
             }
         };
 
-        let info = device.read_device_info().await.ok();
-        let device_type = device.device_type();
-        let name = device.name().map(|s| s.to_string());
+        let info = link.read_device_info().await.ok();
+        let device_type = link.device_type();
+        let name = link.name().map(|s| s.to_string());
 
-        // Update the managed device atomically
+        // Update the entry atomically
         {
             let mut devices = self.devices.write().await;
-            if let Some(managed) = devices.get_mut(identifier) {
+            if let Some(entry) = devices.get_mut(identifier) {
                 // Clear the connecting flag
-                managed.connecting.store(false, Ordering::SeqCst);
+                entry.connecting.store(false, Ordering::SeqCst);
 
                 // Check if another task connected while we were connecting
                 // (shouldn't happen with the atomic flag, but be defensive)
-                if managed.device.is_some() {
+                if entry.link.is_some() {
                     // Another task beat us to it - disconnect our connection
                     debug!(
                         "Another task connected {} while we were connecting, discarding our connection",
                         identifier
                     );
                     drop(devices); // Release lock before async disconnect
-                    let _ = device.disconnect().await;
+                    let _ = link.disconnect().await;
                     return Ok(());
                 }
 
-                managed.device = Some(device);
-                managed.info = info.clone();
-                managed.device_type = device_type;
-                managed.name = name.clone();
+                entry.link = Some(link);
+                entry.info = info.clone();
+                entry.device_type = device_type;
+                entry.name = name.clone();
             } else {
                 // Device was removed while we were connecting - still connect but add it back
-                let mut managed = ManagedDevice::new(identifier);
-                managed.device = Some(device);
-                managed.info = info.clone();
-                managed.device_type = device_type;
-                managed.name = name.clone();
-                devices.insert(identifier.to_string(), managed);
+                let mut entry = Entry::new(ReconnectOptions::default(), DevicePriority::default());
+                entry.link = Some(link);
+                entry.info = info.clone();
+                entry.device_type = device_type;
+                entry.name = name.clone();
+                devices.insert(identifier.to_string(), entry);
             }
         }
 
@@ -602,20 +589,17 @@ impl DeviceManager {
         Ok(())
     }
 
-    /// Disconnect from a device.
-    pub async fn disconnect(&self, identifier: &str) -> Result<()> {
-        let device_arc = {
+    pub(crate) async fn disconnect(&self, identifier: &str) -> Result<()> {
+        let link = {
             let mut devices = self.devices.write().await;
-            if let Some(managed) = devices.get_mut(identifier) {
-                managed.device.take()
-            } else {
-                None
-            }
+            devices
+                .get_mut(identifier)
+                .and_then(|entry| entry.link.take())
         };
 
         // Disconnect outside the lock
-        if let Some(device) = device_arc {
-            device.disconnect().await?;
+        if let Some(link) = link {
+            link.disconnect().await?;
             self.events.send(DeviceEvent::Disconnected {
                 device: DeviceId::new(identifier),
                 reason: DisconnectReason::UserRequested,
@@ -625,59 +609,44 @@ impl DeviceManager {
         Ok(())
     }
 
-    /// Remove a device from the manager.
-    pub async fn remove_device(&self, identifier: &str) -> Result<()> {
+    pub(crate) async fn remove_device(&self, identifier: &str) -> Result<()> {
         self.disconnect(identifier).await?;
         self.devices.write().await.remove(identifier);
         info!("Removed device from manager: {}", identifier);
         Ok(())
     }
 
-    /// Get a list of all managed device IDs.
-    pub async fn device_ids(&self) -> Vec<String> {
+    pub(crate) async fn device_ids(&self) -> Vec<String> {
         self.devices.read().await.keys().cloned().collect()
     }
 
-    /// Get the number of managed devices.
-    pub async fn device_count(&self) -> usize {
+    pub(crate) async fn device_count(&self) -> usize {
         self.devices.read().await.len()
     }
 
-    /// Get the number of connected devices (fast, doesn't query BLE).
-    ///
-    /// This returns the number of devices that have an active device handle,
-    /// without querying the BLE stack. Use `connected_count_verified` for
-    /// an accurate count that queries each device.
-    pub async fn connected_count(&self) -> usize {
+    pub(crate) async fn connected_count(&self) -> usize {
         let devices = self.devices.read().await;
-        devices.values().filter(|m| m.has_device()).count()
+        devices
+            .values()
+            .filter(|entry| entry.link.is_some())
+            .count()
     }
 
-    /// Check if a new connection can be made without exceeding the limit.
-    ///
-    /// Returns `true` if another connection can be made, `false` if at limit.
-    /// Always returns `true` if `max_concurrent_connections` is 0 (unlimited).
-    pub async fn can_connect(&self) -> bool {
+    pub(crate) async fn can_connect(&self) -> bool {
         if self.config.max_concurrent_connections == 0 {
             return true;
         }
         self.connected_count().await < self.config.max_concurrent_connections
     }
 
-    /// Get the connection limit status.
-    ///
-    /// Returns (current_connections, max_connections). If max is 0, there is no limit.
-    pub async fn connection_status(&self) -> (usize, usize) {
+    pub(crate) async fn connection_status(&self) -> (usize, usize) {
         (
             self.connected_count().await,
             self.config.max_concurrent_connections,
         )
     }
 
-    /// Get the number of available connection slots.
-    ///
-    /// Returns `None` if there is no connection limit (unlimited).
-    pub async fn available_connections(&self) -> Option<usize> {
+    pub(crate) async fn available_connections(&self) -> Option<usize> {
         if self.config.max_concurrent_connections == 0 {
             return None;
         }
@@ -689,38 +658,35 @@ impl DeviceManager {
         )
     }
 
-    /// Get the number of connected devices (verified via BLE).
-    ///
-    /// This method queries each device to verify its connection status.
-    /// The lock is released before making BLE calls to avoid contention.
-    pub async fn connected_count_verified(&self) -> usize {
-        // Collect device handles while holding the lock briefly
-        let device_arcs: Vec<Arc<Device>> = {
+    pub(crate) async fn connected_count_verified(&self) -> usize {
+        // Collect links while holding the lock briefly
+        let links: Vec<Arc<L>> = {
             let devices = self.devices.read().await;
-            devices.values().filter_map(|m| m.device_arc()).collect()
+            devices
+                .values()
+                .filter_map(|entry| entry.link.clone())
+                .collect()
         };
         // Lock is released here
 
         // Check connection status in parallel
-        let futures = device_arcs.iter().map(|d| d.is_connected());
-        let results = join_all(futures).await;
+        let results = join_all(links.iter().map(|link| link.is_connected())).await;
 
         results.into_iter().filter(|&connected| connected).count()
     }
 
-    /// Read current values from a specific device.
-    pub async fn read_current(&self, identifier: &str) -> Result<CurrentReading> {
-        // Get device Arc while holding the lock briefly
-        let device = {
+    pub(crate) async fn read_current(&self, identifier: &str) -> Result<CurrentReading> {
+        // Get the link while holding the lock briefly
+        let link = {
             let devices = self.devices.read().await;
-            let managed = devices
+            let entry = devices
                 .get(identifier)
                 .ok_or_else(|| Error::device_not_found(identifier))?;
-            managed.device_arc().ok_or(Error::NotConnected)?
+            entry.link.clone().ok_or(Error::NotConnected)?
         };
         // Lock is released here
 
-        let reading = device.read_current().await?;
+        let reading = link.read_current().await?;
 
         // Emit reading event
         self.events.send(DeviceEvent::Reading {
@@ -731,38 +697,29 @@ impl DeviceManager {
         // Update cached reading
         {
             let mut devices = self.devices.write().await;
-            if let Some(managed) = devices.get_mut(identifier) {
-                managed.last_reading = Some(reading);
+            if let Some(entry) = devices.get_mut(identifier) {
+                entry.last_reading = Some(reading);
             }
         }
 
         Ok(reading)
     }
 
-    /// Read current values from all connected devices (in parallel).
-    ///
-    /// This method releases the lock before performing async BLE operations,
-    /// allowing other tasks to add/remove devices while reads are in progress.
-    /// All reads are performed in parallel for maximum performance.
-    pub async fn read_all(&self) -> HashMap<String, Result<CurrentReading>> {
-        // Collect device handles while holding the lock briefly
-        let devices_to_read: Vec<(String, Arc<Device>)> = {
+    pub(crate) async fn read_all(&self) -> HashMap<String, Result<CurrentReading>> {
+        // Collect links while holding the lock briefly
+        let links: Vec<(String, Arc<L>)> = {
             let devices = self.devices.read().await;
             devices
                 .iter()
-                .filter_map(|(id, managed)| managed.device_arc().map(|d| (id.clone(), d)))
+                .filter_map(|(id, entry)| entry.link.clone().map(|link| (id.clone(), link)))
                 .collect()
         };
         // Lock is released here
 
         // Perform all reads in parallel
-        let read_futures = devices_to_read.iter().map(|(id, device)| {
-            let id = id.clone();
-            let device = Arc::clone(device);
-            async move {
-                let result = device.read_current().await;
-                (id, result)
-            }
+        let read_futures = links.into_iter().map(|(id, link)| async move {
+            let result = link.read_current().await;
+            (id, result)
         });
 
         let read_results: Vec<(String, Result<CurrentReading>)> = join_all(read_futures).await;
@@ -782,9 +739,9 @@ impl DeviceManager {
             let mut devices = self.devices.write().await;
             for (id, result) in &read_results {
                 if let Ok(reading) = result
-                    && let Some(managed) = devices.get_mut(id)
+                    && let Some(entry) = devices.get_mut(id)
                 {
-                    managed.last_reading = Some(*reading);
+                    entry.last_reading = Some(*reading);
                 }
             }
         }
@@ -792,46 +749,33 @@ impl DeviceManager {
         read_results.into_iter().collect()
     }
 
-    /// Connect to all known devices (in parallel).
-    ///
-    /// Returns a map of device IDs to connection results.
-    pub async fn connect_all(&self) -> HashMap<String, Result<()>> {
+    pub(crate) async fn connect_all(&self) -> HashMap<String, Result<()>> {
         let ids: Vec<_> = self.devices.read().await.keys().cloned().collect();
 
         // Note: We can't fully parallelize connect because it modifies state,
         // but we can at least attempt connections concurrently
-        let connect_futures = ids.iter().map(|id| {
-            let id = id.clone();
-            async move {
-                let result = self.connect(&id).await;
-                (id, result)
-            }
+        let connect_futures = ids.into_iter().map(|id| async move {
+            let result = self.connect(&id).await;
+            (id, result)
         });
 
         join_all(connect_futures).await.into_iter().collect()
     }
 
-    /// Disconnect from all devices (in parallel).
-    ///
-    /// Returns a map of device IDs to disconnection results.
-    pub async fn disconnect_all(&self) -> HashMap<String, Result<()>> {
-        // Collect all device arcs first
-        let devices_to_disconnect: Vec<(String, Arc<Device>)> = {
+    pub(crate) async fn disconnect_all(&self) -> HashMap<String, Result<()>> {
+        // Collect all links first
+        let links: Vec<(String, Arc<L>)> = {
             let mut devices = self.devices.write().await;
             devices
                 .iter_mut()
-                .filter_map(|(id, managed)| managed.device.take().map(|d| (id.clone(), d)))
+                .filter_map(|(id, entry)| entry.link.take().map(|link| (id.clone(), link)))
                 .collect()
         };
 
         // Disconnect all in parallel
-        let disconnect_futures = devices_to_disconnect.iter().map(|(id, device)| {
-            let id = id.clone();
-            let device = Arc::clone(device);
-            async move {
-                let result = device.disconnect().await;
-                (id, result)
-            }
+        let disconnect_futures = links.into_iter().map(|(id, link)| async move {
+            let result = link.disconnect().await;
+            (id, result)
         });
 
         let results: Vec<(String, Result<()>)> = join_all(disconnect_futures).await;
@@ -849,6 +793,475 @@ impl DeviceManager {
         results.into_iter().collect()
     }
 
+    pub(crate) fn try_is_connected(&self, identifier: &str) -> Option<bool> {
+        // Try to acquire the lock without blocking
+        match self.devices.try_read() {
+            Ok(devices) => Some(
+                devices
+                    .get(identifier)
+                    .is_some_and(|entry| entry.link.is_some()),
+            ),
+            Err(_) => None, // Lock was held, couldn't check
+        }
+    }
+
+    pub(crate) async fn is_connected(&self, identifier: &str) -> bool {
+        let link = {
+            let devices = self.devices.read().await;
+            devices.get(identifier).and_then(|entry| entry.link.clone())
+        };
+
+        if let Some(link) = link {
+            link.is_connected().await
+        } else {
+            false
+        }
+    }
+
+    pub(crate) async fn get_device_info(&self, identifier: &str) -> Option<DeviceInfo> {
+        let devices = self.devices.read().await;
+        devices.get(identifier).and_then(|entry| entry.info.clone())
+    }
+
+    pub(crate) async fn get_last_reading(&self, identifier: &str) -> Option<CurrentReading> {
+        let devices = self.devices.read().await;
+        devices.get(identifier).and_then(|entry| entry.last_reading)
+    }
+
+    pub(crate) fn spawn_health_monitor(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // Initialize adaptive interval if enabled
+            let mut adaptive = if self.config.use_adaptive_interval {
+                Some(AdaptiveInterval::new(
+                    self.config.health_check_interval,
+                    self.config.min_health_check_interval,
+                    self.config.max_health_check_interval,
+                ))
+            } else {
+                None
+            };
+
+            loop {
+                // Get current interval
+                let current_interval = adaptive
+                    .as_ref()
+                    .map(|a| a.current())
+                    .unwrap_or(self.config.health_check_interval);
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("Health monitor cancelled, shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(current_interval) => {
+                        let mut any_failures = false;
+                        let mut any_successes = false;
+
+                        // Get devices that need checking
+                        let devices_to_check: Vec<(String, Option<Arc<L>>, bool, DevicePriority)> = {
+                            let devices = self.devices.read().await;
+                            devices
+                                .iter()
+                                .map(|(id, entry)| {
+                                    (
+                                        id.clone(),
+                                        entry.link.clone(),
+                                        entry.auto_reconnect,
+                                        entry.priority,
+                                    )
+                                })
+                                .collect()
+                        };
+
+                        // Sort by priority (higher priority checked first)
+                        let mut sorted_devices = devices_to_check;
+                        sorted_devices.sort_by_key(|d| std::cmp::Reverse(d.3));
+
+                        for (id, link, auto_reconnect, _priority) in sorted_devices {
+                            let should_reconnect = match link {
+                                Some(link) => {
+                                    // Use connection validation if enabled
+                                    if self.config.use_connection_validation {
+                                        !link.is_alive().await
+                                    } else {
+                                        !link.is_connected().await
+                                    }
+                                }
+                                None => true,
+                            };
+
+                            if should_reconnect && auto_reconnect {
+                                debug!("Health monitor: attempting reconnect for {}", id);
+                                any_failures = true;
+
+                                match self.connect(&id).await {
+                                    Ok(()) => {
+                                        any_successes = true;
+                                        // Update success in the entry
+                                        if let Some(entry) = self.devices.write().await.get_mut(&id) {
+                                            entry.record_success();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Health monitor: reconnect failed for {}: {}", id, e);
+                                        // Update failure in the entry
+                                        if let Some(entry) = self.devices.write().await.get_mut(&id) {
+                                            entry.record_failure();
+                                        }
+                                    }
+                                }
+                            } else if !should_reconnect {
+                                any_successes = true;
+                            }
+                        }
+
+                        // Update adaptive interval
+                        if let Some(ref mut adaptive) = adaptive {
+                            if any_failures && !any_successes {
+                                adaptive.on_failure();
+                            } else if any_successes && !any_failures {
+                                adaptive.on_success();
+                            }
+                            // Mixed results: don't change interval
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    pub(crate) async fn add_device_with_priority(
+        &self,
+        identifier: &str,
+        priority: DevicePriority,
+    ) -> Result<()> {
+        let mut devices = self.devices.write().await;
+
+        if let Some(entry) = devices.get_mut(identifier) {
+            // Update priority if device already exists
+            entry.priority = priority;
+            return Ok(());
+        }
+
+        devices.insert(
+            identifier.to_string(),
+            Entry::new(self.config.default_reconnect_options.clone(), priority),
+        );
+
+        info!(
+            "Added device to manager with priority {:?}: {}",
+            priority, identifier
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn lowest_priority_connected(&self) -> Option<String> {
+        let devices = self.devices.read().await;
+        devices
+            .iter()
+            .filter(|(_, entry)| entry.link.is_some() && entry.priority != DevicePriority::Critical)
+            .min_by_key(|(_, entry)| entry.priority)
+            .map(|(id, _)| id.clone())
+    }
+
+    pub(crate) async fn evict_lowest_priority(&self) -> Result<bool> {
+        if let Some(id) = self.lowest_priority_connected().await {
+            info!("Evicting lowest priority device: {}", id);
+            self.disconnect(&id).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub(crate) fn spawn_hybrid_monitor(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+        options: PassiveMonitorOptions,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            info!("Starting hybrid monitor (passive + active)");
+
+            // Create passive monitor
+            let passive_monitor = Arc::new(PassiveMonitor::new(options));
+            let mut passive_rx = passive_monitor.subscribe();
+
+            // Start passive monitoring
+            let passive_cancel = cancel.clone();
+            let _passive_handle = passive_monitor.start(passive_cancel);
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("Hybrid monitor cancelled");
+                        break;
+                    }
+                    result = passive_rx.recv() => {
+                        match result {
+                            Ok(passive_reading) => {
+                                // Convert passive reading to CurrentReading and emit event
+                                if let Some(reading) = passive_reading_to_current(&passive_reading) {
+                                    // Update last reading in the entry if it exists
+                                    if let Some(entry) = self.devices.write().await.get_mut(&passive_reading.device_id) {
+                                        entry.last_reading = Some(reading);
+                                        entry.record_success();
+                                    }
+
+                                    // Emit reading event
+                                    self.events.send(DeviceEvent::Reading {
+                                        device: DeviceId {
+                                            id: passive_reading.device_id.clone(),
+                                            name: passive_reading.device_name.clone(),
+                                            device_type: Some(passive_reading.data.device_type),
+                                        },
+                                        reading,
+                                    });
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("Hybrid monitor lagged {} messages", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                info!("Passive monitor channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    pub(crate) async fn read_hybrid(
+        &self,
+        identifier: &str,
+        max_passive_age: Option<Duration>,
+    ) -> Result<CurrentReading> {
+        let max_age = max_passive_age.unwrap_or(Duration::from_secs(60));
+
+        // Check if we have a recent cached reading
+        {
+            let devices = self.devices.read().await;
+            if let Some(entry) = devices.get(identifier)
+                && let Some(reading) = entry.last_reading
+            {
+                // Check if the reading has a captured_at timestamp
+                if let Some(captured) = reading.captured_at {
+                    let age = time::OffsetDateTime::now_utc() - captured;
+                    if age
+                        < time::Duration::try_from(max_age).unwrap_or(time::Duration::seconds(60))
+                    {
+                        debug!("Using cached passive reading for {}", identifier);
+                        return Ok(reading);
+                    }
+                }
+            }
+        }
+
+        // No recent passive reading, use active connection
+        debug!(
+            "No recent passive reading, using active connection for {}",
+            identifier
+        );
+        self.read_current(identifier).await
+    }
+
+    /// A copy of the entry's lifecycle state, for the lifecycle tests.
+    #[cfg(test)]
+    pub(crate) async fn snapshot(&self, identifier: &str) -> Option<EntrySnapshot> {
+        let devices = self.devices.read().await;
+        devices.get(identifier).map(|entry| EntrySnapshot {
+            has_link: entry.link.is_some(),
+            failures: entry.failures,
+        })
+    }
+}
+
+/// Manager for multiple Aranet devices.
+pub struct DeviceManager {
+    core: Arc<ManagerCore<Device>>,
+}
+
+impl DeviceManager {
+    /// Create a new device manager.
+    pub fn new() -> Self {
+        Self::with_config(ManagerConfig::default())
+    }
+
+    /// Create a manager with custom event capacity.
+    pub fn with_event_capacity(capacity: usize) -> Self {
+        Self::with_config(ManagerConfig {
+            event_capacity: capacity,
+            ..Default::default()
+        })
+    }
+
+    /// Create a manager with full configuration.
+    pub fn with_config(config: ManagerConfig) -> Self {
+        Self {
+            core: Arc::new(ManagerCore::new(config, ble_connector())),
+        }
+    }
+
+    /// Get the event dispatcher for subscribing to events.
+    pub fn events(&self) -> &EventDispatcher {
+        &self.core.events
+    }
+
+    /// Get the manager configuration.
+    pub fn config(&self) -> &ManagerConfig {
+        &self.core.config
+    }
+
+    /// Scan for available devices.
+    pub async fn scan(&self) -> Result<Vec<DiscoveredDevice>> {
+        scan_with_options(self.core.config.scan_options.clone()).await
+    }
+
+    /// Scan with custom options.
+    pub async fn scan_with_options(&self, options: ScanOptions) -> Result<Vec<DiscoveredDevice>> {
+        let devices = scan_with_options(options).await?;
+
+        // Emit discovery events
+        for device in &devices {
+            self.core.events.send(DeviceEvent::Discovered {
+                device: DeviceId {
+                    id: device.identifier.clone(),
+                    name: device.name.clone(),
+                    device_type: device.device_type,
+                },
+                rssi: device.rssi,
+            });
+        }
+
+        Ok(devices)
+    }
+
+    /// Add a device to the manager by identifier.
+    pub async fn add_device(&self, identifier: &str) -> Result<()> {
+        self.core.add_device(identifier).await
+    }
+
+    /// Add a device with custom reconnect options.
+    pub async fn add_device_with_options(
+        &self,
+        identifier: &str,
+        reconnect_options: ReconnectOptions,
+    ) -> Result<()> {
+        self.core
+            .add_device_with_options(identifier, reconnect_options)
+            .await
+    }
+
+    /// Connect to a device.
+    ///
+    /// This method performs an atomic connect-or-skip operation:
+    /// - If the device doesn't exist, it's added and connected
+    /// - If the device exists but is not connected, it's connected
+    /// - If the device is already connected, this is a no-op
+    ///
+    /// # Connection Limits
+    ///
+    /// If `max_concurrent_connections` is set in the config and would be exceeded,
+    /// this method returns an error. Use `connected_count()` to check the current
+    /// number of connections before calling this method.
+    ///
+    /// The lock is held during the device entry update to prevent race conditions,
+    /// but released during the actual BLE connection to avoid blocking other operations.
+    pub async fn connect(&self, identifier: &str) -> Result<()> {
+        self.core.connect(identifier).await
+    }
+
+    /// Disconnect from a device.
+    pub async fn disconnect(&self, identifier: &str) -> Result<()> {
+        self.core.disconnect(identifier).await
+    }
+
+    /// Remove a device from the manager.
+    pub async fn remove_device(&self, identifier: &str) -> Result<()> {
+        self.core.remove_device(identifier).await
+    }
+
+    /// Get a list of all managed device IDs.
+    pub async fn device_ids(&self) -> Vec<String> {
+        self.core.device_ids().await
+    }
+
+    /// Get the number of managed devices.
+    pub async fn device_count(&self) -> usize {
+        self.core.device_count().await
+    }
+
+    /// Get the number of connected devices (fast, doesn't query BLE).
+    ///
+    /// This returns the number of devices that have an active device handle,
+    /// without querying the BLE stack. Use `connected_count_verified` for
+    /// an accurate count that queries each device.
+    pub async fn connected_count(&self) -> usize {
+        self.core.connected_count().await
+    }
+
+    /// Check if a new connection can be made without exceeding the limit.
+    ///
+    /// Returns `true` if another connection can be made, `false` if at limit.
+    /// Always returns `true` if `max_concurrent_connections` is 0 (unlimited).
+    pub async fn can_connect(&self) -> bool {
+        self.core.can_connect().await
+    }
+
+    /// Get the connection limit status.
+    ///
+    /// Returns (current_connections, max_connections). If max is 0, there is no limit.
+    pub async fn connection_status(&self) -> (usize, usize) {
+        self.core.connection_status().await
+    }
+
+    /// Get the number of available connection slots.
+    ///
+    /// Returns `None` if there is no connection limit (unlimited).
+    pub async fn available_connections(&self) -> Option<usize> {
+        self.core.available_connections().await
+    }
+
+    /// Get the number of connected devices (verified via BLE).
+    ///
+    /// This method queries each device to verify its connection status.
+    /// The lock is released before making BLE calls to avoid contention.
+    pub async fn connected_count_verified(&self) -> usize {
+        self.core.connected_count_verified().await
+    }
+
+    /// Read current values from a specific device.
+    pub async fn read_current(&self, identifier: &str) -> Result<CurrentReading> {
+        self.core.read_current(identifier).await
+    }
+
+    /// Read current values from all connected devices (in parallel).
+    ///
+    /// This method releases the lock before performing async BLE operations,
+    /// allowing other tasks to add/remove devices while reads are in progress.
+    /// All reads are performed in parallel for maximum performance.
+    pub async fn read_all(&self) -> HashMap<String, Result<CurrentReading>> {
+        self.core.read_all().await
+    }
+
+    /// Connect to all known devices (in parallel).
+    ///
+    /// Returns a map of device IDs to connection results.
+    pub async fn connect_all(&self) -> HashMap<String, Result<()>> {
+        self.core.connect_all().await
+    }
+
+    /// Disconnect from all devices (in parallel).
+    ///
+    /// Returns a map of device IDs to disconnection results.
+    pub async fn disconnect_all(&self) -> HashMap<String, Result<()>> {
+        self.core.disconnect_all().await
+    }
+
     /// Check if a specific device is connected (fast, doesn't query BLE).
     ///
     /// This method attempts to check if a device has an active connection handle
@@ -859,44 +1272,24 @@ impl DeviceManager {
     /// BLE connection is still alive. Use [`is_connected`](Self::is_connected) for
     /// a verified check.
     pub fn try_is_connected(&self, identifier: &str) -> Option<bool> {
-        // Try to acquire the lock without blocking
-        match self.devices.try_read() {
-            Ok(devices) => Some(
-                devices
-                    .get(identifier)
-                    .map(|m| m.has_device())
-                    .unwrap_or(false),
-            ),
-            Err(_) => None, // Lock was held, couldn't check
-        }
+        self.core.try_is_connected(identifier)
     }
 
     /// Check if a specific device is connected (verified via BLE).
     ///
     /// The lock is released before making the BLE call.
     pub async fn is_connected(&self, identifier: &str) -> bool {
-        let device = {
-            let devices = self.devices.read().await;
-            devices.get(identifier).and_then(|m| m.device_arc())
-        };
-
-        if let Some(device) = device {
-            device.is_connected().await
-        } else {
-            false
-        }
+        self.core.is_connected(identifier).await
     }
 
     /// Get device info for a specific device.
     pub async fn get_device_info(&self, identifier: &str) -> Option<DeviceInfo> {
-        let devices = self.devices.read().await;
-        devices.get(identifier).and_then(|m| m.info.clone())
+        self.core.get_device_info(identifier).await
     }
 
     /// Get the last cached reading for a device.
     pub async fn get_last_reading(&self, identifier: &str) -> Option<CurrentReading> {
-        let devices = self.devices.read().await;
-        devices.get(identifier).and_then(|m| m.last_reading)
+        self.core.get_last_reading(identifier).await
     }
 
     /// Start a background health check task that monitors connection status.
@@ -937,107 +1330,7 @@ impl DeviceManager {
         self: &Arc<Self>,
         cancel_token: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        let manager = Arc::clone(self);
-
-        tokio::spawn(async move {
-            // Initialize adaptive interval if enabled
-            let mut adaptive = if manager.config.use_adaptive_interval {
-                Some(AdaptiveInterval::new(
-                    manager.config.health_check_interval,
-                    manager.config.min_health_check_interval,
-                    manager.config.max_health_check_interval,
-                ))
-            } else {
-                None
-            };
-
-            loop {
-                // Get current interval
-                let current_interval = adaptive
-                    .as_ref()
-                    .map(|a| a.current())
-                    .unwrap_or(manager.config.health_check_interval);
-
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        info!("Health monitor cancelled, shutting down");
-                        break;
-                    }
-                    _ = tokio::time::sleep(current_interval) => {
-                        let mut any_failures = false;
-                        let mut any_successes = false;
-
-                        // Get devices that need checking
-                        let devices_to_check: Vec<(String, Option<Arc<Device>>, bool, DevicePriority)> = {
-                            let devices = manager.devices.read().await;
-                            devices
-                                .iter()
-                                .map(|(id, m)| {
-                                    (
-                                        id.clone(),
-                                        m.device_arc(),
-                                        m.auto_reconnect,
-                                        m.priority,
-                                    )
-                                })
-                                .collect()
-                        };
-
-                        // Sort by priority (higher priority checked first)
-                        let mut sorted_devices = devices_to_check;
-                        sorted_devices.sort_by_key(|d| std::cmp::Reverse(d.3));
-
-                        for (id, device_opt, auto_reconnect, _priority) in sorted_devices {
-                            let should_reconnect = match device_opt {
-                                Some(device) => {
-                                    // Use connection validation if enabled
-                                    if manager.config.use_connection_validation {
-                                        !device.is_connection_alive().await
-                                    } else {
-                                        !device.is_connected().await
-                                    }
-                                }
-                                None => true,
-                            };
-
-                            if should_reconnect && auto_reconnect {
-                                debug!("Health monitor: attempting reconnect for {}", id);
-                                any_failures = true;
-
-                                match manager.connect(&id).await {
-                                    Ok(()) => {
-                                        any_successes = true;
-                                        // Update success in managed device
-                                        if let Some(m) = manager.devices.write().await.get_mut(&id) {
-                                            m.record_success();
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Health monitor: reconnect failed for {}: {}", id, e);
-                                        // Update failure in managed device
-                                        if let Some(m) = manager.devices.write().await.get_mut(&id) {
-                                            m.record_failure();
-                                        }
-                                    }
-                                }
-                            } else if !should_reconnect {
-                                any_successes = true;
-                            }
-                        }
-
-                        // Update adaptive interval
-                        if let Some(ref mut adaptive) = adaptive {
-                            if any_failures && !any_successes {
-                                adaptive.on_failure();
-                            } else if any_successes && !any_failures {
-                                adaptive.on_success();
-                            }
-                            // Mixed results: don't change interval
-                        }
-                    }
-                }
-            }
-        })
+        Arc::clone(&self.core).spawn_health_monitor(cancel_token)
     }
 
     /// Add a device with priority.
@@ -1046,51 +1339,23 @@ impl DeviceManager {
         identifier: &str,
         priority: DevicePriority,
     ) -> Result<()> {
-        let mut devices = self.devices.write().await;
-
-        if devices.contains_key(identifier) {
-            // Update priority if device already exists
-            if let Some(m) = devices.get_mut(identifier) {
-                m.priority = priority;
-            }
-            return Ok(());
-        }
-
-        let mut managed = ManagedDevice::new(identifier);
-        managed.priority = priority;
-        managed.reconnect_options = self.config.default_reconnect_options.clone();
-        devices.insert(identifier.to_string(), managed);
-
-        info!(
-            "Added device to manager with priority {:?}: {}",
-            priority, identifier
-        );
-        Ok(())
+        self.core
+            .add_device_with_priority(identifier, priority)
+            .await
     }
 
     /// Get the lowest priority connected device that could be disconnected.
     ///
     /// Returns None if no devices can be disconnected (all are Critical priority or not connected).
     pub async fn lowest_priority_connected(&self) -> Option<String> {
-        let devices = self.devices.read().await;
-        devices
-            .iter()
-            .filter(|(_, m)| m.has_device() && m.priority != DevicePriority::Critical)
-            .min_by_key(|(_, m)| m.priority)
-            .map(|(id, _)| id.clone())
+        self.core.lowest_priority_connected().await
     }
 
     /// Disconnect the lowest priority device to make room for a new connection.
     ///
     /// Returns Ok(true) if a device was disconnected, Ok(false) if no eligible device found.
     pub async fn evict_lowest_priority(&self) -> Result<bool> {
-        if let Some(id) = self.lowest_priority_connected().await {
-            info!("Evicting lowest priority device: {}", id);
-            self.disconnect(&id).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.core.evict_lowest_priority().await
     }
 
     /// Start hybrid monitoring using both passive (advertisement) and active connections.
@@ -1126,60 +1391,8 @@ impl DeviceManager {
         cancel_token: CancellationToken,
         passive_options: Option<PassiveMonitorOptions>,
     ) -> tokio::task::JoinHandle<()> {
-        let manager = Arc::clone(self);
-        let options = passive_options.unwrap_or_default();
-
-        tokio::spawn(async move {
-            info!("Starting hybrid monitor (passive + active)");
-
-            // Create passive monitor
-            let passive_monitor = Arc::new(PassiveMonitor::new(options));
-            let mut passive_rx = passive_monitor.subscribe();
-
-            // Start passive monitoring
-            let passive_cancel = cancel_token.clone();
-            let _passive_handle = passive_monitor.start(passive_cancel);
-
-            loop {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        info!("Hybrid monitor cancelled");
-                        break;
-                    }
-                    result = passive_rx.recv() => {
-                        match result {
-                            Ok(passive_reading) => {
-                                // Convert passive reading to CurrentReading and emit event
-                                if let Some(reading) = passive_reading_to_current(&passive_reading) {
-                                    // Update last reading in managed device if it exists
-                                    if let Some(m) = manager.devices.write().await.get_mut(&passive_reading.device_id) {
-                                        m.last_reading = Some(reading);
-                                        m.record_success();
-                                    }
-
-                                    // Emit reading event
-                                    manager.events.send(DeviceEvent::Reading {
-                                        device: DeviceId {
-                                            id: passive_reading.device_id.clone(),
-                                            name: passive_reading.device_name.clone(),
-                                            device_type: Some(passive_reading.data.device_type),
-                                        },
-                                        reading,
-                                    });
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                warn!("Hybrid monitor lagged {} messages", n);
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                info!("Passive monitor channel closed");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        })
+        Arc::clone(&self.core)
+            .spawn_hybrid_monitor(cancel_token, passive_options.unwrap_or_default())
     }
 
     /// Get a reading using hybrid approach: try passive first, fall back to active.
@@ -1196,33 +1409,7 @@ impl DeviceManager {
         identifier: &str,
         max_passive_age: Option<Duration>,
     ) -> Result<CurrentReading> {
-        let max_age = max_passive_age.unwrap_or(Duration::from_secs(60));
-
-        // Check if we have a recent cached reading
-        {
-            let devices = self.devices.read().await;
-            if let Some(managed) = devices.get(identifier)
-                && let Some(reading) = managed.last_reading
-            {
-                // Check if the reading has a captured_at timestamp
-                if let Some(captured) = reading.captured_at {
-                    let age = time::OffsetDateTime::now_utc() - captured;
-                    if age
-                        < time::Duration::try_from(max_age).unwrap_or(time::Duration::seconds(60))
-                    {
-                        debug!("Using cached passive reading for {}", identifier);
-                        return Ok(reading);
-                    }
-                }
-            }
-        }
-
-        // No recent passive reading, use active connection
-        debug!(
-            "No recent passive reading, using active connection for {}",
-            identifier
-        );
-        self.read_current(identifier).await
+        self.core.read_hybrid(identifier, max_passive_age).await
     }
 
     /// Check if a device supports passive monitoring (Smart Home enabled).
@@ -1339,5 +1526,69 @@ mod tests {
 
         // Events are only emitted for actual device operations
         assert_eq!(manager.events().receiver_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use super::{EntrySnapshot, ManagerConfig, ManagerCore};
+    use crate::test_support::{FakeConn, FakeRadio, within};
+
+    const TEST_LIMIT: Duration = Duration::from_secs(600);
+
+    fn core(radio: &FakeRadio, config: ManagerConfig) -> Arc<ManagerCore<FakeConn>> {
+        Arc::new(ManagerCore::new(config, radio.connector()))
+    }
+
+    /// Every sensor whose link is up must be held by the manager.
+    async fn assert_no_orphans(core: &ManagerCore<FakeConn>, radio: &FakeRadio) {
+        for id in radio.up_ids() {
+            assert!(
+                core.snapshot(&id).await.is_some_and(|entry| entry.has_link),
+                "{id} is connected but the manager holds no link for it: {:#?}",
+                radio.events()
+            );
+        }
+    }
+
+    /// Guard: a failed or cancelled connect gives its slot back.
+    #[tokio::test(start_paused = true)]
+    async fn failed_or_cancelled_connect_releases_its_slot() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default().with_max_connections(1));
+
+            radio.script_connects("A", [false]);
+            assert!(core.connect("A").await.is_err());
+            assert_eq!(core.available_connections().await, Some(1));
+
+            radio.set_connect_delay("B", Duration::from_secs(10));
+            assert!(
+                timeout(Duration::from_secs(1), core.connect("B"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(core.available_connections().await, Some(1));
+
+            core.connect("C").await.expect("C gets the free slot");
+            assert!(radio.link_up("C"));
+            assert_eq!(core.available_connections().await, Some(0));
+            assert_eq!(
+                core.snapshot("C").await,
+                Some(EntrySnapshot {
+                    has_link: true,
+                    failures: 0,
+                })
+            );
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
     }
 }
