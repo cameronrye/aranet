@@ -46,8 +46,9 @@ pub(crate) fn ble_connector() -> ConnectFn<Device> {
 }
 
 /// Disconnects `link` on a spawned task and awaits it, so it finishes even if
-/// the caller is dropped. `hold` (a connection slot, or `()`) is dropped only
-/// after the disconnect has finished.
+/// the caller is dropped. `hold` (what must stay held until the link is down,
+/// such as a connection slot or a share of a lock guard) is dropped only after
+/// the disconnect has finished.
 pub(crate) async fn release_link<L: SensorLink, H: Send + 'static>(
     link: Arc<L>,
     hold: H,
