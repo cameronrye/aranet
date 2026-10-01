@@ -558,6 +558,12 @@ impl<L: SensorLink> Drop for NewLink<L> {
     }
 }
 
+/// Awaits a disconnect or removal task. A task that panicked, or that was
+/// dropped when its runtime shut down, gives an `Error::Io`.
+async fn finished(task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    task.await.map_err(std::io::Error::from)?
+}
+
 /// What one health-monitor tick did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TickOutcome {
@@ -810,12 +816,29 @@ impl<L: SensorLink> ManagerCore<L> {
         Some(Arc::clone(&entry.op))
     }
 
-    pub(crate) async fn disconnect(&self, identifier: &str) -> Result<()> {
+    pub(crate) async fn disconnect(self: &Arc<Self>, identifier: &str) -> Result<()> {
         let Some(op) = self.withdraw(identifier).await else {
             return Ok(());
         };
-        let held = Arc::new(op.lock_owned().await);
-        self.disconnect_locked(identifier, &held).await
+        finished(self.spawn_disconnect(identifier, op)).await
+    }
+
+    /// Disconnects a withdrawn device (see `withdraw`) on a task, once its
+    /// `op` mutex is free. The health monitor leaves a withdrawn device alone,
+    /// so nothing else would close its link: the task finishes even if the
+    /// caller is dropped, for example while it waits for a connect or a
+    /// check of the device to end.
+    fn spawn_disconnect(
+        self: &Arc<Self>,
+        identifier: &str,
+        op: Arc<Mutex<()>>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let core = Arc::clone(self);
+        let identifier = identifier.to_owned();
+        tokio::spawn(async move {
+            let held = Arc::new(op.lock_owned().await);
+            core.disconnect_locked(&identifier, &held).await
+        })
     }
 
     /// Disconnects `identifier`'s link, if it has one, and returns the
@@ -855,24 +878,31 @@ impl<L: SensorLink> ManagerCore<L> {
         release_link(link, (slot, Arc::clone(held))).await
     }
 
-    pub(crate) async fn remove_device(&self, identifier: &str) -> Result<()> {
+    pub(crate) async fn remove_device(self: &Arc<Self>, identifier: &str) -> Result<()> {
         let Some(op) = self.withdraw(identifier).await else {
             return Ok(());
         };
-        let held = Arc::new(Arc::clone(&op).lock_owned().await);
-        // Not `self.disconnect`: the guard is not reentrant.
-        let result = self.disconnect_locked(identifier, &held).await;
-        // Removed even if closing the link failed: the link has left the
-        // manager, so a kept entry would have nothing left to close.
-        let mut devices = self.devices.write().await;
-        if devices
-            .get(identifier)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.op, &op))
-        {
-            devices.remove(identifier);
-            info!("Removed device from manager: {identifier}");
-        }
-        result
+        // On a task, as in `spawn_disconnect`, so that a dropped caller still
+        // removes the device it has withdrawn.
+        let core = Arc::clone(self);
+        let identifier = identifier.to_owned();
+        finished(tokio::spawn(async move {
+            let held = Arc::new(Arc::clone(&op).lock_owned().await);
+            // Not `disconnect`: the guard is not reentrant.
+            let result = core.disconnect_locked(&identifier, &held).await;
+            // Removed even if closing the link failed: the link has left the
+            // manager, so a kept entry would have nothing left to close.
+            let mut devices = core.devices.write().await;
+            if devices
+                .get(&identifier)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.op, &op))
+            {
+                devices.remove(&identifier);
+                info!("Removed device from manager: {identifier}");
+            }
+            result
+        }))
+        .await
     }
 
     pub(crate) async fn device_ids(&self) -> Vec<String> {
@@ -1012,8 +1042,8 @@ impl<L: SensorLink> ManagerCore<L> {
         join_all(connect_futures).await.into_iter().collect()
     }
 
-    pub(crate) async fn disconnect_all(&self) -> HashMap<String, Result<()>> {
-        let ids: Vec<String> = {
+    pub(crate) async fn disconnect_all(self: &Arc<Self>) -> HashMap<String, Result<()>> {
+        let withdrawn: Vec<(String, Arc<Mutex<()>>)> = {
             let mut devices = self.devices.write().await;
             // Withdraw every device, including those without a link (not
             // connected yet, or lost and waiting for a repair), so the health
@@ -1024,13 +1054,18 @@ impl<L: SensorLink> ManagerCore<L> {
             devices
                 .iter()
                 .filter(|(_, entry)| entry.link.is_some())
-                .map(|(id, _)| id.clone())
+                .map(|(id, entry)| (id.clone(), Arc::clone(&entry.op)))
                 .collect()
         };
-        let disconnects = ids.into_iter().map(|id| async move {
-            let result = self.disconnect(&id).await;
-            (id, result)
-        });
+        // Every disconnect starts before anything else is awaited, so that a
+        // dropped caller can't leave a device it has withdrawn connected.
+        let disconnects: Vec<_> = withdrawn
+            .into_iter()
+            .map(|(id, op)| {
+                let task = self.spawn_disconnect(&id, op);
+                async move { (id, finished(task).await) }
+            })
+            .collect();
         join_all(disconnects).await.into_iter().collect()
     }
 
@@ -1346,7 +1381,7 @@ impl<L: SensorLink> ManagerCore<L> {
             .map(|(id, _)| id.clone())
     }
 
-    pub(crate) async fn evict_lowest_priority(&self) -> Result<bool> {
+    pub(crate) async fn evict_lowest_priority(self: &Arc<Self>) -> Result<bool> {
         if let Some(id) = self.lowest_priority_connected().await {
             info!("Evicting lowest priority device: {}", id);
             self.disconnect(&id).await?;
@@ -1611,9 +1646,10 @@ impl DeviceManager {
     /// fails or this future is dropped. A failed close's error is still
     /// returned.
     ///
-    /// If this future is dropped while the device is being disconnected, the
-    /// disconnect still finishes in the background, and a connect of the same
-    /// device waits for it instead of running alongside it.
+    /// If this future is dropped, a disconnect that has started still
+    /// finishes in the background, even one still waiting for a connect or a
+    /// health check of the device to end, and a connect of the same device
+    /// waits for it instead of running alongside it.
     pub async fn disconnect(&self, identifier: &str) -> Result<()> {
         self.core.disconnect(identifier).await
     }
@@ -1626,7 +1662,8 @@ impl DeviceManager {
     /// connected yet is abandoned: it returns [`Error::Cancelled`], closing
     /// its connection if one comes up. As with `disconnect`, this waits until
     /// that connect's Bluetooth attempt has ended and such a connection is
-    /// closed.
+    /// closed, and a removal that has started still finishes in the
+    /// background if this future is dropped.
     pub async fn remove_device(&self, identifier: &str) -> Result<()> {
         self.core.remove_device(identifier).await
     }
@@ -3349,6 +3386,124 @@ mod lifecycle_tests {
             .await;
         }
 
+        /// A `disconnect()` or `remove_device()` withdraws the device before
+        /// it waits for the device's lock, and from then on the health
+        /// monitor leaves the device alone. So one dropped during that wait
+        /// (here, for a check that finds the link alive) must still finish
+        /// afterwards, or the device stays connected and unchecked.
+        #[tokio::test(start_paused = true)]
+        async fn a_dropped_disconnect_finishes_after_the_check_it_waited_for() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default().with_max_connections(2));
+                for id in ["A", "B"] {
+                    core.connect(id).await.unwrap();
+                    // Each check takes 3 s and finds the link alive.
+                    radio.set_probe_delay(id, Duration::from_secs(3));
+                }
+                let mut events = core.events.subscribe();
+
+                let tick = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { core.health_tick().await }
+                });
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Both wait for the checks, and are given up on at 2 s.
+                let (disconnect, remove) = tokio::join!(
+                    timeout(Duration::from_secs(1), core.disconnect("A")),
+                    timeout(Duration::from_secs(1), core.remove_device("B")),
+                );
+                assert!(disconnect.is_err(), "disconnect() returned {disconnect:?}");
+                assert!(remove.is_err(), "remove_device() returned {remove:?}");
+                assert_eq!(
+                    tick.await.unwrap(),
+                    TickOutcome {
+                        healthy: 2,
+                        repaired: 0,
+                        failed: 0
+                    }
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                assert_eq!(radio.up_ids(), Vec::<String>::new());
+                assert_eq!(core.device_ids().await, ["A"]);
+                assert_eq!(
+                    core.snapshot("A").await,
+                    Some(EntrySnapshot {
+                        has_link: false,
+                        failures: 0,
+                        wanted: false,
+                        gave_up: false,
+                        retry_at: None,
+                    })
+                );
+                assert_eq!(core.available_connections().await, Some(2));
+                let mut sent = drain(&mut events);
+                sent.sort();
+                assert_eq!(
+                    sent,
+                    [
+                        "Disconnected A UserRequested",
+                        "Disconnected B UserRequested"
+                    ]
+                );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// `disconnect_all()` withdraws every device at once and then
+        /// disconnects each one, so one dropped in between (here, while
+        /// another user of the device map holds it) must still disconnect
+        /// the devices it withdrew.
+        #[tokio::test(start_paused = true)]
+        async fn a_dropped_disconnect_all_disconnects_every_device_it_withdrew() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                let mut events = core.events.subscribe();
+
+                // The device map is busy when disconnect_all() starts, and a
+                // reader that asks for it next holds it from the moment
+                // disconnect_all() has withdrawn the devices until 2 s.
+                let busy = core.devices.read().await;
+                let disconnect_all = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { timeout(Duration::from_secs(1), core.disconnect_all()).await }
+                });
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let reader = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move {
+                        let _map = core.devices.read().await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                drop(busy);
+                let given_up = disconnect_all.await.unwrap();
+                assert!(given_up.is_err(), "disconnect_all() returned {given_up:?}");
+                assert!(!core.snapshot("A").await.unwrap().wanted);
+                reader.await.unwrap();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                assert!(
+                    !radio.link_up("A"),
+                    "A is still connected, but withdrawn: {:#?}",
+                    radio.events()
+                );
+                assert!(!core.snapshot("A").await.unwrap().has_link);
+                assert_eq!(drain(&mut events), ["Disconnected A UserRequested"]);
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
         #[tokio::test(start_paused = true)]
         async fn repairs_skip_devices_the_user_changed_during_the_tick() {
             within(LIMIT, async {
@@ -3636,7 +3791,8 @@ mod lifecycle_tests {
         /// `disconnect()` or a `remove_device()` starts closing it, and
         /// `Disconnected` is sent then: a caller dropped during the close,
         /// such as the monitor when it is cancelled or a call under a
-        /// timeout, must not lose the event.
+        /// timeout, must not lose the event. A removal dropped during the
+        /// close still removes the device once the link is down.
         #[tokio::test(start_paused = true)]
         async fn disconnected_is_sent_even_if_the_close_is_cancelled() {
             within(LIMIT, async {
@@ -3685,8 +3841,11 @@ mod lifecycle_tests {
                     assert_eq!(core.try_is_connected(id), Some(false), "{id}");
                 }
 
-                // Until well after both closes have finished.
+                // Until well after the closes have finished.
                 tokio::time::sleep(Duration::from_secs(3)).await;
+                let mut ids = core.device_ids().await;
+                ids.sort();
+                assert_eq!(ids, ["A", "B", "C"], "D wasn't removed");
                 assert_no_orphans(&core, &radio).await;
                 radio.assert_no_drop_teardown();
             })
