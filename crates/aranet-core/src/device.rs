@@ -368,11 +368,26 @@ impl SignalQuality {
 }
 
 impl Device {
-    /// Connect to an Aranet device by name or MAC address.
+    /// Connect to an Aranet device by its address, identifier or full name.
+    ///
+    /// `identifier` must match exactly, as [`find_device`](crate::scan::find_device)
+    /// describes (case is ignored): a name must be the device's whole name, not part
+    /// of it. On macOS, where Bluetooth doesn't expose MAC addresses, use the
+    /// device's identifier (a CoreBluetooth UUID) or its name.
     ///
     /// The device is searched for with scans of 5, 10 and 15 s (up to about 30 s) and
     /// connected with the default [`ConnectionConfig`]. See the "Timeouts" section of
     /// [`Device`] for how long that can take.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidConfig`] if `identifier` is empty or blank, before
+    ///   Bluetooth is used.
+    /// - [`Error::DeviceNotFound`] if no nearby device matches `identifier` exactly,
+    ///   or several do; its reason says which, as
+    ///   [`find_device`](crate::scan::find_device) describes.
+    /// - Otherwise, an error from the Bluetooth adapter or the connection, such as
+    ///   [`Error::Timeout`] when a connect step runs out of time.
     ///
     /// # Example
     ///
@@ -393,6 +408,9 @@ impl Device {
 
     /// Connect with a custom connection timeout.
     ///
+    /// `identifier` must match exactly, and errors are returned, as
+    /// [`Device::connect`] describes.
+    ///
     /// The device search uses scans of 5, 10 and 15 s (up to about 30 s).
     /// `timeout` replaces only the connect timeout (`connection_timeout`); every other
     /// timeout keeps its default. Use [`Device::connect_with_scan_options`] to change
@@ -408,6 +426,9 @@ impl Device {
     }
 
     /// Connect to an Aranet device with full configuration.
+    ///
+    /// `identifier` must match exactly, and errors are returned, as
+    /// [`Device::connect`] describes.
     ///
     /// `config` sets every timeout of the connection itself. The device is searched for
     /// with scans of 5, 10 and 15 s (up to about 30 s); use
@@ -439,6 +460,9 @@ impl Device {
     }
 
     /// Find `identifier` with `scan`, then connect with `config`.
+    ///
+    /// `identifier` must match exactly, and errors are returned, as
+    /// [`Device::connect`] describes.
     ///
     /// The search makes up to three scans of `scan.duration / 2`, `scan.duration` and
     /// `1.5 × scan.duration` (at least 2, 4 and 6 s), so it takes up to about
@@ -489,6 +513,9 @@ impl Device {
     /// Like [`connect_with_config`](Self::connect_with_config), it searches once with
     /// scans of 5, 10 and 15 s (up to about 30 s), and `config` sets the timeouts of
     /// the connection itself.
+    ///
+    /// `identifier` must match exactly, and errors are returned, as
+    /// [`Device::connect`] describes.
     #[tracing::instrument(level = "info", skip_all, fields(identifier = %identifier))]
     pub async fn connect_with_adapter(
         adapter: Adapter,
