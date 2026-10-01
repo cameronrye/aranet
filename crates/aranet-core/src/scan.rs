@@ -1615,10 +1615,11 @@ mod tests {
     // ==================== Device Lookup Tests ====================
 
     /// CoreBluetooth UUIDs as `aranet scan` prints them on macOS. The first two
-    /// are those of a real Aranet2 and AranetRn+; the third is made up.
+    /// are those of a real Aranet2 and AranetRn+; the other two are made up.
     const UUID_1: &str = "1f8893bf-9f7e-02b4-ef4a-7718f4f5d4be";
     const UUID_2: &str = "387c18c7-299f-cc32-d01c-6cf29a8d3ca5";
     const UUID_3: &str = "5b0e4c1d-7a3f-4e2b-9c6d-8f1a2b3c4d5e";
+    const UUID_4: &str = "c4a7e2d9-3b1f-4c8e-a6d5-2f9b8e7c1a04";
 
     fn known(
         identifier: &str,
@@ -1823,28 +1824,39 @@ mod tests {
         );
     }
 
+    /// Every order of the indices `0..n`.
+    fn orders(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut all = Vec::new();
+        for shorter in orders(n - 1) {
+            for at in 0..n {
+                let mut order = shorter.clone();
+                order.insert(at, n - 1);
+                all.push(order);
+            }
+        }
+        all
+    }
+
     #[test]
     fn lookup_result_is_independent_of_order() {
         let devices = [
             on_macos(UUID_1, "Aranet4 12345"),
             on_macos(UUID_2, "Aranet4 1ABCD"),
             on_macos(UUID_3, "Aranet2 2751B"),
-        ];
-        let orders = [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
+            // A second sensor with the first one's name.
+            on_macos(UUID_4, "Aranet4 12345"),
         ];
         let cases = [
-            ("Aranet4 1", "not found", vec![UUID_1, UUID_2]),
+            ("Aranet4 1", "not found", vec![UUID_1, UUID_4, UUID_2]),
             ("aranet2 2751b", "found", vec![UUID_3]),
-            ("Aranet4", "not found", vec![UUID_1, UUID_2]),
+            ("Aranet4", "not found", vec![UUID_1, UUID_4, UUID_2]),
+            ("Aranet4 12345", "ambiguous", vec![UUID_1, UUID_4]),
         ];
         for (query, kind, identifiers) in cases {
-            let outcomes: Vec<(&str, Vec<String>)> = orders
+            let outcomes: Vec<(&str, Vec<String>)> = orders(devices.len())
                 .iter()
                 .map(|order| {
                     let shuffled: Vec<KnownPeripheral> =
