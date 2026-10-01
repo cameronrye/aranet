@@ -217,7 +217,7 @@ aranet read --device <MAC>
 ```
 While `aranet-service` or `aranet server` runs, skip the `aranet read`: the service pairs the sensor again at its next poll, and a connect from a second aranet process during that pairing cancels it. If the sensor refused to pair, the service waits until the 10 minutes are up, or tries at once if you restart it.
 
-2. **Or pair by hand in `bluetoothctl`**, then connect again; a sensor that wants its PIN can only be paired this way. First stop `aranet-service` or `aranet server` and any other aranet command that uses the sensor: a connect during the pairing cancels it. Remove the old pairing if there is one, start a scan, wait until the sensor's MAC address is listed (after `remove`, BlueZ has to find the sensor again before it can pair it), stop the scan, and pair. The sensor may show a PIN on its screen: type it when `bluetoothctl` asks for it.
+2. **Or pair by hand in `bluetoothctl`**, then connect again. A sensor that wants its PIN has to be paired by hand: this way, or in your desktop's Bluetooth settings. First stop `aranet-service` or `aranet server` and any other aranet command that uses the sensor: a connect during the pairing cancels it. Remove the old pairing if there is one, start a scan, wait until the sensor's MAC address is listed (after `remove`, BlueZ has to find the sensor again before it can pair it), stop the scan, and pair. The sensor may show a PIN on its screen: type it when `bluetoothctl` asks for it.
 ```bash
 bluetoothctl
 # then, at the [bluetooth]# prompt:

@@ -28,7 +28,7 @@ Common unit flags:
 | `--bq` / `--pci` | Override radon units |
 
 <Aside type="note" title="Device identifiers match exactly">
-  Since aranet 0.3.0, `-d, --device`, `ARANET_DEVICE`, the addresses saved in aliases and the default device set with `aranet config set device` must identify one device exactly: its MAC address (with or without colons), its device UUID on macOS, or its full name as `aranet scan` shows it, such as `Aranet2 2751B`. Case doesn't matter. A partial name such as `Aranet2` or `2751B` fails with a "did you mean" suggestion instead of connecting to whichever device the scan found first, and a name that two nearby devices share fails as ambiguous: use the address, or an alias for it. `aranet read --passive` needs the name, address or identifier exactly as `aranet scan` prints it, case included.
+  Since aranet 0.3.0, `-d, --device`, `ARANET_DEVICE`, the addresses saved in aliases and the default device set with `aranet config set device` must identify one device exactly: its MAC address (with or without colons), its device UUID on macOS, or its full name as `aranet scan` shows it, such as `Aranet2 2751B`. Case doesn't matter. A partial name such as `Aranet2` or `2751B` fails with a "did you mean" suggestion instead of connecting to whichever device the scan found first, and a name that two nearby devices share fails as ambiguous: use the address, or an alias for it. With `--passive`, `aranet read` and `aranet watch` need the name, address or identifier exactly as `aranet scan` prints it, case included.
 </Aside>
 
 ## scan
