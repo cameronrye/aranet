@@ -3,6 +3,8 @@
 //! Uses a persistent BLE connection to reduce overhead. The connection is only
 //! re-established when a read fails, indicating the device has disconnected.
 //! Implements exponential backoff for reconnection attempts to reduce resource usage.
+//! An identifier that no search can match (empty, only part of a name, or shared by
+//! several devices) fails at once instead, as in the other commands.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,7 +16,7 @@ use crate::format::{
     format_watch_csv_line_with_device, format_watch_line_with_device,
 };
 use crate::style;
-use crate::util::{append_output, require_device_interactive};
+use crate::util::{append_output, device_error, is_identifier_mistake, require_device_interactive};
 use anyhow::Result;
 use aranet_core::Device;
 use aranet_core::advertisement::parse_advertisement_with_name;
@@ -93,6 +95,10 @@ pub async fn cmd_watch(args: WatchArgs<'_>) -> Result<()> {
                     // Reset backoff on successful connection
                     backoff_secs = MIN_BACKOFF_SECS;
                     current_device = Some(d);
+                }
+                // No retry can fix the identifier itself: fail as `read` does.
+                Err(e) if is_identifier_mistake(&e) => {
+                    return Err(device_error("find", &identifier, e));
                 }
                 Err(e) => {
                     eprintln!("Connection failed: {}. Retrying in {}s...", e, backoff_secs);
