@@ -275,7 +275,9 @@ Pass criteria (samples before --warmup aren't judged):
       nothing was still connected after its shutdown, and no shutdown step hung
   (e) lifecycle: every link cut recovered (DeviceManager: ReconnectSucceeded
       within 2 x ${HEALTH_SECS} s + ${REPAIR_BUDGET_SECS} s; ReconnectingDevice: the next read
-      succeeded) and the next sample found the new link up and held
+      succeeded) and the next sample found the new link up and held. A cut
+      that finds its sensor already down (a drop it didn't cause) cuts
+      nothing, but that drop must recover the same way
   (f) service: at least one successful poll, still running at the end, and
       exited within $STOP_LIMIT_SECS s of SIGINT; the failure rate is reported. On
       Linux, with a MAC address and busctl, BlueZ never reported the sensor
@@ -798,7 +800,7 @@ check_resources() {
 }
 
 check_lifecycle() {
-    local summary code problems cuts unrecovered skips times
+    local summary code problems cuts unrecovered natural natural_unrecovered times detail
     summary=$({ grep '"kind":"summary"' "$OUT/lifecycle.jsonl" 2>/dev/null || true; } | tail -n 1)
     code=$(cat "$OUT/lifecycle.exit" 2>/dev/null || true)
     if [[ -z $summary ]]; then
@@ -821,14 +823,19 @@ check_lifecycle() {
     fi
     cuts=$(jq -r '.faults | length' <<<"$summary")
     unrecovered=$(jq -r '.unrecovered' <<<"$summary")
-    skips=$(jq -r '.fault_skips' <<<"$summary")
+    # Cuts that found their sensor already down: drops lifecycle_soak didn't
+    # cause, judged by the same rules as a cut.
+    natural=$(jq -r '.natural_faults | length' <<<"$summary")
+    natural_unrecovered=$(jq -r '.natural_unrecovered' <<<"$summary")
     times=$(jq -r '[.faults[].recovered_after_s | select(. != null)]
         | if length == 0 then "none recovered" else "recovered after \(min)-\(max) s" end' <<<"$summary")
     problems=$(jq -r '.fault_problems[]' <<<"$summary")
+    detail="cuts: $cuts, unrecovered: $unrecovered, $times;"
+    detail+=" already down when a cut was due: $natural, unrecovered: $natural_unrecovered"
     if [[ -z $problems ]]; then
-        report "(e) link cuts" PASS "cuts: $cuts, unrecovered: $unrecovered, skipped: $skips; $times"
+        report "(e) link cuts" PASS "$detail"
     else
-        report "(e) link cuts" FAIL "cuts: $cuts, unrecovered: $unrecovered, skipped: $skips; $times"
+        report "(e) link cuts" FAIL "$detail"
         note_list "$problems"
     fi
 }

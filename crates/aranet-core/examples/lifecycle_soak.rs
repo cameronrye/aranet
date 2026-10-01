@@ -12,6 +12,12 @@
 //! - R recovers when the first read that starts after the cut succeeds;
 //! - either way, the next sample must find the new link up and held by aranet.
 //!
+//! A cut that finds its sensor already down cuts nothing: the link dropped by
+//! itself, as macOS ends unpaired links a few minutes after they come up. That
+//! drop must recover by the same rules, counted from when the cut found it, and
+//! the summary lists these drops (`natural_faults`) apart from the cuts
+//! (`faults`).
+//!
 //! Each sample is one JSON line on stdout (`"kind": "sample"`). `os_connected`
 //! lists the sensors that the Bluetooth stack reports as connected, and `orphans`
 //! those of them that no aranet handle holds: the manager has no handle for M, or
@@ -27,8 +33,9 @@
 //!
 //! - 0 (PASS);
 //! - 1 (FAIL): an orphan in two samples in a row, a sensor still connected after
-//!   shutdown, a link cut that wasn't recovered (or whose new link was gone by
-//!   the next sample) or couldn't be made, or a shutdown step that hung;
+//!   shutdown, a link cut, or a drop found when a cut was due, that wasn't
+//!   recovered (or whose new link was gone by the next sample), a cut that
+//!   couldn't be made, or a shutdown step that hung;
 //! - 2: bad arguments, or a sensor that couldn't be found, or connected in
 //!   three attempts.
 //!
@@ -275,11 +282,24 @@ enum Recovery {
     ReadFailed,
 }
 
+/// Why a fault's link was down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    /// The soak cut it.
+    Cut,
+    /// It was already down when its cut was due, so nothing was cut: a drop
+    /// that the soak didn't cause, such as an unpaired link that macOS ends on
+    /// its own.
+    Natural,
+}
+
 #[derive(Debug)]
 struct Fault {
     side: Side,
     id: String,
+    /// When the cut was made, or found the sensor down.
     at: Duration,
+    cause: Cause,
     recovery: Recovery,
     /// Whether the first sample after the recovery found the link up and held.
     held_at_next_sample: Option<bool>,
@@ -343,13 +363,32 @@ impl Tracker {
     }
 
     fn fault_injected(&mut self, side: Side, id: &str, at: Duration) {
+        self.add_fault(side, id, at, Cause::Cut);
+    }
+
+    /// Records a cut that found the sensor already down at `at`. Nothing was
+    /// cut, but the drop must recover by the same rules as a cut: otherwise a
+    /// driver that stops recovering from drops it didn't cause would only add
+    /// skips, and the other side's cuts would keep the run passing.
+    fn found_down(&mut self, side: Side, id: &str, at: Duration) {
+        self.fault_skips += 1;
+        self.add_fault(side, id, at, Cause::Natural);
+    }
+
+    fn add_fault(&mut self, side: Side, id: &str, at: Duration, cause: Cause) {
         self.faults.push(Fault {
             side,
             id: id.to_string(),
             at,
+            cause,
             recovery: Recovery::Pending,
             held_at_next_sample: None,
         });
+    }
+
+    /// The faults with this cause.
+    fn faults_by(&self, cause: Cause) -> impl Iterator<Item = &Fault> {
+        self.faults.iter().filter(move |fault| fault.cause == cause)
     }
 
     fn reconnect_succeeded(&mut self, side: Side, at: Duration) {
@@ -436,9 +475,8 @@ impl Tracker {
         }
     }
 
-    fn unrecovered(&self) -> usize {
-        self.faults
-            .iter()
+    fn unrecovered(&self, cause: Cause) -> usize {
+        self.faults_by(cause)
             .filter(|fault| {
                 !matches!(fault.recovery, Recovery::Recovered(_))
                     || fault.held_at_next_sample == Some(false)
@@ -482,12 +520,13 @@ impl Tracker {
                 Recovery::Pending => "no read finished after it".to_string(),
                 Recovery::ReadFailed => "the next read failed".to_string(),
             };
-            verdict.faults.push(format!(
-                "link cut on the {} sensor {} at t={}s: {problem}",
-                fault.side.label(),
-                fault.id,
-                fault.at.as_secs()
-            ));
+            let (side, id, at) = (fault.side.label(), &fault.id, fault.at.as_secs());
+            verdict.faults.push(match fault.cause {
+                Cause::Cut => format!("link cut on the {side} sensor {id} at t={at}s: {problem}"),
+                Cause::Natural => format!(
+                    "the {side} sensor {id} was already down when its cut was due at t={at}s: {problem}"
+                ),
+            });
         }
         if self.fault_errors > 0 {
             verdict.faults.push(format!(
@@ -495,15 +534,14 @@ impl Tracker {
                 self.fault_errors
             ));
         }
-        if self.faults_enabled && self.faults.is_empty() {
+        if self.faults_enabled && self.faults_by(Cause::Cut).next().is_none() {
             verdict.faults.push("no link was cut".to_string());
         }
         verdict
     }
 
-    fn fault_report(&self) -> Vec<Value> {
-        self.faults
-            .iter()
+    fn fault_report(&self, cause: Cause) -> Vec<Value> {
+        self.faults_by(cause)
             .map(|fault| {
                 let recovered_after = match fault.recovery {
                     Recovery::Recovered(after) => Some(after.as_secs()),
@@ -518,6 +556,33 @@ impl Tracker {
                 })
             })
             .collect()
+    }
+
+    /// The summary line that `scripts/soak.sh` reads. The cuts (`faults`) and
+    /// the sensors found already down when their cut was due (`natural_faults`)
+    /// are listed apart.
+    fn summary(&self, verdict: &Verdict, connected_after_shutdown: &[String]) -> Value {
+        let reasons: Vec<&String> = verdict.connection.iter().chain(&verdict.faults).collect();
+        json!({
+            "kind": "summary",
+            "result": if verdict.passed() { "PASS" } else { "FAIL" },
+            "reasons": reasons,
+            "connection_problems": verdict.connection,
+            "fault_problems": verdict.faults,
+            "faults": self.fault_report(Cause::Cut),
+            "unrecovered": self.unrecovered(Cause::Cut),
+            "natural_faults": self.fault_report(Cause::Natural),
+            "natural_unrecovered": self.unrecovered(Cause::Natural),
+            "fault_errors": self.fault_errors,
+            "fault_skips": self.fault_skips,
+            "orphaned": self.orphaned.keys().collect::<Vec<_>>(),
+            "connected_after_shutdown": connected_after_shutdown,
+            "samples": self.samples,
+            "m_reconnects": self.m_reconnects,
+            "r_reconnects": self.r_reconnects,
+            "rd_reads_ok": self.reads_ok,
+            "rd_reads_err": self.reads_err,
+        })
     }
 }
 
@@ -543,7 +608,7 @@ impl Snapshot {
             "os_connected": self.os_connected,
             "orphans": self.orphans,
             "probe_error": self.probe_error,
-            "faults": tracker.faults.len(),
+            "faults": tracker.faults_by(Cause::Cut).count(),
             "fault_skips": tracker.fault_skips,
             "fault_errors": tracker.fault_errors,
             "m_reconnects": tracker.m_reconnects,
@@ -751,11 +816,15 @@ impl Soak {
                 self.tracker.borrow_mut().fault_injected(side, id, at);
             }
             Ok(false) => {
+                // The drop came before the check, so a recovery counted from
+                // after the check gets no less time than a cut's.
+                let at = self.start.elapsed();
                 warn!(
-                    "Skipped the link cut: the {} sensor {id} isn't connected",
+                    "Skipped the link cut: the {} sensor {id} isn't connected; \
+                     it must recover as if it had been cut",
                     side.label()
                 );
-                self.tracker.borrow_mut().fault_skips += 1;
+                self.tracker.borrow_mut().found_down(side, id, at);
             }
             Err(e) => {
                 warn!(
@@ -1049,28 +1118,7 @@ async fn run(args: Args) -> Result<bool, String> {
     let tracker = soak.tracker.borrow();
     println!("{}", last.to_json("final", soak.start.elapsed(), &tracker));
     let verdict = tracker.verdict(&last.os_connected, &problems);
-    let reasons: Vec<&String> = verdict.connection.iter().chain(&verdict.faults).collect();
-    println!(
-        "{}",
-        json!({
-            "kind": "summary",
-            "result": if verdict.passed() { "PASS" } else { "FAIL" },
-            "reasons": reasons,
-            "connection_problems": verdict.connection,
-            "fault_problems": verdict.faults,
-            "faults": tracker.fault_report(),
-            "unrecovered": tracker.unrecovered(),
-            "fault_errors": tracker.fault_errors,
-            "fault_skips": tracker.fault_skips,
-            "orphaned": tracker.orphaned.keys().collect::<Vec<_>>(),
-            "connected_after_shutdown": last.os_connected,
-            "samples": tracker.samples,
-            "m_reconnects": tracker.m_reconnects,
-            "r_reconnects": tracker.r_reconnects,
-            "rd_reads_ok": tracker.reads_ok,
-            "rd_reads_err": tracker.reads_err,
-        })
-    );
+    println!("{}", tracker.summary(&verdict, &last.os_connected));
     Ok(verdict.passed())
 }
 
@@ -1317,8 +1365,8 @@ mod tests {
             ["link cut on the manager sensor M at t=900s: no ReconnectSucceeded within 90s"]
         );
         assert_eq!(tracker.m_reconnects, 3);
-        assert_eq!(tracker.unrecovered(), 1);
-        let report = tracker.fault_report();
+        assert_eq!(tracker.unrecovered(Cause::Cut), 1);
+        let report = tracker.fault_report(Cause::Cut);
         assert_eq!(report[0]["recovered_after_s"], json!(14));
         assert_eq!(report[1]["recovered_after_s"], Value::Null);
     }
@@ -1338,7 +1386,126 @@ mod tests {
             ["link cut on the reconnecting sensor R at t=1200s: the next read failed"]
         );
         assert_eq!((tracker.reads_ok, tracker.reads_err), (2, 3));
-        assert_eq!(tracker.fault_report()[0]["recovered_after_s"], json!(71));
+        assert_eq!(
+            tracker.fault_report(Cause::Cut)[0]["recovered_after_s"],
+            json!(71)
+        );
+    }
+
+    /// A driver that stops recovering after a drop it didn't cause leaves its
+    /// sensor down, so every later cut on that side finds nothing to cut. The
+    /// run must still fail, even though the other side's cuts all recover.
+    #[test]
+    fn every_manager_cut_skipped_while_the_reconnecting_cuts_recover_fails() {
+        let mut tracker = Tracker::new(secs(90), true);
+        tracker.sample(secs(0), &ids(), Some(&ids()), &[]);
+        // M's link ends on its own at t=148 s and never comes back.
+        tracker.sample(secs(180), &ids(), Some(&only("R")), &[]);
+        for (m_due, r_cut) in [(900, 1800), (2700, 3600)] {
+            tracker.found_down(Side::Manager, "M", secs(m_due));
+            tracker.sample(secs(m_due + 60), &ids(), Some(&only("R")), &[]);
+            tracker.fault_injected(Side::Reconnecting, "R", secs(r_cut));
+            tracker.read_finished(secs(r_cut + 60), secs(r_cut + 75), true);
+            tracker.sample(secs(r_cut + 120), &ids(), Some(&only("R")), &[]);
+        }
+        assert_eq!(
+            tracker.verdict(&[], &[]).faults,
+            [
+                "the manager sensor M was already down when its cut was due at t=900s: \
+                 no ReconnectSucceeded within 90s",
+                "the manager sensor M was already down when its cut was due at t=2700s: \
+                 no ReconnectSucceeded within 90s",
+            ]
+        );
+        assert_eq!(tracker.fault_skips, 2);
+    }
+
+    #[test]
+    fn sensors_found_down_that_recover_pass_and_are_listed_apart_from_the_cuts() {
+        let mut tracker = Tracker::new(secs(90), true);
+        // M was down when its cut was due; the manager repairs it in time.
+        tracker.found_down(Side::Manager, "M", secs(900));
+        tracker.reconnect_succeeded(Side::Manager, secs(930));
+        tracker.sample(secs(960), &ids(), Some(&ids()), &[]);
+        // R was down too. A read that started before that doesn't count; the
+        // first one that starts after it succeeds.
+        tracker.found_down(Side::Reconnecting, "R", secs(1800));
+        tracker.read_finished(secs(1790), secs(1805), false);
+        tracker.read_finished(secs(1860), secs(1880), true);
+        tracker.sample(secs(1920), &ids(), Some(&ids()), &[]);
+        tracker.fault_injected(Side::Manager, "M", secs(2700));
+        tracker.reconnect_succeeded(Side::Manager, secs(2720));
+        tracker.sample(secs(2760), &ids(), Some(&ids()), &[]);
+
+        let verdict = tracker.verdict(&[], &[]);
+        assert!(verdict.passed(), "{verdict:?}");
+        let summary = tracker.summary(&verdict, &[]);
+        assert_eq!(summary["result"], json!("PASS"));
+        assert_eq!(
+            summary["faults"],
+            json!([{"side": "manager", "id": "M", "t": 2700,
+                    "recovered_after_s": 20, "held_at_next_sample": true}])
+        );
+        assert_eq!(
+            summary["natural_faults"],
+            json!([
+                {"side": "manager", "id": "M", "t": 900,
+                 "recovered_after_s": 30, "held_at_next_sample": true},
+                {"side": "reconnecting", "id": "R", "t": 1800,
+                 "recovered_after_s": 80, "held_at_next_sample": true},
+            ])
+        );
+        assert_eq!(
+            (
+                &summary["unrecovered"],
+                &summary["natural_unrecovered"],
+                &summary["fault_skips"]
+            ),
+            (&json!(0), &json!(0), &json!(2))
+        );
+    }
+
+    #[test]
+    fn a_sensor_found_down_that_does_not_recover_in_time_fails() {
+        let mut tracker = Tracker::new(secs(90), true);
+        tracker.fault_injected(Side::Manager, "M", secs(900));
+        tracker.reconnect_succeeded(Side::Manager, secs(910));
+        tracker.sample(secs(960), &ids(), Some(&ids()), &[]);
+        // Repaired 91 s after the cut found M down: outside the window.
+        tracker.found_down(Side::Manager, "M", secs(1800));
+        tracker.reconnect_succeeded(Side::Manager, secs(1891));
+        // The first read after R was found down failed.
+        tracker.found_down(Side::Reconnecting, "R", secs(2700));
+        tracker.read_finished(secs(2760), secs(2790), false);
+        tracker.read_finished(secs(2820), secs(2830), true);
+        // Repaired in time, but down again at the next sample.
+        tracker.found_down(Side::Manager, "M", secs(3600));
+        tracker.reconnect_succeeded(Side::Manager, secs(3620));
+        tracker.sample(secs(3660), &ids(), Some(&only("R")), &[]);
+
+        assert_eq!(
+            tracker.verdict(&[], &[]).faults,
+            [
+                "the manager sensor M was already down when its cut was due at t=1800s: \
+                 no ReconnectSucceeded within 90s",
+                "the reconnecting sensor R was already down when its cut was due at t=2700s: \
+                 the next read failed",
+                "the manager sensor M was already down when its cut was due at t=3600s: \
+                 it recovered after 20s, but the next sample found the link down or not \
+                 held by aranet",
+            ]
+        );
+        assert_eq!(tracker.unrecovered(Cause::Cut), 0);
+        assert_eq!(tracker.unrecovered(Cause::Natural), 3);
+    }
+
+    #[test]
+    fn a_run_whose_cuts_all_found_their_sensor_down_cut_no_link() {
+        let mut tracker = Tracker::new(secs(90), true);
+        tracker.found_down(Side::Manager, "M", secs(900));
+        tracker.reconnect_succeeded(Side::Manager, secs(930));
+        tracker.sample(secs(960), &ids(), Some(&ids()), &[]);
+        assert_eq!(tracker.verdict(&[], &[]).faults, ["no link was cut"]);
     }
 
     #[test]
@@ -1385,8 +1552,8 @@ mod tests {
         tracker.sample(secs(1920), &ids(), Some(&ids()), &[]);
         let verdict = tracker.verdict(&[], &[]);
         assert!(verdict.passed(), "{verdict:?}");
-        assert_eq!(tracker.unrecovered(), 0);
-        let report = tracker.fault_report();
+        assert_eq!(tracker.unrecovered(Cause::Cut), 0);
+        let report = tracker.fault_report(Cause::Cut);
         assert_eq!(report[0]["held_at_next_sample"], json!(true));
         assert_eq!(report[1]["held_at_next_sample"], json!(true));
     }
@@ -1410,6 +1577,6 @@ mod tests {
                  but the next sample found the link down or not held by aranet",
             ]
         );
-        assert_eq!(tracker.unrecovered(), 2);
+        assert_eq!(tracker.unrecovered(Cause::Cut), 2);
     }
 }
