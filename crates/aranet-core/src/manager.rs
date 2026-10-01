@@ -400,6 +400,10 @@ struct Entry<L> {
     retry_at: Option<Instant>,
     /// Set when automatic reconnects used up `max_attempts`; cleared by `connect`.
     gave_up: bool,
+    /// Whether a link has ever been stored in this entry. Until then, the
+    /// health monitor's connect is the device's first connect, not a
+    /// reconnect, and `max_attempts` of 0 doesn't stop it.
+    ever_connected: bool,
     /// The connection, if connected.
     link: Option<Arc<L>>,
     /// The connection-limit permit, taken before connecting and held until
@@ -424,6 +428,7 @@ impl<L> Entry<L> {
             wanted: true,
             retry_at: None,
             gave_up: false,
+            ever_connected: false,
             link: None,
             slot: None,
             op: Arc::new(Mutex::new(())),
@@ -440,8 +445,7 @@ impl<L> Entry<L> {
     }
 
     /// Gives up on automatic reconnects if they have used up `max_attempts`,
-    /// and then returns the number of failures. `max_attempts` of 0 is used
-    /// up before the first attempt.
+    /// and then returns the number of failures.
     fn give_up_if_attempts_used_up(&mut self) -> Option<u32> {
         let used_up = self
             .reconnect_options
@@ -452,6 +456,20 @@ impl<L> Entry<L> {
             return Some(self.failures);
         }
         None
+    }
+
+    /// Before an automatic reconnect: gives up without one if `max_attempts`
+    /// is already used up, and then returns the number of failures. Only
+    /// `max_attempts` of 0 can be used up here, as a failure that uses up a
+    /// larger one gives up at once. A device that has never been connected
+    /// isn't reconnected but connected for the first time, so it still gets
+    /// that attempt.
+    fn give_up_before_reconnect(&mut self) -> Option<u32> {
+        if self.ever_connected {
+            self.give_up_if_attempts_used_up()
+        } else {
+            None
+        }
     }
 
     /// Records a failed automatic reconnect and schedules the next one.
@@ -733,6 +751,7 @@ impl<L: SensorLink> ManagerCore<L> {
                     let (link, slot) = new_link.into_parts();
                     entry.link = Some(Arc::clone(&link));
                     entry.slot = slot;
+                    entry.ever_connected = true;
                     Ok(link)
                 }
                 _ => Err(new_link),
@@ -1097,10 +1116,11 @@ impl<L: SensorLink> ManagerCore<L> {
             let held = Arc::new(guard);
             // Check again now that the device is ours: it may have been
             // connected, disconnected or removed since the list was made.
-            // With `max_attempts` of 0 there is no attempt to make: give up.
+            // With `max_attempts` of 0 a device that has been connected gets
+            // no reconnect: give up.
             let next = match self.devices.write().await.get_mut(&id) {
                 Some(entry) if Arc::ptr_eq(&entry.op, &op) && entry.is_due_for_repair() => {
-                    match entry.give_up_if_attempts_used_up() {
+                    match entry.give_up_before_reconnect() {
                         Some(failures) => Err(failures),
                         None => Ok(entry.failures.saturating_add(1)),
                     }
@@ -1732,9 +1752,11 @@ impl DeviceManager {
     ///
     /// Each device waits between reconnect attempts as its [`ReconnectOptions`]
     /// say. After `max_attempts` failures in a row the task stops trying and
-    /// emits one [`DeviceEvent::Error`] (with `max_attempts` of 0, as soon as
-    /// it finds the device lost, without trying); [`connect`](Self::connect)
-    /// starts over.
+    /// emits one [`DeviceEvent::Error`]; [`connect`](Self::connect) starts
+    /// over. With `max_attempts` of 0 the task never reconnects a device that
+    /// has been connected: it gives up as soon as it finds the device's
+    /// connection gone, without trying. A device that has never been
+    /// connected, such as one just added, still gets one attempt.
     /// While `max_concurrent_connections` connections are in use, a device
     /// waits for a free one, and that wait isn't counted as a failed attempt.
     ///
@@ -3652,6 +3674,71 @@ mod lifecycle_tests {
                 let a = core.snapshot("A").await.unwrap();
                 assert_eq!((a.failures, a.gave_up), (0, true));
                 assert!(core.snapshot("B").await.unwrap().gave_up);
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// `max_attempts` limits reconnects, not the monitor's first connect
+        /// of a device that has never been connected: with 0, an added device
+        /// is still connected, or tried once, and the monitor gives up on it
+        /// without trying only once it has been connected and is lost.
+        #[tokio::test(start_paused = true)]
+        async fn max_attempts_of_zero_still_connects_an_added_device_once() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                for id in ["A", "B"] {
+                    core.add_device_with_options(id, ReconnectOptions::default().max_attempts(0))
+                        .await
+                        .unwrap();
+                }
+                radio.script_connects("B", [false]);
+                let mut events = core.events.subscribe();
+
+                // The first tick connects A and tries B once.
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 1,
+                        failed: 1
+                    }
+                );
+                assert!(radio.link_up("A"));
+                assert_eq!(
+                    drain(&mut events),
+                    [
+                        "ReconnectStarted A 1",
+                        "Connected A",
+                        "ReconnectSucceeded A 1",
+                        "ReconnectStarted B 1",
+                        "Error B: auto-reconnect gave up after 1 attempt"
+                    ]
+                );
+
+                // A minute of ticks, 5 s apart, after A is lost: the monitor
+                // gives up on A without trying, and never tries B again.
+                radio.lose_link("A");
+                for _ in 0..12 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    core.health_tick().await;
+                }
+                assert_eq!(radio.connect_count("A"), 1, "A was reconnected");
+                assert_eq!(radio.connect_count("B"), 1, "B was tried again");
+                assert_eq!(
+                    drain(&mut events),
+                    [
+                        "Disconnected A Unknown",
+                        "Error A: auto-reconnect gave up after 0 attempts"
+                    ]
+                );
+                for id in ["A", "B"] {
+                    let snapshot = core.snapshot(id).await.unwrap();
+                    assert!(snapshot.gave_up && !snapshot.has_link, "{id}: {snapshot:?}");
+                }
 
                 assert_no_orphans(&core, &radio).await;
                 radio.assert_no_drop_teardown();
