@@ -1962,6 +1962,9 @@ impl DeviceManager {
     /// and for every window queued before it. It returns `false` if no reading
     /// arrives within 15 s, so when those windows take more than 10 s in all,
     /// it can miss a device that does advertise.
+    ///
+    /// The check's scanning stops when it returns, or as soon as this future
+    /// is dropped, for example by a caller's timeout.
     pub async fn supports_passive_monitoring(&self, identifier: &str) -> bool {
         // Create a short-lived passive monitor to check for advertisements
         let options = PassiveMonitorOptions::default()
@@ -1969,18 +1972,35 @@ impl DeviceManager {
             .filter_devices(vec![identifier.to_string()]);
 
         let monitor = Arc::new(PassiveMonitor::new(options));
-        let mut rx = monitor.subscribe();
-        let cancel = CancellationToken::new();
-
-        let _handle = monitor.start(cancel.clone());
+        let readings = monitor.subscribe();
 
         // Wait for a reading or timeout: 5 s of scanning, after up to 10 s of
         // waiting for the scan windows ahead of it.
-        let result = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
-        cancel.cancel();
-
-        matches!(result, Ok(Ok(_)))
+        receives_within(readings, Duration::from_secs(15), |cancel| {
+            monitor.start(cancel)
+        })
+        .await
     }
+}
+
+/// Starts a monitor with `start` and waits up to `limit` for a value on
+/// `readings`, which must be subscribed to that monitor before it starts.
+/// Returns whether one arrived. The token given to `start` is cancelled,
+/// which stops the monitor, when this returns or is dropped.
+async fn receives_within<T: Clone>(
+    mut readings: tokio::sync::broadcast::Receiver<T>,
+    limit: Duration,
+    start: impl FnOnce(CancellationToken) -> tokio::task::JoinHandle<()>,
+) -> bool {
+    let cancel = CancellationToken::new();
+    // Dropping this future, as a caller's timeout does, stops the monitor
+    // too; otherwise it would scan for the rest of the process.
+    let _stop_on_drop = cancel.clone().drop_guard();
+    let _monitor = start(cancel);
+    matches!(
+        tokio::time::timeout(limit, readings.recv()).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Convert a passive advertisement reading to a CurrentReading.
@@ -2025,6 +2045,7 @@ impl Default for DeviceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::within;
 
     #[tokio::test]
     async fn test_manager_add_device() {
@@ -2067,6 +2088,71 @@ mod tests {
 
         // Events are only emitted for actual device operations
         assert_eq!(manager.events().receiver_count(), 1);
+    }
+
+    /// A stand-in for `supports_passive_monitoring`'s monitor: it runs until
+    /// its token is cancelled, sending one reading on `sender` 3 s in if
+    /// `reading` is set, and then tells `stopped`.
+    fn fake_monitor(
+        cancel: CancellationToken,
+        sender: tokio::sync::broadcast::Sender<()>,
+        reading: bool,
+        stopped: tokio::sync::oneshot::Sender<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if reading {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = sender.send(());
+            }
+            cancel.cancelled().await;
+            let _ = stopped.send(());
+        })
+    }
+
+    /// The passive check returns whether a reading arrives in time, and
+    /// stops its monitor when it returns.
+    #[tokio::test(start_paused = true)]
+    async fn the_passive_check_stops_its_monitor_when_it_returns() {
+        within(Duration::from_secs(600), async {
+            for (reading, after) in [(true, 3), (false, 15)] {
+                let (sender, readings) = tokio::sync::broadcast::channel(1);
+                let (stopped, monitor_stopped) = tokio::sync::oneshot::channel();
+                let start = tokio::time::Instant::now();
+
+                let found = receives_within(readings, Duration::from_secs(15), |cancel| {
+                    fake_monitor(cancel, sender, reading, stopped)
+                })
+                .await;
+
+                assert_eq!(found, reading);
+                assert_eq!(start.elapsed(), Duration::from_secs(after));
+                within(Duration::from_secs(10), monitor_stopped)
+                    .await
+                    .expect("the monitor ended without being stopped");
+            }
+        })
+        .await;
+    }
+
+    /// The passive check's monitor also stops when the check is dropped
+    /// before it returns, as by a caller's timeout, instead of scanning for
+    /// the rest of the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_passive_check_stops_its_monitor() {
+        within(Duration::from_secs(600), async {
+            let (sender, readings) = tokio::sync::broadcast::channel(1);
+            let (stopped, monitor_stopped) = tokio::sync::oneshot::channel();
+            let check = receives_within(readings, Duration::from_secs(15), |cancel| {
+                fake_monitor(cancel, sender, false, stopped)
+            });
+
+            let given_up = tokio::time::timeout(Duration::from_secs(1), check).await;
+            assert!(given_up.is_err(), "the check returned {given_up:?}");
+            within(Duration::from_secs(10), monitor_stopped)
+                .await
+                .expect("the monitor ended without being stopped");
+        })
+        .await;
     }
 }
 
