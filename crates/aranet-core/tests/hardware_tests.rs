@@ -161,11 +161,14 @@ async fn read_until_quiet<S: Stream + Unpin>(
     Err(count)
 }
 
-/// A scan whose caller gives up must stop the radio at once, and the process
-/// must be able to scan again. Before the fix, a dropped scan never called
-/// `stop_scan`: CoreBluetooth kept scanning (with duplicates) and events kept
-/// arriving, and on Linux every later scan in the process failed with
-/// `org.bluez.Error.InProgress`.
+/// A scan whose caller gives up must stop the radio, and the process must be
+/// able to scan again. The test gives up on a 30 s scan after 3 s and reads
+/// the events the scan left queued until the stream has been quiet for 1 s; a
+/// scan that still runs never lets it go quiet, and the test fails after 15 s.
+/// It then checks that no event arrives in the next 5 s, and scans again.
+/// Before the fix, a dropped scan never called `stop_scan`: CoreBluetooth kept
+/// scanning (with duplicates) and events kept arriving, and on Linux every
+/// later scan in the process failed with `org.bluez.Error.InProgress`.
 #[tokio::test]
 #[ignore = "requires BLE hardware: Aranet devices advertising nearby"]
 async fn test_cancelled_scan_stops_scanning() {

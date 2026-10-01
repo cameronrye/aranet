@@ -604,7 +604,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn pair_gets_what_is_left_of_the_budget() {
         // The calls before `Pair` count against the budget, so a session
-        // reports within a few call limits of it (Task 11's `PAIRING_GRACE`).
+        // reports within a few call limits of it (`link::PAIRING_GRACE`, the
+        // time a connect gives the pairing step beyond its budget).
         let bus = FakeBus {
             delay: Duration::from_secs(2),
             ..FakeBus::unpaired(PairScript::Hang)

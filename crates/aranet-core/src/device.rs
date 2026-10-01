@@ -459,8 +459,9 @@ impl Device {
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     // Scan for 5, 10 and 15 s (up to about 30 s), then allow 30 s to connect.
-    ///     let scan = ScanOptions::default().duration(Duration::from_secs(10));
+    ///     // Scan for 10, 20 and 30 s (up to about 60 s, twice the default
+    ///     // search), then allow 30 s to connect.
+    ///     let scan = ScanOptions::default().duration(Duration::from_secs(20));
     ///     let config = ConnectionConfig::default().connection_timeout(Duration::from_secs(30));
     ///     let device = Device::connect_with_scan_options("Aranet4 12345", scan, config).await?;
     ///     device.disconnect().await?;
@@ -672,9 +673,12 @@ impl Device {
     /// 2. Disconnect from the BLE peripheral
     ///
     /// Returns [`Error::Timeout`] if the Bluetooth stack doesn't confirm the
-    /// disconnect within 5 s. The disconnect runs as a background task (on
-    /// aranet-core's runtime), so it completes even if this future is dropped,
-    /// for example by a caller's timeout.
+    /// disconnect within 5 s. The disconnect runs as a background task on
+    /// aranet-core's own runtime, or on the caller's runtime if aranet-core's
+    /// can't be started, so it completes even if this future is dropped, for
+    /// example by a caller's timeout. Returns [`Error::Io`] if there is no
+    /// runtime to run it on at all, or if the task panicked or its runtime
+    /// shut down before it finished.
     ///
     /// **Important:** You MUST call this method before dropping the Device
     /// to ensure proper cleanup of BLE resources.

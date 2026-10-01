@@ -415,23 +415,36 @@ pub(crate) async fn connect<L: GattLink>(
     }
 }
 
-/// Connect, discover the services and read the properties.
+/// Pair if needed, connect, discover the services and read the properties:
 ///
-/// If the first discovery finds no services, disconnect, wait 2 s, and connect
-/// and discover once more. If that discovery finds none either, fail with a
-/// retryable `Error::ConnectionFailed` ("the device reported no GATT
-/// services").
+/// 1. On Linux, pair (`GattLink::pair_if_needed`, a no-op elsewhere) with a
+///    budget of `connection_timeout` plus `bluez_discovery_limit`, 35 s at
+///    defaults: when BlueZ connects the sensor for `Pair`, it answers only
+///    after its service discovery. A pairing step still running
+///    `PAIRING_GRACE` after its budget is abandoned. Pairing never fails the
+///    connect.
+/// 2. Connect, giving up after `connection_timeout` ("connect to device").
+/// 3. Discover the services, giving up after `discovery_timeout` ("discover
+///    services").
+/// 4. If that discovery finds no services, disconnect, wait 2 s, and connect
+///    and discover once more ("reconnect to device", "rediscover services").
+///    If that discovery finds none either, fail with a retryable
+///    `Error::ConnectionFailed` ("the device reported no GATT services").
+/// 5. Read the properties, giving up after `read_timeout`.
 ///
 /// On BlueZ, a connect (the first one or the retry's) can end while BlueZ is
 /// still discovering the services on the live link. BlueZ answers
 /// `Device1.Connect` only once the ATT channel is up, a few seconds after the
 /// link, and bluez-async stops waiting for the services 5 s after that answer.
-/// A link that comes up late can use up `connection_timeout` first, while
-/// BlueZ is still setting up the ATT channel or discovering. Either way
-/// the discovery after it first waits for BlueZ to finish, and the wait and
-/// the discovery share `bluez_discovery_limit` with the connection-state query
-/// that tells a connect timeout with the link up from one without it
-/// (`connect_link`, `discover`).
+/// A link that comes up late can also use up `connection_timeout` first, while
+/// BlueZ is still setting up the ATT channel or discovering; `connect_link`
+/// then asks whether the link is up. Either way the discovery after it first
+/// waits for BlueZ to finish (`wait_for_bluez_discovery`), and that
+/// connection-state query, the wait and the discovery share one
+/// `bluez_discovery_limit` (20 s at defaults), whose end fails the connect
+/// with a "discover services" (or "rediscover services") timeout.
+///
+/// `connect` disconnects the link when any step fails.
 async fn connect_and_discover<L: GattLink>(
     link: &L,
     config: &ConnectionConfig,
@@ -626,8 +639,10 @@ async fn connect_link<L: GattLink>(
         }
         Err(e) => return Err(e),
     };
+    // The limit also covers the connection-state query after a connect
+    // timeout, and the discovery after the wait.
     info!(
-        "BlueZ is still discovering services; waiting up to {:?}",
+        "BlueZ is still discovering services; waiting up to {:?} in all",
         bluez_discovery_limit(config)
     );
     Ok(Some(wait))
@@ -1669,8 +1684,10 @@ mod bluez_discovery_tests {
 
     /// On BlueZ, a connect that runs out of time after the link came up, too
     /// late for bluez-async's 5 s wait for the services to run out first,
-    /// waits for BlueZ's service discovery in the same way. The wait gets its
-    /// whole limit after the connect's.
+    /// waits for BlueZ's service discovery in the same way. The wait's limit
+    /// starts when the connect's ends and also covers the connection-state
+    /// query, which answers at once here, so the wait and the discovery get
+    /// all of it.
     #[tokio::test(start_paused = true)]
     async fn a_connect_timeout_with_the_link_up_waits_on_bluez() {
         within(Duration::from_secs(600), async {

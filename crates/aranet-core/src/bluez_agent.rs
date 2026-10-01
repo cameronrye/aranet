@@ -46,15 +46,24 @@
 //!
 //! A pairing that fails is logged as a warning, and the connect goes ahead
 //! unpaired, with the stall or the dialog described above. The next connect
-//! pairs again, unless the sensor refused. To pair a sensor by hand, stop
-//! every aranet process that uses it (a connect during the pairing cancels
-//! it), then run `bluetoothctl` and, at its prompt, `scan on` until the sensor
-//! is listed, `scan off` and `pair <MAC>`, entering its PIN if asked. A
-//! one-line `bluetoothctl pair <MAC>` registers no agent, so on a host without
-//! a desktop agent it can't ask for the PIN. If a sensor was paired with this
-//! computer before and has lost the bond since (after a reset, for example),
-//! BlueZ still lists it as paired and encrypted reads fail. Remove the stale
-//! bond with `bluetoothctl remove <MAC>`; the next connect pairs it again.
+//! pairs again, unless the sensor refused.
+//!
+//! The session's agent has no display or keyboard, so it can't pair a sensor
+//! that asks for its PIN. Some such sensors don't refuse (an Aranet2 with
+//! BlueZ 5.82, for example): the pairing finishes without the PIN, then the
+//! sensor rejects that bond at every later connect, so its reads fail while
+//! BlueZ lists it as paired, and a new bond made the same way fails the same
+//! way. Pair such a sensor once by hand, with its PIN; aranet then uses that
+//! bond. To do that, stop every aranet process that uses it (a connect during
+//! the pairing cancels it) and run `bluetoothctl remove <MAC>`. Then run
+//! `bluetoothctl` and, at its prompt, `scan on` until the sensor is listed,
+//! `scan off` and `pair <MAC>`, entering the PIN when asked. A one-line
+//! `bluetoothctl pair <MAC>` registers no agent, so on a host without a
+//! desktop agent it can't ask for the PIN. A sensor that has lost its bond
+//! with this computer (after a reset, for example) is still listed as paired,
+//! and its encrypted reads fail too: remove the stale bond with
+//! `bluetoothctl remove <MAC>`. The next connect then pairs it again, unless
+//! it asks for its PIN; then pair it by hand as above.
 
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
@@ -81,10 +90,12 @@ const BLUEZ_SERVICE: &str = "org.bluez";
 const BLUEZ_ROOT: &str = "/org/bluez";
 const AGENT_MANAGER_IFACE: &str = "org.bluez.AgentManager1";
 const DEVICE_IFACE: &str = "org.bluez.Device1";
-/// Limit for connecting to the system bus and for every BlueZ call except
-/// `Pair`, which `bluetoothd` answers at once. A session therefore reports its
-/// outcome at most three of these after its budget: the bus connect, and
-/// `Paired` and `CancelPairing` after `Pair` ran out.
+/// Limit for connecting to the system bus and for every BlueZ call but `Pair`:
+/// `bluetoothd` answers each of them at once. It answers `Pair` only when the
+/// pairing ends, so `run_pairing` limits `Pair` by the session's budget
+/// instead. A session therefore reports its outcome at most three of these
+/// after its budget: the bus connect, and `Paired` and `CancelPairing` after
+/// `Pair` ran out.
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 /// `Pair`'s D-Bus reply timeout. `run_pairing` puts its own limits on `Pair`,
 /// so this only has to be longer than they can be. dbus adds it to
@@ -450,10 +461,10 @@ fn log_outcome(address: &str, outcome: &PairOutcome) {
     warn!(
         "Pairing with {address} {failure}; {retry}. Until it is paired, BlueZ asks for pairing \
          at each connection, which can make reads time out on a host without a Bluetooth agent. \
-         To pair it by hand, stop aranet and the aranet service first (a connect during the \
-         pairing cancels it), then run `bluetoothctl` and, at its prompt, `pair {address}`, \
-         entering its PIN if asked; if it was paired with this computer before, run \
-         `bluetoothctl remove {address}` first"
+         aranet can't enter a PIN: if the sensor asks for one, pair it by hand once. Stop aranet \
+         and the aranet service first (a connect during the pairing cancels it), run \
+         `bluetoothctl remove {address}` if it was paired with this computer before, then run \
+         `bluetoothctl` and, at its prompt, `pair {address}`, entering the PIN when asked"
     );
 }
 
@@ -520,7 +531,8 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn deprecated_ensure_agent_is_a_no_op() {
-        // No tokio runtime here: before Phase 3a, `ensure_agent` spawned a task and panicked.
+        // No tokio runtime here: up to aranet-core 0.2.1, `ensure_agent`
+        // spawned a task, which panics outside a runtime.
         ensure_agent();
     }
 
@@ -555,7 +567,9 @@ mod tests {
 
     #[test]
     fn agent_sessions_do_not_share_approvals() {
-        // Before Phase 3a, the allow-list kept approving A after A's connect was over.
+        // In aranet-core 0.2.1, one agent for the whole process approved
+        // every device aranet had connected to, so it kept approving A after
+        // A's connect was over. Each session's agent approves only its own.
         assert_approved(dispatch(
             A,
             agent_call("RequestAuthorization").append1(path(A)),
@@ -856,8 +870,31 @@ mod tests {
         let _ = conn.send(reply);
     }
 
+    /// Runs pairing sessions against `FakeBluez`, scenarios (a) to (f) below.
+    /// The test takes the name `org.bluez` on the bus that
+    /// `DBUS_SYSTEM_BUS_ADDRESS` names, so it needs a throwaway `dbus-daemon`
+    /// whose policy lets any connection own any name, never the host's system
+    /// bus. It runs on the real clock and takes about 6 s, most of it scenario
+    /// (d)'s 1 s budget and scenario (f)'s 3 s budget and 1.5 s wait.
+    ///
+    /// To run it in Docker from the repository root, set `IMAGE` to a Debian
+    /// image with Rust 1.90 or later, `pkg-config` and `libdbus-1-dev` (such as
+    /// `rust:1.90` with those two packages added). The command installs `dbus`,
+    /// for `dbus-daemon`, if the image doesn't have it:
+    ///
+    /// ```text
+    /// docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/work/target/linux "$IMAGE" bash -c 'set -e
+    /// command -v dbus-daemon > /dev/null || { apt-get update -qq && apt-get install -y -qq dbus > /dev/null; }
+    /// cat > /tmp/aranet-test-bus.conf <<EOF
+    /// <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+    /// <busconfig><type>system</type><listen>unix:path=/tmp/aranet-test-bus</listen><auth>EXTERNAL</auth>
+    /// <policy context="default"><allow user="*"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>
+    /// EOF
+    /// dbus-daemon --config-file=/tmp/aranet-test-bus.conf --fork
+    /// DBUS_SYSTEM_BUS_ADDRESS=unix:path=/tmp/aranet-test-bus cargo test --locked -p aranet-core --lib pairing_session_over_a_private_bus -- --ignored --nocapture'
+    /// ```
     #[tokio::test]
-    #[ignore = "needs dbus-daemon and DBUS_SYSTEM_BUS_ADDRESS; run in Docker, see Phase 3a Task 11"]
+    #[ignore = "needs a throwaway dbus-daemon; see this test's doc for the Docker command"]
     async fn pairing_session_over_a_private_bus() {
         assert!(
             std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_some(),
