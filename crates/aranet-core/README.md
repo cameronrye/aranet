@@ -23,7 +23,7 @@ This crate provides low-level Bluetooth Low Energy (BLE) communication with Aran
 - **Current readings** — CO₂, temperature, pressure, humidity, radon, radiation
 - **Historical data** — Download measurement history with timestamps and resumable checkpoints
 - **Device settings** — Read/write measurement interval, Bluetooth range
-- **Auto-reconnection** — Configurable backoff and retry logic with exponential delays
+- **Auto-reconnection** — Reconnects after connection errors with configurable backoff; a health monitor repairs dropped connections
 - **Real-time streaming** — Subscribe to sensor value changes
 - **Multi-device support** — Manage multiple sensors simultaneously with adaptive polling
 - **Passive monitoring** — Monitor devices via BLE advertisements without connecting

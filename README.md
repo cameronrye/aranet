@@ -34,7 +34,8 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - Platform-specific configuration (macOS, Linux, Windows)
   - Bluetooth diagnostics and troubleshooting utilities
   - BLE adapter serialization with semaphore-based locking
-  - Automatic BlueZ agent registration on Linux to prevent BLE pairing hangs
+  - Explicit pairing on Linux: a sensor that isn't paired yet is paired on first connect, without registering a system-wide Bluetooth agent (a sensor that asks for its PIN is paired once with `bluetoothctl`)
+  - Waits for BlueZ's service discovery on Linux, so first connections to an Aranet4 don't fail with "Service discovery timed out"
 - **aranet-cli** — Command-line interface for quick readings and data export
   - Multi-device reading with parallel connections
   - Interactive device picker, device aliases
