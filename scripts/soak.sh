@@ -280,8 +280,9 @@ Pass criteria (samples before --warmup aren't judged):
       nothing, but that drop must recover the same way
   (f) service: at least one successful poll, still running at the end, and
       exited within $STOP_LIMIT_SECS s of SIGINT; the failure rate is reported. On
-      Linux, with a MAC address and busctl, BlueZ never reported the sensor
-      connected for $STREAK_LIMIT_SECS s or more (the collector disconnects after every poll).
+      Linux, with a MAC address and busctl, BlueZ answered the probe after the
+      warm-up and never reported the sensor connected for $STREAK_LIMIT_SECS s or more
+      (the collector disconnects after every poll).
 
 Files in --out: samples.csv, summary.txt, run.env, service.log,
 service.stop, lifecycle.jsonl, lifecycle.log, lifecycle.exit and, on Linux,
@@ -888,12 +889,19 @@ check_service() {
 
     streak="BlueZ probe not run: ${PROBE_NOTE:-no bluez-connected.csv}"
     if [[ -f $OUT/bluez-connected.csv ]]; then
-        longest=$(awk -F, '
-            NR > 1 && $2 == "1" { if (!run) { start = $1; run = 1 }; if ($1 - start > max) max = $1 - start; seen = 1 }
-            NR > 1 && $2 == "0" { run = 0; seen = 1 }
+        # Probe rows before the warm-up aren't judged, like the samples: a
+        # correct service's first poll can keep the link up for longer than
+        # the limit while BlueZ pairs the sensor or discovers its services.
+        longest=$(awk -F, -v w="$WARMUP_S" '
+            NR > 1 && $1 + 0 >= w + 0 && $2 == "1" { if (!run) { start = $1; run = 1 }; if ($1 - start > max) max = $1 - start; seen = 1 }
+            NR > 1 && $1 + 0 >= w + 0 && $2 == "0" { run = 0; seen = 1 }
             END { print seen ? max + 0 : -1 }' "$OUT/bluez-connected.csv")
         if ((longest < 0)); then
-            streak="BlueZ probe got no answer from busctl"
+            # The probe ran but busctl never answered it, for example because
+            # the adapter isn't hci0: the check that matters most on Linux
+            # didn't happen.
+            streak="BlueZ probe got no answer from busctl after the warm-up"
+            problems+="busctl never answered the BlueZ probe after the ${WARMUP_S}s warm-up, so BlueZ's connection streak wasn't checked; see bluez-connected.csv"$'\n'
         else
             streak="longest BlueZ Connected streak ${longest}s (limit ${STREAK_LIMIT_SECS}s)"
             if ((longest >= STREAK_LIMIT_SECS)); then
