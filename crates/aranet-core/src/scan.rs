@@ -683,6 +683,9 @@ fn after_missed_scan(
 /// - [`Error::InvalidConfig`] if `identifier` is empty or blank, before
 ///   Bluetooth is used.
 /// - [`Error::DeviceNotFound`] with
+///   [`DeviceNotFoundReason::NoAdapter`](crate::error::DeviceNotFoundReason::NoAdapter)
+///   if there is no Bluetooth adapter.
+/// - [`Error::DeviceNotFound`] with
 ///   [`DeviceNotFoundReason::Ambiguous`](crate::error::DeviceNotFoundReason::Ambiguous)
 ///   at once if several nearby devices match;
 ///   [`DeviceNotFoundReason::NoExactMatch`](crate::error::DeviceNotFoundReason::NoExactMatch)
