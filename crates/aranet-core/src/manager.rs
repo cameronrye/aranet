@@ -833,7 +833,9 @@ impl<L: SensorLink> ManagerCore<L> {
     /// `op` mutex is free. The health monitor leaves a withdrawn device alone,
     /// so nothing else would close its link: the task finishes even if the
     /// caller is dropped, for example while it waits for a connect or a
-    /// check of the device to end.
+    /// check of the device to end. A `connect()` that re-arms the device
+    /// before the task takes the link supersedes the disconnect, and the task
+    /// then does nothing (see `disconnect_locked`).
     fn spawn_disconnect(
         self: &Arc<Self>,
         identifier: &str,
@@ -843,12 +845,17 @@ impl<L: SensorLink> ManagerCore<L> {
         let identifier = identifier.to_owned();
         tokio::spawn(async move {
             let held = Arc::new(op.lock_owned().await);
-            core.disconnect_locked(&identifier, &held).await
+            core.disconnect_locked(&identifier, &held, true).await
         })
     }
 
     /// Disconnects `identifier`'s link, if it has one, and returns the
     /// close's result. It fails only after taking the link out of the entry.
+    /// With `unless_rearmed`, it does nothing if the entry is wanted again: a
+    /// `connect()` has re-armed the device since it was withdrawn, so that
+    /// connect started before this took the link, and supersedes it. The
+    /// check and the take share one lock of the device map, so no connect
+    /// can come between them.
     /// `held` is the caller's guard of the entry's `op` mutex. The disconnect
     /// keeps a share of that guard, and the slot, until the link is down,
     /// even if this future is dropped: until then no other connect,
@@ -858,12 +865,13 @@ impl<L: SensorLink> ManagerCore<L> {
         &self,
         identifier: &str,
         held: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+        unless_rearmed: bool,
     ) -> Result<()> {
         let op = tokio::sync::OwnedMutexGuard::mutex(held);
         let taken = {
             let mut devices = self.devices.write().await;
             match devices.get_mut(identifier) {
-                Some(entry) if Arc::ptr_eq(&entry.op, op) => {
+                Some(entry) if Arc::ptr_eq(&entry.op, op) && !(unless_rearmed && entry.wanted) => {
                     entry.link.take().map(|link| (link, entry.slot.take()))
                 }
                 _ => None,
@@ -894,8 +902,9 @@ impl<L: SensorLink> ManagerCore<L> {
         let identifier = identifier.to_owned();
         finished(tokio::spawn(async move {
             let held = Arc::new(Arc::clone(&op).lock_owned().await);
-            // Not `disconnect`: the guard is not reentrant.
-            let result = core.disconnect_locked(&identifier, &held).await;
+            // Not `disconnect`: the guard is not reentrant. A removal always
+            // goes ahead, even if a `connect()` has re-armed the device.
+            let result = core.disconnect_locked(&identifier, &held, false).await;
             // Removed even if closing the link failed: the link has left the
             // manager, so a kept entry would have nothing left to close.
             let mut devices = core.devices.write().await;
@@ -1653,8 +1662,10 @@ impl DeviceManager {
     ///
     /// If this future is dropped, a disconnect that has started still
     /// finishes in the background, even one still waiting for a connect or a
-    /// health check of the device to end, and a connect of the same device
-    /// waits for it instead of running alongside it.
+    /// health check of the device to end. A connect of the same device that
+    /// starts meanwhile either waits for the disconnect and then reconnects,
+    /// or, if it starts before the disconnect has taken the connection, keeps
+    /// the device connected, and the disconnect then does nothing.
     pub async fn disconnect(&self, identifier: &str) -> Result<()> {
         self.core.disconnect(identifier).await
     }
@@ -1668,7 +1679,9 @@ impl DeviceManager {
     /// its connection if one comes up. As with `disconnect`, this waits until
     /// that connect's Bluetooth attempt has ended and such a connection is
     /// closed, and a removal that has started still finishes in the
-    /// background if this future is dropped.
+    /// background if this future is dropped. A connect of the same device
+    /// that starts meanwhile doesn't keep it: the device is removed even when
+    /// that connect returns first.
     pub async fn remove_device(&self, identifier: &str) -> Result<()> {
         self.core.remove_device(identifier).await
     }
@@ -3587,6 +3600,200 @@ mod lifecycle_tests {
                     radio.events()
                 );
                 assert!(!core.snapshot("A").await.unwrap().has_link);
+                assert_eq!(drain(&mut events), ["Disconnected A UserRequested"]);
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// A `disconnect()` withdraws the device at once but takes the link
+        /// only once its task runs. A `connect()` that starts in between
+        /// (here, spawned right after it) re-arms the device, finds the link
+        /// up and returns `Ok`, so the disconnect must then do nothing:
+        /// taking the link would leave the device wanted but unlinked, which
+        /// neither order of the two calls gives.
+        #[tokio::test(start_paused = true)]
+        async fn a_connect_spawned_right_after_a_disconnect_keeps_the_device_connected() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                let mut events = core.events.subscribe();
+
+                let disconnect = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { core.disconnect("A").await }
+                });
+                let connect = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { core.connect("A").await }
+                });
+                let disconnect = disconnect.await.unwrap();
+                let connect = connect.await.unwrap();
+
+                assert!(disconnect.is_ok(), "disconnect() returned {disconnect:?}");
+                assert!(connect.is_ok(), "connect() returned {connect:?}");
+                assert!(radio.link_up("A"), "{:#?}", radio.events());
+                assert_eq!(
+                    core.snapshot("A").await,
+                    Some(EntrySnapshot {
+                        has_link: true,
+                        failures: 0,
+                        wanted: true,
+                        gave_up: false,
+                        retry_at: None,
+                    })
+                );
+                assert_eq!(drain(&mut events), Vec::<String>::new());
+                // The disconnect took nothing: the link is still the first one.
+                let a = || "A".to_string();
+                assert_eq!(
+                    radio_log(&radio),
+                    [
+                        FakeEvent::ConnectStarted { id: a() },
+                        FakeEvent::Connected { id: a(), handle: 1 },
+                    ]
+                );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// As in the test above, for `disconnect_all()` and
+        /// `evict_lowest_priority()`, which disconnect each device the same
+        /// way: a device that a `connect()` re-arms first stays connected,
+        /// and the others are still disconnected.
+        #[tokio::test(start_paused = true)]
+        async fn a_connect_spawned_right_after_disconnect_all_or_an_eviction_keeps_its_device() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                for id in ["A", "B"] {
+                    core.connect(id).await.unwrap();
+                }
+                let mut events = core.events.subscribe();
+                let connect_a = || {
+                    let core = Arc::clone(&core);
+                    tokio::spawn(async move { core.connect("A").await })
+                };
+
+                let disconnect_all = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { core.disconnect_all().await }
+                });
+                let connect = connect_a();
+                let results = disconnect_all.await.unwrap();
+                let connect = connect.await.unwrap();
+                assert!(
+                    results.len() == 2 && results.values().all(Result::is_ok),
+                    "disconnect_all() returned {results:?}"
+                );
+                assert!(connect.is_ok(), "connect() returned {connect:?}");
+                assert_eq!(radio.up_ids(), ["A"]);
+                assert_eq!(drain(&mut events), ["Disconnected B UserRequested"]);
+
+                // A is the only device connected, so it is the one evicted.
+                let evict = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { core.evict_lowest_priority().await }
+                });
+                let connect = connect_a();
+                let evicted = evict.await.unwrap();
+                let connect = connect.await.unwrap();
+                assert!(
+                    matches!(evicted, Ok(true)),
+                    "evict_lowest_priority() returned {evicted:?}"
+                );
+                assert!(connect.is_ok(), "connect() returned {connect:?}");
+                assert_eq!(radio.up_ids(), ["A"]);
+                assert_eq!(drain(&mut events), Vec::<String>::new());
+                assert_eq!(radio.connect_count("A"), 1);
+                let a = core.snapshot("A").await.unwrap();
+                assert!(a.wanted && a.has_link, "{a:?}");
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// The same race when the `disconnect()` is dropped after its first
+        /// poll: it has withdrawn the device and left the rest to its task,
+        /// which hasn't run yet when a `connect()` of the device starts.
+        #[tokio::test(start_paused = true)]
+        async fn a_connect_after_a_disconnect_polled_once_keeps_the_device_connected() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                let mut events = core.events.subscribe();
+
+                let mut disconnect = Box::pin(core.disconnect("A"));
+                let first = disconnect
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+                assert!(first.is_pending(), "disconnect() returned {first:?}");
+                drop(disconnect);
+                assert!(!core.snapshot("A").await.unwrap().wanted, "not withdrawn");
+
+                core.connect("A").await.expect("connect");
+                // Until well after the dropped disconnect's task has run.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                assert!(radio.link_up("A"), "{:#?}", radio.events());
+                assert_eq!(
+                    core.snapshot("A").await,
+                    Some(EntrySnapshot {
+                        has_link: true,
+                        failures: 0,
+                        wanted: true,
+                        gave_up: false,
+                        retry_at: None,
+                    })
+                );
+                assert_eq!(drain(&mut events), Vec::<String>::new());
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// A removal always goes ahead: a `connect()` spawned right after a
+        /// `remove_device()` of the same device can return first, and the
+        /// device is removed after it all the same, as when the two calls run
+        /// one after the other.
+        #[tokio::test(start_paused = true)]
+        async fn a_connect_spawned_right_after_a_removal_does_not_keep_the_device() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                let mut events = core.events.subscribe();
+
+                let remove = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { core.remove_device("A").await }
+                });
+                let connect = tokio::spawn({
+                    let core = Arc::clone(&core);
+                    async move { core.connect("A").await }
+                });
+                let remove = remove.await.unwrap();
+                let connect = connect.await.unwrap();
+
+                assert!(remove.is_ok(), "remove_device() returned {remove:?}");
+                // Connected, then removed; or removed while the connect waited.
+                assert!(
+                    matches!(connect, Ok(()) | Err(Error::Cancelled)),
+                    "connect() returned {connect:?}"
+                );
+                assert_eq!(core.device_count().await, 0);
+                assert!(!radio.link_up("A"), "{:#?}", radio.events());
                 assert_eq!(drain(&mut events), ["Disconnected A UserRequested"]);
 
                 assert_no_orphans(&core, &radio).await;
