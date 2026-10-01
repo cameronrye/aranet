@@ -18,8 +18,9 @@
 //!    connection (`org.bluez.AgentManager1.RegisterAgent`).
 //! 4. Call `org.bluez.Device1.Pair` on the same connection. It gets as long as
 //!    a connect that waits for BlueZ's service discovery would. If it runs out
-//!    while BlueZ still doesn't list the sensor as paired, `CancelPairing`
-//!    stops it.
+//!    while BlueZ still lists the sensor as not paired, `CancelPairing` stops
+//!    it. If BlueZ doesn't answer whether it is paired, closing the connection
+//!    stops a pairing that is still running.
 //! 5. Unregister the agent and close the connection.
 //!
 //! When BlueZ connects the sensor for `Pair`, it answers `Pair` only after its
