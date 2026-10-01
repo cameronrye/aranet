@@ -268,8 +268,9 @@ plus $((2 * HEALTH_SECS + REPAIR_BUDGET_SECS)) s plus two intervals, so that eve
 Pass criteria (samples before --warmup aren't judged):
   (a) threads: max - value at warm-up <= $THREAD_TOLERANCE, and end <= value at warm-up + $THREAD_TOLERANCE
   (b) file descriptors: the same, with a tolerance of $FD_TOLERANCE
-  (c) RSS: growth after warm-up is reported; FAIL only if it is above
-      $RSS_GROWTH_LIMIT_PCT% and never decreased between two samples
+  (c) RSS: growth after warm-up is reported; FAIL if the lowest RSS in the
+      last third of the samples after warm-up is more than $RSS_GROWTH_LIMIT_PCT% above the
+      lowest in the first third
   (d) lifecycle: lifecycle_soak finished (exit 0 or 1), no sensor was an
       orphan (connected with no aranet handle) in two samples in a row,
       nothing was still connected after its shutdown, and no shutdown step hung
@@ -750,23 +751,34 @@ note_list() {
 }
 
 check_resources() {
-    local target=$1 stats detail trend
-    local n=0 bt=0 mt=0 et=0 bf=0 mf=0 ef=0 br=0 er=0 mono=0 growth=0
+    local target=$1 stats detail
+    local n=0 bt=0 mt=0 et=0 bf=0 mf=0 ef=0 br=0 er=0 growth=0 first_min=0 last_min=0 min_growth=0
+    # (c) compares the lowest RSS in the last third of the samples after the
+    # warm-up with the lowest in the first third. Memory that is freed again
+    # doesn't raise a minimum, but memory that stays does, even when the RSS
+    # dips now and then. The growth from warm-up to end is only reported.
     stats=$(awk -F, -v t="$target" -v w="$WARMUP_S" '
         NR > 1 && $2 == t && $1 + 0 >= w + 0 && $3 != "" && $4 != "" && $5 != "" {
             n++
-            if (n == 1) { bt = $3 + 0; bf = $4 + 0; br = $5 + 0; mt = bt; mf = bf; mono = 1 }
-            else if ($5 + 0 < pr) { mono = 0 }
+            if (n == 1) { bt = $3 + 0; bf = $4 + 0; br = $5 + 0; mt = bt; mf = bf }
             if ($3 + 0 > mt) { mt = $3 + 0 }
             if ($4 + 0 > mf) { mf = $4 + 0 }
-            et = $3 + 0; ef = $4 + 0; er = $5 + 0; pr = $5 + 0
+            et = $3 + 0; ef = $4 + 0; er = $5 + 0
+            rss[n] = $5 + 0
         }
         END {
             if (n == 0) { print 0; exit }
             growth = br > 0 ? (er - br) * 100 / br : 0
-            printf "%d %d %d %d %d %d %d %d %d %d %.1f\n", n, bt, mt, et, bf, mf, ef, br, er, mono, growth
+            k = int(n / 3)
+            if (k < 1) { k = 1 }
+            fmin = rss[1]
+            for (i = 2; i <= k; i++) { if (rss[i] < fmin) { fmin = rss[i] } }
+            lmin = rss[n]
+            for (i = n - k + 1; i < n; i++) { if (rss[i] < lmin) { lmin = rss[i] } }
+            mgrowth = fmin > 0 ? (lmin - fmin) * 100 / fmin : 0
+            printf "%d %d %d %d %d %d %d %d %d %.1f %d %d %.1f\n", n, bt, mt, et, bf, mf, ef, br, er, growth, fmin, lmin, mgrowth
         }' "$OUT/samples.csv")
-    read -r n bt mt et bf mf ef br er mono growth <<<"$stats"
+    read -r n bt mt et bf mf ef br er growth first_min last_min min_growth <<<"$stats"
     if ((n == 0)); then
         report "(a) threads" FAIL "no $target samples after the ${WARMUP_S}s warm-up"
         report "(b) fds" FAIL "no $target samples after the ${WARMUP_S}s warm-up"
@@ -788,12 +800,9 @@ check_resources() {
         report "(b) fds" FAIL "$detail"
     fi
 
-    trend="decreased at least once"
-    if ((mono == 1)); then
-        trend="never decreased"
-    fi
-    detail="${br} kB at warm-up, ${er} kB at the end: ${growth}%, ${trend} (limit ${RSS_GROWTH_LIMIT_PCT}%)"
-    if ((mono == 1)) && awk -v g="$growth" -v l="$RSS_GROWTH_LIMIT_PCT" 'BEGIN { exit !(g > l) }'; then
+    detail="${br} kB at warm-up, ${er} kB at the end: ${growth}%; lowest ${first_min} kB in the first third"
+    detail+=" and ${last_min} kB in the last: ${min_growth}% (limit ${RSS_GROWTH_LIMIT_PCT}%)"
+    if awk -v g="$min_growth" -v l="$RSS_GROWTH_LIMIT_PCT" 'BEGIN { exit !(g > l) }'; then
         report "(c) rss" FAIL "$detail"
     else
         report "(c) rss" PASS "$detail"
