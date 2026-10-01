@@ -20,9 +20,12 @@
 //! [`ReconnectingDevice::cancel_reconnect`] and [`ReconnectingDevice::disconnect`]
 //! end that wait, or a connect in progress, at once. An operation that waited
 //! for a reconnect that gave up or was stopped returns an error instead of
-//! starting another one. If the operation running a reconnect is dropped
-//! part-way (by a timeout around it, say), the operations waiting for it share
-//! a new reconnect instead, which starts once the old connection is closed.
+//! starting another one, unless [`ReconnectingDevice::cancel_reconnect`]
+//! stopped that reconnect and [`ReconnectingDevice::reset_cancellation`] is
+//! called while the operation still waits. If the operation running a
+//! reconnect is dropped part-way (by a timeout around it, say), the
+//! operations waiting for it share a new reconnect instead, which starts once
+//! the old connection is closed.
 //!
 //! While a reconnect runs, and after one has failed, there is no connection:
 //! `ReconnectingDevice::name()` returns `None` and
@@ -627,7 +630,9 @@ impl ReconnectingDevice {
     ///
     /// A backoff wait or a connect in progress ends at once, and the reconnect
     /// returns `Error::Cancelled`, as do the operations that were waiting for
-    /// it. The flag stays set until
+    /// it, except those still waiting when
+    /// [`reset_cancellation()`](Self::reset_cancellation) is called, which
+    /// start a new reconnect. The flag stays set until
     /// [`reset_cancellation()`](Self::reset_cancellation): until then, an
     /// operation that needs to reconnect also returns `Error::Cancelled`.
     pub fn cancel_reconnect(&self) {

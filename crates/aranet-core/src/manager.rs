@@ -1572,6 +1572,9 @@ impl DeviceManager {
 
     /// Add a device to the manager by identifier.
     ///
+    /// `identifier` must match the device exactly, as [`Device::connect`]
+    /// describes.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] if the config's
@@ -1581,6 +1584,9 @@ impl DeviceManager {
     }
 
     /// Add a device with custom reconnect options.
+    ///
+    /// `identifier` must match the device exactly, as [`Device::connect`]
+    /// describes.
     ///
     /// The health monitor waits between automatic reconnects of the device as
     /// `reconnect_options` say. If the device is already managed, nothing
@@ -1601,6 +1607,9 @@ impl DeviceManager {
     }
 
     /// Connect to a device.
+    ///
+    /// `identifier` must match the device exactly, as [`Device::connect`]
+    /// describes.
     ///
     /// This method performs an atomic connect-or-skip operation:
     /// - If the device doesn't exist, it's added and connected
@@ -1835,9 +1844,13 @@ impl DeviceManager {
     ///
     /// The task runs until the provided cancellation token is cancelled, and
     /// then stops at once, even in the middle of a check or a reconnect. A
-    /// connect it abandons releases the sensor. A lost connection it was
-    /// closing is still closed in the background, and a
-    /// [`connect`](Self::connect) of that device waits for it.
+    /// connect it abandons releases the sensor, except one abandoned after the
+    /// connection is made but before the device information has been read:
+    /// that one keeps its connection, and no
+    /// [`DeviceEvent::ReconnectSucceeded`] follows its
+    /// [`DeviceEvent::ReconnectStarted`]. A lost connection it was closing is
+    /// still closed in the background, and a [`connect`](Self::connect) of
+    /// that device waits for it.
     ///
     /// # Adaptive Intervals
     ///

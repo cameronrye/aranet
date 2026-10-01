@@ -383,6 +383,9 @@ impl Device {
     ///
     /// - [`Error::InvalidConfig`] if `identifier` is empty or blank, before
     ///   Bluetooth is used.
+    /// - [`Error::DeviceNotFound`] with
+    ///   [`DeviceNotFoundReason::NoAdapter`](crate::error::DeviceNotFoundReason::NoAdapter)
+    ///   if there is no Bluetooth adapter.
     /// - [`Error::DeviceNotFound`] if no nearby device matches `identifier` exactly,
     ///   or several do; its reason says which, as
     ///   [`find_device`](crate::scan::find_device) describes.
