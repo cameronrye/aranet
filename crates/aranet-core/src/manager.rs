@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
 
-use crate::connector::{ConnectFn, SensorLink, ble_connector, release_link};
+use crate::connector::{ConnectFn, SensorLink, ble_connector, log_failed_release, release_link};
 use crate::device::Device;
 use crate::error::{ConnectionFailureReason, Error, Result};
 use crate::events::{DeviceEvent, DeviceId, DisconnectReason, EventDispatcher};
@@ -551,7 +551,7 @@ impl<L: SensorLink> Drop for NewLink<L> {
             let identifier = std::mem::take(&mut self.identifier);
             runtime.spawn(async move {
                 if let Err(e) = release_link(link, (slot, held)).await {
-                    warn!("Disconnecting an abandoned new link to {identifier} failed: {e}");
+                    log_failed_release("Disconnecting an abandoned new link", &identifier, &e);
                 }
             });
         }
@@ -763,7 +763,7 @@ impl<L: SensorLink> ManagerCore<L> {
                 debug!("{identifier} was disconnected or removed; closing the new link");
                 let (link, slot) = new_link.into_parts();
                 if let Err(e) = release_link(link, (slot, Arc::clone(held))).await {
-                    warn!("Disconnecting the unused link to {identifier} failed: {e}");
+                    log_failed_release("Disconnecting the unused link", identifier, &e);
                 }
                 return Err(Error::Cancelled);
             }
@@ -1260,7 +1260,7 @@ impl<L: SensorLink> ManagerCore<L> {
         // Close it explicitly: a handle dropped without a disconnect tears
         // down whatever link the sensor has by then, including a new one.
         if let Err(e) = release_link(link, (slot, Arc::clone(held))).await {
-            warn!("Closing the dead connection to {identifier} failed: {e}");
+            log_failed_release("Closing the dead connection", identifier, &e);
         }
     }
 

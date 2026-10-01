@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use tracing::{debug, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
 
 use crate::device::Device;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// A connected sensor that can be checked and closed.
 pub(crate) trait SensorLink: Send + Sync + 'static {
@@ -60,6 +61,36 @@ pub(crate) async fn release_link<L: SensorLink, H: Send + 'static>(
     .map_err(std::io::Error::from)?
 }
 
+/// Whether closing a link that has already dropped on its own times out on
+/// this platform. Where it does, a close that times out usually means only
+/// that the link had dropped, not that the sensor is still connected. True
+/// only on macOS: once CoreBluetooth reports a link down, btleplug's
+/// CoreBluetooth backend forgets the peripheral and never answers a disconnect
+/// for it, so the close runs into its time limit. Links to unpaired sensors
+/// can drop on their own there a few minutes after they come up.
+const CLOSES_TIME_OUT_AFTER_DROP: bool = cfg!(target_os = "macos");
+
+/// Whether `error`, from a failed `release_link`, is expected and so no sign
+/// that the sensor is still connected: true only for a close that timed out,
+/// and only when `closes_time_out_after_drop` (the library passes
+/// `CLOSES_TIME_OUT_AFTER_DROP`). Any other failure may have left the sensor
+/// connected with no handle.
+fn release_failure_is_expected(error: &Error, closes_time_out_after_drop: bool) -> bool {
+    closes_time_out_after_drop && matches!(error, Error::Timeout { .. })
+}
+
+/// Logs that `what` (such as "Closing the old link") to `identifier` failed
+/// with `error`, an error from `release_link`: at debug level if the failure
+/// is expected (`release_failure_is_expected`), and otherwise as a warning,
+/// since the sensor may still be connected with no handle.
+pub(crate) fn log_failed_release(what: &str, identifier: &str, error: &Error) {
+    if release_failure_is_expected(error, CLOSES_TIME_OUT_AFTER_DROP) {
+        debug!("{what} to {identifier} failed: {error}");
+    } else {
+        warn!("{what} to {identifier} failed: {error}");
+    }
+}
+
 impl SensorLink for Device {
     async fn is_connected(&self) -> bool {
         Device::is_connected(self).await
@@ -87,5 +118,35 @@ impl SensorLink for Device {
 
     async fn read_device_info(&self) -> Result<DeviceInfo> {
         Device::read_device_info(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_failure_is_expected;
+    use crate::error::Error;
+    use crate::link::DISCONNECT_TIMEOUT;
+
+    #[test]
+    fn a_timed_out_release_is_expected_only_where_closes_time_out_after_a_drop() {
+        let timed_out = Error::timeout("disconnect from device", DISCONNECT_TIMEOUT);
+        assert!(release_failure_is_expected(&timed_out, true));
+        assert!(!release_failure_is_expected(&timed_out, false));
+    }
+
+    #[test]
+    fn a_release_that_failed_otherwise_is_never_expected() {
+        let failures = [
+            Error::Bluetooth(btleplug::Error::NotConnected),
+            Error::Io(std::io::Error::other("the disconnect task panicked")),
+        ];
+        for error in &failures {
+            for closes_time_out_after_drop in [true, false] {
+                assert!(
+                    !release_failure_is_expected(error, closes_time_out_after_drop),
+                    "{error} (closes_time_out_after_drop: {closes_time_out_after_drop})"
+                );
+            }
+        }
     }
 }
