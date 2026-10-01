@@ -484,8 +484,8 @@ impl<L> Entry<L> {
         self.give_up_if_attempts_used_up()
     }
 
-    /// Starts automatic reconnects over, for an explicit `connect` or after a
-    /// successful repair: the next repair is due at once, with all of
+    /// Starts automatic reconnects over, for an explicit `connect` or once a
+    /// new link is stored: the next repair is due at once, with all of
     /// `max_attempts` available again.
     fn reset_backoff(&mut self) {
         self.failures = 0;
@@ -758,6 +758,9 @@ impl<L: SensorLink> ManagerCore<L> {
                     entry.link = Some(Arc::clone(&link));
                     entry.slot = slot;
                     entry.ever_connected = true;
+                    // The device is connected from here on, even if this
+                    // connect is cancelled before it returns.
+                    entry.reset_backoff();
                     Ok(link)
                 }
                 _ => Err(new_link),
@@ -1191,10 +1194,9 @@ impl<L: SensorLink> ManagerCore<L> {
                 attempt,
             });
             match self.connect_locked(&id, &held, None).await {
+                // `connect_locked` started the backoff over when it stored
+                // the new link.
                 Ok(()) => {
-                    if let Some(entry) = self.devices.write().await.get_mut(&id) {
-                        entry.reset_backoff();
-                    }
                     info!("Health monitor: reconnected {id}");
                     self.events.send(DeviceEvent::ReconnectSucceeded {
                         device: DeviceId::new(&id),
@@ -3708,6 +3710,77 @@ mod lifecycle_tests {
 
                 // The next loss is repaired as attempt 1 again, and one more
                 // failure doesn't use up the two attempts.
+                radio.lose_link("A");
+                radio.script_connects("A", [false]);
+                let mut events = core.events.subscribe();
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 0,
+                        failed: 1
+                    }
+                );
+                assert_eq!(
+                    drain(&mut events),
+                    ["Disconnected A Unknown", "ReconnectStarted A 1"]
+                );
+                assert!(!core.snapshot("A").await.unwrap().gave_up);
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// The same holds for a repair cancelled during the device-info read
+        /// after its link was stored: the device stays connected, so its
+        /// backoff starts over as soon as the link is stored.
+        #[tokio::test(start_paused = true)]
+        async fn a_repair_cancelled_during_the_info_read_starts_the_backoff_over() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.add_device_with_options(
+                    "A",
+                    ReconnectOptions::default()
+                        .max_attempts(2)
+                        .initial_delay(Duration::from_secs(60)),
+                )
+                .await
+                .unwrap();
+                core.connect("A").await.unwrap();
+                radio.lose_link("A");
+                // The first repair fails.
+                radio.script_connects("A", [false]);
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 0,
+                        failed: 1
+                    }
+                );
+                // The one 60 s later connects, and is cancelled 1 s into the
+                // device-info read, which takes 5 s.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                radio.set_info_delay("A", Duration::from_secs(5));
+                let cancelled = timeout(Duration::from_secs(1), core.health_tick()).await;
+                assert!(cancelled.is_err(), "the tick returned {cancelled:?}");
+                assert_eq!(
+                    core.snapshot("A").await,
+                    Some(EntrySnapshot {
+                        has_link: true,
+                        failures: 0,
+                        wanted: true,
+                        gave_up: false,
+                        retry_at: None,
+                    })
+                );
+
+                // The next loss is repaired as attempt 1 again, and one more
+                // failure doesn't use up the two attempts.
+                radio.set_info_delay("A", Duration::ZERO);
                 radio.lose_link("A");
                 radio.script_connects("A", [false]);
                 let mut events = core.events.subscribe();
