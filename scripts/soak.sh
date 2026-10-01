@@ -800,7 +800,8 @@ check_resources() {
 }
 
 check_lifecycle() {
-    local summary code problems cuts unrecovered natural natural_unrecovered times detail
+    local summary code fields problems fault_problems cuts unrecovered natural natural_unrecovered
+    local times detail
     summary=$({ grep '"kind":"summary"' "$OUT/lifecycle.jsonl" 2>/dev/null || true; } | tail -n 1)
     code=$(cat "$OUT/lifecycle.exit" 2>/dev/null || true)
     if [[ -z $summary ]]; then
@@ -809,7 +810,33 @@ check_lifecycle() {
         return 0
     fi
 
-    problems=$(jq -r '.connection_problems[]' <<<"$summary")
+    # One parse that checks every field (d) and (e) read. set -e is off in
+    # evaluate (it runs as an if condition), so without this a jq error on a
+    # summary that was cut short, or that lacks a field, leaves the fields
+    # empty and passes both. Line 1 holds (e)'s counts and recovery times;
+    # each problem follows on a line of its own, after "d " or "e ".
+    # Cuts that found their sensor already down (natural_faults) are drops
+    # lifecycle_soak didn't cause, judged by the same rules as a cut.
+    if ! fields=$(jq -e -r '
+        select((.connection_problems | type) == "array"
+            and (.fault_problems | type) == "array"
+            and (.faults | type) == "array"
+            and (.natural_faults | type) == "array"
+            and (.unrecovered | type) == "number"
+            and (.natural_unrecovered | type) == "number")
+        | "\(.faults | length) \(.unrecovered) \(.natural_faults | length) \(.natural_unrecovered) \(
+            [.faults[].recovered_after_s | numbers]
+            | if length == 0 then "none recovered" else "recovered after \(min)-\(max) s" end)",
+          (.connection_problems[] | "d \(.)"),
+          (.fault_problems[] | "e \(.)")' <<<"$summary" 2>/dev/null); then
+        report "(d) orphans" FAIL "summary unreadable (exit status ${code:-not recorded}); see lifecycle.jsonl"
+        report "(e) link cuts" FAIL "summary unreadable; see lifecycle.jsonl"
+        return 0
+    fi
+    read -r cuts unrecovered natural natural_unrecovered times <<<"$fields"
+    problems=$(sed -n '2,$s/^d //p' <<<"$fields")
+    fault_problems=$(sed -n '2,$s/^e //p' <<<"$fields")
+
     if [[ ($code == 0 || $code == 1) && -z $problems ]]; then
         report "(d) orphans" PASS "no orphan in two samples in a row, nothing connected after shutdown (exit $code)"
     else
@@ -821,22 +848,13 @@ check_lifecycle() {
         report "(e) link cuts" SKIP "--fault-every 0"
         return 0
     fi
-    cuts=$(jq -r '.faults | length' <<<"$summary")
-    unrecovered=$(jq -r '.unrecovered' <<<"$summary")
-    # Cuts that found their sensor already down: drops lifecycle_soak didn't
-    # cause, judged by the same rules as a cut.
-    natural=$(jq -r '.natural_faults | length' <<<"$summary")
-    natural_unrecovered=$(jq -r '.natural_unrecovered' <<<"$summary")
-    times=$(jq -r '[.faults[].recovered_after_s | select(. != null)]
-        | if length == 0 then "none recovered" else "recovered after \(min)-\(max) s" end' <<<"$summary")
-    problems=$(jq -r '.fault_problems[]' <<<"$summary")
     detail="cuts: $cuts, unrecovered: $unrecovered, $times;"
     detail+=" already down when a cut was due: $natural, unrecovered: $natural_unrecovered"
-    if [[ -z $problems ]]; then
+    if [[ -z $fault_problems ]]; then
         report "(e) link cuts" PASS "$detail"
     else
         report "(e) link cuts" FAIL "$detail"
-        note_list "$problems"
+        note_list "$fault_problems"
     fi
 }
 
