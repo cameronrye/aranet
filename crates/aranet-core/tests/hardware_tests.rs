@@ -511,14 +511,15 @@ async fn test_validate_connection_without_pairing() {
         let valid = device.validate_connection().await;
         println!("{dev}: validate_connection = {valid}");
         if !valid {
-            // Why it failed: a read that works unpaired, then the battery read.
+            // Why it failed: the read the check makes, with a longer limit.
+            // Never read the battery level here. It needs pairing, so on an
+            // unpaired sensor it starts a pairing (a passkey window on macOS,
+            // a pairing request on Linux), which could pair the sensors this
+            // test needs unpaired.
             let current = timeout(Duration::from_secs(10), device.read_current())
                 .await
                 .map(|r| r.map(|_| ()));
-            let battery = timeout(Duration::from_secs(5), device.read_battery())
-                .await
-                .map(|r| r.map(|_| ()));
-            println!("{dev}: read_current = {current:?}, read_battery = {battery:?}");
+            println!("{dev}: read_current = {current:?}");
             failed.push(dev);
         }
         let _ = device.disconnect().await;

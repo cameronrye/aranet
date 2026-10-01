@@ -1265,4 +1265,129 @@ mod lifecycle_tests {
         })
         .await;
     }
+
+    /// `with_device`'s path, `run_owned`: after a connection error the
+    /// closure runs once more, on the new link; after any other error it
+    /// doesn't run again; and a closure that fails with a connection error
+    /// both times runs twice in all.
+    #[tokio::test(start_paused = true)]
+    async fn run_owned_runs_again_only_after_a_connection_error_and_at_most_twice() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            let calls = AtomicU32::new(0);
+
+            let handle = core
+                .run_owned(|link| {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    let handle = link.handle();
+                    async move {
+                        if first {
+                            Err(Error::NotConnected)
+                        } else {
+                            Ok(handle)
+                        }
+                    }
+                })
+                .await;
+            assert_eq!(handle.ok(), Some(2), "{:#?}", radio.events());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(radio.connect_count("A"), 2);
+
+            calls.store(0, Ordering::SeqCst);
+            let invalid = core
+                .run_owned(|_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Err::<(), _>(Error::InvalidData("bad".into())) }
+                })
+                .await;
+            assert!(
+                matches!(&invalid, Err(Error::InvalidData(msg)) if msg == "bad"),
+                "{invalid:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{:#?}", radio.events());
+            assert_eq!(radio.connect_count("A"), 2);
+
+            calls.store(0, Ordering::SeqCst);
+            let lost = core
+                .run_owned(|_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Err::<(), _>(Error::NotConnected) }
+                })
+                .await;
+            assert!(matches!(lost, Err(Error::NotConnected)), "{lost:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{:#?}", radio.events());
+            assert_eq!(radio.connect_count("A"), 3, "one reconnect");
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// A stop that comes in after a recovery's connect has returned, but
+    /// before the new link is installed, still stops it: the new link is
+    /// closed instead of installed, and the recovering call returns
+    /// `Cancelled`. An operation's read guard holds the recovery at that
+    /// point here, once for `cancel_reconnect()` and once for `disconnect()`,
+    /// which also moves the generation on. A stop during the connect itself
+    /// ends the connect instead and never gets this far.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_after_the_connect_returns_closes_the_new_link() {
+        within(LIMIT, async {
+            for stop in ["cancel_reconnect", "disconnect"] {
+                let radio = FakeRadio::new();
+                let core = Arc::new(connected_core(&radio, ReconnectOptions::default()).await);
+                radio.set_connect_delay("A", Duration::from_secs(10));
+                radio.lose_link("A");
+
+                // 1 s of backoff, then a connect that returns at 11 s, while
+                // the read guard taken at 5 s keeps its link from being
+                // installed.
+                let recovering = spawn_run(&core);
+                sleep(Duration::from_secs(5)).await;
+                let reading = core.link.read().await;
+                sleep(Duration::from_secs(10)).await;
+                assert_eq!(radio.connect_count("A"), 2, "{stop}: {:#?}", radio.events());
+                let disconnecting = if stop == "disconnect" {
+                    let core = Arc::clone(&core);
+                    Some(tokio::spawn(async move { core.disconnect().await }))
+                } else {
+                    core.cancel();
+                    None
+                };
+                // The disconnect runs up to its wait for the recovery.
+                sleep(Duration::from_millis(10)).await;
+                drop(reading);
+
+                let result = recovering.await.expect("join");
+                assert!(
+                    matches!(result, Err(Error::Cancelled)),
+                    "{stop}: {result:?}"
+                );
+                if let Some(disconnecting) = disconnecting {
+                    let disconnected = disconnecting.await.expect("join");
+                    assert!(disconnected.is_ok(), "{disconnected:?}");
+                }
+                let events = radio.events();
+                assert!(
+                    core.link().await.is_none(),
+                    "{stop}: the new link was installed: {events:#?}"
+                );
+                assert_eq!(core.state().await, ConnectionState::Disconnected, "{stop}");
+                assert!(
+                    position(
+                        &events,
+                        &FakeEvent::Disconnect {
+                            id: "A".into(),
+                            handle: 2,
+                        }
+                    )
+                    .is_some(),
+                    "{stop}: the new link was not closed: {events:#?}"
+                );
+                assert!(!radio.link_up("A"), "{stop}: {events:#?}");
+                radio.assert_no_drop_teardown();
+            }
+        })
+        .await;
+    }
 }
