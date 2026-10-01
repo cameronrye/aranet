@@ -20,7 +20,9 @@
 //! [`ReconnectingDevice::cancel_reconnect`] and [`ReconnectingDevice::disconnect`]
 //! end that wait, or a connect in progress, at once. An operation that waited
 //! for a reconnect that gave up or was stopped returns an error instead of
-//! starting another one.
+//! starting another one. If the operation running a reconnect is dropped
+//! part-way (by a timeout around it, say), the operations waiting for it share
+//! a new reconnect instead, which starts once the old connection is closed.
 //!
 //! While a reconnect runs, and after one has failed, there is no connection:
 //! `ReconnectingDevice::name()` returns `None` and
@@ -192,7 +194,11 @@ pub enum ConnectionState {
 ///
 /// Lock order: `serial`, then `link`. Operations hold a `link` read guard while
 /// they run, so a recovery or a disconnect waits for them before it takes the
-/// link out.
+/// link out. A recovery or a disconnect shares its `serial` guard with each
+/// close it starts (of the old link, or of a new link it doesn't install), and
+/// the close keeps it until that link is down, even if the recovery or
+/// disconnect is dropped first, so the next recovery can't connect while the
+/// close is still running.
 ///
 /// The generation protocol (all `SeqCst`) keeps a recovery from undoing a
 /// `cancel()` or a `disconnect()`, and `disconnect()` from waiting for a whole
@@ -205,21 +211,28 @@ pub enum ConnectionState {
 ///   `generation` and `cancelled`, so a call that those checks miss cancels its
 ///   token.
 /// - `recover` installs a new link, under the `link` write lock, only if
-///   `generation` is still the value it set when it took the old link out and
-///   its token isn't cancelled.
+///   `generation` is still the value its checks found and its token isn't
+///   cancelled.
 /// - A recovery that gives up bumps `generation` too, so the callers queued
 ///   behind it share its failure instead of starting another one.
+/// - Taking the old link out doesn't bump `generation`. A recovery whose
+///   caller is dropped part-way (by a timeout, say) settles nothing, so the
+///   first caller queued behind it finds `generation` unchanged and starts
+///   another, instead of returning `NotConnected` when nobody gave up. The
+///   callers queued behind a recovery that `cancel()` stopped find it
+///   unchanged too, and stop at the sticky flag.
 pub(crate) struct ReconnectCore<L: SensorLink> {
     identifier: String,
     connect: ConnectFn<L>,
     link: RwLock<Option<Arc<L>>>,
-    /// Bumped by every install and removal of a link, by a recovery that gives
-    /// up, and by `disconnect()`.
+    /// Bumped by every install of a link, by a recovery that gives up, and by
+    /// `disconnect()` (as it starts, and as it takes the link out).
     generation: AtomicU64,
     /// The number of `disconnect()` calls in progress.
     disconnecting: AtomicU32,
-    /// One recovery or one disconnect at a time.
-    serial: Mutex<()>,
+    /// One recovery or one disconnect at a time. Each close they start keeps
+    /// a share of the guard until its link is down.
+    serial: Arc<Mutex<()>>,
     /// Cancelled by `cancel()` and `disconnect()` to end a backoff wait or a
     /// connect at once. Each recovery starts with a new token.
     wake: std::sync::Mutex<CancellationToken>,
@@ -244,7 +257,7 @@ impl<L: SensorLink> ReconnectCore<L> {
             link: RwLock::new(Some(link)),
             generation: AtomicU64::new(0),
             disconnecting: AtomicU32::new(0),
-            serial: Mutex::new(()),
+            serial: Arc::new(Mutex::new(())),
             wake: std::sync::Mutex::new(CancellationToken::new()),
             cancelled: AtomicBool::new(false),
             state: RwLock::new(ConnectionState::Connected),
@@ -399,7 +412,9 @@ impl<L: SensorLink> ReconnectCore<L> {
         let _in_progress = DisconnectInProgress::start(&self.disconnecting);
         self.lock_wake().cancel();
 
-        let _serial = self.serial.lock().await;
+        // Held until this returns. The close below keeps a share until the
+        // link is down, even if this future is dropped first.
+        let serial = Arc::new(Arc::clone(&self.serial).lock_owned().await);
         let link = {
             let mut link = self.link.write().await;
             self.generation.fetch_add(1, Ordering::SeqCst);
@@ -408,7 +423,7 @@ impl<L: SensorLink> ReconnectCore<L> {
         // Disconnected even if closing the link fails.
         *self.state.write().await = ConnectionState::Disconnected;
         match link {
-            Some(link) => release_link(link, ()).await,
+            Some(link) => release_link(link, Arc::clone(&serial)).await,
             None => Ok(()),
         }
     }
@@ -417,7 +432,10 @@ impl<L: SensorLink> ReconnectCore<L> {
     /// connect with backoff until a connect succeeds, the attempts run out, or
     /// `cancel()` or `disconnect()` stops it.
     async fn recover(&self, seen: u64) -> Result<()> {
-        let _serial = self.serial.lock().await;
+        // Held until this returns. The close of the old link, or of a new link
+        // that isn't installed, keeps a share until that link is down, even if
+        // this future is dropped first.
+        let serial = Arc::new(Arc::clone(&self.serial).lock_owned().await);
         // A fresh token first, then the checks (see the protocol above).
         let wake = {
             let mut wake = self.lock_wake();
@@ -442,16 +460,11 @@ impl<L: SensorLink> ReconnectCore<L> {
 
         // Close the old link before connecting. A disconnect acts on the sensor,
         // not on the handle, so closing the old handle later (or dropping it
-        // unclosed) would take the new link down.
-        let (old, mine) = {
-            let mut link = self.link.write().await;
-            (
-                link.take(),
-                self.generation.fetch_add(1, Ordering::SeqCst) + 1,
-            )
-        };
+        // unclosed) would take the new link down. Taking it out leaves
+        // `generation` as it is (see the protocol above).
+        let old = self.link.write().await.take();
         if let Some(old) = old
-            && let Err(e) = release_link(old, ()).await
+            && let Err(e) = release_link(old, Arc::clone(&serial)).await
         {
             log_failed_release("Closing the old link", &self.identifier, &e);
         }
@@ -505,10 +518,10 @@ impl<L: SensorLink> ReconnectCore<L> {
             };
 
             let mut link = self.link.write().await;
-            if self.generation.load(Ordering::SeqCst) != mine || wake.is_cancelled() {
+            if self.generation.load(Ordering::SeqCst) != seen || wake.is_cancelled() {
                 // cancel() or disconnect() came in as the connect finished.
                 drop(link);
-                if let Err(e) = release_link(new, ()).await {
+                if let Err(e) = release_link(new, Arc::clone(&serial)).await {
                     log_failed_release("Closing the new link", &self.identifier, &e);
                 }
                 return self.cancelled_reconnect().await;
@@ -1275,6 +1288,185 @@ mod lifecycle_tests {
             assert_eq!(core.state().await, ConnectionState::Disconnected);
             assert_eq!(radio.connect_count("A"), 1);
             assert!(!radio.link_up("A"));
+        })
+        .await;
+    }
+
+    /// The links `FakeRadio` connected and disconnected, with their times.
+    fn link_events(radio: &FakeRadio) -> Vec<(Duration, FakeEvent)> {
+        radio
+            .events()
+            .into_iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    FakeEvent::Connected { .. } | FakeEvent::Disconnect { .. }
+                )
+            })
+            .collect()
+    }
+
+    fn connected_at(secs: u64, handle: u64) -> (Duration, FakeEvent) {
+        let id = "A".into();
+        (
+            Duration::from_secs(secs),
+            FakeEvent::Connected { id, handle },
+        )
+    }
+
+    fn disconnected_at(secs: u64, handle: u64) -> (Duration, FakeEvent) {
+        let id = "A".into();
+        (
+            Duration::from_secs(secs),
+            FakeEvent::Disconnect { id, handle },
+        )
+    }
+
+    /// A recovering caller that is dropped while the old link is still
+    /// closing (here by its own timeout) settles nothing. The callers queued
+    /// behind it, one whose operation failed on the old link and one that
+    /// came in during the close, wait until the old link is down and then
+    /// share one reconnect: the old link's close can't take the new link
+    /// down, and neither caller returns `NotConnected` when nobody gave up.
+    #[tokio::test(start_paused = true)]
+    async fn queued_callers_recover_after_a_recovery_dropped_while_closing_the_old_link() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = Arc::new(connected_core(&radio, ReconnectOptions::default()).await);
+            radio.set_disconnect_delay("A", Duration::from_secs(4));
+
+            // An operation is running when the link drops. It fails only
+            // after the recovery below has started, and queues behind it.
+            let in_flight = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move {
+                    core.run(|link| {
+                        Box::pin(async move {
+                            sleep(Duration::from_secs(1)).await;
+                            link.op().await
+                        })
+                    })
+                    .await
+                }
+            });
+            sleep(Duration::from_millis(500)).await;
+            radio.lose_link("A");
+
+            // The recovery takes the old link out at 1 s, once that operation
+            // has failed, and its caller gives up at 2 s, 1 s into the old
+            // link's 4 s close.
+            let recovering = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move {
+                    tokio::time::timeout(Duration::from_millis(1500), core.run(run_op)).await
+                }
+            });
+            sleep(Duration::from_secs(1)).await;
+            let arriving = spawn_run(&core);
+
+            let recovering = recovering.await.expect("join");
+            assert!(recovering.is_err(), "{recovering:?}");
+            let in_flight = in_flight.await.expect("join");
+            let arriving = arriving.await.expect("join");
+            assert!(in_flight.is_ok(), "{in_flight:?} after {:#?}", radio.events());
+            assert!(arriving.is_ok(), "{arriving:?} after {:#?}", radio.events());
+            // The close ends at 5 s, and the next recovery waits for it before
+            // its 1 s backoff, so handle 1 is down before handle 2 connects.
+            assert_eq!(
+                link_events(&radio),
+                [connected_at(0, 1), disconnected_at(5, 1), connected_at(6, 2)]
+            );
+            assert_eq!(radio.connect_count("A"), 2, "one shared reconnect");
+            assert_eq!(core.link().await.map(|link| link.handle()), Some(2));
+            assert_eq!(core.state().await, ConnectionState::Connected);
+
+            // Long after the old link's close, the new link is still up.
+            sleep(Duration::from_secs(60)).await;
+            assert!(radio.link_up("A"), "{:#?}", radio.events());
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// A `disconnect()` that is dropped (here by a timeout) while it closes
+    /// the link still keeps the next recovery waiting until the link is down,
+    /// so the late close can't take the new link down.
+    #[tokio::test(start_paused = true)]
+    async fn a_recovery_waits_for_the_close_of_a_dropped_disconnect() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = connected_core(&radio, ReconnectOptions::default()).await;
+            radio.set_disconnect_delay("A", Duration::from_secs(4));
+
+            let disconnected_in_time =
+                tokio::time::timeout(Duration::from_secs(1), core.disconnect()).await;
+            assert!(disconnected_in_time.is_err(), "{disconnected_in_time:?}");
+            // The close ends at 4 s, then the recovery backs off for 1 s.
+            let result = core.run(run_op).await;
+
+            assert!(result.is_ok(), "{result:?} after {:#?}", radio.events());
+            assert_eq!(
+                link_events(&radio),
+                [
+                    connected_at(0, 1),
+                    disconnected_at(4, 1),
+                    connected_at(5, 2)
+                ]
+            );
+            sleep(Duration::from_secs(60)).await;
+            assert!(radio.link_up("A"), "{:#?}", radio.events());
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// A recovery that a stop reaches after its connect has returned closes
+    /// the new link, and the next recovery waits until that link is down even
+    /// if the stopped recovery's caller is dropped (here by a timeout) during
+    /// the close.
+    #[tokio::test(start_paused = true)]
+    async fn a_recovery_waits_for_the_new_link_that_a_dropped_recovery_closes() {
+        within(LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = Arc::new(connected_core(&radio, ReconnectOptions::default()).await);
+            radio.set_disconnect_delay("A", Duration::from_secs(4));
+            radio.set_connect_delay("A", Duration::from_secs(10));
+            radio.lose_link("A");
+
+            // The old link closes until 4 s and the backoff ends at 5 s. The
+            // connect returns at 15 s, while the read guard taken at 10 s keeps
+            // its link from being installed, and the caller gives up at 17 s.
+            let recovering = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move { tokio::time::timeout(Duration::from_secs(17), core.run(run_op)).await }
+            });
+            sleep(Duration::from_secs(10)).await;
+            let reading = core.link.read().await;
+            sleep(Duration::from_secs(6)).await;
+            core.cancel();
+            radio.set_connect_delay("A", Duration::ZERO);
+            // The recovery closes the new link from 16 s to 20 s.
+            drop(reading);
+
+            let recovering = recovering.await.expect("join");
+            assert!(recovering.is_err(), "{recovering:?}");
+            core.reset_cancellation();
+            let result = core.run(run_op).await;
+
+            assert!(result.is_ok(), "{result:?} after {:#?}", radio.events());
+            assert_eq!(
+                link_events(&radio),
+                [
+                    connected_at(0, 1),
+                    disconnected_at(4, 1),
+                    connected_at(15, 2),
+                    disconnected_at(20, 2),
+                    connected_at(21, 3),
+                ]
+            );
+            sleep(Duration::from_secs(60)).await;
+            assert!(radio.link_up("A"), "{:#?}", radio.events());
+            radio.assert_no_drop_teardown();
         })
         .await;
     }
