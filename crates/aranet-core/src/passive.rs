@@ -183,7 +183,7 @@ impl PassiveMonitor {
     /// advertisements and parses Aranet device data.
     ///
     /// The task stops as soon as the cancellation token is triggered, even
-    /// during a scan or a wait.
+    /// while it gets the Bluetooth adapter, scans or waits.
     pub fn start(self: &Arc<Self>, cancel_token: CancellationToken) -> tokio::task::JoinHandle<()> {
         let monitor = Arc::clone(self);
 
@@ -193,20 +193,9 @@ impl PassiveMonitor {
             // Acquire the adapter once and reuse across scan cycles.
             // On persistent errors we re-acquire it in case the adapter
             // was reset or the D-Bus connection was lost.
-            let mut adapter = loop {
-                match get_adapter().await {
-                    Ok(a) => break a,
-                    Err(e) => {
-                        warn!("Passive monitor failed to get adapter: {e} — retrying in 10s");
-                        tokio::select! {
-                            _ = cancel_token.cancelled() => {
-                                info!("Passive monitor cancelled while waiting for adapter");
-                                return;
-                            }
-                            _ = sleep(Duration::from_secs(10)) => {}
-                        }
-                    }
-                }
+            let Some(mut adapter) = first_adapter(&cancel_token, get_adapter).await else {
+                info!("Passive monitor cancelled while waiting for adapter");
+                return;
             };
             let mut consecutive_errors: u32 = 0;
 
@@ -407,9 +396,33 @@ impl Default for PassiveMonitor {
     }
 }
 
+/// The adapter that a passive monitor starts with, from `get` (`get_adapter` in
+/// the library), which is called again 10 s after each failure. `None` as soon
+/// as `cancel` is triggered, even while `get` is still waiting for an answer,
+/// which on Linux can take up to the 30 s D-Bus timeout when bluetoothd is slow.
+async fn first_adapter<A, F>(cancel: &CancellationToken, mut get: impl FnMut() -> F) -> Option<A>
+where
+    F: Future<Output = Result<A>>,
+{
+    loop {
+        match cancel.run_until_cancelled(get()).await? {
+            Ok(adapter) => return Some(adapter),
+            Err(e) => {
+                warn!("Passive monitor failed to get adapter: {e} — retrying in 10s");
+                cancel
+                    .run_until_cancelled(sleep(Duration::from_secs(10)))
+                    .await?;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::error::{DeviceNotFoundReason, Error};
+    use crate::test_support::within;
 
     #[test]
     fn test_passive_monitor_options_default() {
@@ -571,5 +584,76 @@ mod tests {
 
         // device-2 has no cache entry, so it should emit even with identical data.
         assert!(monitor.should_emit("device-2", &data).await);
+    }
+
+    // ==================== First Adapter Tests ====================
+
+    /// Longest any first-adapter test may take on the paused clock.
+    const TEST_LIMIT: Duration = Duration::from_secs(600);
+
+    /// What `get_adapter` returns when the system has no Bluetooth adapter.
+    fn no_adapter() -> Error {
+        Error::DeviceNotFound(DeviceNotFoundReason::NoAdapter)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_stops_the_first_adapter_fetch() {
+        within(TEST_LIMIT, async {
+            // A fetch that never answers, like a D-Bus call to a stalled
+            // bluetoothd, cancelled 1 s in.
+            let cancel = CancellationToken::new();
+            let started = tokio::time::Instant::now();
+            let (adapter, ()) = tokio::join!(
+                within(
+                    Duration::from_secs(10),
+                    first_adapter(&cancel, std::future::pending::<Result<()>>)
+                ),
+                async {
+                    sleep(Duration::from_secs(1)).await;
+                    cancel.cancel();
+                }
+            );
+            assert_eq!(adapter, None);
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_adapter_fetch_is_retried_every_10_s_until_cancelled() {
+        within(TEST_LIMIT, async {
+            // Two failures, then an adapter from the third fetch, 20 s in.
+            let calls = std::cell::Cell::new(0);
+            let started = tokio::time::Instant::now();
+            let adapter = first_adapter(&CancellationToken::new(), || {
+                calls.set(calls.get() + 1);
+                let call = calls.get();
+                async move {
+                    if call < 3 {
+                        Err(no_adapter())
+                    } else {
+                        Ok(call)
+                    }
+                }
+            })
+            .await;
+            assert_eq!(adapter, Some(3));
+            assert_eq!(started.elapsed(), Duration::from_secs(20));
+
+            // Fetches that keep failing, cancelled 15 s in, during the wait
+            // before the third.
+            let cancel = CancellationToken::new();
+            let started = tokio::time::Instant::now();
+            let (adapter, ()) = tokio::join!(
+                first_adapter(&cancel, || async { Err::<(), _>(no_adapter()) }),
+                async {
+                    sleep(Duration::from_secs(15)).await;
+                    cancel.cancel();
+                }
+            );
+            assert_eq!(adapter, None);
+            assert_eq!(started.elapsed(), Duration::from_secs(15));
+        })
+        .await;
     }
 }
