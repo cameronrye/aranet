@@ -32,7 +32,9 @@ use futures::{Stream, StreamExt};
 use tokio::time::timeout;
 
 /// Default timeout for BLE operations
-const BLE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// A connect's search alone takes up to about 30 s (scans of 5, 10 and 15 s).
+const BLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Extended timeout for history operations
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(120);
