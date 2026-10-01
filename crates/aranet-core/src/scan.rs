@@ -8,6 +8,7 @@
 //! window runs on aranet-core's background runtime and stops as soon as its
 //! caller is dropped.
 
+use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -624,6 +625,38 @@ fn search_filter(attempt: u32, max_attempts: u32, filter_until_last: bool) -> Sc
     }
 }
 
+/// What a device search does after its scan window `attempt` (counted from 1) of
+/// `max_attempts` found no device that `query` names, where `similar` are the
+/// names that contain the query (from `Search::Missing`): `Continue` to scan
+/// again, or `Break` with the error the search fails with.
+///
+/// Similar names end the search at once with `NoExactMatch`, so a query that is
+/// part of a name, the commonest mistake, fails after the first window that
+/// leaves such names known instead of after the last window. Scanning on could
+/// still find a device that the query names only if no window has heard that
+/// device yet and its whole name is part of the name of one that has been
+/// heard. Without similar names the search scans again until its last window,
+/// then fails with `NotFound`.
+fn after_missed_scan(
+    query: &str,
+    similar: Vec<String>,
+    attempt: u32,
+    max_attempts: u32,
+) -> ControlFlow<Error> {
+    use crate::error::DeviceNotFoundReason;
+
+    if !similar.is_empty() {
+        return ControlFlow::Break(Error::DeviceNotFound(DeviceNotFoundReason::NoExactMatch {
+            identifier: query.to_string(),
+            similar,
+        }));
+    }
+    if attempt < max_attempts {
+        return ControlFlow::Continue(());
+    }
+    ControlFlow::Break(Error::device_not_found(query))
+}
+
 /// Find a device by its address, identifier or full name.
 ///
 /// `identifier` is trimmed and case is ignored, but otherwise it must match one
@@ -649,9 +682,10 @@ fn search_filter(attempt: u32, max_attempts: u32, filter_until_last: bool) -> Sc
 ///   [`DeviceNotFoundReason::Ambiguous`](crate::error::DeviceNotFoundReason::Ambiguous)
 ///   at once if several nearby devices match;
 ///   [`DeviceNotFoundReason::NoExactMatch`](crate::error::DeviceNotFoundReason::NoExactMatch)
-///   if none matches but some Aranet device names contain `identifier`; and
+///   if none matches but some Aranet device names contain `identifier`, after
+///   the first scan that ends that way rather than after the last; and
 ///   [`DeviceNotFoundReason::NotFound`](crate::error::DeviceNotFoundReason::NotFound)
-///   otherwise.
+///   otherwise, after the last scan.
 /// - [`Error::Bluetooth`] if the adapter fails.
 pub async fn find_device(identifier: &str) -> Result<(Adapter, Peripheral)> {
     find_device_with_options(identifier, ScanOptions::default()).await
@@ -705,8 +739,6 @@ pub async fn find_device_with_adapter_progress(
     options: ScanOptions,
     progress: Option<ProgressCallback>,
 ) -> Result<Peripheral> {
-    use crate::error::DeviceNotFoundReason;
-
     let query = parse_query(identifier)?;
 
     info!("Looking for device: {}", identifier);
@@ -719,13 +751,15 @@ pub async fn find_device_with_adapter_progress(
         return Ok(peripheral);
     }
 
-    // Names that contain the query, from the latest search after a scan.
-    let mut similar = Vec::new();
     let max_attempts: u32 = 3;
     let base_duration = options.duration.as_millis() as u64 / 2;
     let base_duration = Duration::from_millis(base_duration.max(2000));
 
-    for attempt in 1..=max_attempts {
+    // Ends after `max_attempts` windows at the latest: `after_missed_scan`
+    // stops the search after the last one.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
         let scan_duration = base_duration * attempt;
         let duration_secs = scan_duration.as_secs();
 
@@ -766,7 +800,7 @@ pub async fn find_device_with_adapter_progress(
 
         run_scan(adapter, permit, filter, scan_duration).await?;
 
-        match search_known_peripherals(adapter, query).await? {
+        let similar = match search_known_peripherals(adapter, query).await? {
             Search::Found(peripheral) => {
                 info!("Found device on attempt {}", attempt);
                 if let Some(ref cb) = progress {
@@ -774,28 +808,25 @@ pub async fn find_device_with_adapter_progress(
                 }
                 return Ok(peripheral);
             }
-            Search::Missing { similar: names } => similar = names,
-        }
+            Search::Missing { similar } => similar,
+        };
 
-        if attempt < max_attempts {
-            warn!("Device not found, retrying...");
-            if let Some(ref cb) = progress {
-                cb(FindProgress::RetryNeeded { attempt });
+        match after_missed_scan(query, similar, attempt, max_attempts) {
+            ControlFlow::Break(error) => {
+                warn!(
+                    "Device not found after {} of {} attempts: {}",
+                    attempt, max_attempts, identifier
+                );
+                return Err(error);
+            }
+            ControlFlow::Continue(()) => {
+                warn!("Device not found, retrying...");
+                if let Some(ref cb) = progress {
+                    cb(FindProgress::RetryNeeded { attempt });
+                }
             }
         }
     }
-
-    warn!(
-        "Device not found after {} attempts: {}",
-        max_attempts, identifier
-    );
-    if similar.is_empty() {
-        return Err(Error::device_not_found(query));
-    }
-    Err(Error::DeviceNotFound(DeviceNotFoundReason::NoExactMatch {
-        identifier: query.to_string(),
-        similar,
-    }))
 }
 
 /// Find a specific device with progress callback for UI feedback.
@@ -1025,6 +1056,7 @@ mod tests {
 
     use futures::FutureExt;
 
+    use crate::error::DeviceNotFoundReason;
     use crate::test_support::within;
 
     // ==================== ScanOptions Tests ====================
@@ -1535,6 +1567,48 @@ mod tests {
                 vec![ScanFilter::default(); max_attempts as usize],
                 "{max_attempts} attempts"
             );
+        }
+    }
+
+    // ==================== Missed Scan Tests ====================
+
+    #[test]
+    fn a_search_fails_after_the_first_scan_that_finds_only_similar_names() {
+        // A partial name such as `-d Aranet4` fails as soon as a scan window
+        // ends with names that contain it, not after the last window.
+        for attempt in 1..=3 {
+            let similar = vec!["Aranet4 12345".to_string(), "Aranet4 1ABCD".to_string()];
+            match after_missed_scan("Aranet4", similar, attempt, 3) {
+                ControlFlow::Break(Error::DeviceNotFound(DeviceNotFoundReason::NoExactMatch {
+                    identifier,
+                    similar,
+                })) => {
+                    assert_eq!(identifier, "Aranet4", "attempt {attempt}");
+                    assert_eq!(
+                        similar,
+                        ["Aranet4 12345", "Aranet4 1ABCD"],
+                        "attempt {attempt}"
+                    );
+                }
+                other => panic!("attempt {attempt} of 3: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_search_without_similar_names_scans_until_its_last_attempt() {
+        for attempt in 1..3 {
+            let decision = after_missed_scan("Aranet4 12345", Vec::new(), attempt, 3);
+            assert!(
+                matches!(decision, ControlFlow::Continue(())),
+                "attempt {attempt} of 3: {decision:?}"
+            );
+        }
+        match after_missed_scan("Aranet4 12345", Vec::new(), 3, 3) {
+            ControlFlow::Break(Error::DeviceNotFound(DeviceNotFoundReason::NotFound {
+                identifier,
+            })) => assert_eq!(identifier, "Aranet4 12345"),
+            other => panic!("attempt 3 of 3: {other:?}"),
         }
     }
 
