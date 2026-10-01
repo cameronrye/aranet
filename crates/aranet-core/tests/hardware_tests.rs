@@ -1356,7 +1356,7 @@ async fn test_cancelled_connect_leaves_sensor_disconnected() {
 }
 
 // =============================================================================
-// Adapter Reuse Tests (macOS)
+// Adapter Reuse Tests
 // =============================================================================
 
 /// Number of OS threads in this process (macOS `ps -M` prints a header plus one line per thread).
@@ -1388,13 +1388,17 @@ async fn test_get_adapter_does_not_spawn_a_thread_per_call() {
     );
 }
 
-/// btleplug runs the CoreBluetooth adapter's event loop on the tokio runtime
-/// that created the adapter. Each `#[tokio::test]` (and any library user that
-/// builds a runtime per call) drops its runtime when done, so an adapter cached
-/// from a runtime that has shut down would silently stop discovering devices.
-#[cfg(target_os = "macos")]
+/// Each `#[tokio::test]` (and any library user that builds a runtime per call)
+/// drops its runtime when done, and what aranet caches across calls must keep
+/// working after the runtime that first used it has shut down:
+/// - on macOS, the adapter: btleplug runs the CoreBluetooth adapter's event
+///   loop on the runtime that created it, so a cached adapter created on the
+///   first runtime would silently stop discovering devices;
+/// - on Linux, the Bluetooth manager: bluez-async runs the D-Bus connection's
+///   only I/O task on the runtime that created the manager, so every later
+///   call on it would wait out the 30 s D-Bus timeout and fail.
 #[test]
-#[ignore = "requires BLE hardware and an Aranet device in range (macOS)"]
+#[ignore = "requires BLE hardware and an Aranet device in range"]
 fn test_get_adapter_still_discovers_after_its_runtime_shuts_down() {
     // Current-thread runtimes, like `#[tokio::test]`, so no extra worker threads.
     let runtime = || {
