@@ -86,6 +86,10 @@ struct FakeSensor {
     disconnect_delay: Duration,
     /// How long each `read_device_info()` takes.
     info_delay: Duration,
+    /// The link is up but answers nothing (`FakeRadio::make_zombie`).
+    zombie: bool,
+    /// How long `is_connected` and `is_alive` take (`FakeRadio::set_probe_delay`).
+    probe_delay: Duration,
 }
 
 impl RadioState {
@@ -143,7 +147,9 @@ impl FakeRadio {
         }
         state.last_handle += 1;
         let handle = state.last_handle;
-        state.sensor(&id).up = true;
+        let sensor = state.sensor(&id);
+        sensor.up = true;
+        sensor.zombie = false;
         self.log(
             &mut state,
             FakeEvent::Connected {
@@ -208,6 +214,18 @@ impl FakeRadio {
         }
     }
 
+    /// The sensor's link stays up, so `is_connected` is true, but it answers
+    /// nothing: `is_alive` is false and reads time out. The next connect
+    /// clears it.
+    pub(crate) fn make_zombie(&self, id: &str) {
+        self.state().sensor(id).zombie = true;
+    }
+
+    /// `is_connected` and `is_alive` on `id`'s links take `delay`.
+    pub(crate) fn set_probe_delay(&self, id: &str, delay: Duration) {
+        self.state().sensor(id).probe_delay = delay;
+    }
+
     /// The sensor went out of range: its link is down, and no handle knows yet.
     pub(crate) fn lose_link(&self, id: &str) {
         self.state().sensor(id).up = false;
@@ -266,8 +284,28 @@ impl FakeConn {
         self.handle
     }
 
+    /// Waits as long as `set_probe_delay` says.
+    async fn probe_delay(&self) {
+        let delay = self.radio.state().sensor(&self.id).probe_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// The error every read of a zombie link returns.
+    fn zombie_timeout(&self) -> Result<()> {
+        if self.radio.state().sensor(&self.id).zombie {
+            return Err(Error::Timeout {
+                operation: "read from device".into(),
+                duration: Duration::from_secs(10),
+            });
+        }
+        Ok(())
+    }
+
     /// Any operation on the sensor: it works while the sensor's link is up.
     pub(crate) async fn op(&self) -> Result<()> {
+        self.zombie_timeout()?;
         let mut state = self.radio.state();
         let ok = state.sensor(&self.id).up;
         self.radio.log(
@@ -284,6 +322,7 @@ impl FakeConn {
 
 impl SensorLink for FakeConn {
     async fn is_connected(&self) -> bool {
+        self.probe_delay().await;
         self.radio.link_up(&self.id)
     }
 
@@ -313,10 +352,14 @@ impl SensorLink for FakeConn {
     }
 
     async fn is_alive(&self) -> bool {
-        self.radio.link_up(&self.id)
+        self.probe_delay().await;
+        let mut state = self.radio.state();
+        let sensor = state.sensor(&self.id);
+        sensor.up && !sensor.zombie
     }
 
     async fn read_current(&self) -> Result<CurrentReading> {
+        self.zombie_timeout()?;
         if self.radio.link_up(&self.id) {
             Ok(CurrentReading::default())
         } else {
@@ -325,6 +368,7 @@ impl SensorLink for FakeConn {
     }
 
     async fn read_device_info(&self) -> Result<DeviceInfo> {
+        self.zombie_timeout()?;
         let delay = self.radio.state().sensor(&self.id).info_delay;
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
