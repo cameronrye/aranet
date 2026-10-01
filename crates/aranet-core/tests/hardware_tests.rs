@@ -1,8 +1,12 @@
 //! Hardware integration tests for aranet-core
 //!
-//! These tests require actual BLE hardware and should be run with:
+//! These tests require actual BLE hardware and should be run one at a time
+//! (`--test-threads=1`): a process runs one scan at a time and the tests share
+//! one adapter, so in parallel they wait behind each other's scans and see each
+//! other's scan events, which makes them fail against correct code. Run them
+//! with:
 //! ```
-//! cargo test --package aranet-core --test hardware_tests -- --ignored --nocapture
+//! cargo test --package aranet-core --test hardware_tests -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Configure devices via environment variables:
@@ -14,7 +18,7 @@
 //!
 //! Example:
 //! ```
-//! ARANET4_DEVICE="Aranet4 12345" cargo test --package aranet-core --test hardware_tests -- --ignored --nocapture
+//! ARANET4_DEVICE="Aranet4 12345" cargo test --package aranet-core --test hardware_tests -- --ignored --nocapture --test-threads=1
 //! ```
 
 use std::env;
