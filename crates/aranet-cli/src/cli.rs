@@ -36,7 +36,7 @@ pub enum StyleMode {
 /// Reusable device connection arguments
 #[derive(Debug, Clone, Args)]
 pub struct DeviceArgs {
-    /// Device: MAC address, macOS UUID or full name (exact, any case), or an alias; or set ARANET_DEVICE
+    /// Device: MAC address, macOS UUID or full name (exact), or an alias; or set ARANET_DEVICE
     #[arg(short, long, env = "ARANET_DEVICE")]
     pub device: Option<String>,
 
@@ -767,5 +767,32 @@ mod tests {
     #[test]
     fn test_set_smart_home_requires_value() {
         assert!(Cli::try_parse_from(["aranet", "set", "--device", "x", "smart-home"]).is_err());
+    }
+
+    #[test]
+    fn test_passive_commands_do_not_promise_names_in_any_case() {
+        // `--passive` compares names exactly, case included.
+        let cli = Cli::command();
+        let passive_commands: Vec<_> = cli
+            .get_subcommands()
+            .filter(|command| command.get_arguments().any(|arg| arg.get_id() == "passive"))
+            .collect();
+        assert!(!passive_commands.is_empty());
+
+        for command in passive_commands {
+            let device = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "device")
+                .unwrap_or_else(|| panic!("`{}` has no --device", command.get_name()));
+            let help = device
+                .get_help()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(
+                !help.contains("any case"),
+                "`{}` --device: {help}",
+                command.get_name()
+            );
+        }
     }
 }
