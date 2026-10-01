@@ -1037,7 +1037,7 @@ impl<L: SensorLink> ManagerCore<L> {
     pub(crate) async fn health_tick(&self) -> TickOutcome {
         let mut outcome = TickOutcome::default();
 
-        // Phase 1: check every connected device at once, so a slow device
+        // First pass: check every connected device at once, so a slow device
         // doesn't hold up the others.
         let targets: Vec<_> = {
             let devices = self.devices.read().await;
@@ -1061,8 +1061,8 @@ impl<L: SensorLink> ManagerCore<L> {
             .filter(|&healthy| healthy)
             .count();
 
-        // Phase 2: reconnect one device at a time (a second search would only
-        // wait for the scan permit), highest priority first.
+        // Second pass: reconnect one device at a time (a second search would
+        // only wait for the scan permit), highest priority first.
         let mut due: Vec<_> = {
             let devices = self.devices.read().await;
             devices
@@ -1536,8 +1536,11 @@ impl DeviceManager {
     ///
     /// A connect of the same device that hasn't connected yet is abandoned:
     /// it returns [`Error::Cancelled`], closing its connection if one comes
-    /// up. The health monitor doesn't reconnect the device until
-    /// [`connect`](Self::connect) is called.
+    /// up. This waits until that connect's Bluetooth attempt has ended and
+    /// such a connection is closed, which can take the connect's whole time
+    /// budget: tens of seconds at default settings. The health monitor
+    /// doesn't reconnect the device until [`connect`](Self::connect) is
+    /// called.
     ///
     /// If this future is dropped while the device is being disconnected, the
     /// disconnect still finishes in the background, and a connect of the same
@@ -1552,7 +1555,9 @@ impl DeviceManager {
     /// manager and the error is returned, but the health monitor doesn't
     /// reconnect it until [`connect`](Self::connect) is called. A connect of
     /// the device that hasn't connected yet is abandoned: it returns
-    /// [`Error::Cancelled`], closing its connection if one comes up.
+    /// [`Error::Cancelled`], closing its connection if one comes up. As with
+    /// [`disconnect`](Self::disconnect), this waits until that connect's
+    /// Bluetooth attempt has ended and such a connection is closed.
     pub async fn remove_device(&self, identifier: &str) -> Result<()> {
         self.core.remove_device(identifier).await
     }
@@ -1770,7 +1775,9 @@ impl DeviceManager {
     ///
     /// Returns Ok(true) if a device was disconnected, Ok(false) if no eligible device found.
     /// The health monitor doesn't reconnect the evicted device until
-    /// [`connect`](Self::connect) is called for it.
+    /// [`connect`](Self::connect) is called for it. The device is disconnected
+    /// as [`disconnect`](Self::disconnect) does it, so this too waits for a
+    /// connect of that device that is running to end.
     pub async fn evict_lowest_priority(&self) -> Result<bool> {
         self.core.evict_lowest_priority().await
     }
@@ -1834,10 +1841,11 @@ impl DeviceManager {
     /// This performs a quick scan to check if the device is broadcasting
     /// advertisement data with sensor readings.
     ///
-    /// Scans in one process run one at a time, so the check's 5 s scan first
-    /// waits for any scan that is already running. It returns `false` if no
-    /// reading arrives within 15 s, so a scan window of more than 10 s that is
-    /// already running can make it miss a device that does advertise.
+    /// Scans in one process run one at a time, in the order they asked to, so
+    /// the check's 5 s scan first waits for the scan window that is running
+    /// and for every window queued before it. It returns `false` if no reading
+    /// arrives within 15 s, so when those windows take more than 10 s in all,
+    /// it can miss a device that does advertise.
     pub async fn supports_passive_monitoring(&self, identifier: &str) -> bool {
         // Create a short-lived passive monitor to check for advertisements
         let options = PassiveMonitorOptions::default()
@@ -1851,7 +1859,7 @@ impl DeviceManager {
         let _handle = monitor.start(cancel.clone());
 
         // Wait for a reading or timeout: 5 s of scanning, after up to 10 s of
-        // waiting for a scan window that is already running.
+        // waiting for the scan windows ahead of it.
         let result = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
         cancel.cancel();
 
@@ -2421,8 +2429,8 @@ mod lifecycle_tests {
         .await;
     }
 
-    /// Task 14: the health monitor (BR-5 dead links, BR-8 intent, backoff
-    /// and cancellation).
+    /// The health monitor: dead links, the user's intent, backoff and
+    /// cancellation.
     mod health {
         use std::sync::Arc;
         use std::time::Duration;
@@ -2494,7 +2502,7 @@ mod lifecycle_tests {
             })
         }
 
-        // ---- BR-5 ----
+        // ---- Dead links ----
 
         #[tokio::test(start_paused = true)]
         async fn health_tick_replaces_a_dead_handle() {
@@ -2816,9 +2824,9 @@ mod lifecycle_tests {
         }
 
         /// A `connect()` given up on while it closes a dead link keeps the
-        /// device until that link is down, as a cancelled `disconnect()` does
-        /// (Task 13): a disconnect acts on the sensor, not on the handle, so
-        /// a new link made before it finished would be taken down by it.
+        /// device until that link is down, as a cancelled `disconnect()` does:
+        /// a disconnect acts on the sensor, not on the handle, so a new link
+        /// made before it finished would be taken down by it.
         #[tokio::test(start_paused = true)]
         async fn connect_after_a_cancelled_connect_waits_for_the_dead_link_to_go_down() {
             within(LIMIT, async {
@@ -2900,7 +2908,7 @@ mod lifecycle_tests {
             .await;
         }
 
-        // ---- BR-8 ----
+        // ---- The user's intent, backoff and limits ----
 
         #[tokio::test(start_paused = true)]
         async fn health_tick_skips_user_disconnected_device() {

@@ -1456,7 +1456,7 @@ mod tests {
     // ==================== Device Lookup Tests ====================
 
     /// CoreBluetooth UUIDs as `aranet scan` prints them on macOS. The first two
-    /// are the Aranet2 and the AranetRn+ in the Phase 1 hardware log.
+    /// are those of a real Aranet2 and AranetRn+; the third is made up.
     const UUID_1: &str = "1f8893bf-9f7e-02b4-ef4a-7718f4f5d4be";
     const UUID_2: &str = "387c18c7-299f-cc32-d01c-6cf29a8d3ca5";
     const UUID_3: &str = "5b0e4c1d-7a3f-4e2b-9c6d-8f1a2b3c4d5e";
@@ -1762,8 +1762,12 @@ mod tests {
 
     #[tokio::test]
     async fn find_device_rejects_an_empty_identifier_without_bluetooth() {
-        // Real clock and a 5 s limit (Global Constraints exception): before the
-        // fix this reaches the Bluetooth stack.
+        // The real clock, unlike the other async tests here. Both calls must
+        // return before they touch Bluetooth. If one reached the Bluetooth
+        // stack, a paused clock would jump to the limit while the call waited
+        // on the `aranet-ble` thread, and the failure would show a timeout
+        // instead of the stack's own error. A correct call never waits, so the
+        // 5 s limit matters only then.
         let found = within(Duration::from_secs(5), find_device("")).await;
         assert!(
             matches!(found, Err(Error::InvalidConfig(_))),

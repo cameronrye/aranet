@@ -58,9 +58,10 @@ pub(crate) enum FakeEvent {
     },
 }
 
-/// Sensors as BlueZ and (since Phase 1) CoreBluetooth see them: one link per
-/// sensor, and a disconnect from any handle, or the `Drop` of a handle that
-/// was never disconnected, takes down whichever link is up.
+/// Sensors as BlueZ and CoreBluetooth see them (aranet-core shares one
+/// CoreBluetooth central across the process): one link per sensor, and a
+/// disconnect from any handle, or the `Drop` of a handle that was never
+/// disconnected, takes down whichever link is up.
 #[derive(Clone)]
 pub(crate) struct FakeRadio {
     inner: Arc<Mutex<RadioState>>,
@@ -126,7 +127,8 @@ impl FakeRadio {
         })
     }
 
-    /// Dropping this future part-way changes nothing, like Task 5's `Device::connect`.
+    /// Dropping this future part-way leaves no link up, as dropping
+    /// `Device::connect` does: that disconnects the link it was making.
     async fn connect(&self, id: String) -> Result<FakeConn> {
         let delay = {
             let mut state = self.state();
@@ -332,8 +334,9 @@ impl SensorLink for FakeConn {
         if delay.is_zero() {
             return self.radio.disconnect_now(&self.id, self.handle);
         }
-        // Like `Device::disconnect` (Task 6), a slow disconnect runs on its own
-        // task, so it takes the link down even if this future is dropped.
+        // Like `Device::disconnect`, which runs the disconnect as a task on
+        // aranet-core's runtime, a slow disconnect runs on its own task, so it
+        // takes the link down even if this future is dropped.
         let (radio, id, handle) = (self.radio.clone(), self.id.clone(), self.handle);
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
