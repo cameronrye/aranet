@@ -1427,8 +1427,10 @@ fn test_get_adapter_still_discovers_after_its_runtime_shuts_down() {
 // =============================================================================
 
 /// The adapter's peripheral for `device`: its scan identifier, its btleplug ID, or its
-/// name (either half of CoreBluetooth's "GAP [advertised]" form), any case.
-async fn find_peripheral(device: &str) -> btleplug::platform::Peripheral {
+/// name (either half of CoreBluetooth's "GAP [advertised]" form), any case. `None`
+/// when the adapter doesn't know it: CoreBluetooth forgets a peripheral once it
+/// has disconnected, until a scan finds it again.
+async fn known_peripheral(device: &str) -> Option<btleplug::platform::Peripheral> {
     use btleplug::api::{Central as _, Peripheral as _};
 
     let adapter = aranet_core::scan::get_adapter().await.expect("adapter");
@@ -1453,10 +1455,34 @@ async fn find_peripheral(device: &str) -> btleplug::platform::Peripheral {
             || p.id().to_string().eq_ignore_ascii_case(device)
             || name.as_deref().is_some_and(is_device)
         {
-            return p;
+            return Some(p);
         }
     }
-    panic!("{device} is not known to the adapter");
+    None
+}
+
+/// The adapter's peripheral for `device`, which must be known to the adapter.
+async fn find_peripheral(device: &str) -> btleplug::platform::Peripheral {
+    known_peripheral(device)
+        .await
+        .unwrap_or_else(|| panic!("{device} is not known to the adapter"))
+}
+
+/// Whether the Bluetooth stack reports `device` as connected. `false` when the
+/// adapter doesn't know it (see `known_peripheral`) or doesn't answer within
+/// 5 s: btleplug never answers for a peripheral that CoreBluetooth has dropped.
+async fn peripheral_connected(device: &str) -> bool {
+    let Some(p) = known_peripheral(device).await else {
+        return false;
+    };
+    matches!(
+        timeout(
+            Duration::from_secs(5),
+            btleplug::api::Peripheral::is_connected(&p)
+        )
+        .await,
+        Ok(Ok(true))
+    )
 }
 
 /// Disconnect `device` behind aranet's back (same CBPeripheral / BlueZ object path), as if it went out of range.
@@ -1536,4 +1562,107 @@ async fn test_reconnecting_device_recovers_from_link_loss() {
         "the forced link loss should have made it reconnect"
     );
     assert_eq!(reconnects, 1, "the new link should survive the old one");
+}
+
+/// BR-5, BR-8: the health monitor replaces a connection that dropped behind
+/// its back, and leaves the device alone once `disconnect()` was called.
+#[tokio::test]
+#[ignore = "requires BLE hardware and an Aranet2 device"]
+async fn test_health_monitor_repairs_link_loss_and_respects_disconnect() {
+    use std::sync::Arc;
+
+    use aranet_core::{DeviceEvent, DeviceManager, ManagerConfig};
+    use tokio_util::sync::CancellationToken;
+
+    /// How long the monitor gets to repair the lost link: up to two ticks
+    /// (5 s apart), the validation read (at most 3 s), closing the dead link
+    /// (at most 5 s), and up to two searches and connects. On macOS the first
+    /// connect after a forced disconnect can time out after 15 s; the monitor
+    /// then tries again at the next tick.
+    const REPAIR_TIMEOUT: Duration = Duration::from_secs(90);
+
+    let Some(dev) = get_device("aranet2") else {
+        println!("SKIP: ARANET2_DEVICE not set");
+        return;
+    };
+
+    let manager = Arc::new(DeviceManager::with_config(
+        ManagerConfig::default()
+            .health_check_interval(Duration::from_secs(5))
+            .adaptive_interval(false),
+    ));
+    let mut events = manager.events().subscribe();
+    timeout(BLE_TIMEOUT, manager.connect(&dev))
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+    let cancel = CancellationToken::new();
+    let monitor = manager.start_health_monitor(cancel.clone());
+
+    // 1. The link drops behind the manager's back: the monitor closes the dead
+    //    handle and connects again.
+    force_link_loss(&dev).await;
+    let lost_at = std::time::Instant::now();
+    let saw_disconnect = timeout(REPAIR_TIMEOUT, async {
+        let mut saw_disconnect = false;
+        loop {
+            match events.recv().await.expect("event channel") {
+                DeviceEvent::Disconnected { device, reason } if device.id == dev => {
+                    println!("{:.1?}: Disconnected ({reason:?})", lost_at.elapsed());
+                    saw_disconnect = true;
+                }
+                DeviceEvent::ReconnectSucceeded { device, attempts } if device.id == dev => {
+                    println!(
+                        "{:.1?}: ReconnectSucceeded after {attempts} attempt(s)",
+                        lost_at.elapsed()
+                    );
+                    return saw_disconnect;
+                }
+                other => println!("{:.1?}: {other:?}", lost_at.elapsed()),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the monitor did not repair the link within {REPAIR_TIMEOUT:?}"));
+    assert!(
+        saw_disconnect,
+        "ReconnectSucceeded came without a Disconnected"
+    );
+    let reading = timeout(BLE_TIMEOUT, manager.read_current(&dev))
+        .await
+        .expect("read timed out")
+        .expect("read after the repair failed");
+    println!("read after the repair: {reading:?}");
+
+    // 2. The user disconnects: the monitor must leave the device alone.
+    while events.try_recv().is_ok() {}
+    timeout(BLE_TIMEOUT, manager.disconnect(&dev))
+        .await
+        .expect("disconnect timed out")
+        .expect("disconnect failed");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let mut reconnects = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        println!("after disconnect(): {event:?}");
+        if matches!(
+            event,
+            DeviceEvent::Connected { .. } | DeviceEvent::ReconnectStarted { .. }
+        ) {
+            reconnects.push(event);
+        }
+    }
+    assert!(
+        reconnects.is_empty(),
+        "the monitor reconnected the device after disconnect(): {reconnects:?}"
+    );
+    assert!(
+        !peripheral_connected(&dev).await,
+        "the sensor is still connected after disconnect()"
+    );
+
+    cancel.cancel();
+    timeout(Duration::from_secs(5), monitor)
+        .await
+        .expect("the health monitor did not stop within 5 s")
+        .expect("the health monitor panicked");
 }
