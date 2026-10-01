@@ -69,6 +69,10 @@ pub(crate) async fn release_link<L: SensorLink, H: Send + 'static>(
 /// CoreBluetooth backend forgets the peripheral and never answers a disconnect
 /// for it, so the close runs into its time limit. Links to unpaired sensors
 /// can drop on their own there a few minutes after they come up.
+///
+/// Workaround for btleplug 0.11.8
+/// (<https://github.com/deviceplug/btleplug/issues/494>); re-check when
+/// upgrading btleplug.
 const CLOSES_TIME_OUT_AFTER_DROP: bool = cfg!(target_os = "macos");
 
 /// Whether `error`, from a failed `release_link`, is expected and so no sign

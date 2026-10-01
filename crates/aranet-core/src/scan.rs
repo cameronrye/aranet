@@ -610,6 +610,10 @@ fn aranet_service_filter() -> ScanFilter {
 /// process and leaks a little memory for every advertisement it receives, so
 /// unfiltered searches near many Bluetooth devices make a long-running program
 /// grow by 1-2 MB an hour. Linux and Windows searches ask for every device.
+///
+/// Workaround for btleplug 0.11.8
+/// (<https://github.com/deviceplug/btleplug/issues/494>); re-check when
+/// upgrading btleplug.
 const FILTER_SEARCH_UNTIL_LAST_ATTEMPT: bool = cfg!(target_os = "macos");
 
 /// The scan filter of attempt `attempt` (counted from 1) of a device search that
