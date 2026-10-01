@@ -21,21 +21,34 @@ pub async fn disconnect_device(device: &aranet_core::Device) {
     }
 }
 
-/// Build a user-friendly device error with suggestions and timestamp.
-///
-/// An identifier that is empty, ambiguous or only part of a name gets no
-/// suggestions: the fix is to type it exactly, which the cause already says.
-fn device_error(operation: &str, identifier: &str, cause: aranet_core::Error) -> anyhow::Error {
+/// Whether a device search failed because of the identifier itself: it is
+/// empty (the only `InvalidConfig` a search returns), shared by several nearby
+/// devices, or only part of a name. Searching again gives the same answer, so
+/// `watch` fails at once instead of retrying. A device that wasn't heard
+/// (`DeviceNotFoundReason::NotFound`) isn't one: the next search may hear it.
+pub(crate) fn is_identifier_mistake(error: &aranet_core::Error) -> bool {
     use aranet_core::{DeviceNotFoundReason, Error};
 
-    let base_msg = format!("Failed to {} device: {}", operation, identifier);
-    if matches!(
-        cause,
+    matches!(
+        error,
         Error::InvalidConfig(_)
             | Error::DeviceNotFound(
                 DeviceNotFoundReason::Ambiguous { .. } | DeviceNotFoundReason::NoExactMatch { .. }
             )
-    ) {
+    )
+}
+
+/// Build a user-friendly device error with suggestions and timestamp.
+///
+/// An identifier mistake ([`is_identifier_mistake`]) gets no suggestions: the
+/// fix is to type the identifier exactly, which the cause already says.
+pub(crate) fn device_error(
+    operation: &str,
+    identifier: &str,
+    cause: aranet_core::Error,
+) -> anyhow::Error {
+    let base_msg = format!("Failed to {} device: {}", operation, identifier);
+    if is_identifier_mistake(&cause) {
         return anyhow::anyhow!("{}\n\nCause: {}", base_msg, cause);
     }
     let timestamp = aranet_cli::local_now_fmt("[year]-[month]-[day] [hour]:[minute]:[second]");
@@ -325,11 +338,12 @@ mod tests {
         assert_eq!(content, "header\nrow1\nrow2\n");
     }
 
-    #[test]
-    fn test_identifier_mistakes_get_no_bluetooth_suggestions() {
+    /// The errors a search returns for an identifier that is empty, only part
+    /// of a name, or shared by two nearby devices.
+    fn identifier_mistakes() -> [aranet_core::Error; 3] {
         use aranet_core::{DeviceNotFoundReason, Error};
 
-        let mistakes = [
+        [
             Error::invalid_config("device identifier is empty"),
             Error::DeviceNotFound(DeviceNotFoundReason::NoExactMatch {
                 identifier: "2751B".to_string(),
@@ -342,14 +356,30 @@ mod tests {
                     "Aranet4 12345 (AA:BB:CC:DD:EE:02)".to_string(),
                 ],
             }),
-        ];
-        for cause in mistakes {
+        ]
+    }
+
+    #[test]
+    fn test_identifier_mistakes_get_no_bluetooth_suggestions() {
+        for cause in identifier_mistakes() {
             let expected = format!("Failed to find device: x\n\nCause: {cause}");
             assert_eq!(device_error("find", "x", cause).to_string(), expected);
         }
 
         // A device that isn't heard at all keeps the troubleshooting list.
-        let absent = device_error("find", "x", Error::device_not_found("x")).to_string();
+        let absent =
+            device_error("find", "x", aranet_core::Error::device_not_found("x")).to_string();
         assert!(absent.contains("Bluetooth may be disabled"), "{absent}");
+    }
+
+    #[test]
+    fn test_is_identifier_mistake() {
+        for mistake in identifier_mistakes() {
+            assert!(is_identifier_mistake(&mistake), "{mistake}");
+        }
+
+        // The next search may hear a device this one missed, so `watch` retries.
+        let absent = aranet_core::Error::device_not_found("Aranet2 2751B");
+        assert!(!is_identifier_mistake(&absent), "{absent}");
     }
 }

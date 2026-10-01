@@ -980,6 +980,29 @@ fn test_history_json() {
 // Watch Tests
 // =============================================================================
 
+/// `watch` fails at once on an identifier that no search can fix, with the
+/// message `read` gives, instead of retrying it forever. An empty identifier is
+/// the one such mistake that needs no Bluetooth: aranet-core rejects it before
+/// it scans.
+#[test]
+fn test_watch_fails_at_once_on_an_identifier_mistake() {
+    let env = TestEnv::new();
+    let output = env.run(&["watch", "--device", "", "--count", "1"]);
+
+    assert!(
+        !output.status.success(),
+        "watch with an empty identifier should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Failed to find device: \n\nCause: Invalid configuration: device identifier is empty"
+        ),
+        "should fail the way read does: {stderr}"
+    );
+    assert!(!stderr.contains("Retrying"), "should not retry: {stderr}");
+}
+
 #[test]
 #[ignore = "requires BLE hardware and device - slow"]
 fn test_watch_limited_count() {
