@@ -5,17 +5,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
 
-use crate::connector::{ConnectFn, SensorLink, ble_connector};
+use crate::connector::{ConnectFn, SensorLink, ble_connector, release_link};
 use crate::device::Device;
 use crate::error::{ConnectionFailureReason, Error, Result};
 use crate::events::{DeviceEvent, DeviceId, DisconnectReason, EventDispatcher};
@@ -373,8 +372,12 @@ struct Entry<L> {
     failures: u32,
     /// The connection, if connected.
     link: Option<Arc<L>>,
-    /// Whether a connection attempt is currently in progress.
-    connecting: AtomicBool,
+    /// The connection-limit permit, taken before connecting and held until
+    /// the link has been disconnected.
+    slot: Option<OwnedSemaphorePermit>,
+    /// Serialises connect, disconnect and removal of this device. Taken
+    /// without holding the device map lock.
+    op: Arc<Mutex<()>>,
 }
 
 impl<L> Entry<L> {
@@ -389,7 +392,8 @@ impl<L> Entry<L> {
             auto_reconnect: true,
             failures: 0,
             link: None,
-            connecting: AtomicBool::new(false),
+            slot: None,
+            op: Arc::new(Mutex::new(())),
         }
     }
 
@@ -410,6 +414,54 @@ pub(crate) struct EntrySnapshot {
     pub(crate) failures: u32,
 }
 
+/// A new link and its slot, not yet stored in the link's entry, with a share
+/// of its connect's `op` guard. If it is dropped before `into_parts` (its
+/// connect was cancelled while waiting for the device map), it disconnects
+/// the link on a spawned task, which keeps the slot and the share of the
+/// guard until the link is down.
+struct NewLink<L: SensorLink> {
+    parts: Option<(Arc<L>, Option<OwnedSemaphorePermit>)>,
+    held: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl<L: SensorLink> NewLink<L> {
+    fn new(
+        link: Arc<L>,
+        slot: Option<OwnedSemaphorePermit>,
+        held: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Self {
+        Self {
+            parts: Some((link, slot)),
+            held: Arc::clone(held),
+        }
+    }
+
+    /// Hands over the link and its slot; dropping `self` then only gives back
+    /// its share of the guard, which the connect still holds.
+    fn into_parts(mut self) -> (Arc<L>, Option<OwnedSemaphorePermit>) {
+        self.parts
+            .take()
+            .expect("a NewLink is taken apart only once")
+    }
+}
+
+impl<L: SensorLink> Drop for NewLink<L> {
+    fn drop(&mut self) {
+        let Some((link, slot)) = self.parts.take() else {
+            return;
+        };
+        // Without a runtime, dropping the link runs its own teardown.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let held = Arc::clone(&self.held);
+            runtime.spawn(async move {
+                if let Err(e) = release_link(link, (slot, held)).await {
+                    debug!("Disconnecting an abandoned new link failed: {e}");
+                }
+            });
+        }
+    }
+}
+
 /// The device manager's logic, generic over the connection type so that the
 /// lifecycle tests can run it on `test_support::FakeRadio`. `DeviceManager` is
 /// this over `Device`.
@@ -418,15 +470,57 @@ pub(crate) struct ManagerCore<L: SensorLink> {
     events: EventDispatcher,
     config: ManagerConfig,
     connect: ConnectFn<L>,
+    /// One permit per allowed connection; `None` when connections are not limited.
+    slots: Option<Arc<Semaphore>>,
 }
 
 impl<L: SensorLink> ManagerCore<L> {
     pub(crate) fn new(config: ManagerConfig, connect: ConnectFn<L>) -> Self {
+        let max = config.max_concurrent_connections;
+        let slots = if max == 0 {
+            None
+        } else if max > Semaphore::MAX_PERMITS {
+            warn!(
+                "max_concurrent_connections ({max}) is above {}; connections are not limited",
+                Semaphore::MAX_PERMITS
+            );
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(max)))
+        };
         Self {
             devices: RwLock::new(HashMap::new()),
             events: EventDispatcher::new(config.event_capacity),
             config,
             connect,
+            slots,
+        }
+    }
+
+    /// The error for a connect that the connection limit rejects.
+    fn limit_error(&self, identifier: &str) -> Error {
+        let max = self.config.max_concurrent_connections;
+        let free = self
+            .slots
+            .as_ref()
+            .map_or(0, |slots| slots.available_permits());
+        let used = max.saturating_sub(free);
+        warn!("Connection limit reached ({used}/{max}), cannot connect to {identifier}");
+        Error::connection_failed(
+            Some(identifier.to_string()),
+            ConnectionFailureReason::Other(format!("Connection limit reached ({used}/{max})")),
+        )
+    }
+
+    /// Takes a connection slot for `identifier`: `None` when connections are
+    /// not limited, the limit error when no slot is free.
+    fn take_slot(&self, identifier: &str) -> Result<Option<OwnedSemaphorePermit>> {
+        match &self.slots {
+            Some(slots) => Arc::clone(slots)
+                .try_acquire_owned()
+                .map(Some)
+                .map_err(|_| self.limit_error(identifier)),
+            None => Ok(None),
         }
     }
 
@@ -456,122 +550,108 @@ impl<L: SensorLink> ManagerCore<L> {
     }
 
     pub(crate) async fn connect(&self, identifier: &str) -> Result<()> {
-        // Check if we need to connect (atomically check and mark as pending)
-        {
+        let (op, reserved) = {
             let mut devices = self.devices.write().await;
-
-            // Check connection limit before doing anything else
-            if self.config.max_concurrent_connections > 0 {
-                // Check if already connected (doesn't count toward limit)
-                let already_connected = devices
-                    .get(identifier)
-                    .is_some_and(|entry| entry.link.is_some());
-
-                if !already_connected {
-                    let current_connections = devices
-                        .values()
-                        .filter(|entry| entry.link.is_some())
-                        .count();
-                    if current_connections >= self.config.max_concurrent_connections {
-                        warn!(
-                            "Connection limit reached ({}/{}), cannot connect to {}",
-                            current_connections, self.config.max_concurrent_connections, identifier
-                        );
-                        return Err(Error::connection_failed(
-                            Some(identifier.to_string()),
-                            ConnectionFailureReason::Other(format!(
-                                "Connection limit reached ({}/{})",
-                                current_connections, self.config.max_concurrent_connections
-                            )),
-                        ));
-                    }
-                }
-            }
-
-            // Get or create the entry
+            // A device that the manager doesn't know yet takes its slot here,
+            // under the same lock that adds it, so a connect that the limit
+            // rejects doesn't add the device.
+            let reserved = if devices.contains_key(identifier) {
+                None
+            } else {
+                self.take_slot(identifier)?
+            };
             let entry = devices.entry(identifier.to_string()).or_insert_with(|| {
-                info!("Adding device to manager: {}", identifier);
+                info!("Adding device to manager: {identifier}");
                 Entry::new(
                     self.config.default_reconnect_options.clone(),
                     DevicePriority::default(),
                 )
             });
+            (Arc::clone(&entry.op), reserved)
+        };
+        // The map lock is released before waiting. One connect, disconnect or
+        // removal of this device runs at a time. A cancelled caller releases
+        // the guard, and a reserved slot, with its future, except that a new
+        // link it abandons keeps a share of the guard until it is down.
+        let held = Arc::new(Arc::clone(&op).lock_owned().await);
+        self.connect_locked(identifier, &held, reserved).await
+    }
 
-            // If already connected, nothing to do
-            if entry.link.is_some() {
-                debug!("Device {} already has a connection handle", identifier);
-                return Ok(());
-            }
-
-            // Try to atomically set the connecting flag to prevent race conditions.
-            // If another task is already connecting, return Ok(()) immediately.
-            //
-            // NOTE: The caller should verify `is_connected()` afterward if the
-            // connection must be established before proceeding, since this early
-            // return does not wait for the in-flight connection attempt to finish.
-            if entry
-                .connecting
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                debug!(
-                    "Another task is already connecting to device {}, returning early",
-                    identifier
-                );
-                return Ok(());
+    /// Connects `identifier` unless its entry already has a link. The caller
+    /// holds the entry's `op` guard and passes it, shared, as `held`; a new
+    /// link that is abandoned keeps a share of it until the link is down.
+    /// `reserved` is the slot that `connect` took when it added the device;
+    /// without one, a slot is taken here.
+    async fn connect_locked(
+        &self,
+        identifier: &str,
+        held: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+        reserved: Option<OwnedSemaphorePermit>,
+    ) -> Result<()> {
+        let op = tokio::sync::OwnedMutexGuard::mutex(held);
+        {
+            let devices = self.devices.read().await;
+            match devices.get(identifier) {
+                Some(entry) if Arc::ptr_eq(&entry.op, op) => {
+                    if entry.link.is_some() {
+                        debug!("Device {identifier} already has a connection handle");
+                        return Ok(());
+                    }
+                }
+                // Removed while this connect waited for the guard.
+                _ => return Err(Error::Cancelled),
             }
         }
-        // Lock is released here - other tasks can now access the device map
 
-        // Perform BLE connection (this may take time)
-        let link = match (self.connect)(identifier).await {
-            Ok(link) => Arc::new(link),
-            Err(e) => {
-                // Clear the connecting flag on failure
-                let devices = self.devices.read().await;
-                if let Some(entry) = devices.get(identifier) {
-                    entry.connecting.store(false, Ordering::SeqCst);
+        // Stored with the link and held until the link has been disconnected.
+        // Dropped here if the connect fails or its caller is cancelled.
+        let slot = match reserved {
+            Some(slot) => Some(slot),
+            None => self.take_slot(identifier)?,
+        };
+
+        let new_link = NewLink::new(Arc::new((self.connect)(identifier).await?), slot, held);
+
+        // Store the link as soon as the map lock is free, so that a cancel from
+        // then on leaves a link that the manager holds. A cancel while waiting
+        // for the lock drops `new_link`, which disconnects it.
+        let stored = {
+            let mut devices = self.devices.write().await;
+            match devices.get_mut(identifier) {
+                Some(entry) if Arc::ptr_eq(&entry.op, op) => {
+                    let (link, slot) = new_link.into_parts();
+                    entry.link = Some(Arc::clone(&link));
+                    entry.slot = slot;
+                    Ok(link)
                 }
-                return Err(e);
+                _ => Err(new_link),
+            }
+        };
+        let link = match stored {
+            Ok(link) => link,
+            Err(new_link) => {
+                debug!("{identifier} was removed while connecting; disconnecting the new link");
+                let (link, slot) = new_link.into_parts();
+                if let Err(e) = release_link(link, (slot, Arc::clone(held))).await {
+                    debug!("Disconnecting the unused link to {identifier} failed: {e}");
+                }
+                return Err(Error::Cancelled);
             }
         };
 
         let info = link.read_device_info().await.ok();
         let device_type = link.device_type();
         let name = link.name().map(|s| s.to_string());
-
-        // Update the entry atomically
         {
             let mut devices = self.devices.write().await;
-            if let Some(entry) = devices.get_mut(identifier) {
-                // Clear the connecting flag
-                entry.connecting.store(false, Ordering::SeqCst);
-
-                // Check if another task connected while we were connecting
-                // (shouldn't happen with the atomic flag, but be defensive)
-                if entry.link.is_some() {
-                    // Another task beat us to it - disconnect our connection
-                    debug!(
-                        "Another task connected {} while we were connecting, discarding our connection",
-                        identifier
-                    );
-                    drop(devices); // Release lock before async disconnect
-                    let _ = link.disconnect().await;
-                    return Ok(());
+            match devices.get_mut(identifier) {
+                Some(entry) if Arc::ptr_eq(&entry.op, op) => {
+                    entry.info = info.clone();
+                    entry.device_type = device_type;
+                    entry.name = name.clone();
                 }
-
-                entry.link = Some(link);
-                entry.info = info.clone();
-                entry.device_type = device_type;
-                entry.name = name.clone();
-            } else {
-                // Device was removed while we were connecting - still connect but add it back
-                let mut entry = Entry::new(ReconnectOptions::default(), DevicePriority::default());
-                entry.link = Some(link);
-                entry.info = info.clone();
-                entry.device_type = device_type;
-                entry.name = name.clone();
-                devices.insert(identifier.to_string(), entry);
+                // Whoever removed the entry released its link.
+                _ => return Err(Error::Cancelled),
             }
         }
 
@@ -585,34 +665,73 @@ impl<L: SensorLink> ManagerCore<L> {
             info,
         });
 
-        info!("Connected to device: {}", identifier);
+        info!("Connected to device: {identifier}");
         Ok(())
     }
 
+    /// The entry's `op` mutex, if the device is managed.
+    async fn entry_op(&self, identifier: &str) -> Option<Arc<Mutex<()>>> {
+        let devices = self.devices.read().await;
+        devices.get(identifier).map(|entry| Arc::clone(&entry.op))
+    }
+
     pub(crate) async fn disconnect(&self, identifier: &str) -> Result<()> {
-        let link = {
+        let Some(op) = self.entry_op(identifier).await else {
+            return Ok(());
+        };
+        let held = Arc::new(op.lock_owned().await);
+        self.disconnect_locked(identifier, &held).await
+    }
+
+    /// Disconnects `identifier`'s link, if it has one. `held` is the caller's
+    /// guard of the entry's `op` mutex. The disconnect keeps a share of that
+    /// guard, and the slot, until the link is down, even if this future is
+    /// dropped: until then no other connect, disconnect or removal of the
+    /// device starts, so none can overlap the old link's disconnect.
+    async fn disconnect_locked(
+        &self,
+        identifier: &str,
+        held: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<()> {
+        let op = tokio::sync::OwnedMutexGuard::mutex(held);
+        let taken = {
             let mut devices = self.devices.write().await;
-            devices
-                .get_mut(identifier)
-                .and_then(|entry| entry.link.take())
+            match devices.get_mut(identifier) {
+                Some(entry) if Arc::ptr_eq(&entry.op, op) => {
+                    entry.link.take().map(|link| (link, entry.slot.take()))
+                }
+                _ => None,
+            }
+        };
+        let Some((link, slot)) = taken else {
+            return Ok(());
         };
 
-        // Disconnect outside the lock
-        if let Some(link) = link {
-            link.disconnect().await?;
+        let result = release_link(link, (slot, Arc::clone(held))).await;
+        if result.is_ok() {
             self.events.send(DeviceEvent::Disconnected {
                 device: DeviceId::new(identifier),
                 reason: DisconnectReason::UserRequested,
             });
         }
-
-        Ok(())
+        result
     }
 
     pub(crate) async fn remove_device(&self, identifier: &str) -> Result<()> {
-        self.disconnect(identifier).await?;
-        self.devices.write().await.remove(identifier);
-        info!("Removed device from manager: {}", identifier);
+        let Some(op) = self.entry_op(identifier).await else {
+            return Ok(());
+        };
+        let held = Arc::new(Arc::clone(&op).lock_owned().await);
+        // Not `self.disconnect`: the guard is not reentrant.
+        self.disconnect_locked(identifier, &held).await?;
+        let mut devices = self.devices.write().await;
+        if devices
+            .get(identifier)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.op, &op))
+        {
+            devices.remove(identifier);
+            info!("Removed device from manager: {identifier}");
+        }
         Ok(())
     }
 
@@ -633,10 +752,9 @@ impl<L: SensorLink> ManagerCore<L> {
     }
 
     pub(crate) async fn can_connect(&self) -> bool {
-        if self.config.max_concurrent_connections == 0 {
-            return true;
-        }
-        self.connected_count().await < self.config.max_concurrent_connections
+        self.slots
+            .as_ref()
+            .is_none_or(|slots| slots.available_permits() > 0)
     }
 
     pub(crate) async fn connection_status(&self) -> (usize, usize) {
@@ -647,15 +765,7 @@ impl<L: SensorLink> ManagerCore<L> {
     }
 
     pub(crate) async fn available_connections(&self) -> Option<usize> {
-        if self.config.max_concurrent_connections == 0 {
-            return None;
-        }
-        let current = self.connected_count().await;
-        Some(
-            self.config
-                .max_concurrent_connections
-                .saturating_sub(current),
-        )
+        self.slots.as_ref().map(|slots| slots.available_permits())
     }
 
     pub(crate) async fn connected_count_verified(&self) -> usize {
@@ -763,34 +873,22 @@ impl<L: SensorLink> ManagerCore<L> {
     }
 
     pub(crate) async fn disconnect_all(&self) -> HashMap<String, Result<()>> {
-        // Collect all links first
-        let links: Vec<(String, Arc<L>)> = {
-            let mut devices = self.devices.write().await;
+        let ids: Vec<String> = {
+            let devices = self.devices.read().await;
             devices
-                .iter_mut()
-                .filter_map(|(id, entry)| entry.link.take().map(|link| (id.clone(), link)))
+                .iter()
+                .filter(|(_, entry)| entry.link.is_some())
+                .map(|(id, _)| id.clone())
                 .collect()
         };
 
-        // Disconnect all in parallel
-        let disconnect_futures = links.into_iter().map(|(id, link)| async move {
-            let result = link.disconnect().await;
+        // Disconnect all in parallel; each waits for its device's guard.
+        let disconnect_futures = ids.into_iter().map(|id| async move {
+            let result = self.disconnect(&id).await;
             (id, result)
         });
 
-        let results: Vec<(String, Result<()>)> = join_all(disconnect_futures).await;
-
-        // Emit disconnection events
-        for (id, result) in &results {
-            if result.is_ok() {
-                self.events.send(DeviceEvent::Disconnected {
-                    device: DeviceId::new(id),
-                    reason: DisconnectReason::UserRequested,
-                });
-            }
-        }
-
-        results.into_iter().collect()
+        join_all(disconnect_futures).await.into_iter().collect()
     }
 
     pub(crate) fn try_is_connected(&self, identifier: &str) -> Option<bool> {
@@ -1163,24 +1261,48 @@ impl DeviceManager {
     /// - If the device exists but is not connected, it's connected
     /// - If the device is already connected, this is a no-op
     ///
+    /// A second connect of the same device waits for the first and returns its
+    /// own real result: `Ok(())` if the first one connected the device,
+    /// otherwise the result of its own attempt. A connect that waits for a
+    /// [`remove_device`](Self::remove_device) of the same device returns
+    /// [`Error::Cancelled`] instead of adding the device back.
+    ///
+    /// If this future is dropped after the connection is made but before the
+    /// device information has been read, the device stays connected, but no
+    /// [`DeviceEvent::Connected`] is sent and
+    /// [`get_device_info`](Self::get_device_info) returns `None` until the
+    /// device is reconnected.
+    ///
     /// # Connection Limits
     ///
     /// If `max_concurrent_connections` is set in the config and would be exceeded,
-    /// this method returns an error. Use `connected_count()` to check the current
-    /// number of connections before calling this method.
+    /// this method returns an error. The limit counts connects in progress; use
+    /// `can_connect()` or `available_connections()` to check it before calling
+    /// this method.
     ///
-    /// The lock is held during the device entry update to prevent race conditions,
-    /// but released during the actual BLE connection to avoid blocking other operations.
+    /// The device map is locked only while the entry is updated, not during the
+    /// BLE connection, so operations on other devices don't wait for it;
+    /// operations on the same device do, as described above.
     pub async fn connect(&self, identifier: &str) -> Result<()> {
         self.core.connect(identifier).await
     }
 
     /// Disconnect from a device.
+    ///
+    /// If a connect of the same device is in progress, this waits for it to
+    /// finish first.
+    ///
+    /// If this future is dropped while the device is being disconnected, the
+    /// disconnect still finishes in the background, and a connect of the same
+    /// device waits for it instead of running alongside it.
     pub async fn disconnect(&self, identifier: &str) -> Result<()> {
         self.core.disconnect(identifier).await
     }
 
     /// Remove a device from the manager.
+    ///
+    /// The device is disconnected first. If that fails, it stays in the
+    /// manager and the error is returned.
     pub async fn remove_device(&self, identifier: &str) -> Result<()> {
         self.core.remove_device(identifier).await
     }
@@ -1207,7 +1329,8 @@ impl DeviceManager {
     /// Check if a new connection can be made without exceeding the limit.
     ///
     /// Returns `true` if another connection can be made, `false` if at limit.
-    /// Always returns `true` if `max_concurrent_connections` is 0 (unlimited).
+    /// Connects in progress count against the limit. Always returns `true` if
+    /// `max_concurrent_connections` is 0 (unlimited).
     pub async fn can_connect(&self) -> bool {
         self.core.can_connect().await
     }
@@ -1215,13 +1338,19 @@ impl DeviceManager {
     /// Get the connection limit status.
     ///
     /// Returns (current_connections, max_connections). If max is 0, there is no limit.
+    ///
+    /// `current_connections` counts devices with a connection handle; connects in
+    /// progress are not included but already hold a slot, so use
+    /// `available_connections` or `can_connect` to see whether `connect()` will
+    /// pass the limit.
     pub async fn connection_status(&self) -> (usize, usize) {
         self.core.connection_status().await
     }
 
     /// Get the number of available connection slots.
     ///
-    /// Returns `None` if there is no connection limit (unlimited).
+    /// Connects in progress hold a slot, and so does a disconnect until the link
+    /// is down. Returns `None` if there is no connection limit (unlimited).
     pub async fn available_connections(&self) -> Option<usize> {
         self.core.available_connections().await
     }
@@ -1537,7 +1666,8 @@ mod lifecycle_tests {
     use tokio::time::timeout;
 
     use super::{EntrySnapshot, ManagerConfig, ManagerCore};
-    use crate::test_support::{FakeConn, FakeRadio, within};
+    use crate::error::{ConnectionFailureReason, Error, Result};
+    use crate::test_support::{FakeConn, FakeEvent, FakeRadio, within};
 
     const TEST_LIMIT: Duration = Duration::from_secs(600);
 
@@ -1554,6 +1684,155 @@ mod lifecycle_tests {
                 radio.events()
             );
         }
+    }
+
+    fn is_limit_error(result: &Result<()>) -> bool {
+        matches!(
+            result,
+            Err(Error::ConnectionFailed {
+                reason: ConnectionFailureReason::Other(message),
+                ..
+            }) if message.starts_with("Connection limit reached")
+        )
+    }
+
+    /// BR-9: a connect dropped by its caller's timeout left the `connecting`
+    /// flag set, and every later connect returned Ok without connecting.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_connect_does_not_wedge_the_device() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default());
+
+            radio.set_connect_delay("A", Duration::from_secs(10));
+            assert!(
+                timeout(Duration::from_secs(1), core.connect("A"))
+                    .await
+                    .is_err()
+            );
+
+            radio.set_connect_delay("A", Duration::ZERO);
+            core.connect("A").await.expect("second connect");
+            assert!(
+                radio.link_up("A"),
+                "the second connect returned Ok without connecting"
+            );
+            assert_eq!(radio.connect_count("A"), 2);
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9: a second connect of the same device returned Ok at once while
+    /// the first was still running, even when the first then failed.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_connects_to_one_device_share_the_real_result() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default());
+            radio.set_connect_delay("A", Duration::from_secs(5));
+            radio.script_connects("A", [false, false]);
+
+            let (first, second) = tokio::join!(core.connect("A"), core.connect("A"));
+            assert!(first.is_err(), "first connect: {first:?}");
+            assert!(
+                second.is_err(),
+                "the second connect returned {second:?} although no connect succeeded"
+            );
+
+            // The second attempt starts only after the first has failed.
+            let a = || "A".to_string();
+            let events: Vec<FakeEvent> =
+                radio.events().into_iter().map(|(_, event)| event).collect();
+            assert_eq!(
+                events,
+                [
+                    FakeEvent::ConnectStarted { id: a() },
+                    FakeEvent::ConnectFailed { id: a() },
+                    FakeEvent::ConnectStarted { id: a() },
+                    FakeEvent::ConnectFailed { id: a() },
+                ]
+            );
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9: the limit counted installed links only, so connects that were
+    /// still running all passed the check.
+    #[tokio::test(start_paused = true)]
+    async fn connection_limit_counts_in_flight_connects() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default().with_max_connections(1));
+            radio.set_connect_delay("A", Duration::from_secs(5));
+            radio.set_connect_delay("B", Duration::from_secs(5));
+
+            let (a, b) = tokio::join!(core.connect("A"), core.connect("B"));
+            let results = [a, b];
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                1,
+                "{results:?}"
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| is_limit_error(result))
+                    .count(),
+                1,
+                "{results:?}"
+            );
+            assert_eq!(core.connected_count().await, 1);
+            // A connect that the limit rejects doesn't add the device.
+            assert_eq!(core.device_count().await, 1);
+            assert_eq!(radio.up_ids().len(), 1, "links up: {:?}", radio.up_ids());
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9: `connect_all` starts every connect at once, so they all passed
+    /// the limit check.
+    #[tokio::test(start_paused = true)]
+    async fn connect_all_respects_the_connection_limit() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default().with_max_connections(2));
+            for id in ["A", "B", "C", "D"] {
+                radio.set_connect_delay(id, Duration::from_secs(5));
+                core.add_device(id).await.expect("add_device");
+            }
+
+            let results = core.connect_all().await;
+            assert_eq!(results.len(), 4);
+            assert_eq!(
+                results.values().filter(|result| result.is_ok()).count(),
+                2,
+                "{results:?}"
+            );
+            assert_eq!(
+                results
+                    .values()
+                    .filter(|result| is_limit_error(result))
+                    .count(),
+                2,
+                "{results:?}"
+            );
+            assert_eq!(core.connected_count().await, 2);
+            assert_eq!(radio.up_ids().len(), 2, "links up: {:?}", radio.up_ids());
+            assert_eq!(core.available_connections().await, Some(0));
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
     }
 
     /// Guard: a failed or cancelled connect gives its slot back.
@@ -1584,6 +1863,265 @@ mod lifecycle_tests {
                     has_link: true,
                     failures: 0,
                 })
+            );
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9: the slot was free as soon as the link was taken out of the map,
+    /// while the sensor was still connected.
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_releases_slot_only_after_the_link_is_down() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default().with_max_connections(1));
+            core.connect("A").await.expect("connect");
+            radio.set_disconnect_delay("A", Duration::from_secs(2));
+
+            let disconnect = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move { core.disconnect("A").await }
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(radio.link_up("A"), "the disconnect is still running");
+            assert_eq!(
+                core.available_connections().await,
+                Some(0),
+                "the slot was freed while the sensor was still connected"
+            );
+
+            disconnect
+                .await
+                .expect("disconnect task")
+                .expect("disconnect");
+            assert!(!radio.link_up("A"));
+            assert_eq!(core.available_connections().await, Some(1));
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9: the new link was a local variable until the device-info read
+    /// finished, so a cancel during that read dropped a live link.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_device_info_read_leaves_no_dropped_link() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default().with_max_connections(1));
+            radio.set_info_delay("A", Duration::from_secs(5));
+            let mut events = core.events.subscribe();
+
+            assert!(
+                timeout(Duration::from_secs(1), core.connect("A"))
+                    .await
+                    .is_err()
+            );
+
+            assert!(
+                core.snapshot("A").await.is_some_and(|entry| entry.has_link),
+                "the manager holds no link after the cancel: {:#?}",
+                radio.events()
+            );
+            assert!(radio.link_up("A"));
+            assert_eq!(core.available_connections().await, Some(0));
+            // As `DeviceManager::connect` documents: the device stays connected,
+            // but has no device information, and no `Connected` event was sent.
+            assert!(core.get_device_info("A").await.is_none());
+            let sent = events.try_recv();
+            assert!(sent.is_err(), "unexpected event: {sent:?}");
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9: the limit was checked when `connect` added a new device, but the
+    /// slot was taken later. Two connects of new devices that waited for the
+    /// device map together both passed the check and both added their device.
+    #[tokio::test(start_paused = true)]
+    async fn rejected_connect_adds_no_device_while_the_map_is_busy() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default().with_max_connections(1));
+            radio.set_connect_delay("A", Duration::from_secs(5));
+            radio.set_connect_delay("B", Duration::from_secs(5));
+
+            // Another user of the device map (a read, a snapshot, a monitor)
+            // holds it while both connects start.
+            let busy = core.devices.read().await;
+            let spawn_connect = |id: &'static str| {
+                let core = Arc::clone(&core);
+                tokio::spawn(async move { core.connect(id).await })
+            };
+            let a = spawn_connect("A");
+            let b = spawn_connect("B");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(busy);
+
+            let a = a.await.expect("connect A task");
+            let b = b.await.expect("connect B task");
+            assert!(a.is_ok(), "A asked first and gets the only slot: {a:?}");
+            assert!(is_limit_error(&b), "B is over the limit: {b:?}");
+            assert_eq!(
+                core.device_ids().await,
+                ["A"],
+                "a connect that the limit rejects doesn't add the device"
+            );
+            assert_eq!(radio.up_ids(), ["A"]);
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9: a connect cancelled while it waited for the device map to store
+    /// its new link dropped the link, whose `Drop` tore it down, and freed
+    /// the slot before the link was down.
+    #[tokio::test(start_paused = true)]
+    async fn connect_cancelled_while_storing_its_link_disconnects_it() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default().with_max_connections(1));
+            radio.set_connect_delay("A", Duration::from_secs(2));
+            radio.set_disconnect_delay("A", Duration::from_secs(2));
+
+            let connect = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move { timeout(Duration::from_secs(3), core.connect("A")).await }
+            });
+            // Hold the device map from 1 s, while the connect is under way, so
+            // that at 2 s the new link waits to be stored until the caller
+            // gives up at 3 s.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let busy = core.devices.read().await;
+            assert!(connect.await.expect("connect task").is_err());
+
+            assert!(
+                radio.link_up("A"),
+                "the cancelled connect dropped its new link: {:#?}",
+                radio.events()
+            );
+            assert_eq!(
+                core.available_connections().await,
+                Some(0),
+                "the slot was freed while the sensor was still connected"
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(!radio.link_up("A"), "the new link was not disconnected");
+            assert_eq!(core.available_connections().await, Some(1));
+            drop(busy);
+
+            assert!(
+                core.snapshot("A")
+                    .await
+                    .is_some_and(|entry| !entry.has_link)
+            );
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9, in BR-4's pattern: a disconnect whose caller gave up still ran
+    /// to the end (as `Device::disconnect` does), but a connect of the same
+    /// device made meanwhile didn't wait for it, so the old link's disconnect
+    /// took the new link down while the manager kept the new handle.
+    #[tokio::test(start_paused = true)]
+    async fn connect_after_a_cancelled_disconnect_waits_for_the_link_to_go_down() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default());
+            core.connect("A").await.expect("first connect");
+            radio.set_disconnect_delay("A", Duration::from_secs(2));
+
+            assert!(
+                timeout(Duration::from_millis(500), core.disconnect("A"))
+                    .await
+                    .is_err()
+            );
+            core.connect("A").await.expect("second connect");
+            // Until well after the first link's disconnect has finished.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            assert!(
+                radio.link_up("A"),
+                "the old link's disconnect took down the new link: {:#?}",
+                radio.events()
+            );
+            // The second connect started only once the first link was down.
+            let a = || "A".to_string();
+            let events: Vec<FakeEvent> =
+                radio.events().into_iter().map(|(_, event)| event).collect();
+            assert_eq!(
+                events,
+                [
+                    FakeEvent::ConnectStarted { id: a() },
+                    FakeEvent::Connected { id: a(), handle: 1 },
+                    FakeEvent::Disconnect { id: a(), handle: 1 },
+                    FakeEvent::ConnectStarted { id: a() },
+                    FakeEvent::Connected { id: a(), handle: 2 },
+                ]
+            );
+
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// BR-9, in BR-4's pattern: a connect of the same device made after a
+    /// connect was cancelled while its new link waited for the device map
+    /// didn't wait for that link to go down, so the abandoned link's
+    /// disconnect could take the new link down.
+    #[tokio::test(start_paused = true)]
+    async fn connect_after_a_cancelled_connect_waits_for_its_link_to_go_down() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default());
+            radio.set_connect_delay("A", Duration::from_secs(2));
+            radio.set_disconnect_delay("A", Duration::from_secs(2));
+
+            // As in test 9: the new link waits for the map from 2 s until the
+            // caller gives up at 3 s.
+            let connect = tokio::spawn({
+                let core = Arc::clone(&core);
+                async move { timeout(Duration::from_secs(3), core.connect("A")).await }
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let busy = core.devices.read().await;
+            assert!(connect.await.expect("connect task").is_err());
+            drop(busy);
+
+            radio.set_connect_delay("A", Duration::ZERO);
+            core.connect("A").await.expect("second connect");
+            // Until well after the abandoned link's disconnect has finished.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            assert!(
+                radio.link_up("A"),
+                "A is down after the second connect: {:#?}",
+                radio.events()
+            );
+            // The second connect started only once the abandoned link was down.
+            let a = || "A".to_string();
+            let events: Vec<FakeEvent> =
+                radio.events().into_iter().map(|(_, event)| event).collect();
+            assert_eq!(
+                events,
+                [
+                    FakeEvent::ConnectStarted { id: a() },
+                    FakeEvent::Connected { id: a(), handle: 1 },
+                    FakeEvent::Disconnect { id: a(), handle: 1 },
+                    FakeEvent::ConnectStarted { id: a() },
+                    FakeEvent::Connected { id: a(), handle: 2 },
+                ]
             );
 
             assert_no_orphans(&core, &radio).await;
