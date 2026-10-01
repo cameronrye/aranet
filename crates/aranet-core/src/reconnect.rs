@@ -34,7 +34,7 @@ use futures::future::BoxFuture;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord};
 
@@ -453,7 +453,7 @@ impl<L: SensorLink> ReconnectCore<L> {
         if let Some(old) = old
             && let Err(e) = release_link(old, ()).await
         {
-            debug!("Closing the old link to {} failed: {e}", self.identifier);
+            warn!("Closing the old link to {} failed: {e}", self.identifier);
         }
 
         loop {
@@ -507,7 +507,7 @@ impl<L: SensorLink> ReconnectCore<L> {
                 // cancel() or disconnect() came in as the connect finished.
                 drop(link);
                 if let Err(e) = release_link(new, ()).await {
-                    debug!("Closing the new link to {} failed: {e}", self.identifier);
+                    warn!("Closing the new link to {} failed: {e}", self.identifier);
                 }
                 return self.cancelled_reconnect().await;
             }

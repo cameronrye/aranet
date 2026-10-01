@@ -439,15 +439,10 @@ impl<L> Entry<L> {
             && self.retry_at.is_none_or(|at| at <= Instant::now())
     }
 
-    /// Records a failed automatic reconnect and schedules the next one.
-    /// Returns the number of failures when this one used up `max_attempts`.
-    fn record_repair_failure(&mut self, now: Instant) -> Option<u32> {
-        self.failures = self.failures.saturating_add(1);
-        let wait = self
-            .reconnect_options
-            .delay_for_attempt(self.failures - 1)
-            .min(MAX_RETRY_WAIT);
-        self.retry_at = Some(now + wait);
+    /// Gives up on automatic reconnects if they have used up `max_attempts`,
+    /// and then returns the number of failures. `max_attempts` of 0 is used
+    /// up before the first attempt.
+    fn give_up_if_attempts_used_up(&mut self) -> Option<u32> {
         let used_up = self
             .reconnect_options
             .max_attempts
@@ -457,6 +452,18 @@ impl<L> Entry<L> {
             return Some(self.failures);
         }
         None
+    }
+
+    /// Records a failed automatic reconnect and schedules the next one.
+    /// Returns the number of failures when this one used up `max_attempts`.
+    fn record_repair_failure(&mut self, now: Instant) -> Option<u32> {
+        self.failures = self.failures.saturating_add(1);
+        let wait = self
+            .reconnect_options
+            .delay_for_attempt(self.failures - 1)
+            .min(MAX_RETRY_WAIT);
+        self.retry_at = Some(now + wait);
+        self.give_up_if_attempts_used_up()
     }
 
     /// Starts automatic reconnects over, for an explicit `connect` or after a
@@ -486,17 +493,21 @@ pub(crate) struct EntrySnapshot {
 /// the link on a spawned task, which keeps the slot and the share of the
 /// guard until the link is down.
 struct NewLink<L: SensorLink> {
+    /// The device the link connects, for the log.
+    identifier: String,
     parts: Option<(Arc<L>, Option<OwnedSemaphorePermit>)>,
     held: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl<L: SensorLink> NewLink<L> {
     fn new(
+        identifier: &str,
         link: Arc<L>,
         slot: Option<OwnedSemaphorePermit>,
         held: &Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Self {
         Self {
+            identifier: identifier.to_owned(),
             parts: Some((link, slot)),
             held: Arc::clone(held),
         }
@@ -519,9 +530,10 @@ impl<L: SensorLink> Drop for NewLink<L> {
         // Without a runtime, dropping the link runs its own teardown.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let held = Arc::clone(&self.held);
+            let identifier = std::mem::take(&mut self.identifier);
             runtime.spawn(async move {
                 if let Err(e) = release_link(link, (slot, held)).await {
-                    debug!("Disconnecting an abandoned new link failed: {e}");
+                    warn!("Disconnecting an abandoned new link to {identifier} failed: {e}");
                 }
             });
         }
@@ -704,7 +716,12 @@ impl<L: SensorLink> ManagerCore<L> {
             None => self.take_slot(identifier)?,
         };
 
-        let new_link = NewLink::new(Arc::new((self.connect)(identifier).await?), slot, held);
+        let new_link = NewLink::new(
+            identifier,
+            Arc::new((self.connect)(identifier).await?),
+            slot,
+            held,
+        );
 
         // Store the link as soon as the map lock is free, so that a cancel from
         // then on leaves a link that the manager holds. A cancel while waiting
@@ -727,7 +744,7 @@ impl<L: SensorLink> ManagerCore<L> {
                 debug!("{identifier} was disconnected or removed; closing the new link");
                 let (link, slot) = new_link.into_parts();
                 if let Err(e) = release_link(link, (slot, Arc::clone(held))).await {
-                    debug!("Disconnecting the unused link to {identifier} failed: {e}");
+                    warn!("Disconnecting the unused link to {identifier} failed: {e}");
                 }
                 return Err(Error::Cancelled);
             }
@@ -1080,11 +1097,22 @@ impl<L: SensorLink> ManagerCore<L> {
             let held = Arc::new(guard);
             // Check again now that the device is ours: it may have been
             // connected, disconnected or removed since the list was made.
-            let attempt = match self.devices.read().await.get(&id) {
+            // With `max_attempts` of 0 there is no attempt to make: give up.
+            let next = match self.devices.write().await.get_mut(&id) {
                 Some(entry) if Arc::ptr_eq(&entry.op, &op) && entry.is_due_for_repair() => {
-                    entry.failures.saturating_add(1)
+                    match entry.give_up_if_attempts_used_up() {
+                        Some(failures) => Err(failures),
+                        None => Ok(entry.failures.saturating_add(1)),
+                    }
                 }
                 _ => continue,
+            };
+            let attempt = match next {
+                Ok(attempt) => attempt,
+                Err(failures) => {
+                    self.report_give_up(&id, failures);
+                    continue;
+                }
             };
             // With every connection slot taken, the repair would fail at once,
             // without a Bluetooth attempt: wait for a free slot instead, and
@@ -1125,20 +1153,27 @@ impl<L: SensorLink> ManagerCore<L> {
                         .get_mut(&id)
                         .and_then(|entry| entry.record_repair_failure(Instant::now()));
                     if let Some(failures) = gave_up_after {
-                        warn!(
-                            "Health monitor: giving up on {id} after {failures} failed reconnects; \
-                             connect() starts over"
-                        );
-                        self.events.send(DeviceEvent::Error {
-                            device: DeviceId::new(&id),
-                            error: format!("auto-reconnect gave up after {failures} attempts"),
-                        });
+                        self.report_give_up(&id, failures);
                     }
                     outcome.failed += 1;
                 }
             }
         }
         outcome
+    }
+
+    /// Logs that the health monitor stops reconnecting `id` after `failures`
+    /// failed attempts, and emits the one `DeviceEvent::Error` that says so.
+    fn report_give_up(&self, id: &str, failures: u32) {
+        let attempts = if failures == 1 { "attempt" } else { "attempts" };
+        warn!(
+            "Health monitor: giving up on {id} after {failures} failed {attempts}; \
+             connect() starts over"
+        );
+        self.events.send(DeviceEvent::Error {
+            device: DeviceId::new(id),
+            error: format!("auto-reconnect gave up after {failures} {attempts}"),
+        });
     }
 
     /// Checks one connected device for `health_tick` and closes its link if
@@ -1163,8 +1198,8 @@ impl<L: SensorLink> ManagerCore<L> {
     }
 
     /// Closes `link` if the entry for `identifier` still holds it: takes the
-    /// link and its slot, disconnects the link, frees the slot once the link
-    /// is down, and emits `Disconnected`. `held` is the caller's guard of the
+    /// link and its slot, emits `Disconnected`, disconnects the link and frees
+    /// the slot once the link is down. `held` is the caller's guard of the
     /// entry's `op` mutex. As in `disconnect_locked`, the disconnect keeps a
     /// share of that guard until the link is down, even if this future is
     /// dropped, so no connect of the device can overlap the old link's
@@ -1195,15 +1230,18 @@ impl<L: SensorLink> ManagerCore<L> {
         let Some((link, slot)) = taken else {
             return;
         };
-        // Close it explicitly: a handle dropped without a disconnect tears
-        // down whatever link the sensor has by then, including a new one.
-        if let Err(e) = release_link(link, (slot, Arc::clone(held))).await {
-            debug!("Closing the dead connection to {identifier} failed: {e}");
-        }
+        // The link has left the manager: say so before the close, which can
+        // take seconds and goes on in the background if this future is
+        // dropped, so a dropped caller can't lose the event.
         self.events.send(DeviceEvent::Disconnected {
             device: DeviceId::new(identifier),
             reason,
         });
+        // Close it explicitly: a handle dropped without a disconnect tears
+        // down whatever link the sensor has by then, including a new one.
+        if let Err(e) = release_link(link, (slot, Arc::clone(held))).await {
+            warn!("Closing the dead connection to {identifier} failed: {e}");
+        }
     }
 
     pub(crate) fn spawn_health_monitor(
@@ -1694,7 +1732,9 @@ impl DeviceManager {
     ///
     /// Each device waits between reconnect attempts as its [`ReconnectOptions`]
     /// say. After `max_attempts` failures in a row the task stops trying and
-    /// emits one [`DeviceEvent::Error`]; [`connect`](Self::connect) starts over.
+    /// emits one [`DeviceEvent::Error`] (with `max_attempts` of 0, as soon as
+    /// it finds the device lost, without trying); [`connect`](Self::connect)
+    /// starts over.
     /// While `max_concurrent_connections` connections are in use, a device
     /// waits for a free one, and that wait isn't counted as a failed attempt.
     ///
@@ -3512,6 +3552,106 @@ mod lifecycle_tests {
                 assert!(!monitor.is_finished());
                 cancel.cancel();
                 monitor.await.expect("the health monitor panicked");
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// A dead link leaves the manager when a check or a `connect()` starts
+        /// closing it, and `Disconnected` is sent then: a caller dropped
+        /// during the close, such as the monitor when it is cancelled or a
+        /// `connect()` under a timeout, must not lose the event.
+        #[tokio::test(start_paused = true)]
+        async fn disconnected_is_sent_even_if_the_close_is_cancelled() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(
+                    &radio,
+                    ManagerConfig::default()
+                        .health_check_interval(Duration::from_secs(5))
+                        .adaptive_interval(false),
+                );
+                for id in ["A", "B"] {
+                    core.connect(id).await.unwrap();
+                    radio.set_disconnect_delay(id, Duration::from_secs(2));
+                }
+                radio.lose_link("A");
+                let mut events = core.events.subscribe();
+
+                // The tick at 5 s starts closing A's dead link, which takes
+                // 2 s; the monitor is cancelled 0.5 s later.
+                let cancel = CancellationToken::new();
+                let monitor = Arc::clone(&core).spawn_health_monitor(cancel.clone());
+                tokio::time::sleep(Duration::from_millis(5500)).await;
+                cancel.cancel();
+                monitor.await.unwrap();
+                // A connect() given up on 0.5 s into closing B's dead link.
+                radio.lose_link("B");
+                let given_up = timeout(Duration::from_millis(500), core.connect("B")).await;
+                assert!(given_up.is_err(), "connect() returned {given_up:?}");
+
+                assert_eq!(
+                    drain(&mut events),
+                    ["Disconnected A Unknown", "Disconnected B Unknown"]
+                );
+                for id in ["A", "B"] {
+                    assert_eq!(core.try_is_connected(id), Some(false), "{id}");
+                }
+
+                // Until well after both closes have finished.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// `max_attempts` counts reconnect attempts: 0 allows none, so the
+        /// monitor gives up on the first loss it finds without trying, and 1
+        /// allows one.
+        #[tokio::test(start_paused = true)]
+        async fn max_attempts_counts_from_zero() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                for (id, max) in [("A", 0), ("B", 1)] {
+                    core.add_device_with_options(id, ReconnectOptions::default().max_attempts(max))
+                        .await
+                        .unwrap();
+                    core.connect(id).await.unwrap();
+                    radio.lose_link(id);
+                }
+                radio.script_connects("B", [false]);
+                let mut events = core.events.subscribe();
+
+                // A minute of ticks, 5 s apart.
+                for _ in 0..12 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    core.health_tick().await;
+                }
+
+                assert_eq!(radio.connect_count("A"), 1, "A was reconnected");
+                assert_eq!(
+                    radio.connect_count("B"),
+                    2,
+                    "the first connect and one repair"
+                );
+                let errors: Vec<String> = drain(&mut events)
+                    .into_iter()
+                    .filter(|line| line.starts_with("Error"))
+                    .collect();
+                assert_eq!(
+                    errors,
+                    [
+                        "Error A: auto-reconnect gave up after 0 attempts",
+                        "Error B: auto-reconnect gave up after 1 attempt"
+                    ]
+                );
+                let a = core.snapshot("A").await.unwrap();
+                assert_eq!((a.failures, a.gave_up), (0, true));
+                assert!(core.snapshot("B").await.unwrap().gave_up);
 
                 assert_no_orphans(&core, &radio).await;
                 radio.assert_no_drop_teardown();
