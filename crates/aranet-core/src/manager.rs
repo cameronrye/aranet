@@ -27,7 +27,8 @@ use crate::scan::{DiscoveredDevice, ScanOptions, scan_with_options};
 ///
 /// The manager never disconnects a device on its own to make room for
 /// another: when the connection limit is reached, `connect()` fails, and
-/// [`DeviceManager::evict_lowest_priority`] frees a slot when you call it.
+/// [`DeviceManager::evict_lowest_priority`] frees a slot when you call it,
+/// unless a `connect()` of the device it picks keeps that device connected.
 /// The health monitor ([`DeviceManager::start_health_monitor`]) reconnects
 /// lost devices highest priority first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -1624,7 +1625,8 @@ impl DeviceManager {
     /// [`disconnect_all`](Self::disconnect_all),
     /// [`evict_lowest_priority`](Self::evict_lowest_priority) or
     /// [`remove_device`](Self::remove_device) is called for the same device
-    /// returns [`Error::Cancelled`], closing its connection if one comes up.
+    /// returns [`Error::Cancelled`], closing its connection if one comes up,
+    /// unless another `connect()` re-arms the device first.
     /// A connect that waits for a [`remove_device`](Self::remove_device) of
     /// the same device returns [`Error::Cancelled`] instead of adding the
     /// device back.
@@ -1657,11 +1659,11 @@ impl DeviceManager {
     ///
     /// A connect of the same device that hasn't connected yet is abandoned:
     /// it returns [`Error::Cancelled`], closing its connection if one comes
-    /// up. This waits until that connect's Bluetooth attempt has ended and
-    /// such a connection is closed, which can take the connect's whole time
-    /// budget: tens of seconds at default settings. The health monitor
-    /// doesn't reconnect the device until [`connect`](Self::connect) is
-    /// called.
+    /// up, unless another `connect()` re-arms the device first. This waits
+    /// until that connect's Bluetooth attempt has ended and such a
+    /// connection is closed, which can take the connect's whole time budget:
+    /// tens of seconds at default settings. The health monitor doesn't
+    /// reconnect the device until [`connect`](Self::connect) is called.
     ///
     /// [`DeviceEvent::Disconnected`], with [`DisconnectReason::UserRequested`],
     /// is sent as soon as the manager lets go of the connection, before the
@@ -1671,10 +1673,13 @@ impl DeviceManager {
     ///
     /// If this future is dropped, a disconnect that has started still
     /// finishes in the background, even one still waiting for a connect or a
-    /// health check of the device to end. A connect of the same device that
-    /// starts meanwhile either waits for the disconnect and then reconnects,
-    /// or, if it starts before the disconnect has taken the connection, keeps
-    /// the device connected, and the disconnect then does nothing.
+    /// health check of the device to end.
+    ///
+    /// Whether or not this future is dropped, a connect of the same device
+    /// that starts while the disconnect runs either waits for it and then
+    /// reconnects, or, if it starts before the disconnect has taken the
+    /// connection, keeps the device connected, and the disconnect then does
+    /// nothing.
     pub async fn disconnect(&self, identifier: &str) -> Result<()> {
         self.core.disconnect(identifier).await
     }
@@ -1685,12 +1690,16 @@ impl DeviceManager {
     /// does, and then removed, even if closing its connection fails: that
     /// error is still returned. A connect of the device that hasn't
     /// connected yet is abandoned: it returns [`Error::Cancelled`], closing
-    /// its connection if one comes up. As with `disconnect`, this waits until
-    /// that connect's Bluetooth attempt has ended and such a connection is
-    /// closed, and a removal that has started still finishes in the
-    /// background if this future is dropped. A connect of the same device
-    /// that starts meanwhile doesn't keep it: the device is removed even when
-    /// that connect returns first.
+    /// its connection if one comes up, unless another `connect()` re-arms the
+    /// device first, in which case it connects, and the device is removed
+    /// after that. As with `disconnect`, this waits until that connect's
+    /// Bluetooth attempt has ended and such a connection is closed, and a
+    /// removal that has started still finishes in the background if this
+    /// future is dropped.
+    ///
+    /// Whether or not this future is dropped, a connect of the same device
+    /// that starts while the removal runs doesn't keep it: the device is
+    /// removed even when that connect returns first.
     pub async fn remove_device(&self, identifier: &str) -> Result<()> {
         self.core.remove_device(identifier).await
     }
@@ -1892,6 +1901,9 @@ impl DeviceManager {
 
     /// Add a device with priority.
     ///
+    /// `identifier` must match the device exactly, as [`Device::connect`]
+    /// describes.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] if the config's
@@ -1915,11 +1927,13 @@ impl DeviceManager {
 
     /// Disconnect the lowest priority device to make room for a new connection.
     ///
-    /// Returns Ok(true) if a device was disconnected, Ok(false) if no eligible device found.
+    /// Returns Ok(true) if a device was chosen, Ok(false) if no eligible device found.
     /// The health monitor doesn't reconnect the evicted device until
     /// [`connect`](Self::connect) is called for it. The device is disconnected
     /// as [`disconnect`](Self::disconnect) does it, so this too waits for a
-    /// connect of that device that is running to end.
+    /// connect of that device that is running to end. A connect of the device
+    /// that starts before the eviction has taken its connection keeps it
+    /// connected, and then no slot is freed.
     pub async fn evict_lowest_priority(&self) -> Result<bool> {
         self.core.evict_lowest_priority().await
     }

@@ -698,9 +698,10 @@ impl ReconnectingDevice {
     /// their own reconnect. A call made while another reconnect is running
     /// waits for that one instead of starting its own, and shares its result:
     /// `Ok` if it connected, `Error::Cancelled` if
-    /// [`cancel_reconnect()`](Self::cancel_reconnect) stopped it, and
-    /// `Error::NotConnected` if it gave up or [`disconnect()`](Self::disconnect)
-    /// stopped it.
+    /// [`cancel_reconnect()`](Self::cancel_reconnect) stopped it (a call still
+    /// waiting when [`reset_cancellation()`](Self::reset_cancellation) is
+    /// called starts a new reconnect instead), and `Error::NotConnected` if it
+    /// gave up or [`disconnect()`](Self::disconnect) stopped it.
     ///
     /// `cancel_reconnect()` and `disconnect()` end a reconnect at once, and it
     /// returns `Error::Cancelled`. After `max_attempts` failed attempts it
