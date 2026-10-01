@@ -35,6 +35,10 @@
 //!   `btd_adapter_remove_bonding` at adapter.c:8334-8350). So when `Paired`
 //!   can't be read, nothing is cancelled: closing the connection ends a
 //!   bonding that is still running (below) and leaves a finished one alone.
+//!   The cost: the outcome is then `TimedOut` while BlueZ may still be
+//!   bonding, and on BlueZ 5.81 and later the connect that follows can be
+//!   refused with `org.bluez.Error.InProgress`. That connect fails and can
+//!   be retried, and the next connect pairs again.
 //! - That `Paired` session still has BlueZ's answer to `Pair` coming, and
 //!   closing the connection before it arrives cancels BlueZ's service
 //!   discovery (the browse request's disconnect watch, device.c:6755-6763 and
@@ -164,7 +168,10 @@ pub(crate) trait PairingBus: Sync {
 /// connection stays open meanwhile. If it is false, `CancelPairing` stops
 /// `Pair`. If it can't be read, nothing is cancelled: a `CancelPairing` would
 /// remove a bond made meanwhile, and the caller closing the connection ends a
-/// bonding that is still running. The outcome is reported
+/// bonding that is still running. The outcome is then `TimedOut` while BlueZ
+/// may still be bonding, so on BlueZ 5.81 and later the connect that follows
+/// can be refused with `org.bluez.Error.InProgress`: it fails, and can be
+/// retried, and the next connect pairs again. The outcome is reported
 /// (`PairingBus::report`) as soon as it is known, before the cleanup and that
 /// wait. Errors from `CancelPairing` and `UnregisterAgent` are ignored:
 /// closing the connection removes the agent anyway.
