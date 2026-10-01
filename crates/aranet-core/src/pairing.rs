@@ -26,13 +26,15 @@
 //!   `org.bluez.Error.AlreadyExists` there (the guard at device.c:3422).
 //!   `AlreadyExists` still counts as paired (device.c:3435).
 //! - A `Pair` that runs out of time is cancelled with `CancelPairing`, but
-//!   only while `Paired` is still false. BlueZ answers `Pair` only after
+//!   only when `Paired` reads false. BlueZ answers `Pair` only after
 //!   service discovery: once the bond is made it sets `Paired` and drops the
 //!   bonding request, then waits for the GATT client (device.c:7397-7434,
 //!   device-5.66.c:6060-6093). On an Aranet4 whose services BlueZ hasn't
 //!   cached, that wait can outlast the budget, and `CancelPairing` with no
 //!   bonding request unpairs and disconnects the sensor (device.c:3549-3566,
-//!   `btd_adapter_remove_bonding` at adapter.c:8334-8350).
+//!   `btd_adapter_remove_bonding` at adapter.c:8334-8350). So when `Paired`
+//!   can't be read, nothing is cancelled: closing the connection ends a
+//!   bonding that is still running (below) and leaves a finished one alone.
 //! - That `Paired` session still has BlueZ's answer to `Pair` coming, and
 //!   closing the connection before it arrives cancels BlueZ's service
 //!   discovery (the browse request's disconnect watch, device.c:6755-6763 and
@@ -102,8 +104,8 @@ pub(crate) enum PairOutcome {
     /// `bluetoothd` restart, or `org.bluez.Error.InProgress` while another
     /// D-Bus client connects or pairs the same sensor.
     Failed(BluezError),
-    /// `Pair` didn't answer within the budget and `Paired` was still false or
-    /// couldn't be read, so it was cancelled.
+    /// `Pair` didn't answer within the budget, and `Paired` was still false
+    /// (so `Pair` was cancelled) or couldn't be read (so nothing was).
     TimedOut,
     /// BlueZ couldn't be asked: reading `Paired` or registering the agent
     /// failed, so `Pair` was never sent.
@@ -159,11 +161,13 @@ pub(crate) trait PairingBus: Sync {
 /// bonded and holds `Pair`'s reply until its service discovery ends: the
 /// outcome is `Paired`, nothing is cancelled, and after unregistering the
 /// agent this waits up to `budget` more for that reply, so that the caller's
-/// connection stays open meanwhile. Otherwise `CancelPairing` stops it. The
-/// outcome is reported (`PairingBus::report`) as soon as it is known, before
-/// the cleanup and that wait. Errors from `CancelPairing` and
-/// `UnregisterAgent` are ignored: closing the connection removes the agent
-/// anyway.
+/// connection stays open meanwhile. If it is false, `CancelPairing` stops
+/// `Pair`. If it can't be read, nothing is cancelled: a `CancelPairing` would
+/// remove a bond made meanwhile, and the caller closing the connection ends a
+/// bonding that is still running. The outcome is reported
+/// (`PairingBus::report`) as soon as it is known, before the cleanup and that
+/// wait. Errors from `CancelPairing` and `UnregisterAgent` are ignored:
+/// closing the connection removes the agent anyway.
 pub(crate) async fn run_pairing<B: PairingBus>(bus: &B, budget: Duration) -> PairOutcome {
     let start = Instant::now();
     let before_pair = match bus.is_paired().await {
@@ -187,17 +191,22 @@ pub(crate) async fn run_pairing<B: PairingBus>(bus: &B, budget: Duration) -> Pai
         Ok(Err(e)) => PairOutcome::Failed(e),
         // BlueZ answers `Pair` only after service discovery, so time can run
         // out after the bond is made. `CancelPairing` would then unpair and
-        // disconnect the sensor, so it is sent only while `Paired` is false.
-        Err(_) => {
-            if matches!(bus.is_paired().await, Ok(true)) {
+        // disconnect the sensor, so it is sent only when `Paired` reads false.
+        // If it can't be read, closing the connection ends a bonding that is
+        // still running and leaves a finished one alone.
+        Err(_) => match bus.is_paired().await {
+            Ok(true) => {
                 bus.report(&PairOutcome::Paired);
                 let _ = bus.unregister_agent().await;
                 let _ = tokio::time::timeout(budget, &mut pair).await;
                 return PairOutcome::Paired;
             }
-            let _ = bus.cancel_pairing().await;
-            PairOutcome::TimedOut
-        }
+            Ok(false) => {
+                let _ = bus.cancel_pairing().await;
+                PairOutcome::TimedOut
+            }
+            Err(_) => PairOutcome::TimedOut,
+        },
     };
     bus.report(&outcome);
     let _ = bus.unregister_agent().await;
@@ -451,40 +460,65 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pair_timeout_cancels_and_unregisters() {
-        // When time runs out, `Paired` is read again. Still false, or no reply
-        // in time from bluetoothd, means the bonding may still be running, so
-        // it is cancelled. CancelPairing answers DoesNotExist when the bonding
-        // completed after that read (device.c:3557-3561). That must not change
-        // the outcome or skip UnregisterAgent.
-        let no_answer = err("org.freedesktop.DBus.Error.Timeout");
-        for paired_after_timeout in [Ok(false), Err(no_answer)] {
-            let bus = FakeBus {
-                paired_after_timeout,
-                cleanup: Err(err("org.bluez.Error.DoesNotExist")),
-                ..FakeBus::unpaired(PairScript::Hang)
-            };
-            // Not the default budget, so a hard-coded limit fails this test.
-            let budget = Duration::from_secs(7);
-            let start = Instant::now();
+        // When time runs out, `Paired` is read again. Still false means the
+        // bonding may still be running, so it is cancelled. If the bonding
+        // completed after that read, CancelPairing finds no bonding request:
+        // it then removes the new bond, disconnects the sensor and answers
+        // DoesNotExist (device.c:3549-3566). That must not change the outcome
+        // or skip UnregisterAgent.
+        let bus = FakeBus {
+            cleanup: Err(err("org.bluez.Error.DoesNotExist")),
+            ..FakeBus::unpaired(PairScript::Hang)
+        };
+        // Not the default budget, so a hard-coded limit fails this test.
+        let budget = Duration::from_secs(7);
+        let start = Instant::now();
 
-            let outcome = within(Duration::from_secs(600), run_pairing(&bus, budget)).await;
+        let outcome = within(Duration::from_secs(600), run_pairing(&bus, budget)).await;
 
-            let reread = &bus.paired_after_timeout;
-            assert_eq!(outcome, PairOutcome::TimedOut, "{reread:?}");
-            assert_eq!(start.elapsed(), budget, "{reread:?}");
-            assert_eq!(
-                bus.calls(),
-                [
-                    "IsPaired",
-                    "RegisterAgent",
-                    "Pair",
-                    "IsPaired",
-                    "CancelPairing",
-                    "UnregisterAgent"
-                ],
-                "{reread:?}"
-            );
-        }
+        assert_eq!(outcome, PairOutcome::TimedOut);
+        assert_eq!(start.elapsed(), budget);
+        assert_eq!(
+            bus.calls(),
+            [
+                "IsPaired",
+                "RegisterAgent",
+                "Pair",
+                "IsPaired",
+                "CancelPairing",
+                "UnregisterAgent"
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pair_timeout_without_an_answer_about_paired_cancels_nothing() {
+        // bluetoothd didn't answer the second `Paired` read in time, as when
+        // it is busy with a first service discovery. The bond may have been
+        // made meanwhile, and a CancelPairing would remove it. Closing the
+        // session's connection ends a bonding that is still running instead
+        // (device.c:3346-3361), and leaves a finished one alone.
+        let bus = FakeBus {
+            paired_after_timeout: Err(err("org.freedesktop.DBus.Error.Timeout")),
+            ..FakeBus::unpaired(PairScript::Hang)
+        };
+        let budget = Duration::from_secs(7);
+        let start = Instant::now();
+
+        let outcome = within(Duration::from_secs(600), run_pairing(&bus, budget)).await;
+
+        assert_eq!(outcome, PairOutcome::TimedOut);
+        assert_eq!(start.elapsed(), budget);
+        assert_eq!(
+            bus.calls(),
+            [
+                "IsPaired",
+                "RegisterAgent",
+                "Pair",
+                "IsPaired",
+                "UnregisterAgent"
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
