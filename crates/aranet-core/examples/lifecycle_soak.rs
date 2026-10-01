@@ -276,9 +276,10 @@ impl Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Recovery {
     Pending,
-    /// Recovered this long after the cut.
+    /// Recovered this long after the cut, or after the drop was found.
     Recovered(Duration),
-    /// The first read that started after the cut failed.
+    /// The first read that started after the cut, or after the drop was
+    /// found, failed.
     ReadFailed,
 }
 
@@ -310,7 +311,8 @@ struct Fault {
 struct Verdict {
     /// Criterion (d): orphans, sensors left connected, blind probes, hung shutdown steps.
     connection: Vec<String>,
-    /// Criterion (e): link cuts that weren't recovered or couldn't be made.
+    /// Criterion (e): link cuts that weren't recovered or couldn't be made,
+    /// and drops found when a cut was due that weren't recovered.
     faults: Vec<String>,
 }
 
@@ -411,7 +413,8 @@ impl Tracker {
     }
 
     /// Records a read of the `ReconnectingDevice`. The first read that starts
-    /// after a cut decides whether that cut recovered.
+    /// after a cut, or after a drop found when a cut was due, decides whether
+    /// that fault recovered.
     fn read_finished(&mut self, started: Duration, finished: Duration, ok: bool) {
         if ok {
             self.reads_ok += 1;
