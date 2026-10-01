@@ -273,7 +273,10 @@ pub struct ManagerConfig {
     /// The health monitor ([`DeviceManager::start_health_monitor`]) waits
     /// between automatic reconnects of a device as these options say, and
     /// stops after `max_attempts` failures in a row, emitting one
-    /// [`DeviceEvent::Error`]; [`DeviceManager::connect`] starts over.
+    /// [`DeviceEvent::Error`]; [`DeviceManager::connect`] starts over. With
+    /// `max_attempts` of 0 it never reconnects a device that has been
+    /// connected, but a device that has never been connected, such as one
+    /// just added, still gets one attempt.
     ///
     /// The default is [`ReconnectOptions::unlimited`] since 0.3.0. With the
     /// five attempts of `ReconnectOptions::default()`, the monitor would give
