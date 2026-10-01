@@ -82,6 +82,10 @@ struct FakeSensor {
     /// Outcomes of the next connects; `false` fails. Unscripted connects succeed.
     script: VecDeque<bool>,
     fail_disconnects: bool,
+    /// How long each `disconnect()` waits before the link goes down.
+    disconnect_delay: Duration,
+    /// How long each `read_device_info()` takes.
+    info_delay: Duration,
 }
 
 impl RadioState {
@@ -170,6 +174,40 @@ impl FakeRadio {
         self.state().sensor(id).fail_disconnects = true;
     }
 
+    /// Every later `disconnect()` of `id` waits `delay` before the link goes
+    /// down, on its own task.
+    pub(crate) fn set_disconnect_delay(&self, id: &str, delay: Duration) {
+        self.state().sensor(id).disconnect_delay = delay;
+    }
+
+    /// Every later `read_device_info()` on `id` takes `delay`.
+    pub(crate) fn set_info_delay(&self, id: &str, delay: Duration) {
+        self.state().sensor(id).info_delay = delay;
+    }
+
+    /// Takes `id`'s link down for `handle`'s `disconnect()`.
+    fn disconnect_now(&self, id: &str, handle: u64) -> Result<()> {
+        let mut state = self.state();
+        let sensor = state.sensor(id);
+        sensor.up = false;
+        let fail = sensor.fail_disconnects;
+        self.log(
+            &mut state,
+            FakeEvent::Disconnect {
+                id: id.to_owned(),
+                handle,
+            },
+        );
+        if fail {
+            Err(Error::Timeout {
+                operation: "disconnect from device".into(),
+                duration: Duration::from_secs(5),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// The sensor went out of range: its link is down, and no handle knows yet.
     pub(crate) fn lose_link(&self, id: &str) {
         self.state().sensor(id).up = false;
@@ -251,25 +289,19 @@ impl SensorLink for FakeConn {
 
     async fn disconnect(&self) -> Result<()> {
         self.disconnected.store(true, Ordering::SeqCst);
-        let mut state = self.radio.state();
-        let sensor = state.sensor(&self.id);
-        sensor.up = false;
-        let fail = sensor.fail_disconnects;
-        self.radio.log(
-            &mut state,
-            FakeEvent::Disconnect {
-                id: self.id.clone(),
-                handle: self.handle,
-            },
-        );
-        if fail {
-            Err(Error::Timeout {
-                operation: "disconnect from device".into(),
-                duration: Duration::from_secs(5),
-            })
-        } else {
-            Ok(())
+        let delay = self.radio.state().sensor(&self.id).disconnect_delay;
+        if delay.is_zero() {
+            return self.radio.disconnect_now(&self.id, self.handle);
         }
+        // Like `Device::disconnect` (Task 6), a slow disconnect runs on its own
+        // task, so it takes the link down even if this future is dropped.
+        let (radio, id, handle) = (self.radio.clone(), self.id.clone(), self.handle);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            radio.disconnect_now(&id, handle)
+        })
+        .await
+        .expect("the fake's disconnect task panicked")
     }
 
     fn name(&self) -> Option<&str> {
@@ -293,6 +325,10 @@ impl SensorLink for FakeConn {
     }
 
     async fn read_device_info(&self) -> Result<DeviceInfo> {
+        let delay = self.radio.state().sensor(&self.id).info_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         if self.radio.link_up(&self.id) {
             Ok(DeviceInfo::default())
         } else {
