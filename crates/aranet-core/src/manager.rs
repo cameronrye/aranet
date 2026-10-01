@@ -818,11 +818,13 @@ impl<L: SensorLink> ManagerCore<L> {
         self.disconnect_locked(identifier, &held).await
     }
 
-    /// Disconnects `identifier`'s link, if it has one. `held` is the caller's
-    /// guard of the entry's `op` mutex. The disconnect keeps a share of that
-    /// guard, and the slot, until the link is down, even if this future is
-    /// dropped: until then no other connect, disconnect or removal of the
-    /// device starts, so none can overlap the old link's disconnect.
+    /// Disconnects `identifier`'s link, if it has one, and returns the
+    /// close's result. It fails only after taking the link out of the entry.
+    /// `held` is the caller's guard of the entry's `op` mutex. The disconnect
+    /// keeps a share of that guard, and the slot, until the link is down,
+    /// even if this future is dropped: until then no other connect,
+    /// disconnect or removal of the device starts, so none can overlap the
+    /// old link's disconnect.
     async fn disconnect_locked(
         &self,
         identifier: &str,
@@ -842,14 +844,15 @@ impl<L: SensorLink> ManagerCore<L> {
             return Ok(());
         };
 
-        let result = release_link(link, (slot, Arc::clone(held))).await;
-        if result.is_ok() {
-            self.events.send(DeviceEvent::Disconnected {
-                device: DeviceId::new(identifier),
-                reason: DisconnectReason::UserRequested,
-            });
-        }
-        result
+        // The link has left the manager: say so before the close, as `detach`
+        // does. The close can fail (on macOS, closing a link that dropped on
+        // its own times out) or go on in the background if this future is
+        // dropped, and nothing would send the event later.
+        self.events.send(DeviceEvent::Disconnected {
+            device: DeviceId::new(identifier),
+            reason: DisconnectReason::UserRequested,
+        });
+        release_link(link, (slot, Arc::clone(held))).await
     }
 
     pub(crate) async fn remove_device(&self, identifier: &str) -> Result<()> {
@@ -858,7 +861,9 @@ impl<L: SensorLink> ManagerCore<L> {
         };
         let held = Arc::new(Arc::clone(&op).lock_owned().await);
         // Not `self.disconnect`: the guard is not reentrant.
-        self.disconnect_locked(identifier, &held).await?;
+        let result = self.disconnect_locked(identifier, &held).await;
+        // Removed even if closing the link failed: the link has left the
+        // manager, so a kept entry would have nothing left to close.
         let mut devices = self.devices.write().await;
         if devices
             .get(identifier)
@@ -867,7 +872,7 @@ impl<L: SensorLink> ManagerCore<L> {
             devices.remove(identifier);
             info!("Removed device from manager: {identifier}");
         }
-        Ok(())
+        result
     }
 
     pub(crate) async fn device_ids(&self) -> Vec<String> {
@@ -1600,6 +1605,12 @@ impl DeviceManager {
     /// doesn't reconnect the device until [`connect`](Self::connect) is
     /// called.
     ///
+    /// [`DeviceEvent::Disconnected`], with [`DisconnectReason::UserRequested`],
+    /// is sent as soon as the manager lets go of the connection, before the
+    /// connection is closed, so it is sent even if closing the connection
+    /// fails or this future is dropped. A failed close's error is still
+    /// returned.
+    ///
     /// If this future is dropped while the device is being disconnected, the
     /// disconnect still finishes in the background, and a connect of the same
     /// device waits for it instead of running alongside it.
@@ -1609,13 +1620,13 @@ impl DeviceManager {
 
     /// Remove a device from the manager.
     ///
-    /// The device is disconnected first. If that fails, it stays in the
-    /// manager and the error is returned, but the health monitor doesn't
-    /// reconnect it until [`connect`](Self::connect) is called. A connect of
-    /// the device that hasn't connected yet is abandoned: it returns
-    /// [`Error::Cancelled`], closing its connection if one comes up. As with
-    /// [`disconnect`](Self::disconnect), this waits until that connect's
-    /// Bluetooth attempt has ended and such a connection is closed.
+    /// The device is disconnected first, as [`disconnect`](Self::disconnect)
+    /// does, and then removed, even if closing its connection fails: that
+    /// error is still returned. A connect of the device that hasn't
+    /// connected yet is abandoned: it returns [`Error::Cancelled`], closing
+    /// its connection if one comes up. As with `disconnect`, this waits until
+    /// that connect's Bluetooth attempt has ended and such a connection is
+    /// closed.
     pub async fn remove_device(&self, identifier: &str) -> Result<()> {
         self.core.remove_device(identifier).await
     }
@@ -1702,7 +1713,8 @@ impl DeviceManager {
     /// Returns a map of device IDs to disconnection results, with an entry for
     /// each device that had a connection. Every managed device is withdrawn,
     /// connected or not: the health monitor reconnects none of them until
-    /// [`connect`](Self::connect) is called.
+    /// [`connect`](Self::connect) is called. Each connected device is
+    /// disconnected as [`disconnect`](Self::disconnect) describes.
     pub async fn disconnect_all(&self) -> HashMap<String, Result<()>> {
         self.core.disconnect_all().await
     }
@@ -2023,14 +2035,38 @@ mod lifecycle_tests {
 
     use tokio::time::timeout;
 
-    use super::{EntrySnapshot, ManagerConfig, ManagerCore, TickOutcome};
+    use super::{DevicePriority, EntrySnapshot, ManagerConfig, ManagerCore, TickOutcome};
     use crate::error::{ConnectionFailureReason, Error, Result};
+    use crate::events::{DeviceEvent, EventReceiver};
     use crate::test_support::{FakeConn, FakeEvent, FakeRadio, within};
 
     const TEST_LIMIT: Duration = Duration::from_secs(600);
 
     fn core(radio: &FakeRadio, config: ManagerConfig) -> Arc<ManagerCore<FakeConn>> {
         Arc::new(ManagerCore::new(config, radio.connector()))
+    }
+
+    /// The manager events received so far, one line each (`DeviceEvent`
+    /// has no `PartialEq`).
+    fn drain(events: &mut EventReceiver) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            lines.push(match event {
+                DeviceEvent::Connected { device, .. } => format!("Connected {}", device.id),
+                DeviceEvent::Disconnected { device, reason } => {
+                    format!("Disconnected {} {reason:?}", device.id)
+                }
+                DeviceEvent::ReconnectStarted { device, attempt } => {
+                    format!("ReconnectStarted {} {attempt}", device.id)
+                }
+                DeviceEvent::ReconnectSucceeded { device, attempts } => {
+                    format!("ReconnectSucceeded {} {attempts}", device.id)
+                }
+                DeviceEvent::Error { device, error } => format!("Error {}: {error}", device.id),
+                other => format!("{other:?}"),
+            });
+        }
+        lines
     }
 
     /// Every sensor whose link is up must be held by the manager.
@@ -2491,33 +2527,72 @@ mod lifecycle_tests {
         .await;
     }
 
-    /// `remove_device` disconnects first. When that disconnect fails, the
-    /// device stays in the manager, withdrawn, and the error is returned.
+    /// A disconnect sends `Disconnected` once it has taken the link out of
+    /// the manager, even if closing the link then fails (as closing a link
+    /// that dropped on its own does on macOS): the manager reports the device
+    /// as disconnected from then on, and nothing sends the event later. The
+    /// error is still returned.
     #[tokio::test(start_paused = true)]
-    async fn remove_device_keeps_the_device_when_its_disconnect_fails() {
+    async fn disconnects_send_disconnected_even_if_the_close_fails() {
+        within(TEST_LIMIT, async {
+            let radio = FakeRadio::new();
+            let core = core(&radio, ManagerConfig::default());
+            core.add_device_with_priority("B", DevicePriority::Low)
+                .await
+                .expect("add_device_with_priority");
+            for id in ["A", "B", "C"] {
+                core.connect(id).await.expect("connect");
+                radio.fail_disconnects(id);
+            }
+            let mut events = core.events.subscribe();
+
+            let result = core.disconnect("A").await;
+            assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+            assert_eq!(drain(&mut events), ["Disconnected A UserRequested"]);
+
+            // B has the lowest priority.
+            let result = core.evict_lowest_priority().await;
+            assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+            assert_eq!(drain(&mut events), ["Disconnected B UserRequested"]);
+
+            // C is the only device still connected.
+            let results = core.disconnect_all().await;
+            assert!(
+                results.len() == 1 && matches!(results.get("C"), Some(Err(Error::Timeout { .. }))),
+                "{results:?}"
+            );
+            assert_eq!(drain(&mut events), ["Disconnected C UserRequested"]);
+
+            for id in ["A", "B", "C"] {
+                assert_eq!(core.try_is_connected(id), Some(false), "{id}");
+            }
+            assert_no_orphans(&core, &radio).await;
+            radio.assert_no_drop_teardown();
+        })
+        .await;
+    }
+
+    /// `remove_device` disconnects first. When closing the link fails, the
+    /// device is still removed, as the manager no longer holds a link that a
+    /// second call could close, and the error is returned.
+    #[tokio::test(start_paused = true)]
+    async fn remove_device_removes_the_device_even_if_its_disconnect_fails() {
         within(TEST_LIMIT, async {
             let radio = FakeRadio::new();
             let core = core(&radio, ManagerConfig::default());
             core.connect("A").await.expect("connect");
             radio.fail_disconnects("A");
+            let mut events = core.events.subscribe();
 
             let result = core.remove_device("A").await;
 
             assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
-            assert_eq!(core.device_ids().await, ["A"]);
-            assert_eq!(
-                core.snapshot("A").await,
-                Some(EntrySnapshot {
-                    has_link: false,
-                    failures: 0,
-                    wanted: false,
-                    gave_up: false,
-                    retry_at: None,
-                })
-            );
-            // Withdrawn: the health monitor leaves it alone.
+            assert_eq!(core.device_count().await, 0);
+            assert_eq!(drain(&mut events), ["Disconnected A UserRequested"]);
+            // Gone: the health monitor has nothing to reconnect.
             assert_eq!(core.health_tick().await, TickOutcome::default());
             assert_eq!(radio.connect_count("A"), 1);
+            assert!(!radio.link_up("A"));
 
             assert_no_orphans(&core, &radio).await;
             radio.assert_no_drop_teardown();
@@ -2534,9 +2609,8 @@ mod lifecycle_tests {
         use tokio::time::{Instant, timeout};
         use tokio_util::sync::CancellationToken;
 
-        use super::{assert_no_orphans, core};
+        use super::{assert_no_orphans, core, drain};
         use crate::error::Error;
-        use crate::events::{DeviceEvent, EventReceiver};
         use crate::manager::{DevicePriority, EntrySnapshot, ManagerConfig, TickOutcome};
         use crate::reconnect::ReconnectOptions;
         use crate::test_support::{FakeEvent, FakeRadio, within};
@@ -2544,29 +2618,6 @@ mod lifecycle_tests {
         const LIMIT: Duration = Duration::from_secs(600);
         /// For the tests that run an hour or more of paused time.
         const LONG_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
-
-        /// The manager events received so far, one line each (`DeviceEvent`
-        /// has no `PartialEq`).
-        fn drain(events: &mut EventReceiver) -> Vec<String> {
-            let mut lines = Vec::new();
-            while let Ok(event) = events.try_recv() {
-                lines.push(match event {
-                    DeviceEvent::Connected { device, .. } => format!("Connected {}", device.id),
-                    DeviceEvent::Disconnected { device, reason } => {
-                        format!("Disconnected {} {reason:?}", device.id)
-                    }
-                    DeviceEvent::ReconnectStarted { device, attempt } => {
-                        format!("ReconnectStarted {} {attempt}", device.id)
-                    }
-                    DeviceEvent::ReconnectSucceeded { device, attempts } => {
-                        format!("ReconnectSucceeded {} {attempts}", device.id)
-                    }
-                    DeviceEvent::Error { device, error } => format!("Error {}: {error}", device.id),
-                    other => format!("{other:?}"),
-                });
-            }
-            lines
-        }
 
         /// The radio log without times and without `Op` entries.
         fn radio_log(radio: &FakeRadio) -> Vec<FakeEvent> {
@@ -3581,10 +3632,11 @@ mod lifecycle_tests {
             .await;
         }
 
-        /// A dead link leaves the manager when a check or a `connect()` starts
-        /// closing it, and `Disconnected` is sent then: a caller dropped
-        /// during the close, such as the monitor when it is cancelled or a
-        /// `connect()` under a timeout, must not lose the event.
+        /// A link leaves the manager when a check, a `connect()`, a
+        /// `disconnect()` or a `remove_device()` starts closing it, and
+        /// `Disconnected` is sent then: a caller dropped during the close,
+        /// such as the monitor when it is cancelled or a call under a
+        /// timeout, must not lose the event.
         #[tokio::test(start_paused = true)]
         async fn disconnected_is_sent_even_if_the_close_is_cancelled() {
             within(LIMIT, async {
@@ -3595,7 +3647,7 @@ mod lifecycle_tests {
                         .health_check_interval(Duration::from_secs(5))
                         .adaptive_interval(false),
                 );
-                for id in ["A", "B"] {
+                for id in ["A", "B", "C", "D"] {
                     core.connect(id).await.unwrap();
                     radio.set_disconnect_delay(id, Duration::from_secs(2));
                 }
@@ -3613,12 +3665,23 @@ mod lifecycle_tests {
                 radio.lose_link("B");
                 let given_up = timeout(Duration::from_millis(500), core.connect("B")).await;
                 assert!(given_up.is_err(), "connect() returned {given_up:?}");
+                // A disconnect() and a remove_device() given up on 0.5 s into
+                // closing C's and D's links.
+                let given_up = timeout(Duration::from_millis(500), core.disconnect("C")).await;
+                assert!(given_up.is_err(), "disconnect() returned {given_up:?}");
+                let given_up = timeout(Duration::from_millis(500), core.remove_device("D")).await;
+                assert!(given_up.is_err(), "remove_device() returned {given_up:?}");
 
                 assert_eq!(
                     drain(&mut events),
-                    ["Disconnected A Unknown", "Disconnected B Unknown"]
+                    [
+                        "Disconnected A Unknown",
+                        "Disconnected B Unknown",
+                        "Disconnected C UserRequested",
+                        "Disconnected D UserRequested"
+                    ]
                 );
-                for id in ["A", "B"] {
+                for id in ["A", "B", "C", "D"] {
                     assert_eq!(core.try_is_connected(id), Some(false), "{id}");
                 }
 
