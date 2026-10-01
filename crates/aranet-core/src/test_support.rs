@@ -8,6 +8,8 @@ use std::time::Duration;
 use futures::FutureExt;
 use tokio::time::Instant;
 
+use aranet_types::{CurrentReading, DeviceInfo, DeviceType};
+
 use crate::connector::{ConnectFn, SensorLink};
 use crate::error::{Error, Result};
 
@@ -147,6 +149,7 @@ impl FakeRadio {
         );
         Ok(FakeConn {
             radio: self.clone(),
+            name: format!("Aranet4 {id}"),
             id,
             handle,
             disconnected: AtomicBool::new(false),
@@ -181,6 +184,19 @@ impl FakeRadio {
         self.state().sensor(id).connects
     }
 
+    /// The sensors whose link is up, sorted.
+    pub(crate) fn up_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .state()
+            .sensors
+            .iter()
+            .filter(|(_, sensor)| sensor.up)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub(crate) fn events(&self) -> Vec<(Duration, FakeEvent)> {
         self.state().events.clone()
     }
@@ -201,6 +217,8 @@ impl FakeRadio {
 pub(crate) struct FakeConn {
     radio: FakeRadio,
     id: String,
+    /// What `SensorLink::name` returns: "Aranet4 <id>".
+    name: String,
     handle: u64,
     disconnected: AtomicBool,
 }
@@ -251,6 +269,34 @@ impl SensorLink for FakeConn {
             })
         } else {
             Ok(())
+        }
+    }
+
+    fn name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
+    fn device_type(&self) -> Option<DeviceType> {
+        Some(DeviceType::Aranet4)
+    }
+
+    async fn is_alive(&self) -> bool {
+        self.radio.link_up(&self.id)
+    }
+
+    async fn read_current(&self) -> Result<CurrentReading> {
+        if self.radio.link_up(&self.id) {
+            Ok(CurrentReading::default())
+        } else {
+            Err(Error::NotConnected)
+        }
+    }
+
+    async fn read_device_info(&self) -> Result<DeviceInfo> {
+        if self.radio.link_up(&self.id) {
+            Ok(DeviceInfo::default())
+        } else {
+            Err(Error::NotConnected)
         }
     }
 }
