@@ -85,6 +85,10 @@ Device identification varies by platform:
 - **macOS**: Devices are identified by a UUID assigned by CoreBluetooth (stable per Mac, but differs between Macs)
 - **Linux/Windows**: Devices are identified by their Bluetooth MAC address (e.g., `AA:BB:CC:DD:EE:FF`)
 
+Device identifiers must match exactly, in any case: a MAC address, a macOS device UUID or the full device name, not part of it.
+
+On Linux, connecting to a sensor that BlueZ doesn't list as paired pairs it first.
+
 ## Examples
 
 Run the examples with:
