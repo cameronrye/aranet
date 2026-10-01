@@ -472,7 +472,9 @@ impl<L: SensorLink> ReconnectCore<L> {
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 return Err(Error::Timeout {
                     operation: format!("reconnect to '{}'", self.identifier),
-                    duration: self.options.max_delay * max,
+                    // Saturating: the options accept a `max_delay` of
+                    // `Duration::MAX`, and multiplying that would panic.
+                    duration: self.options.max_delay.saturating_mul(max),
                 });
             }
 
@@ -1165,23 +1167,34 @@ mod lifecycle_tests {
         .await;
     }
 
+    /// The error's duration is `max_delay` times `max_attempts`, and an
+    /// unlimited `max_delay` (`Duration::MAX`, which the options accept)
+    /// saturates it instead of panicking.
     #[tokio::test(start_paused = true)]
     async fn gives_up_after_max_attempts() {
         within(LIMIT, async {
-            let radio = FakeRadio::new();
-            let core = connected_core(&radio, ReconnectOptions::default().max_attempts(2)).await;
-            radio.script_connects("A", [false; 3]);
-            radio.lose_link("A");
+            for (max_delay, total) in [
+                (Duration::from_secs(60), Duration::from_secs(120)),
+                (Duration::MAX, Duration::MAX),
+            ] {
+                let radio = FakeRadio::new();
+                let options = ReconnectOptions::default()
+                    .max_attempts(2)
+                    .max_delay(max_delay);
+                let core = connected_core(&radio, options).await;
+                radio.script_connects("A", [false; 3]);
+                radio.lose_link("A");
 
-            let result = core.run(run_op).await;
+                let result = core.run(run_op).await;
 
-            assert!(
-                matches!(&result, Err(Error::Timeout { operation, .. }) if operation.contains("reconnect to 'A'")),
-                "{result:?}"
-            );
-            assert_eq!(core.state().await, ConnectionState::Failed);
-            assert_eq!(radio.connect_count("A"), 3, "the first link and two attempts");
-            radio.assert_no_drop_teardown();
+                assert!(
+                    matches!(&result, Err(Error::Timeout { operation, duration }) if operation.contains("reconnect to 'A'") && *duration == total),
+                    "{result:?}"
+                );
+                assert_eq!(core.state().await, ConnectionState::Failed);
+                assert_eq!(radio.connect_count("A"), 3, "the first link and two attempts");
+                radio.assert_no_drop_teardown();
+            }
         })
         .await;
     }
