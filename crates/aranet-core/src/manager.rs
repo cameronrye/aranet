@@ -404,6 +404,11 @@ impl<L> Entry<L> {
     fn record_failure(&mut self) {
         self.failures += 1;
     }
+
+    /// Whether the health monitor should reconnect this device now.
+    fn is_due_for_repair(&self) -> bool {
+        self.auto_reconnect && self.link.is_none()
+    }
 }
 
 /// What the lifecycle tests can see of an entry.
@@ -460,6 +465,17 @@ impl<L: SensorLink> Drop for NewLink<L> {
             });
         }
     }
+}
+
+/// What one health-monitor tick did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TickOutcome {
+    /// Connected devices that passed their check.
+    pub(crate) healthy: usize,
+    /// Devices this tick reconnected.
+    pub(crate) repaired: usize,
+    /// Reconnects that failed.
+    pub(crate) failed: usize,
 }
 
 /// The device manager's logic, generic over the connection type so that the
@@ -577,9 +593,11 @@ impl<L: SensorLink> ManagerCore<L> {
         self.connect_locked(identifier, &held, reserved).await
     }
 
-    /// Connects `identifier` unless its entry already has a link. The caller
-    /// holds the entry's `op` guard and passes it, shared, as `held`; a new
-    /// link that is abandoned keeps a share of it until the link is down.
+    /// Connects `identifier` unless it already has a link that the Bluetooth
+    /// stack reports as up; a link that is down is closed and replaced. The
+    /// caller holds the entry's `op` guard and passes it, shared, as `held`;
+    /// a lost link being closed (see `detach`) and a new link that is
+    /// abandoned each keep a share of it until that link is down.
     /// `reserved` is the slot that `connect` took when it added the device;
     /// without one, a slot is taken here.
     async fn connect_locked(
@@ -589,18 +607,22 @@ impl<L: SensorLink> ManagerCore<L> {
         reserved: Option<OwnedSemaphorePermit>,
     ) -> Result<()> {
         let op = tokio::sync::OwnedMutexGuard::mutex(held);
-        {
+        let existing = {
             let devices = self.devices.read().await;
             match devices.get(identifier) {
-                Some(entry) if Arc::ptr_eq(&entry.op, op) => {
-                    if entry.link.is_some() {
-                        debug!("Device {identifier} already has a connection handle");
-                        return Ok(());
-                    }
-                }
+                Some(entry) if Arc::ptr_eq(&entry.op, op) => entry.link.clone(),
                 // Removed while this connect waited for the guard.
                 _ => return Err(Error::Cancelled),
             }
+        };
+        if let Some(link) = existing {
+            if link.is_connected().await {
+                debug!("Device {identifier} is already connected");
+                return Ok(());
+            }
+            info!("The connection to {identifier} was lost; reconnecting");
+            self.detach(identifier, &link, held, DisconnectReason::Unknown)
+                .await;
         }
 
         // Stored with the link and held until the link has been disconnected.
@@ -926,108 +948,195 @@ impl<L: SensorLink> ManagerCore<L> {
         devices.get(identifier).and_then(|entry| entry.last_reading)
     }
 
+    /// One pass of the health monitor.
+    ///
+    /// Checks every connected device at once and closes the links that fail,
+    /// then reconnects the devices that are due, one at a time and highest
+    /// priority first. A device whose connect, disconnect or removal is
+    /// running is left alone.
+    pub(crate) async fn health_tick(&self) -> TickOutcome {
+        let mut outcome = TickOutcome::default();
+
+        // Phase 1: check every connected device at once, so a slow device
+        // doesn't hold up the others.
+        let targets: Vec<_> = {
+            let devices = self.devices.read().await;
+            devices
+                .iter()
+                .filter_map(|(id, entry)| {
+                    let link = entry.link.as_ref()?;
+                    Some((id.clone(), Arc::clone(link), Arc::clone(&entry.op)))
+                })
+                .collect()
+        };
+        let mut probes = Vec::with_capacity(targets.len());
+        for (id, link, op) in targets {
+            probes.push(self.probe(id, link, op));
+        }
+        outcome.healthy = join_all(probes)
+            .await
+            .into_iter()
+            .filter(|&healthy| healthy)
+            .count();
+
+        // Phase 2: reconnect one device at a time (a second search would only
+        // wait for the scan permit), highest priority first.
+        let mut due: Vec<_> = {
+            let devices = self.devices.read().await;
+            devices
+                .iter()
+                .filter(|(_, entry)| entry.is_due_for_repair())
+                .map(|(id, entry)| (id.clone(), entry.priority, Arc::clone(&entry.op)))
+                .collect()
+        };
+        due.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (id, _priority, op) in due {
+            // A connect, disconnect or remove of this device is running.
+            let Ok(guard) = Arc::clone(&op).try_lock_owned() else {
+                continue;
+            };
+            let held = Arc::new(guard);
+            // Check again now that the device is ours: it may have been
+            // connected, disconnected or removed since the list was made.
+            let attempt = match self.devices.read().await.get(&id) {
+                Some(entry) if Arc::ptr_eq(&entry.op, &op) && entry.is_due_for_repair() => {
+                    entry.failures.saturating_add(1)
+                }
+                _ => continue,
+            };
+            debug!("Health monitor: reconnecting {id} (attempt {attempt})");
+            self.events.send(DeviceEvent::ReconnectStarted {
+                device: DeviceId::new(&id),
+                attempt,
+            });
+            match self.connect_locked(&id, &held, None).await {
+                Ok(()) => {
+                    if let Some(entry) = self.devices.write().await.get_mut(&id) {
+                        entry.record_success();
+                    }
+                    info!("Health monitor: reconnected {id}");
+                    self.events.send(DeviceEvent::ReconnectSucceeded {
+                        device: DeviceId::new(&id),
+                        attempts: attempt,
+                    });
+                    outcome.repaired += 1;
+                }
+                // The device was removed while this repair waited.
+                Err(Error::Cancelled) => debug!("Health monitor: reconnect of {id} cancelled"),
+                Err(e) => {
+                    warn!("Health monitor: reconnect {attempt} of {id} failed: {e}");
+                    if let Some(entry) = self.devices.write().await.get_mut(&id) {
+                        entry.record_failure();
+                    }
+                    outcome.failed += 1;
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Checks one connected device for `health_tick` and closes its link if
+    /// the check fails. Returns whether the device was checked and is healthy.
+    async fn probe(&self, id: String, link: Arc<L>, op: Arc<Mutex<()>>) -> bool {
+        // A connect, disconnect or remove of this device is running.
+        let Ok(guard) = op.try_lock_owned() else {
+            return false;
+        };
+        let held = Arc::new(guard);
+        let alive = if self.config.use_connection_validation {
+            link.is_alive().await
+        } else {
+            link.is_connected().await
+        };
+        if !alive {
+            warn!("Health monitor: the connection to {id} is dead; closing it");
+            self.detach(&id, &link, &held, DisconnectReason::Unknown)
+                .await;
+        }
+        alive
+    }
+
+    /// Closes `link` if the entry for `identifier` still holds it: takes the
+    /// link and its slot, disconnects the link, frees the slot once the link
+    /// is down, and emits `Disconnected`. `held` is the caller's guard of the
+    /// entry's `op` mutex. As in `disconnect_locked`, the disconnect keeps a
+    /// share of that guard until the link is down, even if this future is
+    /// dropped, so no connect of the device can overlap the old link's
+    /// disconnect.
+    async fn detach(
+        &self,
+        identifier: &str,
+        link: &Arc<L>,
+        held: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+        reason: DisconnectReason,
+    ) {
+        let taken = {
+            let mut devices = self.devices.write().await;
+            match devices.get_mut(identifier) {
+                Some(entry)
+                    if entry
+                        .link
+                        .as_ref()
+                        .is_some_and(|stored| Arc::ptr_eq(stored, link)) =>
+                {
+                    entry.link.take().map(|stored| (stored, entry.slot.take()))
+                }
+                _ => None,
+            }
+        };
+        let Some((link, slot)) = taken else {
+            return;
+        };
+        // Close it explicitly: a handle dropped without a disconnect tears
+        // down whatever link the sensor has by then, including a new one.
+        if let Err(e) = release_link(link, (slot, Arc::clone(held))).await {
+            debug!("Closing the dead connection to {identifier} failed: {e}");
+        }
+        self.events.send(DeviceEvent::Disconnected {
+            device: DeviceId::new(identifier),
+            reason,
+        });
+    }
+
     pub(crate) fn spawn_health_monitor(
         self: Arc<Self>,
         cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            // Initialize adaptive interval if enabled
-            let mut adaptive = if self.config.use_adaptive_interval {
-                Some(AdaptiveInterval::new(
+            let mut adaptive = self.config.use_adaptive_interval.then(|| {
+                AdaptiveInterval::new(
                     self.config.health_check_interval,
                     self.config.min_health_check_interval,
                     self.config.max_health_check_interval,
-                ))
-            } else {
-                None
-            };
-
+                )
+            });
             loop {
-                // Get current interval
-                let current_interval = adaptive
+                let interval = adaptive
                     .as_ref()
-                    .map(|a| a.current())
-                    .unwrap_or(self.config.health_check_interval);
-
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        info!("Health monitor cancelled, shutting down");
-                        break;
-                    }
-                    _ = tokio::time::sleep(current_interval) => {
-                        let mut any_failures = false;
-                        let mut any_successes = false;
-
-                        // Get devices that need checking
-                        let devices_to_check: Vec<(String, Option<Arc<L>>, bool, DevicePriority)> = {
-                            let devices = self.devices.read().await;
-                            devices
-                                .iter()
-                                .map(|(id, entry)| {
-                                    (
-                                        id.clone(),
-                                        entry.link.clone(),
-                                        entry.auto_reconnect,
-                                        entry.priority,
-                                    )
-                                })
-                                .collect()
-                        };
-
-                        // Sort by priority (higher priority checked first)
-                        let mut sorted_devices = devices_to_check;
-                        sorted_devices.sort_by_key(|d| std::cmp::Reverse(d.3));
-
-                        for (id, link, auto_reconnect, _priority) in sorted_devices {
-                            let should_reconnect = match link {
-                                Some(link) => {
-                                    // Use connection validation if enabled
-                                    if self.config.use_connection_validation {
-                                        !link.is_alive().await
-                                    } else {
-                                        !link.is_connected().await
-                                    }
-                                }
-                                None => true,
-                            };
-
-                            if should_reconnect && auto_reconnect {
-                                debug!("Health monitor: attempting reconnect for {}", id);
-                                any_failures = true;
-
-                                match self.connect(&id).await {
-                                    Ok(()) => {
-                                        any_successes = true;
-                                        // Update success in the entry
-                                        if let Some(entry) = self.devices.write().await.get_mut(&id) {
-                                            entry.record_success();
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Health monitor: reconnect failed for {}: {}", id, e);
-                                        // Update failure in the entry
-                                        if let Some(entry) = self.devices.write().await.get_mut(&id) {
-                                            entry.record_failure();
-                                        }
-                                    }
-                                }
-                            } else if !should_reconnect {
-                                any_successes = true;
-                            }
-                        }
-
-                        // Update adaptive interval
-                        if let Some(ref mut adaptive) = adaptive {
-                            if any_failures && !any_successes {
-                                adaptive.on_failure();
-                            } else if any_successes && !any_failures {
-                                adaptive.on_success();
-                            }
-                            // Mixed results: don't change interval
-                        }
+                    .map_or(self.config.health_check_interval, AdaptiveInterval::current);
+                if cancel
+                    .run_until_cancelled(tokio::time::sleep(interval))
+                    .await
+                    .is_none()
+                {
+                    break;
+                }
+                // Cancelling mid-tick drops the tick: a connect in progress
+                // gives back its slot and `op` guard, and releases the sensor;
+                // a dead link being closed, or a new link not stored yet,
+                // keeps both until it is down.
+                let Some(outcome) = cancel.run_until_cancelled(self.health_tick()).await else {
+                    break;
+                };
+                if let Some(adaptive) = adaptive.as_mut() {
+                    if outcome.failed > 0 {
+                        adaptive.on_failure();
+                    } else if outcome.healthy > 0 && outcome.repaired == 0 {
+                        adaptive.on_success();
                     }
                 }
             }
+            info!("Health monitor cancelled, shutting down");
         })
     }
 
@@ -2128,5 +2237,482 @@ mod lifecycle_tests {
             radio.assert_no_drop_teardown();
         })
         .await;
+    }
+
+    /// Task 14: the health monitor (BR-5 dead links, BR-8 intent, backoff
+    /// and cancellation).
+    mod health {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tokio::time::{Instant, timeout};
+        use tokio_util::sync::CancellationToken;
+
+        use super::{assert_no_orphans, core};
+        use crate::events::{DeviceEvent, EventReceiver};
+        use crate::manager::{DevicePriority, ManagerConfig, TickOutcome};
+        use crate::reconnect::ReconnectOptions;
+        use crate::test_support::{FakeEvent, FakeRadio, within};
+
+        const LIMIT: Duration = Duration::from_secs(600);
+
+        /// The manager events received so far, one line each (`DeviceEvent`
+        /// has no `PartialEq`).
+        fn drain(events: &mut EventReceiver) -> Vec<String> {
+            let mut lines = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                lines.push(match event {
+                    DeviceEvent::Connected { device, .. } => format!("Connected {}", device.id),
+                    DeviceEvent::Disconnected { device, reason } => {
+                        format!("Disconnected {} {reason:?}", device.id)
+                    }
+                    DeviceEvent::ReconnectStarted { device, attempt } => {
+                        format!("ReconnectStarted {} {attempt}", device.id)
+                    }
+                    DeviceEvent::ReconnectSucceeded { device, attempts } => {
+                        format!("ReconnectSucceeded {} {attempts}", device.id)
+                    }
+                    DeviceEvent::Error { device, error } => format!("Error {}: {error}", device.id),
+                    other => format!("{other:?}"),
+                });
+            }
+            lines
+        }
+
+        /// The radio log without times and without `Op` entries.
+        fn radio_log(radio: &FakeRadio) -> Vec<FakeEvent> {
+            radio
+                .events()
+                .into_iter()
+                .map(|(_, event)| event)
+                .filter(|event| !matches!(event, FakeEvent::Op { .. }))
+                .collect()
+        }
+
+        /// When each connect to `id` started.
+        fn connect_starts(radio: &FakeRadio, id: &str) -> Vec<Duration> {
+            radio
+                .events()
+                .into_iter()
+                .filter_map(|(at, event)| {
+                    matches!(&event, FakeEvent::ConnectStarted { id: started } if started == id)
+                        .then_some(at)
+                })
+                .collect()
+        }
+
+        /// When `id`'s link was first closed with a disconnect.
+        fn first_disconnect(radio: &FakeRadio, id: &str) -> Option<Duration> {
+            radio.events().into_iter().find_map(|(at, event)| {
+                matches!(&event, FakeEvent::Disconnect { id: closed, .. } if closed == id)
+                    .then_some(at)
+            })
+        }
+
+        // ---- BR-5 ----
+
+        #[tokio::test(start_paused = true)]
+        async fn health_tick_replaces_a_dead_handle() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                radio.lose_link("A");
+                let mut events = core.events.subscribe();
+
+                let outcome = core.health_tick().await;
+
+                assert_eq!(
+                    outcome,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 1,
+                        failed: 0
+                    }
+                );
+                let log = radio_log(&radio);
+                let [
+                    FakeEvent::ConnectStarted { .. },
+                    FakeEvent::Connected { handle: first, .. },
+                    FakeEvent::Disconnect { handle: closed, .. },
+                    FakeEvent::ConnectStarted { .. },
+                    FakeEvent::Connected { handle: second, .. },
+                ] = log.as_slice()
+                else {
+                    panic!("unexpected radio log: {log:?}");
+                };
+                assert_eq!(closed, first, "the dead handle was not the one closed");
+                assert_ne!(second, first);
+                assert!(radio.link_up("A"));
+                assert_eq!(
+                    drain(&mut events),
+                    [
+                        "Disconnected A Unknown",
+                        "ReconnectStarted A 1",
+                        "Connected A",
+                        "ReconnectSucceeded A 1"
+                    ]
+                );
+                core.read_current("A").await.unwrap();
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn connect_replaces_a_dead_link() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                // A link that is up: connecting again changes nothing.
+                core.connect("A").await.unwrap();
+                assert_eq!(radio.connect_count("A"), 1);
+
+                radio.lose_link("A");
+                let mut events = core.events.subscribe();
+                core.connect("A").await.unwrap();
+
+                assert_eq!(radio.connect_count("A"), 2, "connect() kept the dead link");
+                let log = radio_log(&radio);
+                let [
+                    FakeEvent::ConnectStarted { .. },
+                    FakeEvent::Connected { handle: first, .. },
+                    FakeEvent::Disconnect { handle: closed, .. },
+                    FakeEvent::ConnectStarted { .. },
+                    FakeEvent::Connected { handle: second, .. },
+                ] = log.as_slice()
+                else {
+                    panic!("unexpected radio log: {log:?}");
+                };
+                assert_eq!(closed, first, "the dead handle was not the one closed");
+                assert_ne!(second, first);
+                assert!(radio.link_up("A"));
+                assert_eq!(
+                    drain(&mut events),
+                    ["Disconnected A Unknown", "Connected A"]
+                );
+                core.read_current("A").await.unwrap();
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn health_tick_replaces_a_zombie_handle_when_validation_is_on() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let validating = core(&radio, ManagerConfig::default().connection_validation(true));
+                validating.connect("A").await.unwrap();
+                radio.make_zombie("A");
+
+                assert_eq!(
+                    validating.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 1,
+                        failed: 0
+                    }
+                );
+                assert_eq!(radio.connect_count("A"), 2);
+                assert!(radio.link_up("A"));
+                // The new link answers.
+                assert_eq!(
+                    validating.health_tick().await,
+                    TickOutcome {
+                        healthy: 1,
+                        repaired: 0,
+                        failed: 0
+                    }
+                );
+                validating.read_current("A").await.unwrap();
+                assert_no_orphans(&validating, &radio).await;
+                radio.assert_no_drop_teardown();
+
+                // Documented limitation: without validation the monitor only
+                // asks the stack, which still reports the zombie as connected.
+                let radio = FakeRadio::new();
+                let asking = core(
+                    &radio,
+                    ManagerConfig::default().connection_validation(false),
+                );
+                asking.connect("A").await.unwrap();
+                radio.make_zombie("A");
+                assert_eq!(
+                    asking.health_tick().await,
+                    TickOutcome {
+                        healthy: 1,
+                        repaired: 0,
+                        failed: 0
+                    }
+                );
+                assert_eq!(radio.connect_count("A"), 1);
+                assert!(
+                    asking.read_current("A").await.is_err(),
+                    "the zombie's reads should time out"
+                );
+                assert_no_orphans(&asking, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn health_tick_counts_a_failed_repair_as_failure() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                radio.lose_link("A");
+                radio.script_connects("A", [false]);
+
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 0,
+                        failed: 1
+                    }
+                );
+                let snapshot = core.snapshot("A").await.unwrap();
+                assert!(!snapshot.has_link);
+                assert_eq!(snapshot.failures, 1);
+                assert!(!radio.link_up("A"));
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn health_monitor_tightens_interval_while_repairs_fail() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                // 30 s base interval, adaptive, 5 s minimum.
+                let core = core(&radio, ManagerConfig::default());
+                core.add_device_with_options(
+                    "A",
+                    ReconnectOptions {
+                        max_attempts: None,
+                        ..ReconnectOptions::fixed_delay(Duration::from_millis(100))
+                    },
+                )
+                .await
+                .unwrap();
+                core.connect("A").await.unwrap();
+                // B stays healthy on every tick: a failed repair of A still
+                // counts as a failure.
+                core.connect("B").await.unwrap();
+                radio.lose_link("A");
+                radio.script_connects("A", [false; 10]);
+
+                let cancel = CancellationToken::new();
+                let monitor = Arc::clone(&core).spawn_health_monitor(cancel.clone());
+                tokio::time::sleep(Duration::from_secs(70)).await;
+                cancel.cancel();
+                monitor.await.unwrap();
+
+                // Each tick with a failed repair halves the interval: 30 s, 15 s,
+                // 7.5 s, then the 5 s minimum. The first start is `connect`.
+                let starts = connect_starts(&radio, "A");
+                assert_eq!(
+                    starts[1..],
+                    [30_000, 45_000, 52_500, 57_500, 62_500, 67_500].map(Duration::from_millis)
+                );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn probes_run_concurrently_so_a_slow_device_does_not_delay_others() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default().connection_validation(true));
+                core.add_device_with_priority("A", DevicePriority::High)
+                    .await
+                    .unwrap();
+                core.add_device_with_priority("B", DevicePriority::Normal)
+                    .await
+                    .unwrap();
+                core.connect("A").await.unwrap();
+                core.connect("B").await.unwrap();
+                // A's check takes 3 s and fails (a validation read that times
+                // out); B's link is simply gone.
+                radio.make_zombie("A");
+                radio.set_probe_delay("A", Duration::from_secs(3));
+                radio.lose_link("B");
+
+                assert_eq!(
+                    core.health_tick().await,
+                    TickOutcome {
+                        healthy: 0,
+                        repaired: 2,
+                        failed: 0
+                    }
+                );
+                let b = first_disconnect(&radio, "B").expect("B's dead link was not closed");
+                assert!(
+                    b < Duration::from_secs(1),
+                    "B was closed at {b:?}, after A's check"
+                );
+                let a = first_disconnect(&radio, "A").expect("A's zombie link was not closed");
+                assert!(
+                    a >= Duration::from_secs(3),
+                    "A was closed at {a:?}, before its check ended"
+                );
+                // Repairs run one at a time, highest priority first.
+                let started: Vec<FakeEvent> = radio_log(&radio)
+                    .into_iter()
+                    .filter(|event| matches!(event, FakeEvent::ConnectStarted { .. }))
+                    .collect();
+                assert_eq!(
+                    started[2..],
+                    [
+                        FakeEvent::ConnectStarted { id: "A".into() },
+                        FakeEvent::ConnectStarted { id: "B".into() }
+                    ]
+                );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn health_monitor_stops_promptly_when_cancelled_mid_reconnect() {
+            within(LIMIT, async {
+                let start = Instant::now();
+                let radio = FakeRadio::new();
+                let core = core(
+                    &radio,
+                    ManagerConfig::default()
+                        .health_check_interval(Duration::from_secs(5))
+                        .adaptive_interval(false),
+                );
+                // Added but not connected yet: the tick at 5 s connects it,
+                // and that connect takes 60 s.
+                core.add_device("A").await.unwrap();
+                radio.set_connect_delay("A", Duration::from_secs(60));
+
+                let cancel = CancellationToken::new();
+                let monitor = Arc::clone(&core).spawn_health_monitor(cancel.clone());
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                assert_eq!(radio.connect_count("A"), 1, "the tick started no connect");
+
+                cancel.cancel();
+                monitor.await.unwrap();
+                let stopped = start.elapsed();
+                assert!(
+                    stopped < Duration::from_secs(10),
+                    "the monitor stopped at {stopped:?}"
+                );
+
+                // The abandoned connect never completes, and its slot is free.
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                assert!(!radio.link_up("A"));
+                assert_eq!(
+                    core.available_connections().await,
+                    Some(core.config.max_concurrent_connections)
+                );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// A `connect()` given up on while it closes a dead link keeps the
+        /// device until that link is down, as a cancelled `disconnect()` does
+        /// (Task 13): a disconnect acts on the sensor, not on the handle, so
+        /// a new link made before it finished would be taken down by it.
+        #[tokio::test(start_paused = true)]
+        async fn connect_after_a_cancelled_connect_waits_for_the_dead_link_to_go_down() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(&radio, ManagerConfig::default());
+                core.connect("A").await.unwrap();
+                radio.set_disconnect_delay("A", Duration::from_secs(2));
+                radio.lose_link("A");
+
+                // Given up on 0.5 s into closing the dead link, which takes 2 s.
+                let first = timeout(Duration::from_millis(500), core.connect("A")).await;
+                assert!(
+                    first.is_err(),
+                    "connect() returned {first:?} without closing the dead link"
+                );
+                core.connect("A").await.expect("second connect");
+                // Until well after the dead link's disconnect has finished.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+
+                assert!(
+                    radio.link_up("A"),
+                    "the old link's disconnect took down the new link: {:#?}",
+                    radio.events()
+                );
+                // The second connect started only once the dead link was down.
+                assert_eq!(
+                    connect_starts(&radio, "A"),
+                    [Duration::ZERO, Duration::from_secs(2)]
+                );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
+
+        /// The same for a health tick that the monitor's cancel drops while
+        /// the tick closes a dead link.
+        #[tokio::test(start_paused = true)]
+        async fn connect_after_a_cancelled_health_tick_waits_for_the_dead_link_to_go_down() {
+            within(LIMIT, async {
+                let radio = FakeRadio::new();
+                let core = core(
+                    &radio,
+                    ManagerConfig::default()
+                        .health_check_interval(Duration::from_secs(5))
+                        .adaptive_interval(false),
+                );
+                core.connect("A").await.unwrap();
+                radio.set_disconnect_delay("A", Duration::from_secs(2));
+                radio.lose_link("A");
+
+                // The tick at 5 s finds the link dead and starts closing it,
+                // which takes 2 s; the monitor is cancelled 0.5 s later.
+                let cancel = CancellationToken::new();
+                let monitor = Arc::clone(&core).spawn_health_monitor(cancel.clone());
+                tokio::time::sleep(Duration::from_millis(5500)).await;
+                cancel.cancel();
+                monitor.await.unwrap();
+                core.connect("A").await.expect("connect after the cancel");
+                assert_eq!(radio.connect_count("A"), 2, "the dead link was kept");
+                // Until well after the dead link's disconnect has finished.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+
+                assert!(
+                    radio.link_up("A"),
+                    "the old link's disconnect took down the new link: {:#?}",
+                    radio.events()
+                );
+                // The connect started only once the dead link was down.
+                assert_eq!(
+                    connect_starts(&radio, "A"),
+                    [Duration::ZERO, Duration::from_secs(7)]
+                );
+
+                assert_no_orphans(&core, &radio).await;
+                radio.assert_no_drop_teardown();
+            })
+            .await;
+        }
     }
 }
