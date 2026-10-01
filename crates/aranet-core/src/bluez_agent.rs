@@ -464,7 +464,8 @@ fn log_outcome(address: &str, outcome: &PairOutcome) {
          aranet can't enter a PIN: if the sensor asks for one, pair it by hand once. Stop aranet \
          and the aranet service first (a connect during the pairing cancels it), run \
          `bluetoothctl remove {address}` if it was paired with this computer before, then run \
-         `bluetoothctl` and, at its prompt, `pair {address}`, entering the PIN when asked"
+         `bluetoothctl` and, at its prompt, `scan on` until the sensor is listed, `scan off` \
+         and `pair {address}`, entering the PIN when asked"
     );
 }
 
