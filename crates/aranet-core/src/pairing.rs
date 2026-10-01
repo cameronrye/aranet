@@ -421,38 +421,48 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// `run_pairing` with the default budget, on the paused clock. `bus`
+    /// answers every call at once, so the session must take no time: one that
+    /// waited out its budget, or one more for a `Pair` reply, fails here.
+    async fn run_pairing_at_once(bus: &FakeBus) -> PairOutcome {
+        let start = Instant::now();
+        let outcome = within(Duration::from_secs(600), run_pairing(bus, BUDGET)).await;
+        assert_eq!(start.elapsed(), Duration::ZERO, "{outcome:?}");
+        outcome
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn already_paired_device_skips_agent_and_pair() {
         let bus = FakeBus::new(Ok(true), Ok(()), PairScript::Ok);
 
-        assert_eq!(run_pairing(&bus, BUDGET).await, PairOutcome::AlreadyPaired);
+        assert_eq!(run_pairing_at_once(&bus).await, PairOutcome::AlreadyPaired);
         assert_eq!(bus.calls(), ["IsPaired"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unpaired_device_registers_pairs_then_unregisters() {
         let bus = FakeBus::unpaired(PairScript::Ok);
 
-        assert_eq!(run_pairing(&bus, BUDGET).await, PairOutcome::Paired);
+        assert_eq!(run_pairing_at_once(&bus).await, PairOutcome::Paired);
         assert_eq!(bus.calls(), FULL_SEQUENCE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pair_already_exists_counts_as_paired() {
         // Something else bonded the sensor after `Paired` was read. BlueZ newer
         // than 5.66 answers AlreadyExists for it (device.c:3422 and :3435).
         let bus = FakeBus::unpaired(PairScript::Err(err(ALREADY_EXISTS)));
 
-        assert_eq!(run_pairing(&bus, BUDGET).await, PairOutcome::AlreadyPaired);
+        assert_eq!(run_pairing_at_once(&bus).await, PairOutcome::AlreadyPaired);
         assert_eq!(bus.calls(), FULL_SEQUENCE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failed_pair_still_unregisters_agent() {
         let bus = FakeBus::unpaired(PairScript::Err(err("org.bluez.Error.AuthenticationFailed")));
 
         assert_eq!(
-            run_pairing(&bus, BUDGET).await,
+            run_pairing_at_once(&bus).await,
             PairOutcome::Failed(err("org.bluez.Error.AuthenticationFailed"))
         );
         assert_eq!(bus.calls(), FULL_SEQUENCE);
@@ -658,20 +668,20 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::from_secs(9));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bluez_unreachable_skips_pairing() {
         // bluetoothd isn't running, so nothing owns org.bluez on the system bus.
         let unknown = err("org.freedesktop.DBus.Error.ServiceUnknown");
         let bus = FakeBus::new(Err(unknown.clone()), Ok(()), PairScript::Ok);
 
         assert_eq!(
-            run_pairing(&bus, BUDGET).await,
+            run_pairing_at_once(&bus).await,
             PairOutcome::Unavailable(unknown)
         );
         assert_eq!(bus.calls(), ["IsPaired"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn register_failure_skips_pair() {
         // RegisterAgent answers AlreadyExists when the connection already has an
         // agent (agent.c:956-958). Unlike Pair's, that says nothing about the
@@ -680,13 +690,13 @@ mod tests {
         let bus = FakeBus::new(Ok(false), Err(taken.clone()), PairScript::Ok);
 
         assert_eq!(
-            run_pairing(&bus, BUDGET).await,
+            run_pairing_at_once(&bus).await,
             PairOutcome::Unavailable(taken)
         );
         assert_eq!(bus.calls(), ["IsPaired", "RegisterAgent"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn each_pairing_registers_its_own_agent_after_a_failed_one() {
         // bluetoothd restarted while `Pair` was waiting: the bus answered for it,
         // and the cleanup calls failed too. That is still `Failed`: only a
@@ -697,7 +707,7 @@ mod tests {
             ..FakeBus::unpaired(PairScript::Err(no_reply.clone()))
         };
         assert_eq!(
-            run_pairing(&first, BUDGET).await,
+            run_pairing_at_once(&first).await,
             PairOutcome::Failed(no_reply)
         );
         assert_eq!(first.calls(), FULL_SEQUENCE);
@@ -705,7 +715,7 @@ mod tests {
         // The next attempt talks to the new bluetoothd, which has no agent from
         // aranet. Nothing may be remembered from the first run.
         let second = FakeBus::unpaired(PairScript::Ok);
-        assert_eq!(run_pairing(&second, BUDGET).await, PairOutcome::Paired);
+        assert_eq!(run_pairing_at_once(&second).await, PairOutcome::Paired);
         assert_eq!(second.calls(), FULL_SEQUENCE);
     }
 
