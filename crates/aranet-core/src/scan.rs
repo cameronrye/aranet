@@ -487,9 +487,7 @@ pub async fn scan_with_adapter(
 
     // Create scan filter - optionally filter for Aranet service UUIDs
     let scan_filter = if options.use_service_filter {
-        ScanFilter {
-            services: vec![SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD],
-        }
+        aranet_service_filter()
     } else {
         ScanFilter::default()
     };
@@ -597,6 +595,35 @@ fn is_aranet_device(properties: &btleplug::api::PeripheralProperties) -> bool {
     false
 }
 
+/// A scan filter that asks the Bluetooth stack only for devices that advertise
+/// an Aranet service.
+fn aranet_service_filter() -> ScanFilter {
+    ScanFilter {
+        services: vec![SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD],
+    }
+}
+
+/// Whether device searches ask the Bluetooth stack only for Aranet sensors until
+/// their last attempt (see `search_filter`). Only on macOS: btleplug's
+/// CoreBluetooth backend keeps every device a scan reports for the rest of the
+/// process and leaks a little memory for every advertisement it receives, so
+/// unfiltered searches near many Bluetooth devices make a long-running program
+/// grow by 1-2 MB an hour. Linux and Windows searches ask for every device.
+const FILTER_SEARCH_UNTIL_LAST_ATTEMPT: bool = cfg!(target_os = "macos");
+
+/// The scan filter of attempt `attempt` (counted from 1) of a device search that
+/// makes `max_attempts`. With `filter_until_last`, every attempt but the last
+/// asks only for devices that advertise an Aranet service, and the last asks for
+/// every device, so a sensor that doesn't advertise one is still found. Without
+/// it, every attempt asks for every device.
+fn search_filter(attempt: u32, max_attempts: u32, filter_until_last: bool) -> ScanFilter {
+    if filter_until_last && attempt < max_attempts {
+        aranet_service_filter()
+    } else {
+        ScanFilter::default()
+    }
+}
+
 /// Find a device by its address, identifier or full name.
 ///
 /// `identifier` is trimmed and case is ignored, but otherwise it must match one
@@ -610,6 +637,9 @@ fn is_aranet_device(properties: &btleplug::api::PeripheralProperties) -> bool {
 ///   `"Kitchen [Aranet4 1A2B3]"` also matches `Kitchen` or `Aranet4 1A2B3`.
 ///
 /// An address or identifier match wins over a name match.
+///
+/// The device is searched for as [`find_device_with_options`] describes, with the
+/// default [`ScanOptions`].
 ///
 /// # Errors
 ///
@@ -637,6 +667,12 @@ pub async fn find_device(identifier: &str) -> Result<(Adapter, Peripheral)> {
 ///
 /// This helps with BLE reliability issues where devices may not appear
 /// on every scan due to advertisement timing.
+///
+/// Only `options.duration` is used: the search ignores the filter flags of
+/// `options`. On macOS every scan attempt but the last asks the Bluetooth stack
+/// only for devices that advertise an Aranet service, and the last asks for every
+/// device, so a sensor that doesn't advertise one is still found. On other
+/// platforms every attempt asks for every device.
 pub async fn find_device_with_options(
     identifier: &str,
     options: ScanOptions,
@@ -646,7 +682,8 @@ pub async fn find_device_with_options(
 
 /// Find a specific device using a pre-existing adapter.
 ///
-/// `identifier` must match exactly, as [`find_device`] describes.
+/// `identifier` must match exactly, as [`find_device`] describes, and the device
+/// is searched for as [`find_device_with_options`] describes.
 ///
 /// This avoids creating a new btleplug `Manager` (and D-Bus connection) on
 /// every call.  The caller is responsible for keeping the `Adapter` alive.
@@ -660,7 +697,8 @@ pub async fn find_device_with_adapter(
 
 /// Find a specific device using a pre-existing adapter, with progress callback.
 ///
-/// `identifier` must match exactly, as [`find_device`] describes.
+/// `identifier` must match exactly, as [`find_device`] describes, and the device
+/// is searched for as [`find_device_with_options`] describes.
 pub async fn find_device_with_adapter_progress(
     adapter: &Adapter,
     identifier: &str,
@@ -705,6 +743,18 @@ pub async fn find_device_with_adapter_progress(
             "Scan attempt {}/{} ({}s)...",
             attempt, max_attempts, duration_secs
         );
+        let filter = search_filter(attempt, max_attempts, FILTER_SEARCH_UNTIL_LAST_ATTEMPT);
+        debug!(
+            "Scan attempt {}/{} ({}s, {})",
+            attempt,
+            max_attempts,
+            duration_secs,
+            if filter.services.is_empty() {
+                "all devices"
+            } else {
+                "Aranet sensors only"
+            }
+        );
 
         if let Some(ref cb) = progress {
             cb(FindProgress::ScanAttempt {
@@ -714,7 +764,7 @@ pub async fn find_device_with_adapter_progress(
             });
         }
 
-        run_scan(adapter, permit, ScanFilter::default(), scan_duration).await?;
+        run_scan(adapter, permit, filter, scan_duration).await?;
 
         match search_known_peripherals(adapter, query).await? {
             Search::Found(peripheral) => {
@@ -750,7 +800,8 @@ pub async fn find_device_with_adapter_progress(
 
 /// Find a specific device with progress callback for UI feedback.
 ///
-/// `identifier` must match exactly, as [`find_device`] describes.
+/// `identifier` must match exactly, as [`find_device`] describes, and the device
+/// is searched for as [`find_device_with_options`] describes.
 ///
 /// The progress callback is called with updates about the search progress,
 /// including cache hits, scan attempts, and retry information.
@@ -1451,6 +1502,40 @@ mod tests {
             within(secs(1), lock.acquire()).await;
         })
         .await;
+    }
+
+    // ==================== Search Filter Tests ====================
+
+    /// The filters that the attempts of a search with `max_attempts` use, in order.
+    fn search_filters(max_attempts: u32, filter_until_last: bool) -> Vec<ScanFilter> {
+        (1..=max_attempts)
+            .map(|attempt| search_filter(attempt, max_attempts, filter_until_last))
+            .collect()
+    }
+
+    #[test]
+    fn search_filter_asks_only_for_aranet_sensors_before_the_last_attempt() {
+        let aranet = || ScanFilter {
+            services: vec![SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD],
+        };
+        let every_device = ScanFilter::default;
+        assert_eq!(search_filters(1, true), [every_device()]);
+        assert_eq!(search_filters(2, true), [aranet(), every_device()]);
+        assert_eq!(
+            search_filters(3, true),
+            [aranet(), aranet(), every_device()]
+        );
+    }
+
+    #[test]
+    fn search_filter_asks_for_every_device_when_not_filtering() {
+        for max_attempts in 1..=3 {
+            assert_eq!(
+                search_filters(max_attempts, false),
+                vec![ScanFilter::default(); max_attempts as usize],
+                "{max_attempts} attempts"
+            );
+        }
     }
 
     // ==================== Device Lookup Tests ====================
