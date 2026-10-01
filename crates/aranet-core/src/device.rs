@@ -445,7 +445,9 @@ impl Device {
     /// 3 × `scan.duration`, plus any wait for another scan in the same process.
     /// Only `scan.duration` is used: as in
     /// [`find_device_with_options`](crate::scan::find_device_with_options), the search
-    /// ignores `scan`'s filter flags and keeps its default filter.
+    /// ignores `scan`'s filter flags. On macOS it asks the Bluetooth stack only for
+    /// Aranet sensors (devices that advertise an Aranet service) until its last scan,
+    /// which asks for every device.
     /// A device that the adapter already knows from an earlier scan is used without
     /// scanning. `config` sets the timeouts of the connection itself; see the
     /// "Timeouts" section of [`Device`].
