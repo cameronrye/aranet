@@ -35,9 +35,10 @@
 //! calling connection registered. On a host with no other agent, BlueZ also
 //! makes the session's agent the default one while it is registered, so the
 //! agent approves requests only for the object path of the sensor being paired
-//! and rejects the rest. It always rejects `AuthorizeService`. Closing the
-//! connection removes the agent and cancels an unfinished pairing, even when
-//! the session is cut short.
+//! and rejects the rest. It always rejects `AuthorizeService`, and
+//! `RequestPasskey`, which would need a keyboard. Closing the connection
+//! removes the agent and cancels an unfinished pairing, even when the session
+//! is cut short.
 //!
 //! aranet never asks to be BlueZ's default agent, and it keeps no agent
 //! registered between connects. Since BlueZ 5.51 the first agent to register
@@ -290,6 +291,18 @@ fn authorize_service(device: &dbus::Path, uuid: &str) -> Result<(), MethodErr> {
         .into())
 }
 
+/// Answer BlueZ's `RequestPasskey` request: always reject.
+///
+/// BlueZ asks for a passkey when this side has to type in the one that the
+/// device shows, which takes a keyboard. The agent has none
+/// (`NoInputNoOutput`), so BlueZ pairs sensors with "Just Works", which never
+/// asks. If BlueZ asks anyway, aranet has no passkey to give for any device,
+/// and rejects the request rather than make one up.
+fn request_passkey(device: &dbus::Path) -> Result<(u32,), MethodErr> {
+    warn!("BlueZ agent: rejecting RequestPasskey for {device} (aranet can't enter a passkey)");
+    Err(("org.bluez.Error.Rejected", "aranet can't enter a passkey").into())
+}
+
 /// The `org.bluez.Agent1` object of one pairing session, which approves
 /// requests for `device` only.
 fn agent_crossroads(device: dbus::Path<'static>) -> Crossroads {
@@ -304,12 +317,7 @@ fn agent_crossroads(device: dbus::Path<'static>) -> Crossroads {
             "RequestPasskey",
             ("device",),
             ("passkey",),
-            |_, data, (device,): (dbus::Path,)| {
-                debug!("BlueZ agent: RequestPasskey for {device}");
-                check_session_device(data, &device)?;
-                // Return 0 for "Just Works" pairing
-                Ok((0u32,))
-            },
+            |_, _, (device,): (dbus::Path,)| request_passkey(&device),
         );
 
         b.method(
@@ -548,13 +556,6 @@ mod tests {
             A,
             agent_call("RequestConfirmation").append2(path(A), PASSKEY),
         ));
-        let mut reply = dispatch(A, agent_call("RequestPasskey").append1(path(A)));
-        let passkey: u32 = reply
-            .as_result()
-            .expect("RequestPasskey should be answered")
-            .read1()
-            .unwrap();
-        assert_eq!(passkey, 0);
 
         assert_rejected(dispatch(
             A,
@@ -564,7 +565,6 @@ mod tests {
             A,
             agent_call("RequestConfirmation").append2(path(B), PASSKEY),
         ));
-        assert_rejected(dispatch(A, agent_call("RequestPasskey").append1(path(B))));
     }
 
     #[test]
@@ -588,6 +588,18 @@ mod tests {
             A,
             agent_call("AuthorizeService").append2(path(A), HID_SERVICE),
         ));
+    }
+
+    #[test]
+    fn agent_rejects_request_passkey_even_for_the_device_being_paired() {
+        // The agent has no keyboard, so it has no passkey to enter for any
+        // device, and must not make one up.
+        for device in [A, B] {
+            assert_rejected(dispatch(
+                A,
+                agent_call("RequestPasskey").append1(path(device)),
+            ));
+        }
     }
 
     #[test]
