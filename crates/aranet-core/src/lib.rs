@@ -46,8 +46,9 @@
 //! aranet-core runs Bluetooth background work on its own one-thread tokio runtime
 //! (thread `aranet-ble`): the Bluetooth manager and adapter, scans, the cleanup of
 //! connections that fail or are cancelled and, on Linux, the pairing of sensors that
-//! aren't paired yet. It can be used from any number of tokio runtimes. Scans in one process run one at a time; a search that needs a scan while
-//! another is running waits for it, then reuses what it found.
+//! aren't paired yet. It can be used from any number of tokio runtimes. Scans in one
+//! process run one at a time; a search that needs a scan while another is running
+//! waits for it, then reuses what it found.
 //!
 //! # Quick Start
 //!
