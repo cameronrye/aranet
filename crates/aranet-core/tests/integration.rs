@@ -1,11 +1,14 @@
 //! Integration tests for aranet-core
 //!
-//! These tests require actual BLE hardware and should be run with:
-//! `cargo test --package aranet-core -- --ignored --nocapture`
+//! These tests require actual BLE hardware and should be run one at a time
+//! (`--test-threads=1`): they share one adapter and one sensor, and a process
+//! runs one scan at a time, so in parallel they wait behind each other's scans
+//! and connections and time out. Run them with:
+//! `cargo test --package aranet-core -- --ignored --nocapture --test-threads=1`
 //!
 //! Set the ARANET_DEVICE environment variable to the device to test: its MAC
 //! address, macOS UUID or full name (exact, any case):
-//! `ARANET_DEVICE="Aranet4 12345" cargo test --package aranet-core -- --ignored`
+//! `ARANET_DEVICE="Aranet4 12345" cargo test --package aranet-core -- --ignored --test-threads=1`
 //!
 //! Tests that connect to a device print `SKIP` and pass when it is not set.
 
