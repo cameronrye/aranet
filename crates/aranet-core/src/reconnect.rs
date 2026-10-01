@@ -38,7 +38,7 @@ use tracing::{info, warn};
 
 use aranet_types::{CurrentReading, DeviceInfo, DeviceType, HistoryRecord};
 
-use crate::connector::{ConnectFn, SensorLink, ble_connector, release_link};
+use crate::connector::{ConnectFn, SensorLink, ble_connector, log_failed_release, release_link};
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::events::{DeviceEvent, DeviceId, EventSender};
@@ -453,7 +453,7 @@ impl<L: SensorLink> ReconnectCore<L> {
         if let Some(old) = old
             && let Err(e) = release_link(old, ()).await
         {
-            warn!("Closing the old link to {} failed: {e}", self.identifier);
+            log_failed_release("Closing the old link", &self.identifier, &e);
         }
 
         loop {
@@ -507,7 +507,7 @@ impl<L: SensorLink> ReconnectCore<L> {
                 // cancel() or disconnect() came in as the connect finished.
                 drop(link);
                 if let Err(e) = release_link(new, ()).await {
-                    warn!("Closing the new link to {} failed: {e}", self.identifier);
+                    log_failed_release("Closing the new link", &self.identifier, &e);
                 }
                 return self.cancelled_reconnect().await;
             }
