@@ -35,8 +35,15 @@ FD_TOLERANCE=4                  # (b)
 RSS_GROWTH_LIMIT_PCT=20         # (c)
 STREAK_LIMIT_SECS=45            # (f), Linux only
 PROBE_EVERY_SECS=7              # BlueZ Connected probe period
-STOP_LIMIT_SECS=10              # (f)
-STOP_WAIT_SECS=30               # SIGKILL after this
+# (f): how long a correct aranet-service may take to exit after SIGINT. Its
+# collector waits up to 10 s for a poll in progress, then up to 2 s for its
+# config reload watcher, and the SIGINT usually lands early in a poll (the
+# samples and the polls share the 60 s phase). The rest is exit time and
+# stop_secs counting whole seconds. A collector that stopped waiting for its
+# poll would exit within a few seconds.
+STOP_LIMIT_SECS=15
+STOP_WAIT_SECS=30               # SIGKILL aranet-service this long after SIGINT
+LIFECYCLE_KILL_SECS=60          # SIGKILL lifecycle_soak this long after SIGINT
 START_LIMIT_SECS=600            # lifecycle_soak's scan, and up to three connects per sensor
 LIFECYCLE_STOP_SECS=150         # its shutdown: three 30 s steps, 5 s settle, final sample
 SERVICE_LOG_FILTER="aranet_core=info,aranet_service=info"
@@ -98,6 +105,9 @@ print_warning() {
     printf '  %sWarning:%s %s\n' "$YELLOW" "$NC" "$1" >&2
 }
 
+# die MESSAGE: prints MESSAGE and exits 2, the setup-error status. Every setup
+# step fails through it, so that a setup error never exits with the failing
+# command's own status (1 would read as FAIL).
 die() {
     printf '%sError:%s %s\n' "$RED" "$NC" "$1" >&2
     exit 2
@@ -135,6 +145,14 @@ lower() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+# trim TEXT: prints TEXT without its leading and trailing whitespace.
+trim() {
+    local text=$1
+    text=${text#"${text%%[![:space:]]*}"}
+    text=${text%"${text##*[![:space:]]}"}
+    printf '%s' "$text"
+}
+
 # to_secs NAME VALUE: prints VALUE (90, 90s, 15m or 24h) in seconds.
 to_secs() {
     if [[ ! $2 =~ ^([0-9]+)([smh]?)$ ]]; then
@@ -164,16 +182,24 @@ wait_for_exit() {
 
 # shellcheck disable=SC2329 # run by the EXIT trap
 cleanup() {
-    local status=$? pid
+    local status=$? pid wait_secs
     trap - EXIT INT TERM
     set +e
     if [[ -n $PROBE_PID ]]; then
         kill -TERM "$PROBE_PID" 2>/dev/null
     fi
+    # Each program gets as long as stop_all gives it. lifecycle_soak's
+    # shutdown (stop the monitor, disconnect both sensors, wait 5 s, check
+    # them) takes longer when a disconnect waits out its limit, and a SIGKILL
+    # before it ends loses its last lines and can leave a sensor connected.
     for pid in "$LIFECYCLE_PID" "$SERVICE_PID"; do
         if [[ -n $pid ]] && is_running "$pid"; then
+            wait_secs=$STOP_WAIT_SECS
+            if [[ $pid == "$LIFECYCLE_PID" ]]; then
+                wait_secs=$LIFECYCLE_KILL_SECS
+            fi
             kill -INT "$pid" 2>/dev/null
-            wait_for_exit "$pid" 15 || kill -KILL "$pid" 2>/dev/null
+            wait_for_exit "$pid" "$wait_secs" || kill -KILL "$pid" 2>/dev/null
         fi
     done
     if [[ -n $WORK_DIR ]]; then
@@ -304,11 +330,12 @@ parse_args() {
     done
 }
 
+# The sensors in --lifecycle-devices, trimmed as lifecycle_soak trims them.
 split_lifecycle_devices() {
-    M_DEVICE=${LIFECYCLE_DEVICES%%,*}
+    M_DEVICE=$(trim "${LIFECYCLE_DEVICES%%,*}")
     R_DEVICE=""
     if [[ $LIFECYCLE_DEVICES == *,* ]]; then
-        R_DEVICE=${LIFECYCLE_DEVICES#*,}
+        R_DEVICE=$(trim "${LIFECYCLE_DEVICES#*,}")
     fi
 }
 
@@ -333,6 +360,7 @@ validate_options() {
         die "--duration must be longer than --warmup plus two intervals"
     fi
     if wants service; then
+        SERVICE_DEVICE=$(trim "$SERVICE_DEVICE")
         if [[ -z $SERVICE_DEVICE ]]; then
             die "--target $TARGET needs --service-device"
         fi
@@ -345,7 +373,7 @@ validate_options() {
             die "--target $TARGET needs --lifecycle-devices"
         fi
         split_lifecycle_devices
-        if [[ -z $M_DEVICE || $R_DEVICE == *,* ]]; then
+        if [[ -z $M_DEVICE || $R_DEVICE == *,* || ($LIFECYCLE_DEVICES == *,* && -z $R_DEVICE) ]]; then
             die "--lifecycle-devices takes one or two sensors: M[,R]"
         fi
         # lifecycle_soak's own rules (parse_args in
@@ -367,6 +395,7 @@ validate_options() {
         fi
     fi
     if [[ $TARGET == both ]]; then
+        # All three names are trimmed by now, as the programs trim them.
         local service manager reconnecting
         service=$(lower "$SERVICE_DEVICE")
         manager=$(lower "$M_DEVICE")
@@ -403,8 +432,8 @@ prepare_out() {
     if [[ -z $OUT ]]; then
         OUT="$PROJECT_ROOT/target/soak/$(date +%Y%m%d-%H%M%S)"
     fi
-    mkdir -p "$OUT"
-    OUT=$(cd "$OUT" && pwd)
+    mkdir -p "$OUT" || die "can't create --out $OUT"
+    OUT=$(cd "$OUT" && pwd) || die "can't use --out $OUT"
     if [[ -e $OUT/samples.csv ]]; then
         die "$OUT already holds a soak run; choose another --out"
     fi
@@ -417,8 +446,9 @@ prepare_out() {
         printf 'FAULT_EVERY_S=%s\n' "$FAULT_EVERY_S"
         printf 'SERVICE_DEVICE=%s\n' "$SERVICE_DEVICE"
         printf 'LIFECYCLE_DEVICES=%s\n' "$LIFECYCLE_DEVICES"
-    } >"$OUT/run.env"
-    echo "elapsed_s,target,threads,fds,rss_kb,success,failure,os_connected,orphans" >"$OUT/samples.csv"
+    } >"$OUT/run.env" || die "can't write $OUT/run.env"
+    echo "elapsed_s,target,threads,fds,rss_kb,success,failure,os_connected,orphans" >"$OUT/samples.csv" ||
+        die "can't write $OUT/samples.csv"
 }
 
 load_run_env() {
@@ -458,14 +488,16 @@ build_binaries() {
         return 0
     fi
     print_header "Building (release)"
-    cd "$PROJECT_ROOT"
+    cd "$PROJECT_ROOT" || die "can't enter $PROJECT_ROOT"
     if needs_build service; then
-        cargo build --locked --release -p aranet-service
+        cargo build --locked --release -p aranet-service || die "building aranet-service failed"
     fi
     if needs_build lifecycle; then
-        cargo build --locked --release -p aranet-core --example lifecycle_soak
+        cargo build --locked --release -p aranet-core --example lifecycle_soak ||
+            die "building lifecycle_soak failed"
     fi
-    target_dir=$(cargo metadata --locked --format-version 1 --no-deps | jq -r .target_directory)
+    target_dir=$(cargo metadata --locked --format-version 1 --no-deps | jq -r .target_directory) ||
+        die "can't find cargo's target directory"
     if needs_build service; then
         SERVICE_BIN="$target_dir/release/aranet-service"
     fi
@@ -479,7 +511,7 @@ start_service() {
     if curl -s --max-time 2 "http://$SERVICE_BIND/api/status" >/dev/null 2>&1; then
         die "something already answers on $SERVICE_BIND; stop it first"
     fi
-    cat >"$config" <<EOF
+    cat >"$config" <<EOF || die "can't write $config"
 [server]
 bind = "$SERVICE_BIND"
 
@@ -517,14 +549,14 @@ start_bluez_probe() {
     elif ! command -v busctl >/dev/null 2>&1; then
         PROBE_NOTE="busctl is not installed"
     fi
-    printf 'PROBE_NOTE=%s\n' "$PROBE_NOTE" >>"$OUT/run.env"
+    printf 'PROBE_NOTE=%s\n' "$PROBE_NOTE" >>"$OUT/run.env" || die "can't write $OUT/run.env"
     if [[ -n $PROBE_NOTE ]]; then
         return 0
     fi
     local mac path
     mac=$(printf '%s' "$SERVICE_DEVICE" | tr '[:lower:]' '[:upper:]')
     path="/org/bluez/hci0/dev_${mac//:/_}"
-    echo "elapsed_s,connected" >"$OUT/bluez-connected.csv"
+    echo "elapsed_s,connected" >"$OUT/bluez-connected.csv" || die "can't write $OUT/bluez-connected.csv"
     (
         while is_running "$SERVICE_PID"; do
             value=$(busctl get-property org.bluez "$path" org.bluez.Device1 Connected 2>/dev/null || true)
@@ -650,7 +682,7 @@ stop_all() {
         if ! wait_for_exit "$LIFECYCLE_PID" "$grace"; then
             print_warning "lifecycle_soak is still running; sending SIGINT"
             kill -INT "$LIFECYCLE_PID" 2>/dev/null || true
-            if ! wait_for_exit "$LIFECYCLE_PID" 60; then
+            if ! wait_for_exit "$LIFECYCLE_PID" "$LIFECYCLE_KILL_SECS"; then
                 kill -KILL "$LIFECYCLE_PID" 2>/dev/null || true
             fi
         fi
@@ -891,7 +923,7 @@ main() {
     if [[ -n $EVALUATE_DIR ]]; then
         [[ -d $EVALUATE_DIR ]] || die "$EVALUATE_DIR is not a directory"
         command -v jq >/dev/null 2>&1 || die "jq is required"
-        OUT=$(cd "$EVALUATE_DIR" && pwd)
+        OUT=$(cd "$EVALUATE_DIR" && pwd) || die "can't use $EVALUATE_DIR"
         load_run_env
         if evaluate; then
             exit 0
@@ -906,9 +938,10 @@ main() {
     trap 'exit 130' INT TERM
     build_binaries
 
-    WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aranet-soak.XXXXXX")
+    WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aranet-soak.XXXXXX") ||
+        die "can't create a temporary directory in ${TMPDIR:-/tmp}"
     export ARANET_CONFIG_DIR="$WORK_DIR/config" ARANET_DATA_DIR="$WORK_DIR/data"
-    mkdir -p "$ARANET_CONFIG_DIR" "$ARANET_DATA_DIR"
+    mkdir -p "$ARANET_CONFIG_DIR" "$ARANET_DATA_DIR" || die "can't create directories in $WORK_DIR"
 
     print_header "Starting"
     RUN_START=$SECONDS
