@@ -581,6 +581,12 @@ pub struct ReconnectingDevice {
 
 impl ReconnectingDevice {
     /// Create a new reconnecting device wrapper.
+    ///
+    /// It connects with [`Device::connect`] now and for every reconnect, so
+    /// `identifier` must match exactly, as `Device::connect` describes. Returns
+    /// [`Error::InvalidConfig`] if `options` are invalid
+    /// ([`ReconnectOptions::validate`]), and otherwise the errors of
+    /// `Device::connect`.
     pub async fn connect(identifier: &str, options: ReconnectOptions) -> Result<Self> {
         options.validate()?;
         let connect = ble_connector();
@@ -605,6 +611,8 @@ impl ReconnectingDevice {
     }
 
     /// Create with an event sender for notifications.
+    ///
+    /// Connects as [`connect`](Self::connect) does, with the same errors.
     pub async fn connect_with_events(
         identifier: &str,
         options: ReconnectOptions,
