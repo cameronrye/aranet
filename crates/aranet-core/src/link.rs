@@ -329,8 +329,9 @@ pub(crate) fn cleanup_runtime() -> Option<Handle> {
 /// takes it over, and disconnects it if the connect doesn't get that far.
 ///
 /// `connect` closes it, and waits for the disconnect, when a step fails. If
-/// the connect future is dropped first (a caller's timeout or `select!`, an
-/// aborted task), `Drop` runs the disconnect as a task on `cleanup`.
+/// the connect future is dropped before it finishes, even during that
+/// disconnect (a caller's timeout or `select!`, an aborted task), `Drop` runs
+/// the disconnect as a task on `cleanup`.
 #[must_use = "dropping a PendingLink disconnects the link"]
 pub(crate) struct PendingLink<L: GattLink> {
     /// The link to disconnect; `None` once disarmed or closed.
@@ -353,19 +354,24 @@ impl<L: GattLink> PendingLink<L> {
     }
 
     /// Disconnect now, waiting at most `DISCONNECT_TIMEOUT`.
+    ///
+    /// The link stays armed until the disconnect has run, so if this future
+    /// is dropped part-way, `Drop` still disconnects it.
     async fn close(mut self) {
-        if let Some(link) = self.link.take()
-            && let Err(e) = disconnect(&link).await
-        {
-            debug!("Disconnect after a failed connect failed: {e}");
+        if let Some(link) = self.link.clone() {
+            if let Err(e) = disconnect(&link).await {
+                debug!("Disconnect after a failed connect failed: {e}");
+            }
+            self.link = None;
         }
     }
 }
 
 impl<L: GattLink> Drop for PendingLink<L> {
     fn drop(&mut self) {
-        // `disarm` and `close` take the link, so it is still here only when
-        // the connect future was dropped before it finished.
+        // `disarm` takes the link, and `close` clears it once its disconnect
+        // has run, so it is still here only when the connect future was
+        // dropped before it finished, which includes during that disconnect.
         if let Some(link) = self.link.take() {
             warn!("Connect cancelled before it finished; disconnecting");
             self.cleanup.spawn(async move {
@@ -977,6 +983,39 @@ mod tests {
                 Duration::from_secs(15) + DISCONNECT_TIMEOUT
             );
             assert_eq!(fake.calls(), [Call::Connect, Call::Disconnect]);
+        })
+        .await;
+    }
+
+    /// A caller that drops the connect during the disconnect after a failed
+    /// step still gets the link disconnected: the guard stays armed until
+    /// that disconnect has run, so `Drop` disconnects again in the
+    /// background.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_cleanup_still_disconnects() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.script_connect([Outcome::Fail]);
+            // The cleanup's disconnect takes 2 s, and the caller gives up 1 s
+            // into it.
+            fake.script_disconnect([Outcome::After(Duration::from_secs(2))]);
+            let rt = Handle::current();
+            let cfg = ConnectionConfig::default();
+            let start = Instant::now();
+
+            let attempt =
+                tokio::time::timeout(Duration::from_secs(1), connect(&fake, &cfg, &rt)).await;
+            assert!(
+                attempt.is_err(),
+                "the connect should still be disconnecting after 1 s"
+            );
+
+            within(Duration::from_secs(10), fake.disconnected().notified()).await;
+            assert_eq!(start.elapsed(), Duration::from_secs(1));
+            assert_eq!(
+                fake.calls(),
+                [Call::Connect, Call::Disconnect, Call::Disconnect]
+            );
         })
         .await;
     }
