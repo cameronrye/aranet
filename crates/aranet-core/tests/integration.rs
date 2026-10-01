@@ -24,7 +24,9 @@ use tokio::time::timeout;
 // Suppress unused warnings for test-only items
 #[allow(dead_code)]
 /// Default timeout for BLE operations.
-const BLE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// A connect's search alone takes up to about 30 s (scans of 5, 10 and 15 s).
+const BLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The device to test against, from `ARANET_DEVICE`.
 ///
