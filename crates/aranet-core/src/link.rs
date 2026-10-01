@@ -1291,16 +1291,7 @@ mod tests {
 
         /// Check that `error` is a timeout of `operation` after `LIMIT`.
         fn assert_limit_timeout(error: &Error, operation: &str) {
-            match error {
-                Error::Timeout {
-                    operation: op,
-                    duration,
-                } => {
-                    assert_eq!(op, operation);
-                    assert_eq!(*duration, LIMIT);
-                }
-                other => panic!("expected a '{operation}' timeout, got {other:?}"),
-            }
+            super::assert_timeout(error, operation, LIMIT);
         }
 
         #[tokio::test(start_paused = true)]
