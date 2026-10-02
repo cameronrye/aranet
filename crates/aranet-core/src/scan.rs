@@ -604,25 +604,33 @@ fn aranet_service_filter() -> ScanFilter {
     }
 }
 
-/// Whether device searches ask the Bluetooth stack only for Aranet sensors until
-/// their last attempt (see `search_filter`). Only on macOS: btleplug's
-/// CoreBluetooth backend keeps every device a scan reports for the rest of the
-/// process and leaks a little memory for every advertisement it receives, so
-/// unfiltered searches near many Bluetooth devices make a long-running program
-/// grow by 1-2 MB an hour. Linux and Windows searches ask for every device.
+/// Whether every scan window of a device search asks the Bluetooth stack only for
+/// devices that advertise an Aranet service (see `search_filter`). Only on macOS:
+/// btleplug's CoreBluetooth backend keeps every device a scan reports for the
+/// rest of the process and leaks a little memory for every advertisement it
+/// receives, so unfiltered searches near many Bluetooth devices make a
+/// long-running program grow by 1-2 MB an hour. Leaving only a search's last
+/// window unfiltered wasn't enough: in a 12 h macOS soak, the 8.5% of the
+/// service's polls whose search reached that window added about 106 kB each
+/// (about 80% of the growth, against about 2 kB for a search that ended
+/// earlier), and a sensor out of range runs it on every poll, about 6 MB an hour.
+///
+/// The cost: a macOS search doesn't find a sensor that advertises neither Aranet
+/// service UUID. All four current Aranet sensor types advertise 0xFCE0; older
+/// firmware is untested. `aranet scan`, `scan_with_options` and the passive
+/// monitor still see every device. Linux and Windows searches ask for every
+/// device.
 ///
 /// Workaround for btleplug 0.11.8
 /// (<https://github.com/deviceplug/btleplug/issues/494>); re-check when
 /// upgrading btleplug.
-const FILTER_SEARCH_UNTIL_LAST_ATTEMPT: bool = cfg!(target_os = "macos");
+const FILTER_SEARCH_WINDOWS: bool = cfg!(target_os = "macos");
 
-/// The scan filter of attempt `attempt` (counted from 1) of a device search that
-/// makes `max_attempts`. With `filter_until_last`, every attempt but the last
-/// asks only for devices that advertise an Aranet service, and the last asks for
-/// every device, so a sensor that doesn't advertise one is still found. Without
-/// it, every attempt asks for every device.
-fn search_filter(attempt: u32, max_attempts: u32, filter_until_last: bool) -> ScanFilter {
-    if filter_until_last && attempt < max_attempts {
+/// The scan filter of every window of a device search: with `aranet_only`, it
+/// asks only for devices that advertise an Aranet service; without it, for every
+/// device.
+fn search_filter(aranet_only: bool) -> ScanFilter {
+    if aranet_only {
         aranet_service_filter()
     } else {
         ScanFilter::default()
@@ -710,10 +718,9 @@ pub async fn find_device(identifier: &str) -> Result<(Adapter, Peripheral)> {
 /// on every scan due to advertisement timing.
 ///
 /// Only `options.duration` is used: the search ignores the filter flags of
-/// `options`. On macOS every scan attempt but the last asks the Bluetooth stack
-/// only for devices that advertise an Aranet service, and the last asks for every
-/// device, so a sensor that doesn't advertise one is still found. On other
-/// platforms every attempt asks for every device.
+/// `options`. On macOS every scan attempt asks the Bluetooth stack only for
+/// devices that advertise an Aranet service, as every current Aranet sensor does.
+/// On other platforms every attempt asks for every device.
 pub async fn find_device_with_options(
     identifier: &str,
     options: ScanOptions,
@@ -784,7 +791,7 @@ pub async fn find_device_with_adapter_progress(
             "Scan attempt {}/{} ({}s)...",
             attempt, max_attempts, duration_secs
         );
-        let filter = search_filter(attempt, max_attempts, FILTER_SEARCH_UNTIL_LAST_ATTEMPT);
+        let filter = search_filter(FILTER_SEARCH_WINDOWS);
         debug!(
             "Scan attempt {}/{} ({}s, {})",
             attempt,
@@ -1545,34 +1552,33 @@ mod tests {
 
     // ==================== Search Filter Tests ====================
 
-    /// The filters that the attempts of a search with `max_attempts` use, in order.
-    fn search_filters(max_attempts: u32, filter_until_last: bool) -> Vec<ScanFilter> {
-        (1..=max_attempts)
-            .map(|attempt| search_filter(attempt, max_attempts, filter_until_last))
-            .collect()
+    /// The filters that the windows of a search with `windows` scan windows use,
+    /// in order: the search asks `search_filter` once per window.
+    fn search_filters(windows: u32, aranet_only: bool) -> Vec<ScanFilter> {
+        (1..=windows).map(|_| search_filter(aranet_only)).collect()
     }
 
     #[test]
-    fn search_filter_asks_only_for_aranet_sensors_before_the_last_attempt() {
-        let aranet = || ScanFilter {
+    fn search_filter_asks_only_for_aranet_sensors_in_every_window() {
+        let aranet = ScanFilter {
             services: vec![SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD],
         };
-        let every_device = ScanFilter::default;
-        assert_eq!(search_filters(1, true), [every_device()]);
-        assert_eq!(search_filters(2, true), [aranet(), every_device()]);
-        assert_eq!(
-            search_filters(3, true),
-            [aranet(), aranet(), every_device()]
-        );
+        for windows in 1..=3 {
+            assert_eq!(
+                search_filters(windows, true),
+                vec![aranet.clone(); windows as usize],
+                "{windows}-window search"
+            );
+        }
     }
 
     #[test]
     fn search_filter_asks_for_every_device_when_not_filtering() {
-        for max_attempts in 1..=3 {
+        for windows in 1..=3 {
             assert_eq!(
-                search_filters(max_attempts, false),
-                vec![ScanFilter::default(); max_attempts as usize],
-                "{max_attempts} attempts"
+                search_filters(windows, false),
+                vec![ScanFilter::default(); windows as usize],
+                "{windows}-window search"
             );
         }
     }
