@@ -8,15 +8,17 @@
 //! comes back:
 //!
 //! - M recovers when the manager emits `ReconnectSucceeded` within
-//!   `2 × --health-secs + 70 s` of the cut;
+//!   `2 × --health-secs + 70 s` of the cut, for a reconnect that started at or
+//!   after the cut: one that was already running can finish just after the cut,
+//!   with the link that was cut;
 //! - R recovers when the first read that starts after the cut succeeds;
 //! - either way, the next sample must find the new link up and held by aranet.
 //!
 //! A cut that finds its sensor already down cuts nothing: the link dropped by
 //! itself, as macOS ends unpaired links a few minutes after they come up. That
-//! drop must recover by the same rules, counted from when the cut found it, and
-//! the summary lists these drops (`natural_faults`) apart from the cuts
-//! (`faults`).
+//! drop must recover by the same rules, counted from when the cut found it,
+//! except that for M a reconnect that was already running then counts too. The
+//! summary lists these drops (`natural_faults`) apart from the cuts (`faults`).
 //!
 //! Each sample is one JSON line on stdout (`"kind": "sample"`). `os_connected`
 //! lists the sensors that the Bluetooth stack reports as connected, and `orphans`
@@ -332,6 +334,9 @@ struct Tracker {
     fault_errors: u64,
     fault_skips: u64,
     m_reconnects: u64,
+    /// When the manager last started a reconnect, the one that a
+    /// `ReconnectSucceeded` reports.
+    m_reconnect_started: Option<Duration>,
     r_reconnects: u64,
     reads_ok: u64,
     reads_err: u64,
@@ -353,6 +358,7 @@ impl Tracker {
             fault_errors: 0,
             fault_skips: 0,
             m_reconnects: 0,
+            m_reconnect_started: None,
             r_reconnects: 0,
             reads_ok: 0,
             reads_err: 0,
@@ -393,14 +399,32 @@ impl Tracker {
         self.faults.iter().filter(move |fault| fault.cause == cause)
     }
 
+    /// Records a `ReconnectStarted`. The manager repairs one link at a time, so
+    /// a `ReconnectSucceeded` reports the reconnect it last started. The
+    /// `ReconnectingDevice`'s faults are decided by its reads instead.
+    fn reconnect_started(&mut self, side: Side, at: Duration) {
+        if side == Side::Manager {
+            self.m_reconnect_started = Some(at);
+        }
+    }
+
+    /// Records a `ReconnectSucceeded`. On the manager sensor it recovers each
+    /// pending fault whose window it falls in, but a cut only if the reconnect
+    /// started at or after the cut: a reconnect that was already running can
+    /// finish just after the cut, with the link that was cut, and the cut still
+    /// needs its own repair. A drop found when a cut was due came before it was
+    /// found, so for such a drop a reconnect that was already running counts.
     fn reconnect_succeeded(&mut self, side: Side, at: Duration) {
         match side {
             Side::Manager => {
                 self.m_reconnects += 1;
                 let window = self.manager_window;
+                let started = self.m_reconnect_started;
                 for fault in &mut self.faults {
                     if fault.side == Side::Manager
                         && fault.recovery == Recovery::Pending
+                        && (fault.cause == Cause::Natural
+                            || started.is_some_and(|started| fault.at <= started))
                         && fault.at <= at
                         && at <= fault.at + window
                     {
@@ -851,6 +875,12 @@ impl Soak {
                 self.tracker
                     .borrow_mut()
                     .reconnect_succeeded(side, self.start.elapsed());
+                true
+            }
+            Ok(DeviceEvent::ReconnectStarted { .. }) => {
+                self.tracker
+                    .borrow_mut()
+                    .reconnect_started(side, self.start.elapsed());
                 true
             }
             Ok(_) => true,
@@ -1360,8 +1390,10 @@ mod tests {
         let mut tracker = Tracker::new(secs(90), true);
         tracker.fault_injected(Side::Manager, "M", secs(300));
         tracker.reconnect_succeeded(Side::Manager, secs(250));
+        tracker.reconnect_started(Side::Manager, secs(302));
         tracker.reconnect_succeeded(Side::Manager, secs(314));
         tracker.fault_injected(Side::Manager, "M", secs(900));
+        tracker.reconnect_started(Side::Manager, secs(905));
         tracker.reconnect_succeeded(Side::Manager, secs(991));
         assert_eq!(
             tracker.verdict(&[], &[]).faults,
@@ -1372,6 +1404,56 @@ mod tests {
         let report = tracker.fault_report(Cause::Cut);
         assert_eq!(report[0]["recovered_after_s"], json!(14));
         assert_eq!(report[1]["recovered_after_s"], Value::Null);
+    }
+
+    /// The health monitor was repairing an ordinary drop when the soak cut the
+    /// repair's new link, and that repair's `ReconnectSucceeded` came in the same
+    /// millisecond as the cut. The next sample found the cut link down; the
+    /// monitor found it dead 13 s after the cut and reconnected 53 s after it.
+    #[test]
+    fn a_manager_cut_is_recovered_only_by_a_reconnect_that_started_after_it() {
+        let mut tracker = Tracker::new(secs(90), true);
+        let cut = secs(38_700);
+        tracker.reconnect_started(Side::Manager, cut - secs(12));
+        tracker.fault_injected(Side::Manager, "M", cut);
+        tracker.reconnect_succeeded(Side::Manager, cut);
+        tracker.sample(cut + Duration::from_millis(500), &only("M"), Some(&[]), &[]);
+        tracker.reconnect_started(Side::Manager, cut + secs(13));
+        tracker.reconnect_succeeded(Side::Manager, cut + secs(53));
+        tracker.sample(cut + secs(60), &only("M"), Some(&only("M")), &[]);
+
+        let verdict = tracker.verdict(&[], &[]);
+        assert!(verdict.passed(), "{verdict:?}");
+        assert_eq!(
+            tracker.fault_report(Cause::Cut),
+            [json!({"side": "manager", "id": "M", "t": 38_700,
+                    "recovered_after_s": 53, "held_at_next_sample": true})]
+        );
+        assert_eq!(tracker.m_reconnects, 2);
+    }
+
+    /// A reconnect that began before a cut doesn't recover it, even if it
+    /// succeeds at the cut, and neither does one that succeeds after the window.
+    #[test]
+    fn a_reconnect_that_started_before_a_manager_cut_does_not_recover_it() {
+        let mut tracker = Tracker::new(secs(90), true);
+        tracker.reconnect_started(Side::Manager, secs(888));
+        tracker.fault_injected(Side::Manager, "M", secs(900));
+        tracker.reconnect_succeeded(Side::Manager, secs(900));
+        tracker.sample(secs(960), &only("M"), Some(&[]), &[]);
+        tracker.reconnect_started(Side::Manager, secs(975));
+        tracker.reconnect_succeeded(Side::Manager, secs(991));
+        tracker.sample(secs(1020), &only("M"), Some(&only("M")), &[]);
+
+        assert_eq!(
+            tracker.verdict(&[], &[]).faults,
+            ["link cut on the manager sensor M at t=900s: no ReconnectSucceeded within 90s"]
+        );
+        assert_eq!(tracker.unrecovered(Cause::Cut), 1);
+        assert_eq!(
+            tracker.fault_report(Cause::Cut)[0]["recovered_after_s"],
+            Value::Null
+        );
     }
 
     #[test]
@@ -1426,7 +1508,9 @@ mod tests {
     #[test]
     fn sensors_found_down_that_recover_pass_and_are_listed_apart_from_the_cuts() {
         let mut tracker = Tracker::new(secs(90), true);
-        // M was down when its cut was due; the manager repairs it in time.
+        // M was down when its cut was due; the reconnect that the manager had
+        // already started repairs it in time.
+        tracker.reconnect_started(Side::Manager, secs(890));
         tracker.found_down(Side::Manager, "M", secs(900));
         tracker.reconnect_succeeded(Side::Manager, secs(930));
         tracker.sample(secs(960), &ids(), Some(&ids()), &[]);
@@ -1437,6 +1521,7 @@ mod tests {
         tracker.read_finished(secs(1860), secs(1880), true);
         tracker.sample(secs(1920), &ids(), Some(&ids()), &[]);
         tracker.fault_injected(Side::Manager, "M", secs(2700));
+        tracker.reconnect_started(Side::Manager, secs(2705));
         tracker.reconnect_succeeded(Side::Manager, secs(2720));
         tracker.sample(secs(2760), &ids(), Some(&ids()), &[]);
 
@@ -1472,6 +1557,7 @@ mod tests {
     fn a_sensor_found_down_that_does_not_recover_in_time_fails() {
         let mut tracker = Tracker::new(secs(90), true);
         tracker.fault_injected(Side::Manager, "M", secs(900));
+        tracker.reconnect_started(Side::Manager, secs(902));
         tracker.reconnect_succeeded(Side::Manager, secs(910));
         tracker.sample(secs(960), &ids(), Some(&ids()), &[]);
         // Repaired 91 s after the cut found M down: outside the window.
@@ -1548,6 +1634,7 @@ mod tests {
         let mut tracker = Tracker::new(secs(90), true);
         tracker.sample(secs(0), &ids(), Some(&ids()), &[]);
         tracker.fault_injected(Side::Manager, "M", secs(900));
+        tracker.reconnect_started(Side::Manager, secs(905));
         tracker.reconnect_succeeded(Side::Manager, secs(921));
         tracker.sample(secs(960), &ids(), Some(&ids()), &[]);
         tracker.fault_injected(Side::Reconnecting, "R", secs(1800));
@@ -1565,6 +1652,7 @@ mod tests {
     fn a_recovered_link_must_still_be_up_and_held_at_the_next_sample() {
         let mut tracker = Tracker::new(secs(90), true);
         tracker.fault_injected(Side::Manager, "M", secs(900));
+        tracker.reconnect_started(Side::Manager, secs(905));
         tracker.reconnect_succeeded(Side::Manager, secs(921));
         tracker.sample(secs(960), &ids(), Some(&only("R")), &[]);
         tracker.fault_injected(Side::Reconnecting, "R", secs(1800));
