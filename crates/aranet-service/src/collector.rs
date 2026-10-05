@@ -546,8 +546,10 @@ async fn watch_for_reload(
     }
 }
 
-/// Collect readings from a single device every `poll_interval`, the first
-/// time after `first_poll`, until `cancel` is cancelled.
+/// Collect readings from a single device every `poll_interval` while polls
+/// succeed, the first time after `first_poll`, until `cancel` is cancelled.
+/// After a failed poll, the next attempt waits for `backoff_delay` instead.
+/// The module docs' Error Handling section has the details.
 async fn collect_device(
     state: Arc<AppState>,
     address: String,
