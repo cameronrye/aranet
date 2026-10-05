@@ -782,3 +782,199 @@ async fn test_prometheus_metrics_enabled() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("aranet_collector_running"));
 }
+
+// ==========================================================================
+// Config file persistence
+// ==========================================================================
+
+/// An app over the config file at `path`, set up the way `run()` sets it up: the
+/// file is loaded (the defaults if it is missing), then `--bind 127.0.0.1:9999`
+/// and `--database <dir>/override.db` change the running config only.
+fn app_for_config_file(path: &std::path::Path) -> (axum::Router, Arc<AppState>) {
+    let mut config = if path.exists() {
+        Config::load(path).unwrap()
+    } else {
+        Config::default()
+    };
+    config.server.bind = "127.0.0.1:9999".to_string();
+    config.storage.path = path.with_file_name("override.db");
+    let store = Store::open_in_memory().unwrap();
+    let state = AppState::with_config_path(store, config.clone(), path.to_path_buf());
+    let security_config = Arc::new(config.security.clone());
+    let rate_limit_state = Arc::new(RateLimitState::new());
+    let router = app(Arc::clone(&state), security_config, rate_limit_state)
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    (router, state)
+}
+
+const OFFICE_DEVICE: &str =
+    r#"{"address": "Aranet4 12345", "alias": "Office", "poll_interval": 60}"#;
+
+/// `OFFICE_DEVICE` as a new `[[devices]]` entry at the end of a file.
+const OFFICE_DEVICE_TOML: &str =
+    "\n[[devices]]\naddress = \"Aranet4 12345\"\nalias = \"Office\"\npoll_interval = 60\n";
+
+#[tokio::test]
+async fn test_add_device_does_not_persist_runtime_overrides_or_drop_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("server.toml");
+    let original = "# Aranet service\n[server]\n# Only this machine\nbind = \"127.0.0.1:8080\" # default port\n";
+    std::fs::write(&config_path, original).unwrap();
+    let (app, _state) = app_for_config_file(&config_path);
+
+    let (status, body) = post(&app, "/api/config/devices", OFFICE_DEVICE).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let saved = std::fs::read_to_string(&config_path).unwrap();
+    for leaked in ["127.0.0.1:9999", "override.db", "[storage]", "[security]"] {
+        assert!(!saved.contains(leaked), "{leaked:?} written to:\n{saved}");
+    }
+    assert_eq!(saved, format!("{original}{OFFICE_DEVICE_TOML}"));
+}
+
+#[tokio::test]
+async fn test_update_device_keeps_comment_on_its_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("server.toml");
+    let original = r#"[server]
+bind = "127.0.0.1:8080"
+
+# kitchen
+[[devices]]
+address = "Aranet4 AAAAA"
+alias = "Kitchen" # by the window
+
+[[devices]]
+address = "Aranet4 BBBBB"
+"#;
+    std::fs::write(&config_path, original).unwrap();
+    let (app, _state) = app_for_config_file(&config_path);
+
+    let (status, body) = put(
+        &app,
+        "/api/config/devices/Aranet4%20AAAAA",
+        r#"{"alias": "Kitchen sensor"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        original.replace("\"Kitchen\"", "\"Kitchen sensor\"")
+    );
+}
+
+#[tokio::test]
+async fn test_add_device_refuses_to_overwrite_unparseable_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("server.toml");
+    std::fs::write(&config_path, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+    let (app, state) = app_for_config_file(&config_path);
+    // Someone edits the file while the service runs and leaves a syntax error.
+    let broken = "[server\nbind = \"127.0.0.1:8080\"\n";
+    std::fs::write(&config_path, broken).unwrap();
+
+    let (status, body) = post(&app, "/api/config/devices", OFFICE_DEVICE).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.contains("Failed to save configuration: Failed to parse config file"),
+        "{body}"
+    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), broken);
+    assert!(state.config.read().await.devices.is_empty());
+}
+
+#[tokio::test]
+async fn test_add_device_to_missing_file_writes_only_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("aranet").join("server.toml");
+    let (app, _state) = app_for_config_file(&config_path);
+
+    let (status, body) = post(&app, "/api/config/devices", OFFICE_DEVICE).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let saved: toml::Table = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(saved.keys().collect::<Vec<_>>(), ["devices"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&config_path), 0o600);
+        assert_eq!(mode(config_path.parent().unwrap()), 0o700);
+    }
+}
+
+/// The shipped `docker/server.toml` with LF line endings. A Windows checkout may
+/// have converted it to CRLF (the repository has no `.gitattributes`), and the
+/// tests compare it with text written with LF.
+fn shipped_server_toml() -> String {
+    include_str!("../../../docker/server.toml").replace("\r\n", "\n")
+}
+
+#[tokio::test]
+async fn test_device_changes_preserve_shipped_docker_config() {
+    let shipped = shipped_server_toml();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("server.toml");
+    std::fs::write(&config_path, &shipped).unwrap();
+    let (app, _state) = app_for_config_file(&config_path);
+
+    let (status, body) = post(&app, "/api/config/devices", OFFICE_DEVICE).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // The commented-out InfluxDB settings at the end of the file stay under
+    // [influxdb]; the new device goes after them.
+    let added = std::fs::read_to_string(&config_path).unwrap();
+    let influxdb = &added[added.find("\n[influxdb]\n").expect("[influxdb] kept")..];
+    let device = influxdb.find("\n[[devices]]\n").unwrap_or(influxdb.len());
+    assert!(influxdb[..device].contains("# url ="), "{added}");
+    assert!(added.ends_with(OFFICE_DEVICE_TOML), "{added}");
+
+    let (status, body) = put(
+        &app,
+        "/api/config/devices/Aranet4%2012345",
+        r#"{"alias": "Kitchen"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let updated = Config::load(&config_path).unwrap();
+    assert_eq!(updated.devices[0].alias.as_deref(), Some("Kitchen"));
+
+    let (status, body) = delete(&app, "/api/config/devices/Aranet4%2012345").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), shipped);
+}
+
+#[tokio::test]
+async fn test_removing_first_of_two_devices_keeps_shipped_comments() {
+    let shipped = shipped_server_toml();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("server.toml");
+    std::fs::write(&config_path, &shipped).unwrap();
+    let (app, _state) = app_for_config_file(&config_path);
+    for device in [
+        r#"{"address": "Aranet4 AAAAA"}"#,
+        r#"{"address": "Aranet4 BBBBB"}"#,
+    ] {
+        let (status, body) = post(&app, "/api/config/devices", device).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // The commented-out settings at the end of [influxdb] are now above the first
+    // device, and stay when it goes.
+    let (status, body) = delete(&app, "/api/config/devices/Aranet4%20AAAAA").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        format!("{shipped}\n[[devices]]\naddress = \"Aranet4 BBBBB\"\npoll_interval = 60\n")
+    );
+
+    let (status, body) = delete(&app, "/api/config/devices/Aranet4%20BBBBB").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), shipped);
+}

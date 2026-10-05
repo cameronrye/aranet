@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::collector::{Collector, CollectorStartResult, CollectorStopResult};
-use crate::config::DeviceConfig;
+use crate::config::{Config, DeviceConfig};
 use crate::state::CollectorState;
 use crate::state::{AppState, DeviceCollectionStats};
 
@@ -815,7 +815,7 @@ async fn update_config(
             )));
         }
 
-        if let Err(e) = config.save(&state.config_path) {
+        if let Err(e) = Config::save_devices(&state.config_path, &config.devices) {
             config.devices = previous_devices;
             return Err(config_save_error(e));
         }
@@ -902,7 +902,7 @@ async fn add_device(
 
         config.devices.push(device);
 
-        if let Err(e) = config.save(&state.config_path) {
+        if let Err(e) = Config::save_devices(&state.config_path, &config.devices) {
             config.devices.pop();
             return Err(config_save_error(e));
         }
@@ -993,7 +993,7 @@ async fn update_device(
             }
         };
 
-        if let Err(e) = config.save(&state.config_path) {
+        if let Err(e) = Config::save_devices(&state.config_path, &config.devices) {
             config.devices[device_index] = previous_device;
             return Err(config_save_error(e));
         }
@@ -1030,7 +1030,7 @@ async fn remove_device(
             )));
         }
 
-        if let Err(e) = config.save(&state.config_path) {
+        if let Err(e) = Config::save_devices(&state.config_path, &config.devices) {
             config.devices = previous_devices;
             return Err(config_save_error(e));
         }
