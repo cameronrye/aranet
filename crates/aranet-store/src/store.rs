@@ -2011,9 +2011,20 @@ mod tests {
     #[test]
     fn test_open_read_only_does_not_create_missing_file() {
         let dir = tempfile::tempdir().unwrap();
+
+        // The directory exists, so only the missing SQLITE_OPEN_CREATE flag
+        // keeps SQLite from creating an empty database here.
+        let path = dir.path().join("data.db");
+        let err = Store::open_read_only(&path)
+            .err()
+            .expect("the file doesn't exist");
+        assert_sqlite_error(err, rusqlite::ErrorCode::CannotOpen);
+        assert!(!path.exists(), "no file is created");
+
+        // SQLite can't create a file in a missing directory even with CREATE,
+        // but `Store::open` would create the directory first.
         let missing_dir = dir.path().join("missing");
         let path = missing_dir.join("data.db");
-
         let err = Store::open_read_only(&path)
             .err()
             .expect("the file doesn't exist");
