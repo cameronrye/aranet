@@ -1541,9 +1541,9 @@ mod tests {
     use time::Duration;
     use tower::ServiceExt;
 
-    use crate::config::SecurityConfig;
+    use crate::config::{Config, SecurityConfig};
     use crate::middleware::RateLimitState;
-    use crate::test_support::TestState;
+    use crate::test_support::{FakeReader, TestState};
     use aranet_types::HistoryRecord;
 
     fn create_test_state() -> TestState {
@@ -2408,7 +2408,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_start_stop_with_configured_device() {
-        let t = create_test_state();
+        let t = TestState::with_reader(Config::default(), FakeReader::new());
         let state = Arc::clone(&t.state);
         {
             let mut config = state.config.write().await;
