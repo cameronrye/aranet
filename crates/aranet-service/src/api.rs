@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::collector::{Collector, CollectorStartResult, CollectorStopResult};
-use crate::config::{Config, DeviceConfig};
+use crate::config::{Config, ConfigError, DeviceConfig};
 use crate::state::CollectorState;
 use crate::state::{AppState, DeviceCollectionStats};
 
@@ -741,8 +741,43 @@ fn default_poll_interval() -> u64 {
     60
 }
 
-fn config_save_error(error: crate::config::ConfigError) -> AppError {
-    AppError::Internal(format!("Failed to save configuration: {}", error))
+/// The 500 for a configuration change that could not be saved.
+///
+/// The response says what failed and names the file, and the log gets the
+/// whole error. The causes stay out of the response: a parse error quotes the
+/// line it failed on and serde quotes values it rejects, and the file is
+/// readable only by its owner because it can hold passwords and tokens, while
+/// any local process can call this API when no API key is set.
+fn config_save_error(error: ConfigError) -> AppError {
+    use std::error::Error;
+
+    // `ConfigError`'s message ends with its direct cause. Add the causes below
+    // that one, such as the reason a save's self-check failed.
+    let mut detail = error.to_string();
+    let mut cause = error.source().and_then(Error::source);
+    while let Some(e) = cause {
+        detail = format!("{detail}: {e}");
+        cause = e.source();
+    }
+    tracing::error!("Failed to save configuration: {detail}");
+
+    let what = match &error {
+        ConfigError::Read { path, .. } => {
+            format!("config file {} can't be read", path.display())
+        }
+        ConfigError::Parse { path, .. } => format!(
+            "config file {} is not valid TOML or doesn't match the expected settings",
+            path.display()
+        ),
+        ConfigError::Write { path, .. } => {
+            format!("config file {} can't be written", path.display())
+        }
+        ConfigError::Serialize(_) => "the configuration can't be written as TOML".to_string(),
+        ConfigError::Validation(_) => "the configuration is not valid".to_string(),
+    };
+    AppError::Internal(format!(
+        "Failed to save configuration: {what} (see the service log)"
+    ))
 }
 
 /// Get current configuration.
@@ -2513,6 +2548,118 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// Log lines written on this thread at `WARN` or above, as plain text,
+    /// while the value [`LogCapture::start`] returns is alive.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn start(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+            // tracing caches whether anything wants a log statement the first
+            // time it runs. While only one dispatcher is registered it asks just
+            // the default of the thread that got there first, so another test's
+            // thread could cache "never" for a line this capture expects. With a
+            // second, silent dispatcher registered first, it asks both.
+            let silent = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (tracing::subscriber::set_default(subscriber), silent)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_config_save_error_keeps_file_text_out_of_the_response() {
+        let t = create_test_state();
+        // A hand edit left a quote open on a line that holds a secret. toml's
+        // parse error quotes that line. The file is readable only by its owner,
+        // but without an API key any local process can call this endpoint.
+        std::fs::write(t.config_path(), "[mqtt]\npassword = \"hunter2\n").unwrap();
+        let app = router().with_state(Arc::clone(&t.state));
+        let device = r#"{"address":"AA:BB:CC:DD:EE:FF"}"#;
+
+        let logs = LogCapture::default();
+        let (status, json) = {
+            let _capture = logs.start();
+            call_json(&app, "POST", "/api/config/devices", Some(device)).await
+        };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json.to_string();
+        assert!(
+            !body.contains("hunter2"),
+            "the response quotes the file: {body}"
+        );
+        let message = json["error"].as_str().unwrap_or_default();
+        let named = format!(
+            "config file {} is not valid TOML",
+            t.config_path().display()
+        );
+        assert!(message.contains(&named), "{message}");
+        let logs = logs.text();
+        assert!(
+            logs.contains("password = \"hunter2"),
+            "the log lacks the parse error: {logs}"
+        );
+    }
+
+    #[test]
+    fn test_config_save_error_logs_causes_it_keeps_out_of_the_response() {
+        // A cause with a cause of its own, the way a save whose self-check
+        // failed says why: the response shows neither, and the log shows both.
+        #[derive(Debug, thiserror::Error)]
+        #[error("rendered TOML does not read back as the intended values")]
+        struct SelfCheck(#[source] toml::de::Error);
+        let reason = toml::from_str::<toml::Table>("token = \"abc123").unwrap_err();
+        let error = crate::config::ConfigError::Write {
+            path: "/srv/aranet/server.toml".into(),
+            source: std::io::Error::other(SelfCheck(reason)),
+        };
+
+        let logs = LogCapture::default();
+        let response = {
+            let _capture = logs.start();
+            config_save_error(error)
+        };
+
+        let message = match response {
+            AppError::Internal(message) => message,
+            other => panic!("expected AppError::Internal, got {other:?}"),
+        };
+        assert!(
+            message.contains("config file /srv/aranet/server.toml can't be written"),
+            "{message}"
+        );
+        for detail in ["read back", "abc123"] {
+            assert!(
+                !message.contains(detail),
+                "{detail:?} in the response: {message}"
+            );
+        }
+        let logs = logs.text();
+        for detail in ["does not read back", "token = \"abc123"] {
+            assert!(logs.contains(detail), "{detail:?} not logged: {logs}");
+        }
     }
 
     #[tokio::test]
