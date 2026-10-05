@@ -666,8 +666,8 @@ mod tests {
         assert_eq!(stats[0].device_id, "AA:BB:CC:DD:EE:FF");
         assert_eq!(stats[0].alias, Some("Test Device".to_string()));
         assert_eq!(stats[0].poll_interval, 60);
-        // Note: success_count, failure_count, and polling may have changed
-        // due to async collector activity, so we only verify initialization happened
+        // The first (fake) poll has run; collector_polls_through_the_device_reader
+        // checks the success_count, failure_count and polling flag it leaves.
         drop(stats);
 
         collector.stop().await;
