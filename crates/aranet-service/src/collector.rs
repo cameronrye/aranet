@@ -636,17 +636,7 @@ async fn collect_device(
                 };
                 // Check thresholds and send desktop notification
                 #[cfg(feature = "notifications")]
-                {
-                    let alias = configured_alias(&state, &address)
-                        .await
-                        .unwrap_or_else(|| address.clone());
-                    let config = state.config.read().await;
-                    let notif_config = &config.notifications;
-                    if notif_config.enabled {
-                        check_and_notify(&state, &address, &alias, &event.reading, notif_config)
-                            .await;
-                    }
-                }
+                notify_if_needed(&state, &address, &event.reading).await;
                 if state.readings_tx.send(event).is_err() {
                     debug!("No active WebSocket subscribers for reading broadcast");
                 }
@@ -792,78 +782,485 @@ impl DeviceReader for BleDeviceReader {
     }
 }
 
+/// Desktop alerts for readings that reach a configured threshold.
 #[cfg(feature = "notifications")]
 mod notifications {
     use std::collections::HashMap;
-    use std::sync::LazyLock;
-    use std::time::Instant;
-    use tokio::sync::Mutex;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
 
+    use aranet_store::StoredReading;
+    use tokio::sync::Semaphore;
+
+    use super::configured_alias;
     use crate::config::NotificationConfig;
+    use crate::state::AppState;
 
-    static LAST_NOTIFICATION: LazyLock<Mutex<HashMap<String, Instant>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    /// Shows one desktop notification, given its title and body. It may block.
+    pub(crate) type ShowFn = Arc<dyn Fn(String, String) -> Result<(), String> + Send + Sync>;
 
-    pub async fn check_and_notify(
-        _state: &super::AppState,
-        device_id: &str,
-        alias: &str,
-        reading: &aranet_store::StoredReading,
-        config: &NotificationConfig,
-    ) {
-        let cooldown = std::time::Duration::from_secs(config.cooldown_secs);
+    /// Dispatches desktop alerts, at most one per device per cooldown.
+    ///
+    /// `CollectorState` owns it, so every `AppState` has its own cooldowns.
+    pub(crate) struct Notifier {
+        /// When the last alert for each device address was dispatched.
+        last: Mutex<HashMap<String, Instant>>,
+        /// One permit for each device address. A `show()` job holds it until
+        /// `show()` returns, so a notification service that stops answering
+        /// ties up at most one blocking thread per device.
+        running: Mutex<HashMap<String, Arc<Semaphore>>>,
+        show: ShowFn,
+    }
 
-        // Check cooldown
-        {
-            let last = LAST_NOTIFICATION.lock().await;
-            if let Some(last_time) = last.get(device_id)
-                && last_time.elapsed() < cooldown
-            {
-                return;
+    impl Notifier {
+        /// A notifier that shows alerts on the desktop through `notify-rust`.
+        pub(crate) fn desktop() -> Self {
+            Self {
+                last: Mutex::new(HashMap::new()),
+                running: Mutex::new(HashMap::new()),
+                show: Arc::new(show_desktop_notification),
             }
         }
 
-        let mut should_notify = false;
-        let mut body = String::new();
+        /// A notifier that hands each alert's title and body to `show`.
+        #[cfg(test)]
+        pub(crate) fn with_show(show: ShowFn) -> Self {
+            Self {
+                last: Mutex::new(HashMap::new()),
+                running: Mutex::new(HashMap::new()),
+                show,
+            }
+        }
 
+        /// Alert on `reading` from the device at `address`, titled with `name`,
+        /// unless it reaches no threshold in `config`, the device's cooldown is
+        /// still running, or its last `show()` hasn't returned. Returns true
+        /// when an alert was dispatched.
+        ///
+        /// The cooldown starts when the alert is dispatched, so a `show()` that
+        /// fails or hangs isn't retried on every poll. `show()` runs on Tokio's
+        /// blocking pool and nothing waits for it, so this must be called
+        /// inside a Tokio runtime.
+        pub(crate) fn maybe_notify(
+            &self,
+            address: &str,
+            name: &str,
+            reading: &StoredReading,
+            config: &NotificationConfig,
+        ) -> bool {
+            let cooldown = Duration::from_secs(config.cooldown_secs);
+            let (body, permit) = {
+                let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+                if last
+                    .get(address)
+                    .is_some_and(|sent| sent.elapsed() < cooldown)
+                {
+                    return false;
+                }
+                let Some(body) = alert_message(reading, config) else {
+                    return false;
+                };
+                let running = Arc::clone(
+                    self.running
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .entry(address.to_string())
+                        .or_insert_with(|| Arc::new(Semaphore::new(1))),
+                );
+                let Ok(permit) = running.try_acquire_owned() else {
+                    tracing::debug!(
+                        "Skipping desktop notification for {address}: the last one hasn't returned"
+                    );
+                    return false;
+                };
+                last.insert(address.to_string(), Instant::now());
+                (body, permit)
+            };
+
+            let title = format!("Aranet Alert: {name}");
+            let show = Arc::clone(&self.show);
+            // show() blocks: a D-Bus round trip on Linux, synchronous system
+            // calls on macOS and Windows. Keep it off the async workers.
+            tokio::task::spawn_blocking(move || {
+                // Held until show() returns or panics.
+                let _running = permit;
+                if let Err(e) = show(title, body) {
+                    tracing::warn!("Failed to send desktop notification: {e}");
+                }
+            });
+            true
+        }
+    }
+
+    /// Show `title` and `body` as a desktop notification. Blocks until the
+    /// platform's notification service has taken it.
+    fn show_desktop_notification(title: String, body: String) -> Result<(), String> {
+        match notify_rust::Notification::new()
+            .summary(&title)
+            .body(&body)
+            .icon("dialog-warning")
+            .timeout(notify_rust::Timeout::Milliseconds(10000))
+            .show()
+        {
+            // On macOS the notification is sent when the handle is dropped,
+            // which happens here, on the same thread.
+            Ok(_handle) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The alert text for `reading`: one line for each threshold it reaches,
+    /// or `None` if it reaches none. A CO2 value of 0 (a sensor without CO2)
+    /// never alerts.
+    pub(crate) fn alert_message(
+        reading: &StoredReading,
+        config: &NotificationConfig,
+    ) -> Option<String> {
+        let mut lines = Vec::new();
         if reading.co2 > 0 && reading.co2 >= config.co2_threshold {
-            should_notify = true;
-            body.push_str(&format!(
-                "CO\u{2082}: {} ppm (threshold: {})\n",
+            lines.push(format!(
+                "CO\u{2082}: {} ppm (threshold: {})",
                 reading.co2, config.co2_threshold
             ));
         }
-
         if let Some(radon) = reading.radon
             && radon >= config.radon_threshold
         {
-            should_notify = true;
-            body.push_str(&format!(
-                "Radon: {} Bq/m\u{00b3} (threshold: {})\n",
-                radon, config.radon_threshold
+            lines.push(format!(
+                "Radon: {radon} Bq/m\u{00b3} (threshold: {})",
+                config.radon_threshold
             ));
         }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
 
-        if should_notify {
-            let title = format!("Aranet Alert: {}", alias);
-            if let Err(e) = notify_rust::Notification::new()
-                .summary(&title)
-                .body(body.trim())
-                .icon("dialog-warning")
-                .timeout(notify_rust::Timeout::Milliseconds(10000))
-                .show()
-            {
-                tracing::warn!("Failed to send desktop notification: {}", e);
-            } else {
-                let mut last = LAST_NOTIFICATION.lock().await;
-                last.insert(device_id.to_string(), Instant::now());
+    /// Alert on `reading` from the device at `address` if notifications are
+    /// enabled, naming the device by its current alias.
+    ///
+    /// Only copies of the settings and the alias are kept, so no config lock
+    /// is held while the alert is dispatched.
+    pub(crate) async fn notify_if_needed(state: &AppState, address: &str, reading: &StoredReading) {
+        // The read guard is a temporary, released at the end of this statement.
+        let config = state.config.read().await.notifications.clone();
+        if !config.enabled {
+            return;
+        }
+        let alias = configured_alias(state, address).await;
+        let name = alias.as_deref().unwrap_or(address);
+        state
+            .collector
+            .notifier
+            .maybe_notify(address, name, reading, &config);
+    }
+
+    /// Every test here dispatches through a fake `show`, never the desktop.
+    /// They run on real time: a running `spawn_blocking` job would stop a
+    /// paused clock from advancing.
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use aranet_store::StoredReading;
+        use aranet_types::CurrentReading;
+        use tokio::sync::mpsc;
+        use tokio::sync::mpsc::error::TryRecvError;
+        use tokio::time::timeout;
+
+        use super::{Notifier, ShowFn, alert_message, notify_if_needed};
+        use crate::config::{Config, DeviceConfig, NotificationConfig};
+        use crate::state::CollectorState;
+        use crate::test_support::TestState;
+
+        const A: &str = "AA:BB:CC:DD:EE:FF";
+        const B: &str = "11:22:33:44:55:66";
+
+        type Alerts = mpsc::UnboundedReceiver<(String, String)>;
+
+        /// Notifications on, CO2 threshold 1000 ppm, radon 300 Bq/m³, 300 s cooldown.
+        fn enabled() -> NotificationConfig {
+            NotificationConfig {
+                enabled: true,
+                co2_threshold: 1000,
+                radon_threshold: 300,
+                cooldown_secs: 300,
             }
+        }
+
+        fn reading(co2: u16, radon: Option<u32>) -> StoredReading {
+            let current = CurrentReading {
+                co2,
+                radon,
+                ..CurrentReading::default()
+            };
+            StoredReading::from_reading_with_id(A, &current, 1)
+        }
+
+        fn reading_with_co2(co2: u16) -> StoredReading {
+            reading(co2, None)
+        }
+
+        /// Device A, called `alias`, with notifications on.
+        fn config_with_alias(alias: &str) -> Config {
+            Config {
+                devices: vec![DeviceConfig {
+                    address: A.to_string(),
+                    alias: Some(alias.to_string()),
+                    poll_interval: 60,
+                }],
+                notifications: enabled(),
+                ..Config::default()
+            }
+        }
+
+        /// A `show` that hands each (title, body) to the returned receiver.
+        fn recording_show() -> (ShowFn, Alerts) {
+            let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
+            let show: ShowFn = Arc::new(move |title: String, body: String| {
+                tx.send((title, body)).map_err(|e| e.to_string())
+            });
+            (show, rx)
+        }
+
+        /// Application state whose collector sends its alerts to `show`.
+        fn state_with(config: Config, show: ShowFn) -> TestState {
+            let collector = CollectorState::new().with_notifier(Notifier::with_show(show));
+            TestState::with_collector(config, collector)
+        }
+
+        /// The next alert passed to `show`.
+        async fn next_alert(alerts: &mut Alerts) -> (String, String) {
+            timeout(Duration::from_secs(5), alerts.recv())
+                .await
+                .expect("show() ran within 5 s")
+                .expect("the show function is alive")
+        }
+
+        /// Wait until no `show()` job for `address` is running, so its next
+        /// alert can only be held back by its cooldown.
+        async fn wait_for_show_job(notifier: &Notifier, address: &str) {
+            // The map guard is dropped at the end of this statement, before the await.
+            let running = notifier.running.lock().unwrap().get(address).cloned();
+            if let Some(running) = running {
+                let permit = timeout(Duration::from_secs(5), running.acquire())
+                    .await
+                    .expect("the show() job ended within 5 s")
+                    .expect("the semaphore is never closed");
+                drop(permit);
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn notification_does_not_block_config_writers() {
+            let (tx, mut alerts) = mpsc::unbounded_channel::<(String, String)>();
+            // Like a notification service that takes 2 s to answer.
+            let show: ShowFn = Arc::new(move |title: String, body: String| -> Result<(), String> {
+                tx.send((title, body)).map_err(|e| e.to_string())?;
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(())
+            });
+            let t = state_with(config_with_alias("Office"), show);
+
+            let state = Arc::clone(&t.state);
+            let notify = tokio::spawn(async move {
+                notify_if_needed(&state, A, &reading_with_co2(1500)).await;
+            });
+            // show() has started and is now blocking.
+            next_alert(&mut alerts).await;
+
+            // Adding, editing or removing a device through the API takes this lock.
+            let guard = timeout(Duration::from_millis(500), t.state.config.write())
+                .await
+                .expect("a config write waited for the desktop notification");
+            drop(guard);
+            // show() is still asleep, so returning now means it runs elsewhere.
+            timeout(Duration::from_millis(500), notify)
+                .await
+                .expect("notify_if_needed waited for show()")
+                .expect("notify_if_needed did not panic");
+        }
+
+        #[tokio::test]
+        async fn notifier_cooldown_suppresses_repeat_alert() {
+            let (show, mut alerts) = recording_show();
+            let notifier = Notifier::with_show(show);
+            let config = enabled();
+            let reading = reading_with_co2(1500);
+
+            assert!(notifier.maybe_notify(A, "Office", &reading, &config));
+            let (title, _) = next_alert(&mut alerts).await;
+            assert_eq!(title, "Aranet Alert: Office");
+            // Only the cooldown may refuse the next alert, not A's running job.
+            wait_for_show_job(&notifier, A).await;
+            assert!(
+                !notifier.maybe_notify(A, "Office", &reading, &config),
+                "a second alert was dispatched inside the cooldown"
+            );
+            assert_eq!(alerts.try_recv(), Err(TryRecvError::Empty));
+        }
+
+        #[tokio::test]
+        async fn notifier_cooldown_is_per_device() {
+            let (show, mut alerts) = recording_show();
+            let notifier = Notifier::with_show(show);
+            let config = enabled();
+            let reading = reading_with_co2(1500);
+
+            assert!(notifier.maybe_notify(A, "Office", &reading, &config));
+            assert!(
+                notifier.maybe_notify(B, "Kitchen", &reading, &config),
+                "device A's cooldown held back device B's alert"
+            );
+
+            // The two show() calls run on different blocking threads, in either order.
+            let mut titles = vec![
+                next_alert(&mut alerts).await.0,
+                next_alert(&mut alerts).await.0,
+            ];
+            titles.sort();
+            assert_eq!(titles, ["Aranet Alert: Kitchen", "Aranet Alert: Office"]);
+        }
+
+        #[tokio::test]
+        async fn hung_show_holds_back_only_its_device() {
+            let (tx, mut alerts) = mpsc::unbounded_channel::<(String, String)>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let released = std::sync::Mutex::new(Some(released));
+            // The first show() hangs, like a notification service that stops
+            // answering, until the test releases it (at most 5 s). Later ones
+            // return at once.
+            let show: ShowFn = Arc::new(move |title: String, body: String| -> Result<(), String> {
+                let hang = released.lock().unwrap().take();
+                tx.send((title, body)).map_err(|e| e.to_string())?;
+                if let Some(released) = hang {
+                    released.recv_timeout(Duration::from_secs(5)).ok();
+                }
+                Ok(())
+            });
+            let notifier = Notifier::with_show(show);
+            // No cooldown, so only a running show() can hold an alert back.
+            let config = NotificationConfig {
+                cooldown_secs: 0,
+                ..enabled()
+            };
+            let reading = reading_with_co2(1500);
+
+            assert!(notifier.maybe_notify(A, "Office", &reading, &config));
+            let dispatched = notifier.last.lock().unwrap()[A];
+            // Device A's show() has started and hangs.
+            next_alert(&mut alerts).await;
+            assert!(
+                !notifier.maybe_notify(A, "Office", &reading, &config),
+                "a second show() started while device A's first had not returned"
+            );
+            assert_eq!(
+                notifier.last.lock().unwrap()[A],
+                dispatched,
+                "an alert held back by a running show() restarted the cooldown"
+            );
+            assert!(
+                notifier.maybe_notify(B, "Kitchen", &reading, &config),
+                "device A's hung show() held back device B"
+            );
+            assert_eq!(next_alert(&mut alerts).await.0, "Aranet Alert: Kitchen");
+
+            // Let A's show() return, and wait until its job has let go of A.
+            release
+                .send(())
+                .expect("device A's show() is still waiting");
+            wait_for_show_job(&notifier, A).await;
+            assert!(
+                notifier.maybe_notify(A, "Office", &reading, &config),
+                "device A got no alert after its show() returned"
+            );
+            assert_eq!(next_alert(&mut alerts).await.0, "Aranet Alert: Office");
+        }
+
+        #[test]
+        fn alert_message_thresholds() {
+            let config = enabled();
+            // Aranet2 and AranetRn+ readings carry co2 = 0: never a CO2 alert,
+            // even with a threshold of 0.
+            let zero_threshold = NotificationConfig {
+                co2_threshold: 0,
+                ..enabled()
+            };
+            assert_eq!(alert_message(&reading(0, None), &zero_threshold), None);
+            assert_eq!(
+                alert_message(&reading(1000, None), &config).as_deref(),
+                Some("CO\u{2082}: 1000 ppm (threshold: 1000)")
+            );
+            assert_eq!(
+                alert_message(&reading(0, Some(300)), &config).as_deref(),
+                Some("Radon: 300 Bq/m\u{00b3} (threshold: 300)")
+            );
+            assert_eq!(
+                alert_message(&reading(1500, Some(400)), &config).as_deref(),
+                Some(
+                    "CO\u{2082}: 1500 ppm (threshold: 1000)\nRadon: 400 Bq/m\u{00b3} (threshold: 300)"
+                )
+            );
+            assert_eq!(alert_message(&reading(999, Some(299)), &config), None);
+        }
+
+        #[tokio::test]
+        async fn failed_show_still_starts_cooldown() {
+            let (tx, mut alerts) = mpsc::unbounded_channel::<(String, String)>();
+            let show: ShowFn = Arc::new(move |title: String, body: String| -> Result<(), String> {
+                tx.send((title, body)).map_err(|e| e.to_string())?;
+                Err("no session bus".to_string())
+            });
+            let notifier = Notifier::with_show(show);
+            let config = enabled();
+            let reading = reading_with_co2(1500);
+
+            assert!(notifier.maybe_notify(A, "Office", &reading, &config));
+            next_alert(&mut alerts).await;
+            // show() has failed; wait until its job has given A's permit back.
+            wait_for_show_job(&notifier, A).await;
+            assert!(
+                !notifier.maybe_notify(A, "Office", &reading, &config),
+                "a failed show() was retried inside the cooldown"
+            );
+            assert_eq!(alerts.try_recv(), Err(TryRecvError::Empty));
+        }
+
+        #[tokio::test]
+        async fn notification_uses_current_alias() {
+            let (show, mut alerts) = recording_show();
+            let t = state_with(config_with_alias("Office"), show);
+            // A rename through the API edits the config in place; the device
+            // loop keeps running.
+            t.state.config.write().await.devices[0].alias = Some("Kitchen".to_string());
+
+            notify_if_needed(&t.state, A, &reading_with_co2(1500)).await;
+
+            let (title, body) = next_alert(&mut alerts).await;
+            assert_eq!(title, "Aranet Alert: Kitchen");
+            assert_eq!(body, "CO\u{2082}: 1500 ppm (threshold: 1000)");
+        }
+
+        #[tokio::test]
+        async fn disabled_notifications_dispatch_nothing() {
+            let (show, _alerts) = recording_show();
+            let mut config = config_with_alias("Office");
+            config.notifications.enabled = false;
+            let t = state_with(config, show);
+
+            notify_if_needed(&t.state, A, &reading_with_co2(5000)).await;
+
+            let last = t.state.collector.notifier.last.lock().unwrap();
+            assert!(last.is_empty(), "an alert was dispatched: {last:?}");
         }
     }
 }
 
 #[cfg(feature = "notifications")]
-use notifications::check_and_notify;
+pub(crate) use notifications::{Notifier, notify_if_needed};
 
 #[cfg(test)]
 mod tests {
