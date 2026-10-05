@@ -527,24 +527,66 @@ impl Store {
 
     /// Delete history records older than the given timestamp.
     ///
+    /// Records at exactly `older_than` are kept. Records are deleted
+    /// [`PRUNE_BATCH_ROWS`] at a time with
+    /// [`prune_history_batch`](Self::prune_history_batch), and each batch
+    /// commits on its own, so other connections can write between batches and
+    /// an interrupted prune keeps the batches it finished.
+    ///
     /// Returns the number of records deleted.
     pub fn prune_history(&self, older_than: OffsetDateTime) -> Result<u64> {
-        let ts = older_than.unix_timestamp();
+        prune_in_batches(PRUNE_BATCH_ROWS, |max_rows| {
+            self.prune_history_batch(older_than, max_rows)
+        })
+    }
+
+    /// Delete at most `max_rows` history records older than the given
+    /// timestamp, in one statement.
+    ///
+    /// Returns the number of records deleted. A result below `max_rows` means
+    /// no older record is left.
+    pub fn prune_history_batch(&self, older_than: OffsetDateTime, max_rows: u32) -> Result<u64> {
         let deleted = self.conn.execute(
-            "DELETE FROM history WHERE timestamp < ?1",
-            rusqlite::params![ts],
+            PRUNE_HISTORY_BATCH_SQL,
+            rusqlite::params![older_than.unix_timestamp(), max_rows],
         )?;
         Ok(deleted as u64)
     }
 
     /// Delete readings older than the given timestamp.
     ///
+    /// Readings at exactly `older_than` are kept. Readings are deleted
+    /// [`PRUNE_BATCH_ROWS`] at a time with
+    /// [`prune_readings_batch`](Self::prune_readings_batch), and each batch
+    /// commits on its own, so other connections can write between batches and
+    /// an interrupted prune keeps the batches it finished.
+    ///
     /// Returns the number of records deleted.
     pub fn prune_readings(&self, older_than: OffsetDateTime) -> Result<u64> {
-        let ts = older_than.unix_timestamp();
+        self.prune_readings_in_batches(older_than, PRUNE_BATCH_ROWS)
+    }
+
+    /// [`prune_readings`](Self::prune_readings) with a custom batch size, so
+    /// tests can cross batch boundaries with a few rows.
+    pub(crate) fn prune_readings_in_batches(
+        &self,
+        older_than: OffsetDateTime,
+        batch: u32,
+    ) -> Result<u64> {
+        prune_in_batches(batch, |max_rows| {
+            self.prune_readings_batch(older_than, max_rows)
+        })
+    }
+
+    /// Delete at most `max_rows` readings older than the given timestamp, in
+    /// one statement.
+    ///
+    /// Returns the number of readings deleted. A result below `max_rows`
+    /// means no older reading is left.
+    pub fn prune_readings_batch(&self, older_than: OffsetDateTime, max_rows: u32) -> Result<u64> {
         let deleted = self.conn.execute(
-            "DELETE FROM readings WHERE captured_at < ?1",
-            rusqlite::params![ts],
+            PRUNE_READINGS_BATCH_SQL,
+            rusqlite::params![older_than.unix_timestamp(), max_rows],
         )?;
         Ok(deleted as u64)
     }
@@ -553,6 +595,37 @@ impl Store {
     pub fn vacuum(&self) -> Result<()> {
         self.conn.execute_batch("VACUUM;")?;
         Ok(())
+    }
+}
+
+/// Rows deleted per statement by [`Store::prune_readings`] and
+/// [`Store::prune_history`].
+///
+/// Each batch is one short write transaction, so other connections to the same
+/// database, such as a running `aranet-service`, get the write lock between
+/// batches instead of waiting behind one long delete.
+pub const PRUNE_BATCH_ROWS: u32 = 5_000;
+
+// The bundled SQLite is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT, so
+// `DELETE ... LIMIT` is a syntax error. The batches limit a rowid subquery
+// instead, which the time indexes answer.
+const PRUNE_READINGS_BATCH_SQL: &str =
+    "DELETE FROM readings WHERE id IN (SELECT id FROM readings WHERE captured_at < ?1 LIMIT ?2)";
+const PRUNE_HISTORY_BATCH_SQL: &str =
+    "DELETE FROM history WHERE id IN (SELECT id FROM history WHERE timestamp < ?1 LIMIT ?2)";
+
+/// Call `delete_batch(batch)` until it deletes fewer than `batch` rows, and
+/// return the total deleted.
+fn prune_in_batches(batch: u32, mut delete_batch: impl FnMut(u32) -> Result<u64>) -> Result<u64> {
+    // A batch of 0 rows would never finish.
+    let batch = batch.max(1);
+    let mut total = 0;
+    loop {
+        let deleted = delete_batch(batch)?;
+        total += deleted;
+        if deleted < u64::from(batch) {
+            return Ok(total);
+        }
     }
 }
 
@@ -3205,6 +3278,110 @@ invalid-timestamp,test-device,800,22.5,1013.25,45,
         assert_eq!(store.count_history(None).unwrap(), 8);
     }
 
+    // ==================== Prune Tests ====================
+
+    /// First timestamp of the prune tests (2023-11-14T22:13:20Z).
+    fn prune_t0() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+    }
+
+    /// Store `count` readings for "dev", one minute apart from `t0`.
+    fn insert_readings_every_minute(store: &Store, t0: OffsetDateTime, count: i64) {
+        for i in 0..count {
+            let reading = CurrentReading {
+                captured_at: Some(t0 + time::Duration::minutes(i)),
+                ..create_test_reading()
+            };
+            store.insert_reading("dev", &reading).unwrap();
+        }
+    }
+
+    /// Store `count` history records for "dev", one minute apart from `t0`:
+    /// further apart than the 30 s dedup window, so every one is kept.
+    fn insert_history_every_minute(store: &Store, t0: OffsetDateTime, count: i64) {
+        let records: Vec<HistoryRecord> = (0..count)
+            .map(|i| HistoryRecord {
+                timestamp: t0 + time::Duration::minutes(i),
+                co2: 800,
+                temperature: 22.0,
+                pressure: 1013.0,
+                humidity: 45,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            })
+            .collect();
+        assert_eq!(
+            store.insert_history("dev", &records).unwrap(),
+            records.len()
+        );
+    }
+
+    fn reading_times(store: &Store) -> Vec<OffsetDateTime> {
+        let query = ReadingQuery::new().oldest_first();
+        let readings = store.query_readings(&query).unwrap();
+        readings.into_iter().map(|r| r.captured_at).collect()
+    }
+
+    fn history_times(store: &Store) -> Vec<OffsetDateTime> {
+        let query = HistoryQuery::new().oldest_first();
+        let records = store.query_history(&query).unwrap();
+        records.into_iter().map(|r| r.timestamp).collect()
+    }
+
+    #[test]
+    fn test_prune_readings_batch_deletes_at_most_max_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = prune_t0();
+        insert_readings_every_minute(&store, t0, 10);
+        let cutoff = t0 + time::Duration::seconds(300);
+
+        assert_eq!(store.prune_readings_batch(cutoff, 3).unwrap(), 3);
+        assert_eq!(store.count_readings(None).unwrap(), 7);
+        assert_eq!(store.prune_readings_batch(cutoff, 3).unwrap(), 2);
+        assert_eq!(store.prune_readings_batch(cutoff, 3).unwrap(), 0);
+
+        // What is left starts at the cutoff: a row at exactly the cutoff stays.
+        let left = reading_times(&store);
+        assert_eq!(left.len(), 5);
+        assert_eq!(left[0], cutoff);
+        assert!(left.iter().all(|&t| t >= cutoff), "{left:?}");
+    }
+
+    #[test]
+    fn test_prune_history_batch_deletes_at_most_max_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = prune_t0();
+        insert_history_every_minute(&store, t0, 10);
+        let cutoff = t0 + time::Duration::seconds(300);
+
+        assert_eq!(store.prune_history_batch(cutoff, 3).unwrap(), 3);
+        assert_eq!(store.count_history(None).unwrap(), 7);
+        assert_eq!(store.prune_history_batch(cutoff, 3).unwrap(), 2);
+        assert_eq!(store.prune_history_batch(cutoff, 3).unwrap(), 0);
+
+        let left = history_times(&store);
+        assert_eq!(left.len(), 5);
+        assert_eq!(left[0], cutoff);
+        assert!(left.iter().all(|&t| t >= cutoff), "{left:?}");
+    }
+
+    #[test]
+    fn test_prune_readings_removes_all_older_rows_across_batches() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = prune_t0();
+        insert_readings_every_minute(&store, t0, 12);
+        let cutoff = t0 + time::Duration::minutes(10);
+
+        // Batches of 3, 3, 3 and 1.
+        assert_eq!(store.prune_readings_in_batches(cutoff, 3).unwrap(), 10);
+        assert_eq!(
+            reading_times(&store),
+            [cutoff, cutoff + time::Duration::minutes(1)]
+        );
+        assert_eq!(store.prune_readings(cutoff).unwrap(), 0);
+    }
+
     // ==================== Query Plan Tests ====================
 
     /// The `EXPLAIN QUERY PLAN` details for `sql` bound to `params`, one per line.
@@ -3251,6 +3428,22 @@ invalid-timestamp,test-device,800,22.5,1013.25,45,
             assert!(plan.contains(" INDEX "), "{plan}");
             assert!(!plan.contains("TEMP B-TREE"), "{plan}");
         }
+    }
+
+    #[test]
+    fn test_prune_batches_use_time_indexes() {
+        // Each batch finds its rows through the time index instead of scanning
+        // the table. ST-13 (Phase 4) must keep both indexes.
+        let store = Store::open_in_memory().unwrap();
+        let params: [&dyn rusqlite::ToSql; 2] = [&0_i64, &PRUNE_BATCH_ROWS];
+
+        let plan = query_plan(&store, PRUNE_READINGS_BATCH_SQL, &params);
+        assert!(plan.contains("idx_readings_captured_at"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+
+        let plan = query_plan(&store, PRUNE_HISTORY_BATCH_SQL, &params);
+        assert!(plan.contains("idx_history_timestamp"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
     }
 
     // ==================== Edge Cases ====================
