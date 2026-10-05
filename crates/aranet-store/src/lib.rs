@@ -33,11 +33,13 @@ mod models;
 mod queries;
 mod schema;
 mod store;
+mod toml_file;
 
 pub use error::{Error, Result};
 pub use models::{StoredDevice, StoredHistoryRecord, StoredReading, SyncState};
 pub use queries::{HistoryQuery, MAX_QUERY_LIMIT, ReadingQuery};
 pub use store::{HistoryAggregates, HistoryStats, ImportResult, PRUNE_BATCH_ROWS, Store};
+pub use toml_file::{TomlFile, TomlFileError, write_private};
 
 /// Default database path following platform conventions.
 ///

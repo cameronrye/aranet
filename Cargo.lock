@@ -388,6 +388,8 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "toml_edit 0.25.15+spec-1.1.0",
  "tracing",
 ]
 
@@ -6288,6 +6290,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 
