@@ -11,21 +11,25 @@
 //!
 //! ## Thread Safety
 //!
-//! The `Store` struct is **not thread-safe** by itself. When using `Store` in a
-//! multi-threaded context (e.g., `aranet-service`), wrap it in a `Mutex` or similar:
+//! A `Store` is one SQLite connection. It can move to another thread (`Send`)
+//! but can't be shared between threads (not `Sync`). To use the database from
+//! several threads, give each thread its own connection instead of sharing one:
 //!
-//! ```ignore
-//! use tokio::sync::Mutex;
-//! let store = Mutex::new(Store::open_default()?);
+//! - One writer: [`Store::open`] creates the file if needed and migrates the
+//!   schema.
+//! - Any number of readers: [`Store::open_read_only`] opens the existing file
+//!   with `PRAGMA query_only = ON`. WAL mode lets them read while the writer
+//!   writes.
 //!
-//! // Access the store
-//! let guard = store.lock().await;
-//! let devices = guard.list_devices()?;
-//! ```
+//! Every call blocks its thread, and waits up to 5 seconds for a lock that
+//! another connection or process holds (for example `aranet sync` writing
+//! while `aranet-service` runs) before failing with "database is locked".
+//! Async code should therefore call the store from a blocking thread, such as
+//! `tokio::task::spawn_blocking`, not from an async task.
 //!
 //! ## Performance Considerations
 //!
-//! - For high-concurrency scenarios, consider keeping lock hold times short
+//! - Keep write transactions short: other connections wait for them
 //! - Batch operations (like `insert_history`) are more efficient than individual inserts
 //! - Query operations with indexes (`device_id`, `timestamp`) are optimized
 //!
@@ -38,7 +42,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
@@ -100,20 +104,12 @@ use crate::schema;
 ///
 /// # Thread Safety
 ///
-/// `Store` is **not thread-safe**. For concurrent access (e.g., in `aranet-service`),
-/// wrap it in a `Mutex`:
-///
-/// ```ignore
-/// use std::sync::Arc;
-/// use tokio::sync::Mutex;
-/// use aranet_store::Store;
-///
-/// let store = Arc::new(Mutex::new(Store::open_default()?));
-///
-/// // In async context:
-/// let guard = store.lock().await;
-/// let devices = guard.list_devices()?;
-/// ```
+/// A `Store` is one SQLite connection: it is `Send` but not `Sync`. Use one
+/// store per thread, for example one [`Store::open`] writer and a
+/// [`Store::open_read_only`] reader per reading thread, rather than sharing one
+/// behind a lock. Calls block, and wait up to 5 seconds for a lock another
+/// connection holds, so async code should make them on a blocking thread
+/// (`tokio::task::spawn_blocking`).
 ///
 /// # Example
 ///
@@ -233,6 +229,57 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::initialize(&conn)?;
         Ok(Self { conn, path: None })
+    }
+
+    /// Open an existing database for queries only.
+    ///
+    /// Unlike [`Store::open`], this never creates the file or its directory and
+    /// never creates or migrates the schema: open the database with
+    /// [`Store::open`] first. The connection runs with `PRAGMA query_only = ON`,
+    /// so any statement that would change the database fails with
+    /// [`rusqlite::ErrorCode::ReadOnly`].
+    ///
+    /// Each read-only store is a separate connection. In WAL mode (which
+    /// [`Store::open`] enables) it reads while another connection writes, and it
+    /// sees every committed write, including those of other processes. Like any
+    /// `Store`, it waits up to 5 seconds for a lock that another connection holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] with [`rusqlite::ErrorCode::CannotOpen`] if the
+    /// file doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use aranet_store::Store;
+    ///
+    /// let writer = Store::open("/path/to/my/aranet.db")?;
+    /// let reader = Store::open_read_only("/path/to/my/aranet.db")?;
+    /// assert_eq!(reader.list_devices()?.len(), writer.list_devices()?.len());
+    /// # Ok::<(), aranet_store::Error>(())
+    /// ```
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        debug!("Opening database read-only at {}", path.display());
+
+        // Read-write without CREATE: a missing file is an error instead of a new,
+        // empty database, and `query_only` refuses every change.
+        // SQLITE_OPEN_READ_ONLY isn't used: such a connection can't create the
+        // -shm/-wal files or recover and checkpoint the WAL, which matters when
+        // it is the last connection open.
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+
+        Ok(Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        })
     }
 
     /// Return the database path for file-backed stores.
@@ -1933,6 +1980,61 @@ mod tests {
         let path = dir.path().join("data.db");
         let store = Store::open(&path).unwrap();
         assert_eq!(store.database_path(), Some(path.as_path()));
+    }
+
+    fn assert_sqlite_error(err: Error, expected: rusqlite::ErrorCode) {
+        match err {
+            Error::Database(e) => assert_eq!(e.sqlite_error_code(), Some(expected), "{e}"),
+            other => panic!("expected SQLite error {expected:?}, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_open_read_only_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        Store::open(&path)
+            .unwrap()
+            .upsert_device("Aranet4 17C3C", None)
+            .unwrap();
+
+        let reader = Store::open_read_only(&path).unwrap();
+        assert_eq!(reader.database_path(), Some(path.as_path()));
+        assert_eq!(reader.list_devices().unwrap().len(), 1);
+        let err = reader
+            .upsert_device("x", None)
+            .expect_err("the write must fail");
+        assert_sqlite_error(err, rusqlite::ErrorCode::ReadOnly);
+        assert_eq!(reader.list_devices().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_open_read_only_does_not_create_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_dir = dir.path().join("missing");
+        let path = missing_dir.join("data.db");
+
+        let err = Store::open_read_only(&path)
+            .err()
+            .expect("the file doesn't exist");
+        assert_sqlite_error(err, rusqlite::ErrorCode::CannotOpen);
+        assert!(!missing_dir.exists(), "no directory is created");
+    }
+
+    #[test]
+    fn test_open_read_only_sees_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let writer = Store::open(&path).unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        assert!(reader.list_devices().unwrap().is_empty());
+
+        writer
+            .upsert_device("Aranet4 17C3C", Some("Kitchen"))
+            .unwrap();
+        let devices = reader.list_devices().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name.as_deref(), Some("Kitchen"));
     }
 
     #[test]
