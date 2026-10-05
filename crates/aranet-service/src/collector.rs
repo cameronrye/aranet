@@ -566,10 +566,18 @@ use notifications::check_and_notify;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestState;
+    use crate::config::Config;
+    use crate::test_support::{FakeReader, TestState, settle};
 
     fn create_test_state() -> TestState {
         TestState::in_memory()
+    }
+
+    fn config_with_devices(devices: Vec<DeviceConfig>) -> Config {
+        Config {
+            devices,
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -590,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_start_no_devices() {
-        let t = create_test_state();
+        let t = TestState::with_reader(Config::default(), FakeReader::new());
         let state = Arc::clone(&t.state);
         let collector = Collector::new(Arc::clone(&state));
 
@@ -612,9 +620,9 @@ mod tests {
         collector.stop().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_devices_changed_signals_reload_when_collector_is_idle() {
-        let t = create_test_state();
+        let t = TestState::with_reader(Config::default(), FakeReader::new());
         let state = Arc::clone(&t.state);
         let collector = Collector::new(Arc::clone(&state));
         assert_eq!(
@@ -633,27 +641,24 @@ mod tests {
         collector.stop().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_collector_start_with_devices_initializes_stats() {
-        let t = create_test_state();
-        let state = Arc::clone(&t.state);
-
-        // Add a device to config
-        {
-            let mut config = state.config.write().await;
-            config.devices.push(crate::config::DeviceConfig {
+        let t = TestState::with_reader(
+            config_with_devices(vec![DeviceConfig {
                 address: "AA:BB:CC:DD:EE:FF".to_string(),
                 alias: Some("Test Device".to_string()),
                 poll_interval: 60,
-            });
-        }
+            }]),
+            FakeReader::new(),
+        );
+        let state = Arc::clone(&t.state);
 
         let collector = Collector::new(Arc::clone(&state));
         let result = collector.start().await;
         assert_eq!(result, CollectorStartResult::Started);
 
-        // Wait a moment for async initialization
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Let the first (fake) poll run
+        settle().await;
 
         // Check that device stats were initialized
         let stats = state.collector.device_stats.read().await;
@@ -838,37 +843,40 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_collector_multiple_devices() {
-        let t = create_test_state();
+        let reader = FakeReader::new();
+        let t = TestState::with_reader(
+            config_with_devices(vec![
+                DeviceConfig {
+                    address: "DEVICE-1".to_string(),
+                    alias: Some("First".to_string()),
+                    poll_interval: 30,
+                },
+                DeviceConfig {
+                    address: "DEVICE-2".to_string(),
+                    alias: Some("Second".to_string()),
+                    poll_interval: 60,
+                },
+                DeviceConfig {
+                    address: "DEVICE-3".to_string(),
+                    alias: None,
+                    poll_interval: 120,
+                },
+            ]),
+            reader.clone(),
+        );
         let state = Arc::clone(&t.state);
-
-        // Add multiple devices
-        {
-            let mut config = state.config.write().await;
-            config.devices.push(crate::config::DeviceConfig {
-                address: "DEVICE-1".to_string(),
-                alias: Some("First".to_string()),
-                poll_interval: 30,
-            });
-            config.devices.push(crate::config::DeviceConfig {
-                address: "DEVICE-2".to_string(),
-                alias: Some("Second".to_string()),
-                poll_interval: 60,
-            });
-            config.devices.push(crate::config::DeviceConfig {
-                address: "DEVICE-3".to_string(),
-                alias: None,
-                poll_interval: 120,
-            });
-        }
 
         let collector = Collector::new(Arc::clone(&state));
         let result = collector.start().await;
         assert_eq!(result, CollectorStartResult::Started);
 
-        // Wait for initialization
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Devices start 5 s apart, so after 11 s each has been read once
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        for address in ["DEVICE-1", "DEVICE-2", "DEVICE-3"] {
+            assert_eq!(reader.reads_of(address).len(), 1, "{address}");
+        }
 
         // Check all devices were initialized
         let stats = state.collector.device_stats.read().await;
@@ -887,6 +895,39 @@ mod tests {
         assert!(device3.alias.is_none());
         assert_eq!(device3.poll_interval, 120);
         drop(stats);
+
+        collector.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collector_polls_through_the_device_reader() {
+        const ADDRESS: &str = "AA:BB:CC:DD:EE:FF";
+        let reader = FakeReader::new();
+        let t = TestState::with_reader(
+            config_with_devices(vec![DeviceConfig {
+                address: ADDRESS.to_string(),
+                alias: None,
+                poll_interval: 60,
+            }]),
+            reader.clone(),
+        );
+        let state = Arc::clone(&t.state);
+
+        let collector = Collector::new(Arc::clone(&state));
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        settle().await;
+
+        assert_eq!(reader.reads_of(ADDRESS).len(), 1);
+        let stats = state.collector.device_stats.read().await;
+        assert_eq!(stats[0].success_count, 1);
+        assert_eq!(stats[0].failure_count, 0);
+        assert!(!stats[0].polling);
+        drop(stats);
+        let stored = state
+            .with_store_read(|store| store.count_readings(Some(ADDRESS)))
+            .await
+            .unwrap();
+        assert_eq!(stored, 1, "the fake's reading is stored");
 
         collector.stop().await;
     }

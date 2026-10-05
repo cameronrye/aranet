@@ -78,6 +78,27 @@ impl AppState {
 
     /// Create new application state with a custom config path.
     pub fn with_config_path(store: Store, config: Config, config_path: PathBuf) -> Arc<Self> {
+        Self::build(store, config, config_path, CollectorState::new())
+    }
+
+    /// Like [`Self::with_config_path`], with a prepared collector state (for
+    /// example one whose collector reads devices through a fake).
+    #[cfg(test)]
+    pub(crate) fn with_collector(
+        store: Store,
+        config: Config,
+        config_path: PathBuf,
+        collector: CollectorState,
+    ) -> Arc<Self> {
+        Self::build(store, config, config_path, collector)
+    }
+
+    fn build(
+        store: Store,
+        config: Config,
+        config_path: PathBuf,
+        collector: CollectorState,
+    ) -> Arc<Self> {
         let buffer_size = config.server.broadcast_buffer;
         let (readings_tx, _) = broadcast::channel(buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -89,7 +110,7 @@ impl AppState {
             config_path,
             readings_tx,
             ble_semaphore: Semaphore::new(1),
-            collector: CollectorState::new(),
+            collector,
             ws_messages_dropped: AtomicU64::new(0),
             shutdown_tx,
             shutdown_rx,
@@ -194,6 +215,15 @@ impl CollectorState {
             device_tasks: Mutex::new(JoinSet::new()),
             reload_watcher: Mutex::new(None),
             reader: Arc::new(BleDeviceReader),
+        }
+    }
+
+    /// A collector state whose collector reads devices through `reader`.
+    #[cfg(test)]
+    pub(crate) fn with_reader(reader: Arc<dyn DeviceReader>) -> Self {
+        Self {
+            reader,
+            ..Self::new()
         }
     }
 
