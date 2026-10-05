@@ -7,26 +7,40 @@
 //!
 //! The collector uses a "task per device" model:
 //!
-//! - Each configured device gets its own Tokio task
-//! - Tasks run independently with their own polling intervals
-//! - Tasks share access to the application state via `Arc<AppState>`
+//! - A started collector is one *generation*: a [`CancellationToken`], a
+//!   reload watcher task and one task per configured device, each with a child
+//!   token. `CollectorState::lifecycle`, a `tokio::sync::Mutex`, owns it.
+//!   [`Collector::start`], [`Collector::stop`] and the reload watcher take that
+//!   lock, so they never interleave.
+//! - A device task waits for its next tick inside a `select!` on its token.
+//!   Each poll runs as its own task, tracked in `CollectorState::polls`: it
+//!   waits for the Bluetooth adapter (or the token), then connects, reads and
+//!   disconnects within `BLE_POLL_TIMEOUT` (180 s), and stores the reading.
+//! - A device change ([`AppState::on_devices_changed`]) wakes the reload
+//!   watcher. It compares the configured devices with the running tasks by
+//!   address, case-insensitively. It stops the tasks of removed devices and of
+//!   devices whose address spelling or poll interval changed, then starts tasks
+//!   for devices that have none. Alias edits restart nothing, and per-device
+//!   statistics keep their counters.
 //!
 //! ## Lock Acquisition
 //!
-//! Device polling tasks acquire locks in this order:
+//! Locks are taken in this order: `CollectorState::lifecycle`, then
+//! `AppState::config`, then `CollectorState::device_stats`. Device tasks never
+//! take `lifecycle`, and API handlers take it only through [`Collector::start`]
+//! and [`Collector::stop`], holding no other lock, so `stop` and a reload can
+//! wait for device tasks while holding it. A device task takes `device_stats`,
+//! `config` (to look up the alias) and the store one at a time.
 //!
-//! 1. **`device_stats` write lock** - Brief lock to update polling status
-//! 2. **BLE device communication** - No Rust locks, but exclusive Bluetooth access
-//! 3. **`store` mutex** - Brief lock to insert the reading
-//! 4. **`device_stats` write lock** - Brief lock to update success/failure counts
+//! ## Stopping
 //!
-//! ## Graceful Shutdown
-//!
-//! The collector uses a `watch` channel for graceful shutdown:
-//!
-//! - [`Collector::stop()`] sends a stop signal to all tasks
-//! - Each task checks for the stop signal between poll cycles
-//! - Tasks complete their current operation before stopping
+//! A cancelled token stays cancelled, so neither a reload nor a racing start
+//! can undo a stop. [`Collector::stop`] cancels the generation, waits up to
+//! `TASK_STOP_TIMEOUT` for its tasks and aborts any that are left. A device
+//! task stopped during a poll exits at once and leaves the poll to finish:
+//! it disconnects and stores its reading, which is not broadcast. At service
+//! shutdown the collector is stopped for good: a later [`Collector::start`]
+//! starts nothing.
 //!
 //! ## Error Handling
 //!
@@ -42,16 +56,19 @@
 //! collector.start().await;  // Returns immediately, collection is background
 //!
 //! // Later...
-//! collector.stop();  // Signal all tasks to stop
+//! collector.stop().await;  // Cancels every task and waits for them
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
 use time::OffsetDateTime;
 use tokio::sync::watch;
-use tokio::time::interval;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use aranet_core::Device;
@@ -59,55 +76,57 @@ use aranet_store::StoredReading;
 use aranet_types::CurrentReading;
 
 use crate::config::DeviceConfig;
-use crate::state::{AppState, CollectorState, DeviceCollectionStats, ReadingEvent};
+use crate::state::{AppState, DeviceCollectionStats, ReadingEvent};
 
 /// Per-device stagger interval to avoid BLE adapter contention on startup.
 const DEVICE_STAGGER_SECS: u64 = 5;
 
-/// Spawn staggered device-polling tasks into the collector's shared `JoinSet`.
-async fn spawn_staggered_device_tasks(
-    collector: &CollectorState,
-    devices: Vec<DeviceConfig>,
-    state: &Arc<AppState>,
-) {
-    for (index, device_config) in devices.into_iter().enumerate() {
-        let state = Arc::clone(state);
-        let stop_rx = collector.subscribe_stop();
-        let stagger = Duration::from_secs(index as u64 * DEVICE_STAGGER_SECS);
-        collector
-            .spawn_device_task(async move {
-                if !stagger.is_zero() {
-                    debug!(
-                        "Staggering start for {} by {}s",
-                        device_config.address,
-                        stagger.as_secs()
-                    );
-                    tokio::time::sleep(stagger).await;
-                }
-                collect_device(state, device_config, stop_rx).await;
-            })
-            .await;
-    }
+/// Longest one poll (connect, read and disconnect) may take before it is
+/// abandoned and counted as a failure, so a hung Bluetooth call can't hold the
+/// adapter. The slowest successful poll, a first connect on Linux that pairs
+/// the sensor and then waits for BlueZ's service discovery, takes up to about
+/// 177 s.
+pub(crate) const BLE_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long `stop` and a reload wait for cancelled tasks before aborting them.
+/// Cancelled tasks exit at their next `select!`, so this is a safety net.
+pub(crate) const TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long shutdown waits for polls still in flight after the collector
+/// stopped, so they can disconnect and store their reading.
+pub(crate) const POLL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The collector's current generation, if it has been started.
+///
+/// Lives in `CollectorState::lifecycle`. Only [`Collector::start`],
+/// [`Collector::stop`] (with [`Collector::shutdown`]) and the reload watcher
+/// lock it.
+#[derive(Default)]
+pub(crate) struct Lifecycle {
+    generation: Option<Generation>,
+    /// Id of the next generation, so a reload watcher recognises its own.
+    next_id: u64,
+    /// Set by [`Collector::shutdown`] and never cleared: `start` starts
+    /// nothing once the service is shutting down.
+    shutting_down: bool,
 }
 
-/// Initialize per-device collection stats from the current configuration.
-async fn initialize_device_stats(state: &AppState, devices: &[DeviceConfig]) {
-    let mut stats = state.collector.device_stats.write().await;
-    stats.clear();
-    for device in devices {
-        stats.push(DeviceCollectionStats {
-            device_id: device.address.clone(),
-            alias: device.alias.clone(),
-            poll_interval: device.poll_interval,
-            last_poll_at: None,
-            last_error_at: None,
-            last_error: None,
-            last_poll_duration_ms: None,
-            success_count: 0,
-            failure_count: 0,
-            polling: false,
-        });
-    }
+/// The tasks one `start` created and `stop` tears down.
+struct Generation {
+    id: u64,
+    /// Parent of every device task's token.
+    cancel: CancellationToken,
+    watcher: JoinHandle<()>,
+    /// Device tasks, keyed by lowercase address.
+    devices: HashMap<String, DeviceTask>,
+}
+
+/// A running device task and the settings it was started with.
+struct DeviceTask {
+    address: String,
+    poll_interval: u64,
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 /// Result of attempting to start the collector.
@@ -116,6 +135,16 @@ pub enum CollectorStartResult {
     Started,
     AlreadyRunning,
     NoDevicesConfigured,
+}
+
+/// Result of stopping the collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectorStopResult {
+    /// The collector was polling at least one device and has stopped.
+    Stopped,
+    /// The collector wasn't polling any device. A collector started without
+    /// devices is still stopped, so devices added later aren't polled.
+    NotRunning,
 }
 
 /// Background collector that polls devices on their configured intervals.
@@ -134,261 +163,448 @@ impl Collector {
     /// This spawns a separate task for each device that polls at the configured interval.
     /// Returns immediately; collection happens in the background.
     ///
-    /// Also spawns a reload watcher task that will restart the collector when
-    /// the device configuration changes via the API.
+    /// Also spawns a reload watcher task that applies later device changes made
+    /// via the API. With no devices configured this returns
+    /// [`CollectorStartResult::NoDevicesConfigured`] but keeps the watcher, so
+    /// devices added later are polled.
+    ///
+    /// Once the service has begun shutting down, this starts nothing and
+    /// returns [`CollectorStartResult::NoDevicesConfigured`].
     pub async fn start(&self) -> CollectorStartResult {
-        if !self.state.collector.try_start() {
+        let mut lifecycle = self.state.collector.lifecycle.lock().await;
+        if lifecycle.shutting_down {
+            info!("Not starting the collector: the service is shutting down");
+            return CollectorStartResult::NoDevicesConfigured;
+        }
+        if lifecycle
+            .generation
+            .as_ref()
+            .is_some_and(|generation| !generation.devices.is_empty())
+        {
             return CollectorStartResult::AlreadyRunning;
         }
 
-        // Reset stop signal if previously stopped
-        self.state.collector.reset_stop();
+        let Lifecycle {
+            generation,
+            next_id,
+            ..
+        } = &mut *lifecycle;
+        let generation = generation.get_or_insert_with(|| {
+            let id = *next_id;
+            *next_id += 1;
+            let cancel = CancellationToken::new();
+            // Subscribe before the config is read below, so any later edit
+            // wakes the watcher.
+            let reload_rx = self.state.collector.subscribe_reload();
+            let watcher = tokio::spawn(watch_for_reload(
+                Arc::clone(&self.state),
+                id,
+                cancel.clone(),
+                reload_rx,
+            ));
+            Generation {
+                id,
+                cancel,
+                watcher,
+                devices: HashMap::new(),
+            }
+        });
 
-        // Spawn the reload watcher before checking for configured devices so a
-        // service started with an empty device list can recover when devices are
-        // added later via the API.
-        let state = Arc::clone(&self.state);
-        self.state
-            .collector
-            .set_reload_watcher(tokio::spawn(async move {
-                watch_for_reload(state).await;
-            }))
-            .await;
+        let devices = self.state.config.read().await.devices.clone();
+        reconcile(&self.state, generation, &devices).await;
 
-        let config = self.state.config.read().await;
-        let devices = config.devices.clone();
-        drop(config);
-
-        if devices.is_empty() {
+        if generation.devices.is_empty() {
             info!("No devices configured for collection");
-            self.state.collector.set_running(false);
-            return CollectorStartResult::NoDevicesConfigured;
+            CollectorStartResult::NoDevicesConfigured
+        } else {
+            info!(
+                "Collector started for {} device(s)",
+                generation.devices.len()
+            );
+            CollectorStartResult::Started
         }
-
-        info!("Starting collector for {} device(s)", devices.len());
-
-        initialize_device_stats(&self.state, &devices).await;
-
-        // Spawn device tasks into the shared JoinSet on CollectorState
-        // This allows the reload watcher to also spawn tasks that are properly tracked
-        spawn_staggered_device_tasks(&self.state.collector, devices, &self.state).await;
-
-        CollectorStartResult::Started
     }
 
-    /// Stop the collector and wait for all tasks to complete.
-    pub async fn stop(&self) {
+    /// Stop the collector and wait for its tasks to finish.
+    ///
+    /// Cancels every device task and the reload watcher, also when no device
+    /// is configured, so devices added later aren't polled until the next
+    /// start. A Bluetooth poll in flight finishes in the background; its
+    /// reading is stored but not broadcast. Returns
+    /// [`CollectorStopResult::NotRunning`] if no device was being polled.
+    pub async fn stop(&self) -> CollectorStopResult {
+        self.stop_generation(false).await
+    }
+
+    /// Stop the collector for good, at service shutdown: what
+    /// [`stop`](Self::stop) does, and every later [`start`](Self::start)
+    /// starts nothing, so a start sent while the service shuts down can't
+    /// leave a collector running.
+    pub(crate) async fn shutdown(&self) -> CollectorStopResult {
+        self.stop_generation(true).await
+    }
+
+    /// Tear down the current generation, holding the lifecycle lock until
+    /// its tasks have finished. With `shutting_down`, also refuse later starts.
+    async fn stop_generation(&self, shutting_down: bool) -> CollectorStopResult {
+        let mut lifecycle = self.state.collector.lifecycle.lock().await;
+        lifecycle.shutting_down |= shutting_down;
+        let Some(generation) = lifecycle.generation.take() else {
+            return CollectorStopResult::NotRunning;
+        };
+
         info!("Stopping collector");
-        self.state.collector.signal_stop();
+        generation.cancel.cancel();
+        self.state.collector.set_running(false);
+        let result = if generation.devices.is_empty() {
+            CollectorStopResult::NotRunning
+        } else {
+            CollectorStopResult::Stopped
+        };
 
-        // Wait for device tasks in the shared JoinSet (with timeout)
-        let stopped_cleanly = self
-            .state
-            .collector
-            .wait_for_device_tasks(Duration::from_secs(10))
-            .await;
+        let mut tasks = vec![generation.watcher];
+        tasks.extend(generation.devices.into_values().map(|task| task.handle));
+        join_or_abort("collector task", tasks, TASK_STOP_TIMEOUT).await;
 
-        if !stopped_cleanly {
-            warn!("Device tasks did not stop within timeout, aborted");
+        // After the join, so no device task can set it again.
+        for stat in self.state.collector.device_stats.write().await.iter_mut() {
+            stat.polling = false;
         }
-
-        let watcher_stopped = self
-            .state
-            .collector
-            .wait_for_reload_watcher(Duration::from_secs(2))
-            .await;
-        if !watcher_stopped {
-            warn!("Reload watcher did not stop within timeout, aborting");
-        }
+        info!("Collector stopped");
+        result
     }
 
     /// Check if the collector is running.
     pub fn is_running(&self) -> bool {
         self.state.collector.is_running()
     }
-
-    /// Get the number of active collection tasks.
-    pub fn task_count(&self) -> usize {
-        let device_task_count = self
-            .state
-            .collector
-            .device_tasks
-            .try_lock()
-            .map(|tasks| tasks.len())
-            .unwrap_or(0);
-        let watcher_count = self
-            .state
-            .collector
-            .reload_watcher
-            .try_lock()
-            .map(|watcher| usize::from(watcher.is_some()))
-            .unwrap_or(0);
-
-        device_task_count + watcher_count
-    }
 }
 
-/// Watch for configuration reload signals and restart collection tasks.
-async fn watch_for_reload(state: Arc<AppState>) {
-    let mut reload_rx = state.collector.subscribe_reload();
-    let mut stop_rx = state.collector.subscribe_stop();
-
-    loop {
-        tokio::select! {
-            result = reload_rx.changed() => {
-                if result.is_err() {
-                    // Sender dropped, exit
-                    break;
+/// Wait up to `limit` for `tasks` to finish, then abort the ones left.
+pub(crate) async fn join_or_abort(what: &str, mut tasks: Vec<JoinHandle<()>>, limit: Duration) {
+    match tokio::time::timeout(limit, join_all(tasks.iter_mut())).await {
+        Ok(results) => {
+            for result in results {
+                if let Err(e) = result
+                    && e.is_panic()
+                {
+                    error!("A {what} panicked: {e}");
                 }
-
-                info!("Configuration reload requested, restarting device tasks");
-
-                // Signal current tasks to stop and wait for them to finish
-                state.collector.signal_stop();
-                state
-                    .collector
-                    .wait_for_device_tasks(Duration::from_secs(5))
-                    .await;
-
-                // Reset stop signal now that tasks have drained
-                state.collector.reset_stop();
-
-                // Read new config
-                let config = state.config.read().await;
-                let devices = config.devices.clone();
-                drop(config);
-
-                initialize_device_stats(&state, &devices).await;
-
-                if devices.is_empty() {
-                    info!("No devices configured after reload");
-                    state.collector.set_running(false);
-                    continue;
-                }
-
-                info!("Restarting collector for {} device(s)", devices.len());
-                state.collector.set_running(true);
-
-                // Spawn new device tasks into the shared JoinSet
-                spawn_staggered_device_tasks(&state.collector, devices, &state).await;
             }
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    info!("Reload watcher received stop signal");
-                    break;
-                }
+        }
+        Err(_) => {
+            let left = tasks.iter().filter(|task| !task.is_finished()).count();
+            warn!(
+                "{left} {what}(s) did not stop within {}s, aborting",
+                limit.as_secs()
+            );
+            for task in &tasks {
+                task.abort();
             }
         }
     }
 }
 
-/// Collect readings from a single device.
+/// The alias configured for `address` right now (exact address match).
+pub(crate) async fn configured_alias(state: &AppState, address: &str) -> Option<String> {
+    state
+        .config
+        .read()
+        .await
+        .devices
+        .iter()
+        .find(|device| device.address == address)
+        .and_then(|device| device.alias.clone())
+}
+
+/// Make `generation`'s device tasks match `desired`, the configured devices.
+///
+/// Tasks are keyed by lowercase address, like the config's duplicate check and
+/// the API's device lookups. A task is stopped only when its device is gone or
+/// its exact address or poll interval changed, so alias edits restart nothing.
+/// New tasks' first polls are `DEVICE_STAGGER_SECS` apart.
+async fn reconcile(state: &Arc<AppState>, generation: &mut Generation, desired: &[DeviceConfig]) {
+    let wanted: HashMap<String, &DeviceConfig> = desired
+        .iter()
+        .map(|device| (device.address.to_lowercase(), device))
+        .collect();
+
+    let outdated: Vec<String> = generation
+        .devices
+        .iter()
+        .filter(|(key, task)| {
+            wanted.get(key.as_str()).is_none_or(|device| {
+                device.address != task.address || device.poll_interval != task.poll_interval
+            })
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut stopped = Vec::new();
+    let mut handles = Vec::new();
+    for key in outdated {
+        if let Some(task) = generation.devices.remove(&key) {
+            info!("Stopping collector for {}", task.address);
+            task.cancel.cancel();
+            stopped.push(key);
+            handles.push(task.handle);
+        }
+    }
+    join_or_abort("device task", handles, TASK_STOP_TIMEOUT).await;
+
+    sync_device_stats(state, desired).await;
+    // A task stopped during a poll never cleared its flag. Match by key: when
+    // only the address's spelling changed, `sync_device_stats` has already
+    // renamed the kept entry to the new spelling.
+    if !stopped.is_empty() {
+        for stat in state.collector.device_stats.write().await.iter_mut() {
+            if stopped.contains(&stat.device_id.to_lowercase()) {
+                stat.polling = false;
+            }
+        }
+    }
+
+    let mut spawned = 0;
+    for device in desired {
+        let key = device.address.to_lowercase();
+        if generation.devices.contains_key(&key) {
+            continue;
+        }
+        let first_poll = Duration::from_secs(spawned * DEVICE_STAGGER_SECS);
+        spawned += 1;
+        let cancel = generation.cancel.child_token();
+        let handle = tokio::spawn(collect_device(
+            Arc::clone(state),
+            device.address.clone(),
+            Duration::from_secs(device.poll_interval),
+            first_poll,
+            cancel.clone(),
+        ));
+        generation.devices.insert(
+            key,
+            DeviceTask {
+                address: device.address.clone(),
+                poll_interval: device.poll_interval,
+                cancel,
+                handle,
+            },
+        );
+    }
+
+    state.collector.set_running(!generation.devices.is_empty());
+}
+
+/// Rebuild the per-device statistics in config order.
+///
+/// A device that stays configured keeps its counters, timestamps and last
+/// error, and takes the config's spelling, alias and poll interval. A new
+/// device starts from zero, and a removed one is dropped.
+async fn sync_device_stats(state: &AppState, desired: &[DeviceConfig]) {
+    let mut stats = state.collector.device_stats.write().await;
+    let mut previous: HashMap<String, DeviceCollectionStats> = stats
+        .drain(..)
+        .map(|stat| (stat.device_id.to_lowercase(), stat))
+        .collect();
+    *stats = desired
+        .iter()
+        .map(|device| {
+            let kept = previous.remove(&device.address.to_lowercase());
+            let fresh = || DeviceCollectionStats {
+                device_id: String::new(),
+                alias: None,
+                poll_interval: 0,
+                last_poll_at: None,
+                last_error_at: None,
+                last_error: None,
+                last_poll_duration_ms: None,
+                success_count: 0,
+                failure_count: 0,
+                polling: false,
+            };
+            DeviceCollectionStats {
+                device_id: device.address.clone(),
+                alias: device.alias.clone(),
+                poll_interval: device.poll_interval,
+                ..kept.unwrap_or_else(fresh)
+            }
+        })
+        .collect();
+}
+
+/// Apply device changes to generation `id` until `cancel` is cancelled.
+async fn watch_for_reload(
+    state: Arc<AppState>,
+    id: u64,
+    cancel: CancellationToken,
+    mut reload_rx: watch::Receiver<u64>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            changed = reload_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+
+        // `stop` holds the lock while it waits for this task, so stop waiting
+        // for the lock as soon as the token is cancelled.
+        let mut lifecycle = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            lifecycle = state.collector.lifecycle.lock() => lifecycle,
+        };
+        // The config read below includes every change signalled so far.
+        reload_rx.mark_unchanged();
+        let Some(generation) = lifecycle
+            .generation
+            .as_mut()
+            .filter(|generation| generation.id == id)
+        else {
+            continue;
+        };
+
+        info!("Device configuration changed, updating collector tasks");
+        let devices = state.config.read().await.devices.clone();
+        reconcile(&state, generation, &devices).await;
+    }
+}
+
+/// Collect readings from a single device every `poll_interval`, the first
+/// time after `first_poll`, until `cancel` is cancelled.
 async fn collect_device(
     state: Arc<AppState>,
-    config: DeviceConfig,
-    mut stop_rx: watch::Receiver<bool>,
+    address: String,
+    poll_interval: Duration,
+    first_poll: Duration,
+    cancel: CancellationToken,
 ) {
-    let device_id = config.address.clone();
-    let alias = config.alias.as_deref().unwrap_or(&device_id);
-    let poll_interval = Duration::from_secs(config.poll_interval);
-
+    let alias = configured_alias(&state, &address)
+        .await
+        .unwrap_or_else(|| address.clone());
     info!(
         "Starting collector for {} (alias: {}, interval: {}s)",
-        device_id, alias, config.poll_interval
+        address,
+        alias,
+        poll_interval.as_secs()
     );
 
-    let mut interval_timer = interval(poll_interval);
+    let mut ticker = tokio::time::interval_at(Instant::now() + first_poll, poll_interval);
     let mut consecutive_failures = 0u32;
 
     loop {
         tokio::select! {
-            _ = interval_timer.tick() => {
-                // Update stats: mark as polling
-                update_device_stat(&state, &device_id, |stat| {
-                    stat.polling = true;
-                }).await;
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
 
-                let poll_start = Instant::now();
-                match poll_device(&state, &device_id).await {
-                    Ok(reading) => {
-                        let poll_duration = poll_start.elapsed();
-                        consecutive_failures = 0;
-                        debug!(
-                            "Collected reading from {}: CO2={} (took {:.1}s)",
-                            device_id, reading.co2, poll_duration.as_secs_f64()
-                        );
+        // Update stats: mark as polling
+        update_device_stat(&state, &address, |stat| {
+            stat.polling = true;
+        })
+        .await;
 
-                        // Update stats
-                        update_device_stat(&state, &device_id, |stat| {
-                            stat.last_poll_at = Some(OffsetDateTime::now_utc());
-                            stat.last_error_at = None;
-                            stat.last_error = None;
-                            stat.last_poll_duration_ms = Some(poll_duration.as_millis() as u64);
-                            stat.success_count += 1;
-                            stat.polling = false;
-                        }).await;
+        // The poll is its own task, so stopping never waits for Bluetooth.
+        let started = Instant::now();
+        let poll = state.collector.polls.spawn(poll_once(
+            Arc::clone(&state),
+            address.clone(),
+            cancel.clone(),
+        ));
+        let outcome = tokio::select! {
+            biased;
+            // Dropping the handle detaches the poll, which finishes on its own.
+            _ = cancel.cancelled() => break,
+            outcome = poll => outcome,
+        };
+        let poll_duration = started.elapsed();
+        let result = match outcome {
+            Ok(Some(result)) => result.map_err(|e| e.to_string()),
+            // Cancelled while waiting for the Bluetooth adapter.
+            Ok(None) => break,
+            Err(e) => Err(format!("poll task failed: {e}")),
+        };
 
-                        // Broadcast the reading to WebSocket clients
-                        let event = ReadingEvent {
-                            device_id: device_id.clone(),
-                            reading,
-                        };
-                        // Check thresholds and send desktop notification
-                        #[cfg(feature = "notifications")]
-                        {
-                            let config = state.config.read().await;
-                            let notif_config = &config.notifications;
-                            if notif_config.enabled {
-                                check_and_notify(&state, &device_id, alias, &event.reading, notif_config).await;
-                            }
-                        }
-                        if state.readings_tx.send(event).is_err() {
-                            debug!("No active WebSocket subscribers for reading broadcast");
-                        }
+        match result {
+            Ok(reading) => {
+                consecutive_failures = 0;
+                debug!(
+                    "Collected reading from {}: CO2={} (took {:.1}s)",
+                    address,
+                    reading.co2,
+                    poll_duration.as_secs_f64()
+                );
+
+                // Update stats
+                update_device_stat(&state, &address, |stat| {
+                    stat.last_poll_at = Some(OffsetDateTime::now_utc());
+                    stat.last_error_at = None;
+                    stat.last_error = None;
+                    stat.last_poll_duration_ms = Some(poll_duration.as_millis() as u64);
+                    stat.success_count += 1;
+                    stat.polling = false;
+                })
+                .await;
+
+                // Broadcast the reading to WebSocket clients
+                let event = ReadingEvent {
+                    device_id: address.clone(),
+                    reading,
+                };
+                // Check thresholds and send desktop notification
+                #[cfg(feature = "notifications")]
+                {
+                    let alias = configured_alias(&state, &address)
+                        .await
+                        .unwrap_or_else(|| address.clone());
+                    let config = state.config.read().await;
+                    let notif_config = &config.notifications;
+                    if notif_config.enabled {
+                        check_and_notify(&state, &address, &alias, &event.reading, notif_config)
+                            .await;
                     }
-                    Err(e) => {
-                        let poll_duration = poll_start.elapsed();
-                        consecutive_failures += 1;
-
-                        // Update stats
-                        update_device_stat(&state, &device_id, |stat| {
-                            stat.last_error_at = Some(OffsetDateTime::now_utc());
-                            stat.last_error = Some(e.to_string());
-                            stat.last_poll_duration_ms = Some(poll_duration.as_millis() as u64);
-                            stat.failure_count += 1;
-                            stat.polling = false;
-                        }).await;
-
-                        if consecutive_failures <= 3 {
-                            warn!(
-                                "Failed to poll {}: {} (attempt {})",
-                                device_id, e, consecutive_failures
-                            );
-                        } else if consecutive_failures == 4 {
-                            error!(
-                                "Failed to poll {} after {} attempts, reducing log frequency",
-                                device_id, consecutive_failures
-                            );
-                        } else if consecutive_failures.is_multiple_of(100) {
-                            error!(
-                                "Failed to poll {} ({} consecutive failures): {}",
-                                device_id, consecutive_failures, e
-                            );
-                        }
-                        // Continue trying - the device may come back online
-                    }
+                }
+                if state.readings_tx.send(event).is_err() {
+                    debug!("No active WebSocket subscribers for reading broadcast");
                 }
             }
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    info!("Collector for {} received stop signal", device_id);
-                    break;
+            Err(e) => {
+                consecutive_failures += 1;
+
+                // Update stats
+                update_device_stat(&state, &address, |stat| {
+                    stat.last_error_at = Some(OffsetDateTime::now_utc());
+                    stat.last_error = Some(e.clone());
+                    stat.last_poll_duration_ms = Some(poll_duration.as_millis() as u64);
+                    stat.failure_count += 1;
+                    stat.polling = false;
+                })
+                .await;
+
+                if consecutive_failures <= 3 {
+                    warn!(
+                        "Failed to poll {}: {} (attempt {})",
+                        address, e, consecutive_failures
+                    );
+                } else if consecutive_failures == 4 {
+                    error!(
+                        "Failed to poll {} after {} attempts, reducing log frequency",
+                        address, consecutive_failures
+                    );
+                } else if consecutive_failures.is_multiple_of(100) {
+                    error!(
+                        "Failed to poll {} ({} consecutive failures): {}",
+                        address, consecutive_failures, e
+                    );
                 }
+                // Continue trying - the device may come back online
             }
         }
     }
 
-    info!("Collector for {} stopped", device_id);
+    info!("Collector for {} stopped", address);
 }
 
 /// Update stats for a specific device.
@@ -402,41 +618,54 @@ where
     }
 }
 
-/// Poll a single device and store the reading.
+/// Take the Bluetooth adapter, read `address` once and store the reading.
 ///
-/// Acquires the BLE semaphore to ensure only one device uses the Bluetooth
-/// adapter at a time. This prevents BLE contention that causes connection
-/// failures and stale data when multiple devices are configured. The device
-/// itself is read through the collector's [`DeviceReader`].
-async fn poll_device(state: &AppState, device_id: &str) -> Result<StoredReading, CollectorError> {
+/// Returns `None`, without touching the adapter, if `cancel` fires while this
+/// waits for the adapter. Once the read has started it runs until it finishes
+/// or `BLE_POLL_TIMEOUT` passes, even if `cancel` fires, so the device is
+/// disconnected and a reading that arrives is stored.
+async fn poll_once(
+    state: Arc<AppState>,
+    address: String,
+    cancel: CancellationToken,
+) -> Option<Result<StoredReading, CollectorError>> {
     // Serialize BLE adapter access — only one device at a time
-    let permit = state
-        .ble_semaphore
-        .acquire()
-        .await
-        .map_err(|_| CollectorError::BleBusy)?;
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return None,
+        permit = state.ble_semaphore.acquire() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return Some(Err(CollectorError::BleBusy)),
+        },
+    };
 
-    // Connect, read the current values and disconnect
-    let reading_result = state.collector.reader().read_current(device_id).await;
+    // Connect, read and disconnect, within the time limit
+    let read = tokio::time::timeout(
+        BLE_POLL_TIMEOUT,
+        state.collector.reader().read_current(&address),
+    )
+    .await;
 
     // Drop the BLE permit so other devices can poll
     drop(permit);
-    let reading = reading_result?;
+    let reading = match read {
+        Ok(Ok(reading)) => reading,
+        Ok(Err(e)) => return Some(Err(e)),
+        Err(_) => return Some(Err(CollectorError::Timeout(BLE_POLL_TIMEOUT))),
+    };
 
     // Store the reading
-    let row_id = state
-        .with_store_write(|store| store.insert_reading(device_id, &reading))
+    let stored = state
+        .with_store_write(|store| store.insert_reading(&address, &reading))
         .await
-        .map_err(CollectorError::Store)?;
-
-    // Return the stored reading
-    Ok(StoredReading::from_reading_with_id(
-        device_id, &reading, row_id,
-    ))
+        .map(|row_id| StoredReading::from_reading_with_id(&address, &reading, row_id))
+        .map_err(CollectorError::Store);
+    Some(stored)
 }
 
 /// Collector errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CollectorError {
     #[error("BLE adapter busy (semaphore closed)")]
     BleBusy,
@@ -446,6 +675,9 @@ pub enum CollectorError {
     Read(aranet_core::Error),
     #[error("Failed to store: {0}")]
     Store(aranet_store::Error),
+    /// The poll didn't finish within its time limit.
+    #[error("Bluetooth poll timed out after {}s", .0.as_secs())]
+    Timeout(Duration),
 }
 
 /// Reads the current values of one device for the collector.
@@ -567,7 +799,7 @@ use notifications::check_and_notify;
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::test_support::{FakeReader, TestState, settle};
+    use crate::test_support::{FakeReader, ReadRecord, TestState, settle};
 
     fn create_test_state() -> TestState {
         TestState::in_memory()
@@ -596,28 +828,25 @@ mod tests {
         assert!(!collector.is_running());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_collector_start_no_devices() {
-        let t = TestState::with_reader(Config::default(), FakeReader::new());
-        let state = Arc::clone(&t.state);
-        let collector = Collector::new(Arc::clone(&state));
+        let (t, reader, collector) = fake_collector(Vec::new());
 
         // Start with no devices configured
         let result = collector.start().await;
 
         assert_eq!(result, CollectorStartResult::NoDevicesConfigured);
         assert!(!collector.is_running());
-        let stats = state.collector.device_stats.read().await;
-        assert!(stats.is_empty());
+        assert!(t.state.collector.device_stats.read().await.is_empty());
 
-        let watcher = state.collector.reload_watcher.lock().await;
-        assert!(
-            watcher.is_some(),
-            "reload watcher should stay alive for future config changes"
-        );
-        drop(watcher);
+        // The collector keeps watching the config: a device added later is polled.
+        t.state.config.write().await.devices.push(device(A, 60));
+        t.state.on_devices_changed().await;
+        settle().await;
+        assert_eq!(reader.reads_of(A).len(), 1);
+        assert!(collector.is_running());
 
-        collector.stop().await;
+        assert_eq!(collector.stop().await, CollectorStopResult::Stopped);
     }
 
     #[tokio::test(start_paused = true)]
@@ -673,16 +902,14 @@ mod tests {
         collector.stop().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_collector_stop() {
-        let t = create_test_state();
-        let state = Arc::clone(&t.state);
-        state.collector.set_running(true);
-
-        let collector = Collector::new(Arc::clone(&state));
+        let (_t, reader, collector) = fake_collector(vec![device(A, 60)]);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        reader.wait_for_reads(1).await;
         assert!(collector.is_running());
 
-        collector.stop().await;
+        assert_eq!(collector.stop().await, CollectorStopResult::Stopped);
         assert!(!collector.is_running());
     }
 
@@ -812,6 +1039,12 @@ mod tests {
     }
 
     #[test]
+    fn test_collector_error_timeout_display() {
+        let err = CollectorError::Timeout(BLE_POLL_TIMEOUT);
+        assert_eq!(err.to_string(), "Bluetooth poll timed out after 180s");
+    }
+
+    #[test]
     fn test_collector_error_ble_busy_display() {
         let err = CollectorError::BleBusy;
         assert_eq!(err.to_string(), "BLE adapter busy (semaphore closed)");
@@ -930,5 +1163,458 @@ mod tests {
         assert_eq!(stored, 1, "the fake's reading is stored");
 
         collector.stop().await;
+    }
+
+    // ------------------------------------------------------------------
+    // Lifecycle and reload tests. They run on the paused clock with the fake
+    // reader, whose reads take no time unless held. With 60 s intervals, A is
+    // read at 0, 60, 120, … s and B, staggered by 5 s, at 5, 65, 125, … s.
+    // ------------------------------------------------------------------
+
+    const A: &str = "Aranet4 AAAAA";
+    const B: &str = "Aranet4 BBBBB";
+    const C: &str = "Aranet4 CCCCC";
+
+    fn device(address: &str, poll_interval: u64) -> DeviceConfig {
+        DeviceConfig {
+            address: address.to_string(),
+            alias: None,
+            poll_interval,
+        }
+    }
+
+    /// A collector for `devices` that reads through a fake reader.
+    fn fake_collector(devices: Vec<DeviceConfig>) -> (TestState, Arc<FakeReader>, Collector) {
+        let reader = FakeReader::new();
+        let t = TestState::with_reader(config_with_devices(devices), reader.clone());
+        let collector = Collector::new(Arc::clone(&t.state));
+        (t, reader, collector)
+    }
+
+    /// A copy of `address`'s statistics.
+    async fn stat(t: &TestState, address: &str) -> DeviceCollectionStats {
+        t.state
+            .collector
+            .device_stats
+            .read()
+            .await
+            .iter()
+            .find(|stat| stat.device_id == address)
+            .cloned()
+            .unwrap_or_else(|| panic!("no stats for {address}"))
+    }
+
+    /// The reads of `address` that started after `since`.
+    fn reads_after(
+        reader: &FakeReader,
+        address: &str,
+        since: tokio::time::Instant,
+    ) -> Vec<ReadRecord> {
+        reader
+            .reads_of(address)
+            .into_iter()
+            .filter(|read| read.started > since)
+            .collect()
+    }
+
+    /// Seconds from `t0` to the start of each read.
+    fn start_secs(reads: &[ReadRecord], t0: tokio::time::Instant) -> Vec<f64> {
+        reads
+            .iter()
+            .map(|read| (read.started - t0).as_secs_f64())
+            .collect()
+    }
+
+    /// Asserts that the reads started `expected` seconds after `t0`, ±1 s each.
+    fn assert_read_times(reads: &[ReadRecord], t0: tokio::time::Instant, expected: &[u64]) {
+        let actual = start_secs(reads, t0);
+        assert!(
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| (actual - *expected as f64).abs() <= 1.0),
+            "reads started at {actual:?} s, expected {expected:?} s"
+        );
+    }
+
+    /// Asserts that no two of `reads` started less than 59 s apart.
+    fn assert_one_poller(reads: &[ReadRecord], t0: tokio::time::Instant) {
+        assert!(
+            reads
+                .windows(2)
+                .all(|pair| pair[1].started - pair[0].started >= Duration::from_secs(59)),
+            "more than one poller: reads started at {:?} s",
+            start_secs(reads, t0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_returns_promptly_while_a_poll_is_in_flight() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60)]);
+        let mut events = t.state.readings_tx.subscribe();
+        reader.hold(A);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        reader.wait_for_reads(1).await;
+
+        let stopped = tokio::time::timeout(Duration::from_secs(2), collector.stop()).await;
+        assert_eq!(
+            stopped,
+            Ok(CollectorStopResult::Stopped),
+            "stop waited for the Bluetooth read"
+        );
+        assert!(!collector.is_running());
+
+        // The read in flight isn't cancelled: it finishes in the background and
+        // stores its reading, which isn't broadcast. Nothing polls again.
+        reader.release(A);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        let reads = reader.reads_of(A);
+        assert_eq!(reads.len(), 1);
+        assert!(
+            reads[0].finished.is_some() && reads[0].ok,
+            "the stopped poll was cancelled mid-read"
+        );
+        let stored = t
+            .state
+            .with_store_read(|store| store.count_readings(Some(A)))
+            .await
+            .unwrap();
+        assert_eq!(stored, 1, "the stopped poll did not store its reading");
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a stopped poll broadcast its reading"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_cancels_a_poll_waiting_for_the_adapter() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+        reader.hold(A);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        // A's read holds the Bluetooth adapter, and from 5 s B's poll waits for it.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(reader.reads_of(B).is_empty());
+        assert!(
+            stat(&t, B).await.polling,
+            "B's poll is not waiting for the adapter"
+        );
+
+        let stopped = tokio::time::timeout(Duration::from_secs(2), collector.stop()).await;
+        assert_eq!(
+            stopped,
+            Ok(CollectorStopResult::Stopped),
+            "stop waited for the polls"
+        );
+
+        // B's poll gives up its place in the queue: when A's read ends, B isn't
+        // read, and nothing is stored for it.
+        reader.release(A);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(reader.reads_of(B).is_empty(), "B was read after the stop");
+        let stored = t
+            .state
+            .with_store_read(|store| store.count_readings(Some(B)))
+            .await
+            .unwrap();
+        assert_eq!(stored, 0, "a reading of B was stored after the stop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_racing_stop_leaves_exactly_one_poller() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60)]);
+        reader.hold(A);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        reader.wait_for_reads(1).await;
+
+        // Stop from another task, then start again straight away.
+        let stopper = Collector::new(Arc::clone(&t.state));
+        let stop = tokio::spawn(async move { stopper.stop().await });
+        tokio::task::yield_now().await;
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        assert_eq!(stop.await.unwrap(), CollectorStopResult::Stopped);
+
+        let released_at = tokio::time::Instant::now();
+        reader.release(A);
+        tokio::time::sleep(Duration::from_secs(590)).await;
+
+        assert!(collector.is_running());
+        let reads = reads_after(&reader, A, released_at);
+        assert!(
+            reads.len() >= 9,
+            "A was not polled every 60 s after the restart: reads started at {:?} s",
+            start_secs(&reads, released_at)
+        );
+        assert_one_poller(&reads, released_at);
+
+        // The running collector's reload watcher is alive.
+        t.state.config.write().await.devices.push(device(B, 60));
+        t.state.on_devices_changed().await;
+        settle().await;
+        assert_eq!(
+            reader.reads_of(B).len(),
+            1,
+            "a device added later is not polled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_racing_stop_does_not_resurrect_collector() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60)]);
+        reader.hold(A);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        reader.wait_for_reads(1).await;
+
+        t.state.on_devices_changed().await;
+        tokio::task::yield_now().await;
+        assert_eq!(collector.stop().await, CollectorStopResult::Stopped);
+        reader.release(A);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+
+        assert_eq!(reader.reads_of(A).len(), 1, "A was polled after the stop");
+        assert!(
+            !collector.is_running(),
+            "a reload restarted the stopped collector"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_during_reload_does_not_duplicate_pollers() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60)]);
+        reader.hold(A);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        reader.wait_for_reads(1).await;
+
+        t.state.on_devices_changed().await;
+        settle().await;
+        assert_eq!(
+            collector.start().await,
+            CollectorStartResult::AlreadyRunning
+        );
+
+        let released_at = tokio::time::Instant::now();
+        reader.release(A);
+        tokio::time::sleep(Duration::from_secs(590)).await;
+
+        let reads = reads_after(&reader, A, released_at);
+        assert!(
+            reads.len() >= 9,
+            "reads started at {:?} s",
+            start_secs(&reads, released_at)
+        );
+        assert_one_poller(&reads, released_at);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_after_earlier_reload_polls_once_per_interval() {
+        // A replayed reload would race each device task's first poll, so repeat it.
+        for round in 0..20 {
+            let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+            // A device edit before the collector starts.
+            t.state.collector.signal_reload();
+            assert_eq!(collector.start().await, CollectorStartResult::Started);
+            tokio::time::sleep(Duration::from_secs(59)).await;
+
+            assert_eq!(reader.reads_of(A).len(), 1, "round {round}: reads of A");
+            assert_eq!(reader.reads_of(B).len(), 1, "round {round}: reads of B");
+            assert_eq!(collector.stop().await, CollectorStopResult::Stopped);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stagger_wait_is_cancellable() {
+        let (_t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+
+        // B is still waiting out its 5 s start stagger.
+        let stopped = tokio::time::timeout(Duration::from_secs(1), collector.stop()).await;
+        assert_eq!(
+            stopped,
+            Ok(CollectorStopResult::Stopped),
+            "stop waited out B's start stagger"
+        );
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(reader.reads_of(B).is_empty(), "B was polled after the stop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_poll_times_out_and_frees_the_adapter() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+        reader.hold(A); // A never answers
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        tokio::time::sleep(BLE_POLL_TIMEOUT + Duration::from_secs(60)).await;
+
+        assert!(
+            !reader.reads_of(B).is_empty(),
+            "B never got the Bluetooth adapter"
+        );
+        let a = stat(&t, A).await;
+        assert_eq!(a.failure_count, 1);
+        let error = a.last_error.unwrap_or_default();
+        assert!(
+            error.contains("timed out"),
+            "unexpected last_error: {error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn alias_change_keeps_tasks_and_stats() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        tokio::time::sleep(Duration::from_secs(130)).await;
+        assert_eq!(reader.reads_of(A).len(), 3);
+        assert_eq!(reader.reads_of(B).len(), 3);
+        assert_eq!(stat(&t, A).await.success_count, 3);
+        assert_eq!(stat(&t, B).await.success_count, 3);
+
+        t.state.config.write().await.devices[0].alias = Some("Kitchen".to_string());
+        t.state.on_devices_changed().await;
+        settle().await;
+
+        assert_eq!(reader.reads_of(A).len(), 3, "the alias edit re-polled A");
+        assert_eq!(reader.reads_of(B).len(), 3, "the alias edit re-polled B");
+        let a = stat(&t, A).await;
+        assert_eq!(a.success_count, 3, "the alias edit reset A's counters");
+        assert_eq!(stat(&t, B).await.success_count, 3);
+        assert_eq!(a.alias.as_deref(), Some("Kitchen"));
+
+        tokio::time::sleep(Duration::from_secs(52)).await;
+        assert_read_times(&reader.reads_of(A), t0, &[0, 60, 120, 180]);
+        assert_eq!(reader.reads_of(B).len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adding_device_keeps_existing_schedule() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        tokio::time::sleep(Duration::from_secs(130)).await;
+
+        t.state.config.write().await.devices.push(device(C, 60));
+        t.state.on_devices_changed().await;
+        settle().await;
+
+        assert_eq!(reader.reads_of(A).len(), 3, "adding C re-polled A");
+        assert_eq!(reader.reads_of(B).len(), 3, "adding C re-polled B");
+        assert_read_times(&reader.reads_of(C), t0, &[130]);
+        assert_eq!(stat(&t, A).await.success_count, 3);
+        assert_eq!(stat(&t, B).await.success_count, 3);
+        assert_eq!(stat(&t, C).await.success_count, 1);
+
+        tokio::time::sleep(Duration::from_secs(52)).await;
+        assert_read_times(&reader.reads_of(A), t0, &[0, 60, 120, 180]);
+        assert_read_times(&reader.reads_of(B), t0, &[5, 65, 125]);
+        assert_read_times(&reader.reads_of(C), t0, &[130]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_device_stops_only_that_device() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        tokio::time::sleep(Duration::from_secs(130)).await;
+
+        t.state
+            .config
+            .write()
+            .await
+            .devices
+            .retain(|d| d.address != B);
+        t.state.on_devices_changed().await;
+        settle().await;
+
+        assert_eq!(reader.reads_of(A).len(), 3, "removing B re-polled A");
+        let stats = t.state.collector.device_stats.read().await.clone();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].device_id, A);
+        assert_eq!(stats[0].success_count, 3, "removing B reset A's counters");
+
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_read_times(&reader.reads_of(A), t0, &[0, 60, 120, 180, 240]);
+        assert_eq!(
+            reader.reads_of(B).len(),
+            3,
+            "B was polled after its removal"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_interval_change_restarts_only_that_device() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        tokio::time::sleep(Duration::from_secs(130)).await;
+
+        t.state.config.write().await.devices[0].poll_interval = 120;
+        t.state.on_devices_changed().await;
+        settle().await;
+
+        // A restarts with its new interval and is polled at once; B is untouched.
+        assert_read_times(&reader.reads_of(A), t0, &[0, 60, 120, 130]);
+        assert_eq!(reader.reads_of(B).len(), 3, "B was restarted");
+        assert_eq!(
+            (
+                stat(&t, A).await.success_count,
+                stat(&t, B).await.success_count
+            ),
+            (4, 3),
+            "the interval change reset the counters"
+        );
+        assert_eq!(stat(&t, A).await.poll_interval, 120);
+
+        tokio::time::sleep(Duration::from_secs(250)).await;
+        assert_read_times(&reader.reads_of(A), t0, &[0, 60, 120, 130, 250, 370]);
+        assert_read_times(&reader.reads_of(B), t0, &[5, 65, 125, 185, 245, 305, 365]);
+        assert_eq!(stat(&t, A).await.success_count, 6);
+        assert_eq!(stat(&t, B).await.success_count, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn device_edit_keeps_collector_uptime() {
+        let (t, reader, collector) = fake_collector(vec![device(A, 60)]);
+        // Hold A's poll, so a reload that restarts A can't finish before the check.
+        reader.hold(A);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        reader.wait_for_reads(1).await;
+        let before = t.state.collector.started_at();
+        assert!(before.is_some());
+
+        t.state.config.write().await.devices[0].alias = Some("Kitchen".to_string());
+        t.state.on_devices_changed().await;
+        settle().await;
+
+        assert_eq!(
+            t.state.collector.started_at(),
+            before,
+            "the alias edit reset the collector uptime"
+        );
+        assert!(collector.is_running());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_does_not_wait_for_a_reload_queued_behind_it() {
+        let (t, _reader, collector) = fake_collector(vec![device(A, 60)]);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+
+        // Hold the lifecycle lock, so a stop and then the reload watcher queue for it.
+        let lifecycle = t.state.collector.lifecycle.lock().await;
+        let stopper = Collector::new(Arc::clone(&t.state));
+        let stop = tokio::spawn(async move { stopper.stop().await });
+        settle().await;
+        t.state.on_devices_changed().await;
+        settle().await;
+        drop(lifecycle);
+
+        // The stop gets the lock first and cancels the watcher, which has to
+        // leave the queue instead of waiting for the lock the stop holds.
+        let stopped = tokio::time::timeout(Duration::from_secs(1), stop)
+            .await
+            .expect("stop waited for the reload watcher it had cancelled");
+        assert_eq!(stopped.unwrap(), CollectorStopResult::Stopped);
+        assert!(!collector.is_running());
     }
 }
