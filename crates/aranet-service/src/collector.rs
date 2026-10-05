@@ -48,6 +48,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use tokio::time::interval;
@@ -55,6 +56,7 @@ use tracing::{debug, error, info, warn};
 
 use aranet_core::Device;
 use aranet_store::StoredReading;
+use aranet_types::CurrentReading;
 
 use crate::config::DeviceConfig;
 use crate::state::{AppState, CollectorState, DeviceCollectionStats, ReadingEvent};
@@ -404,7 +406,8 @@ where
 ///
 /// Acquires the BLE semaphore to ensure only one device uses the Bluetooth
 /// adapter at a time. This prevents BLE contention that causes connection
-/// failures and stale data when multiple devices are configured.
+/// failures and stale data when multiple devices are configured. The device
+/// itself is read through the collector's [`DeviceReader`].
 async fn poll_device(state: &AppState, device_id: &str) -> Result<StoredReading, CollectorError> {
     // Serialize BLE adapter access — only one device at a time
     let permit = state
@@ -413,23 +416,12 @@ async fn poll_device(state: &AppState, device_id: &str) -> Result<StoredReading,
         .await
         .map_err(|_| CollectorError::BleBusy)?;
 
-    // Connect with moderate timeouts — fail fast and retry rather than blocking
-    let config = aranet_core::device::ConnectionConfig::default();
-    let device = Device::connect_with_config(device_id, config)
-        .await
-        .map_err(CollectorError::Connect)?;
-
-    // Read current values
-    let reading_result = device.read_current().await;
-
-    // Always disconnect after the read attempt to avoid relying on best-effort Drop cleanup.
-    if let Err(e) = device.disconnect().await {
-        debug!("Failed to disconnect {} after poll: {}", device_id, e);
-    }
+    // Connect, read the current values and disconnect
+    let reading_result = state.collector.reader().read_current(device_id).await;
 
     // Drop the BLE permit so other devices can poll
     drop(permit);
-    let reading = reading_result.map_err(CollectorError::Read)?;
+    let reading = reading_result?;
 
     // Store the reading
     let row_id = state
@@ -454,6 +446,48 @@ pub enum CollectorError {
     Read(aranet_core::Error),
     #[error("Failed to store: {0}")]
     Store(aranet_store::Error),
+}
+
+/// Reads the current values of one device for the collector.
+///
+/// The collector calls it while holding the BLE permit
+/// (`AppState::ble_semaphore`), so two reads never overlap. Production uses
+/// [`BleDeviceReader`]; tests put a fake behind `CollectorState::reader()`
+/// so they never touch Bluetooth.
+pub(crate) trait DeviceReader: Send + Sync + 'static {
+    /// Connect to `address`, read the current values and disconnect.
+    fn read_current<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> BoxFuture<'a, Result<CurrentReading, CollectorError>>;
+}
+
+/// Reads devices over Bluetooth with [`aranet_core::Device`].
+pub(crate) struct BleDeviceReader;
+
+impl DeviceReader for BleDeviceReader {
+    fn read_current<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> BoxFuture<'a, Result<CurrentReading, CollectorError>> {
+        Box::pin(async move {
+            // Connect with moderate timeouts — fail fast and retry rather than blocking
+            let config = aranet_core::device::ConnectionConfig::default();
+            let device = Device::connect_with_config(address, config)
+                .await
+                .map_err(CollectorError::Connect)?;
+
+            // Read current values
+            let reading_result = device.read_current().await;
+
+            // Always disconnect after the read attempt to avoid relying on best-effort Drop cleanup.
+            if let Err(e) = device.disconnect().await {
+                debug!("Failed to disconnect {} after poll: {}", address, e);
+            }
+
+            reading_result.map_err(CollectorError::Read)
+        })
+    }
 }
 
 #[cfg(feature = "notifications")]
