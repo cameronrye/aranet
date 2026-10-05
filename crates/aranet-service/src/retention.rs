@@ -134,9 +134,14 @@ pub(crate) fn spawn(state: Arc<AppState>, config: RetentionConfig) -> Option<Joi
     }))
 }
 
-/// When a table's rows are deleted: "after N days", or "never" without a limit.
+/// When a table's rows are deleted: "after N days" ("after 1 day"), or "never"
+/// without a limit.
 fn describe(days: Option<u32>) -> String {
-    days.map_or_else(|| "never".to_string(), |days| format!("after {days} days"))
+    match days {
+        None => "never".to_string(),
+        Some(1) => "after 1 day".to_string(),
+        Some(days) => format!("after {days} days"),
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +505,12 @@ mod tests {
     async fn retention_not_spawned_when_disabled() {
         let t = TestState::in_memory();
         assert!(spawn(Arc::clone(&t.state), RetentionConfig::default()).is_none());
+    }
+
+    #[test]
+    fn describe_says_day_for_a_one_day_limit() {
+        assert_eq!(describe(None), "never");
+        assert_eq!(describe(Some(1)), "after 1 day");
+        assert_eq!(describe(Some(30)), "after 30 days");
     }
 }
