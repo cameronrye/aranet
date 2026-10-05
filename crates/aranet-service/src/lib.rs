@@ -50,6 +50,16 @@
 //! poll_interval = 60
 //! ```
 //!
+//! Readings and cached history are kept until deleted by hand. To make the
+//! service delete older rows at startup and then every hour, set retention
+//! limits in days, and restart the service after changing them:
+//!
+//! ```toml
+//! [storage.retention]
+//! readings_days = 365 # readings the service polled
+//! history_days = 730  # history cached by `aranet sync`, shared with the CLI
+//! ```
+//!
 //! # Security
 //!
 //! Optional security features can be enabled:
@@ -227,6 +237,7 @@ pub mod config;
 pub mod dashboard;
 mod db;
 pub mod middleware;
+mod retention;
 pub mod state;
 pub mod ws;
 
@@ -236,7 +247,8 @@ mod test_support;
 pub use collector::Collector;
 pub use config::{
     Config, ConfigError, DeviceConfig, InfluxDbConfig, MqttConfig, NotificationConfig,
-    PrometheusConfig, SecurityConfig, ServerConfig, StorageConfig, WebhookConfig, WebhookEndpoint,
+    PrometheusConfig, RetentionConfig, SecurityConfig, ServerConfig, StorageConfig, WebhookConfig,
+    WebhookEndpoint,
 };
 pub use state::{AppState, ReadingEvent};
 
@@ -385,6 +397,10 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // waits for them.
     #[cfg_attr(not(feature = "prometheus"), allow(unused_mut))]
     let mut background: Vec<JoinHandle<()>> = Vec::new();
+
+    if let Some(handle) = retention::spawn(Arc::clone(&state), config.storage.retention.clone()) {
+        background.push(handle);
+    }
 
     if !options.no_collector {
         Collector::new(Arc::clone(&state)).start().await;
