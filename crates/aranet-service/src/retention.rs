@@ -1,0 +1,368 @@
+//! Optional data retention (`[storage.retention]`).
+//!
+//! With a limit set, [`spawn`] starts a task that deletes readings and cached
+//! history older than the limit at startup and then every hour. Retention is
+//! off by default: the database is shared with the CLI's history cache, and
+//! aranet keeps data until the user deletes it.
+//!
+//! Rows are deleted [`PRUNE_BATCH_ROWS`] at a time, each batch its own store
+//! write on the blocking pool. The writer lock is first-come first-served, so
+//! a collector insert that queues during a batch runs before the next batch,
+//! and other processes never wait long for the database. After shutdown is
+//! signalled, no new batch starts, so a long first pass doesn't hold up a
+//! restart. The service never runs `VACUUM`, so the file stops growing but
+//! doesn't shrink.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aranet_store::{PRUNE_BATCH_ROWS, Store};
+use time::OffsetDateTime;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
+use tracing::{info, warn};
+
+use crate::config::RetentionConfig;
+use crate::state::AppState;
+
+/// Time between retention passes after the one at startup.
+pub(crate) const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Rows deleted by one retention pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PruneReport {
+    /// Readings deleted.
+    pub(crate) readings: u64,
+    /// Cached history records deleted.
+    pub(crate) history: u64,
+}
+
+/// One table's batch delete: `Store::prune_readings_batch` or
+/// `Store::prune_history_batch`.
+type PruneBatch = fn(&Store, OffsetDateTime, u32) -> aranet_store::Result<u64>;
+
+/// Delete the rows older than the retention limits, counted back from `now`.
+///
+/// A table without a limit is left alone. Each table is pruned in batches
+/// until a batch deletes fewer than [`PRUNE_BATCH_ROWS`] rows. Once
+/// [`AppState::signal_shutdown`] has been called, no new batch starts: the
+/// pass returns what it has deleted so far, and the next start deletes the
+/// rest.
+pub(crate) async fn prune_once(
+    state: &AppState,
+    config: &RetentionConfig,
+    now: OffsetDateTime,
+) -> aranet_store::Result<PruneReport> {
+    let mut report = PruneReport::default();
+    if let Some(days) = config.readings_days {
+        let cutoff = now - time::Duration::days(i64::from(days));
+        report.readings = prune_older_than(state, Store::prune_readings_batch, cutoff).await?;
+    }
+    if let Some(days) = config.history_days {
+        let cutoff = now - time::Duration::days(i64::from(days));
+        report.history = prune_older_than(state, Store::prune_history_batch, cutoff).await?;
+    }
+    Ok(report)
+}
+
+/// Run `prune_batch` until it deletes fewer than [`PRUNE_BATCH_ROWS`] rows or
+/// shutdown is signalled, and return the total deleted.
+async fn prune_older_than(
+    state: &AppState,
+    prune_batch: PruneBatch,
+    cutoff: OffsetDateTime,
+) -> aranet_store::Result<u64> {
+    let shutdown = state.subscribe_shutdown();
+    let mut total = 0;
+    // The flag is read before every batch, so shutdown waits for at most the
+    // batch in flight, not for the whole backlog.
+    while !*shutdown.borrow() {
+        let deleted = state
+            .with_store_write(move |store| prune_batch(store, cutoff, PRUNE_BATCH_ROWS))
+            .await?;
+        total += deleted;
+        if deleted < u64::from(PRUNE_BATCH_ROWS) {
+            break;
+        }
+        // Let other tasks run between batches; a collector insert that queued
+        // on the writer lock during this batch goes first.
+        tokio::task::yield_now().await;
+    }
+    Ok(total)
+}
+
+/// Start the retention task, or return `None` when retention is off.
+///
+/// The task prunes at once, then every [`RETENTION_INTERVAL`], and returns
+/// after [`AppState::signal_shutdown`], within one batch when a pass is
+/// running. It reads `config` once, so changing the limits needs a restart.
+pub(crate) fn spawn(state: Arc<AppState>, config: RetentionConfig) -> Option<JoinHandle<()>> {
+    if config.is_disabled() {
+        return None;
+    }
+    info!(
+        "Retention: readings are deleted {}, history {}; pruning at startup and every hour",
+        describe(config.readings_days),
+        describe(config.history_days),
+    );
+
+    let mut shutdown = state.subscribe_shutdown();
+    Some(tokio::spawn(async move {
+        // The first tick completes at once, so the first pass runs at startup.
+        let mut interval = tokio::time::interval(RETENTION_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    match prune_once(&state, &config, OffsetDateTime::now_utc()).await {
+                        Ok(report) if report != PruneReport::default() => info!(
+                            "Retention: deleted {} readings and {} history records older than the retention limits",
+                            report.readings, report.history
+                        ),
+                        Ok(_) => {}
+                        Err(e) => warn!("Retention: pruning failed, retrying in an hour: {e}"),
+                    }
+                }
+            }
+        }
+    }))
+}
+
+/// When a table's rows are deleted: "after N days", or "never" without a limit.
+fn describe(days: Option<u32>) -> String {
+    days.map_or_else(|| "never".to_string(), |days| format!("after {days} days"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aranet_store::{PRUNE_BATCH_ROWS, ReadingQuery};
+    use aranet_types::{CurrentReading, HistoryRecord};
+    use time::OffsetDateTime;
+
+    use super::*;
+    use crate::config::RetentionConfig;
+    use crate::state::AppState;
+    use crate::test_support::{TestState, settle};
+
+    /// A fixed "now" (2027-01-15T08:00:00Z) for the tests that pass their own clock.
+    fn fixed_now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    fn keep_days(readings_days: Option<u32>, history_days: Option<u32>) -> RetentionConfig {
+        RetentionConfig {
+            readings_days,
+            history_days,
+        }
+    }
+
+    async fn insert_reading_at(state: &AppState, captured_at: OffsetDateTime) {
+        state
+            .with_store_write(move |store| {
+                let reading = CurrentReading {
+                    co2: 800,
+                    captured_at: Some(captured_at),
+                    ..Default::default()
+                };
+                store.insert_reading("dev", &reading).map(|_| ())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn insert_history_at(state: &AppState, timestamp: OffsetDateTime) {
+        let record = HistoryRecord {
+            timestamp,
+            co2: 800,
+            temperature: 21.0,
+            pressure: 1013.0,
+            humidity: 40,
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+        };
+        let inserted = state
+            .with_store_write(move |store| store.insert_history("dev", &[record]))
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+    }
+
+    /// (readings, history records) in the store.
+    async fn counts(state: &AppState) -> (u64, u64) {
+        state
+            .with_store_read(|store| Ok((store.count_readings(None)?, store.count_history(None)?)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prune_once_deletes_only_rows_older_than_cutoff() {
+        let t = TestState::in_memory();
+        let now = fixed_now();
+        insert_reading_at(&t.state, now - time::Duration::days(8)).await;
+        insert_reading_at(&t.state, now - time::Duration::days(1)).await;
+
+        let report = prune_once(&t.state, &keep_days(Some(7), None), now)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report,
+            PruneReport {
+                readings: 1,
+                history: 0
+            }
+        );
+        let left = t
+            .state
+            .with_store_read(|store| store.query_readings(&ReadingQuery::new()))
+            .await
+            .unwrap();
+        let left: Vec<_> = left.iter().map(|r| r.captured_at).collect();
+        assert_eq!(left, [now - time::Duration::days(1)]);
+    }
+
+    #[tokio::test]
+    async fn prune_once_leaves_history_unless_history_days_set() {
+        let t = TestState::in_memory();
+        let now = fixed_now();
+        for days in [8, 1] {
+            insert_reading_at(&t.state, now - time::Duration::days(days)).await;
+            insert_history_at(&t.state, now - time::Duration::days(days)).await;
+        }
+
+        let report = prune_once(&t.state, &keep_days(Some(7), None), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            PruneReport {
+                readings: 1,
+                history: 0
+            }
+        );
+        assert_eq!(counts(&t.state).await, (1, 2));
+
+        let report = prune_once(&t.state, &keep_days(Some(7), Some(7)), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            PruneReport {
+                readings: 0,
+                history: 1
+            }
+        );
+        assert_eq!(counts(&t.state).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn prune_once_deletes_more_than_one_batch() {
+        let t = TestState::in_memory();
+        let now = fixed_now();
+        let old = now - time::Duration::days(30);
+        t.state
+            .with_store_write(move |store| {
+                for _ in 0..=PRUNE_BATCH_ROWS {
+                    let reading = CurrentReading {
+                        captured_at: Some(old),
+                        ..Default::default()
+                    };
+                    store.insert_reading("dev", &reading)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        insert_reading_at(&t.state, now).await;
+
+        let report = prune_once(&t.state, &keep_days(Some(7), None), now)
+            .await
+            .unwrap();
+
+        assert_eq!(report.readings, u64::from(PRUNE_BATCH_ROWS) + 1);
+        assert_eq!(counts(&t.state).await, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn prune_once_stops_after_shutdown() {
+        let t = TestState::in_memory();
+        let now = fixed_now();
+        insert_reading_at(&t.state, now - time::Duration::days(30)).await;
+        insert_history_at(&t.state, now - time::Duration::days(30)).await;
+
+        // The flag is read before every batch: a pass that is running when
+        // shutdown arrives stops after the batch in flight, and one that
+        // starts after it deletes nothing.
+        t.state.signal_shutdown();
+        let report = prune_once(&t.state, &keep_days(Some(7), Some(7)), now)
+            .await
+            .unwrap();
+
+        assert_eq!(report, PruneReport::default());
+        // Nothing was deleted: the next start deletes both rows.
+        assert_eq!(counts(&t.state).await, (1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retention_runs_at_startup_and_every_hour() {
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
+        // `spawn` prunes against the wall clock, which the paused tokio clock
+        // doesn't move.
+        let two_days_ago = || OffsetDateTime::now_utc() - time::Duration::days(2);
+
+        insert_reading_at(&state, two_days_ago()).await;
+        let handle = spawn(Arc::clone(&state), keep_days(Some(1), None)).expect("retention is on");
+        settle().await;
+        assert_eq!(counts(&state).await.0, 0, "the first pass runs at startup");
+
+        insert_reading_at(&state, two_days_ago()).await;
+        tokio::time::sleep(Duration::from_secs(1800)).await;
+        assert_eq!(counts(&state).await.0, 1, "no pass before the hour is up");
+
+        tokio::time::sleep(Duration::from_secs(1801)).await;
+        settle().await;
+        assert_eq!(
+            counts(&state).await.0,
+            0,
+            "the next pass runs an hour later"
+        );
+
+        state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the retention task stops on shutdown")
+            .expect("the retention task does not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retention_stops_on_shutdown() {
+        let t = TestState::in_memory();
+        let handle =
+            spawn(Arc::clone(&t.state), keep_days(Some(1), Some(1))).expect("retention is on");
+        settle().await;
+
+        t.state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the retention task stops on shutdown")
+            .expect("the retention task does not panic");
+    }
+
+    #[tokio::test]
+    async fn retention_not_spawned_when_disabled() {
+        let t = TestState::in_memory();
+        assert!(spawn(Arc::clone(&t.state), RetentionConfig::default()).is_none());
+    }
+}

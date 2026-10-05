@@ -107,6 +107,7 @@ impl Config {
     /// This checks:
     /// - Server bind address is valid (host:port format)
     /// - Storage path is not empty
+    /// - Retention limits, when set, are 1 to 36500 days
     /// - Device addresses are not empty
     /// - Device poll intervals are within reasonable bounds (10s - 1 hour)
     /// - No duplicate device addresses
@@ -273,12 +274,17 @@ impl ServerConfig {
 pub struct StorageConfig {
     /// Database file path.
     pub path: PathBuf,
+    /// Deletion of old rows (`[storage.retention]`). Off by default, and not
+    /// written to the file while off.
+    #[serde(default, skip_serializing_if = "RetentionConfig::is_disabled")]
+    pub retention: RetentionConfig,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: aranet_store::default_db_path(),
+            retention: RetentionConfig::default(),
         }
     }
 }
@@ -290,6 +296,78 @@ impl StorageConfig {
 
         if self.path.as_os_str().is_empty() {
             validate!(errors, "storage.path", "database path cannot be empty");
+        }
+
+        errors.extend(self.retention.validate());
+        errors
+    }
+}
+
+/// Longest accepted retention limit, in days (100 years).
+pub const MAX_RETENTION_DAYS: u32 = 36_500;
+
+/// Data retention settings (`[storage.retention]`).
+///
+/// Retention is off by default: the service keeps every reading and history
+/// record until they are deleted by hand (`aranet cache prune`). With a limit
+/// set, the service deletes older rows at startup and then every hour, in
+/// small batches. It never runs `VACUUM`, so the database file stops growing
+/// but doesn't shrink. To shrink it, stop the service and run
+/// `sqlite3 <database> 'VACUUM;'`. (`aranet cache prune --vacuum` shrinks it
+/// too, but it first deletes cached history older than its `--older-than`
+/// age, whatever these limits say.) Changes take effect when the service
+/// restarts.
+///
+/// ```toml
+/// [storage.retention]
+/// readings_days = 365
+/// history_days = 730
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Delete readings the service polled once they are older than this many
+    /// days. Unset keeps them forever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readings_days: Option<u32>,
+    /// Delete cached device history (shared with `aranet sync`) once it is
+    /// older than this many days. Unset keeps it forever. The next sync may
+    /// download deleted records again while the device still holds them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_days: Option<u32>,
+}
+
+impl RetentionConfig {
+    /// Whether any retention limit is set.
+    pub fn is_enabled(&self) -> bool {
+        self.readings_days.is_some() || self.history_days.is_some()
+    }
+
+    /// Whether no retention limit is set (the default).
+    pub fn is_disabled(&self) -> bool {
+        !self.is_enabled()
+    }
+
+    /// Validate the limits: each one that is set must be 1 to
+    /// [`MAX_RETENTION_DAYS`] days.
+    pub fn validate(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+
+        for (field, days) in [
+            ("storage.retention.readings_days", self.readings_days),
+            ("storage.retention.history_days", self.history_days),
+        ] {
+            match days {
+                Some(0) => validate!(
+                    errors,
+                    field,
+                    "must be at least 1 day (remove the key to keep data forever)"
+                ),
+                Some(days) if days > MAX_RETENTION_DAYS => {
+                    validate!(errors, field, "must be at most {} days", MAX_RETENTION_DAYS)
+                }
+                _ => {}
+            }
         }
 
         errors
@@ -1019,6 +1097,7 @@ mod tests {
             },
             storage: StorageConfig {
                 path: PathBuf::from("/tmp/test.db"),
+                ..Default::default()
             },
             devices: vec![DeviceConfig {
                 address: "AA:BB:CC:DD:EE:FF".to_string(),
@@ -1181,16 +1260,113 @@ mod tests {
         // Valid path
         let valid = StorageConfig {
             path: PathBuf::from("/data/aranet.db"),
+            ..Default::default()
         };
         assert!(valid.validate().is_empty());
 
         // Invalid: empty path
         let empty = StorageConfig {
             path: PathBuf::new(),
+            ..Default::default()
         };
         let errors = empty.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_retention_off_by_default_and_not_serialized() {
+        let config = Config::default();
+        assert_eq!(config.storage.retention, RetentionConfig::default());
+        assert!(config.storage.retention.is_disabled());
+        assert!(!config.storage.retention.is_enabled());
+
+        let toml = toml::to_string(&config).unwrap();
+        assert!(!toml.contains("retention"), "{toml}");
+
+        // Only the limits that are set are written.
+        let mut config = Config::default();
+        config.storage.retention.readings_days = Some(30);
+        let toml = toml::to_string(&config).unwrap();
+        assert!(
+            toml.contains("[storage.retention]\nreadings_days = 30\n"),
+            "{toml}"
+        );
+        assert!(!toml.contains("history_days"), "{toml}");
+    }
+
+    #[test]
+    fn test_retention_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            [storage]
+            path = "/data/aranet.db"
+
+            [storage.retention]
+            readings_days = 30
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.storage.path, PathBuf::from("/data/aranet.db"));
+        assert_eq!(
+            config.storage.retention,
+            RetentionConfig {
+                readings_days: Some(30),
+                history_days: None,
+            }
+        );
+        assert!(config.storage.retention.is_enabled());
+        assert!(config.validate().is_ok());
+
+        // The table on its own keeps the default database path.
+        let config: Config = toml::from_str("[storage.retention]\nhistory_days = 90\n").unwrap();
+        assert_eq!(config.storage.path, aranet_store::default_db_path());
+        assert_eq!(config.storage.retention.readings_days, None);
+        assert_eq!(config.storage.retention.history_days, Some(90));
+    }
+
+    #[test]
+    fn test_retention_rejects_zero_and_too_many_days() {
+        for (days, message) in [
+            (
+                0,
+                "must be at least 1 day (remove the key to keep data forever)",
+            ),
+            (MAX_RETENTION_DAYS + 1, "must be at most 36500 days"),
+        ] {
+            let retention = RetentionConfig {
+                readings_days: Some(days),
+                history_days: Some(days),
+            };
+            let errors = retention.validate();
+            let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+            assert_eq!(
+                fields,
+                [
+                    "storage.retention.readings_days",
+                    "storage.retention.history_days"
+                ],
+                "{days} days"
+            );
+            assert!(errors.iter().all(|e| e.message == message), "{errors:?}");
+        }
+
+        for days in [1, MAX_RETENTION_DAYS] {
+            let retention = RetentionConfig {
+                readings_days: Some(days),
+                history_days: Some(days),
+            };
+            assert!(retention.validate().is_empty(), "{days} days");
+        }
+
+        // Config::validate reports them through StorageConfig::validate.
+        let mut config = Config::default();
+        config.storage.retention.readings_days = Some(0);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("storage.retention.readings_days: must be at least 1 day"),
+            "{error}"
+        );
     }
 
     #[test]
