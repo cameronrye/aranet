@@ -803,6 +803,59 @@ mod store_tests {
     }
 
     #[tokio::test]
+    async fn read_completes_while_write_waits_on_sqlite_lock() {
+        let t = TestState::file_backed(Config::default());
+        t.state
+            .with_store_write(|store| store.upsert_device("Aranet4 17C3C", None).map(|_| ()))
+            .await
+            .unwrap();
+        // Another process, such as `aranet sync`, holds the write lock, and a
+        // collector insert waits for it on the service's writer connection.
+        let blocker = rusqlite::Connection::open(t.db_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let state = Arc::clone(&t.state);
+        let write = tokio::spawn(async move {
+            state
+                .with_store_write(move |store| {
+                    let _ = started_tx.send(());
+                    store.upsert_device("x", None).map(|_| ())
+                })
+                .await
+        });
+        // Once its job runs, the write holds the writer until it returns.
+        tokio::time::timeout(Duration::from_secs(10), started_rx)
+            .await
+            .expect("the write starts")
+            .unwrap();
+
+        // WAL lets any connection read while the lock is held, even the
+        // writer, so what matters is that the read doesn't queue behind the
+        // waiting write: that write holds the writer until SQLite gives up on
+        // the lock after 5 s, well past this bound.
+        let devices = tokio::time::timeout(
+            Duration::from_secs(2),
+            t.state.with_store_read(|store| store.list_devices()),
+        )
+        .await
+        .expect("the read didn't finish while the database was locked")
+        .unwrap();
+        let ids: Vec<_> = devices.iter().map(|device| device.id.as_str()).collect();
+        assert_eq!(ids, ["Aranet4 17C3C"]);
+        assert!(
+            !write.is_finished(),
+            "the write stopped waiting for the lock before the read finished"
+        );
+
+        blocker.execute_batch("COMMIT").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the write finishes once the lock is released")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
     async fn reads_use_query_only_connections() {
         let t = TestState::file_backed(Config::default());
         let err = t
