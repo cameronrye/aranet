@@ -102,6 +102,9 @@ pub(crate) struct ReadRecord {
 struct FakeReaderState {
     latency: HashMap<String, Duration>,
     failing: HashSet<String>,
+    /// What a successful read of each address returns, if not
+    /// `CurrentReading::default()`.
+    readings: HashMap<String, CurrentReading>,
     /// Held addresses, each with the number of the `hold` call that holds it.
     held: HashMap<String, u64>,
     holds: u64,
@@ -112,11 +115,11 @@ struct FakeReaderState {
 /// and a record of every read.
 ///
 /// A read records its start, waits while its address is held, sleeps its
-/// latency on the tokio clock, records its end and returns
-/// `CurrentReading::default()`, or for a failing address
-/// `CollectorError::Read(aranet_core::Error::NotConnected)`. Latency and
-/// failure are looked up when the read starts, so changing them affects later
-/// reads only. Addresses match exactly (case-sensitive).
+/// latency on the tokio clock, records its end and returns the address's
+/// reading (`CurrentReading::default()` unless one was set), or for a failing
+/// address `CollectorError::Read(aranet_core::Error::NotConnected)`. Latency,
+/// failure and the reading are looked up when the read starts, so changing
+/// them affects later reads only. Addresses match exactly (case-sensitive).
 pub(crate) struct FakeReader {
     state: Mutex<FakeReaderState>,
     /// Woken (`notify_waiters`) when a read starts or finishes and on release.
@@ -149,6 +152,14 @@ impl FakeReader {
         } else {
             state.failing.remove(address);
         }
+    }
+
+    /// Make reads of `address` that start from now on return `reading`
+    /// instead of `CurrentReading::default()`. Only the notification tests
+    /// call it, hence the `cfg`: without the feature it would be dead code.
+    #[cfg(feature = "notifications")]
+    pub(crate) fn set_reading(&self, address: &str, reading: CurrentReading) {
+        self.lock().readings.insert(address.to_owned(), reading);
     }
 
     /// Hold reads of `address` that start from now on: each records its start
@@ -205,7 +216,7 @@ impl DeviceReader for FakeReader {
         address: &'a str,
     ) -> BoxFuture<'a, Result<CurrentReading, CollectorError>> {
         Box::pin(async move {
-            let (index, hold, latency, failing) = {
+            let (index, hold, latency, failing, reading) = {
                 let mut state = self.lock();
                 state.records.push(ReadRecord {
                     address: address.to_owned(),
@@ -218,6 +229,7 @@ impl DeviceReader for FakeReader {
                     state.held.get(address).copied(),
                     state.latency.get(address).copied(),
                     state.failing.contains(address),
+                    state.readings.get(address).copied(),
                 )
             };
             self.changed.notify_waiters();
@@ -234,7 +246,7 @@ impl DeviceReader for FakeReader {
             let result = if failing {
                 Err(CollectorError::Read(aranet_core::Error::NotConnected))
             } else {
-                Ok(CurrentReading::default())
+                Ok(reading.unwrap_or_default())
             };
             {
                 let mut state = self.lock();
