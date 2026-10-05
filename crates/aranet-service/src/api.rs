@@ -47,7 +47,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::collector::{Collector, CollectorStartResult};
+use crate::collector::{Collector, CollectorStartResult, CollectorStopResult};
 use crate::config::DeviceConfig;
 use crate::state::CollectorState;
 use crate::state::{AppState, DeviceCollectionStats};
@@ -687,23 +687,22 @@ async fn collector_start(State(state): State<Arc<AppState>>) -> Json<CollectorAc
 }
 
 /// Stop the collector.
+///
+/// Also tears down a collector that was started without devices, so devices
+/// added afterwards aren't polled until the collector is started again.
 async fn collector_stop(State(state): State<Arc<AppState>>) -> Json<CollectorActionResponse> {
-    if !state.collector.is_running() {
-        return Json(CollectorActionResponse {
+    match Collector::new(Arc::clone(&state)).stop().await {
+        CollectorStopResult::Stopped => Json(CollectorActionResponse {
+            success: true,
+            message: "Collector stopped".to_string(),
+            running: false,
+        }),
+        CollectorStopResult::NotRunning => Json(CollectorActionResponse {
             success: false,
             message: "Collector is not running".to_string(),
             running: false,
-        });
+        }),
     }
-
-    let collector = Collector::new(Arc::clone(&state));
-    collector.stop().await;
-
-    Json(CollectorActionResponse {
-        success: true,
-        message: "Collector stopped".to_string(),
-        running: false,
-    })
 }
 
 // ==========================================================================
@@ -1543,7 +1542,7 @@ mod tests {
 
     use crate::config::{Config, SecurityConfig};
     use crate::middleware::RateLimitState;
-    use crate::test_support::{FakeReader, TestState};
+    use crate::test_support::{FakeReader, TestState, settle};
     use aranet_types::HistoryRecord;
 
     fn create_test_state() -> TestState {
@@ -1554,6 +1553,42 @@ mod tests {
         let body = response.into_body();
         let bytes = body.collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Send one request to `app`; returns the status and the JSON body
+    /// (`Null` when the body is empty).
+    async fn call_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder().method(method).uri(uri);
+        let request = match body {
+            Some(body) => request
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        };
+        let response = app.clone().oneshot(request.unwrap()).await.unwrap();
+        let status = response.status();
+        let body = response_body(response).await;
+        (
+            status,
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// A config that monitors one device every 60 s.
+    fn config_with_device(address: &str) -> Config {
+        Config {
+            devices: vec![DeviceConfig {
+                address: address.to_string(),
+                alias: None,
+                poll_interval: 60,
+            }],
+            ..Config::default()
+        }
     }
 
     fn create_security_config() -> SecurityConfig {
@@ -2460,30 +2495,16 @@ mod tests {
         assert_eq!(json["message"], "Collector stopped");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_collector_start_already_running() {
-        let t = create_test_state();
-        let state = Arc::clone(&t.state);
-        state.collector.set_running(true);
+        let t = TestState::with_reader(config_with_device("AA:BB:CC:DD:EE:FF"), FakeReader::new());
+        let app = router().with_state(Arc::clone(&t.state));
 
-        let app = router().with_state(state);
+        let (_, json) = call_json(&app, "POST", "/api/collector/start", None).await;
+        assert_eq!(json["message"], "Collector started");
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/collector/start")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-
+        let (status, json) = call_json(&app, "POST", "/api/collector/start", None).await;
+        assert_eq!(status, StatusCode::OK);
         assert!(!json["success"].as_bool().unwrap());
         assert_eq!(json["message"], "Collector is already running");
     }
@@ -3151,5 +3172,72 @@ mod tests {
         // Should be degraded since collector is not running
         assert_eq!(json["status"], "degraded");
         assert!(!json["collector"]["running"].as_bool().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_tears_down_idle_collector() {
+        let reader = FakeReader::new();
+        let t = TestState::with_reader(Config::default(), reader.clone());
+        let app = router().with_state(Arc::clone(&t.state));
+
+        let (_, json) = call_json(&app, "POST", "/api/collector/start", None).await;
+        assert_eq!(json["message"], "No devices configured");
+        let (_, json) = call_json(&app, "POST", "/api/collector/stop", None).await;
+        assert_eq!(json["message"], "Collector is not running");
+
+        let device = r#"{"address":"AA:BB:CC:DD:EE:FF"}"#;
+        let (status, _) = call_json(&app, "POST", "/api/config/devices", Some(device)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+
+        let polls = reader.reads().len();
+        assert_eq!(polls, 0, "the stopped collector polled the new device");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_collector_stop_returns_promptly_during_poll() {
+        let reader = FakeReader::new();
+        reader.hold("AA:BB:CC:DD:EE:FF");
+        let t = TestState::with_reader(config_with_device("AA:BB:CC:DD:EE:FF"), reader.clone());
+        let app = router().with_state(Arc::clone(&t.state));
+
+        let (_, json) = call_json(&app, "POST", "/api/collector/start", None).await;
+        assert_eq!(json["message"], "Collector started");
+        reader.wait_for_reads(1).await;
+
+        let (status, json) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            call_json(&app, "POST", "/api/collector/stop", None),
+        )
+        .await
+        .expect("POST /api/collector/stop waited for the Bluetooth read");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["message"], "Collector stopped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_update_device_alias_keeps_status_counters() {
+        let t = TestState::with_reader(config_with_device("AA:BB:CC:DD:EE:FF"), FakeReader::new());
+        let app = router().with_state(Arc::clone(&t.state));
+
+        let (_, json) = call_json(&app, "POST", "/api/collector/start", None).await;
+        assert_eq!(json["message"], "Collector started");
+        // Polls at 0 s and 60 s.
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+        settle().await;
+        let (_, status) = call_json(&app, "GET", "/api/status", None).await;
+        assert_eq!(status["devices"][0]["success_count"], 2);
+
+        let uri = "/api/config/devices/AA:BB:CC:DD:EE:FF";
+        let (code, _) = call_json(&app, "PUT", uri, Some(r#"{"alias":"New"}"#)).await;
+        assert_eq!(code, StatusCode::OK);
+        settle().await;
+
+        let (_, status) = call_json(&app, "GET", "/api/status", None).await;
+        assert_eq!(
+            status["devices"][0]["success_count"], 2,
+            "renaming the sensor reset its counters or re-polled it"
+        );
+        assert_eq!(status["devices"][0]["alias"], "New");
     }
 }

@@ -26,14 +26,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use aranet_store::Store;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::task::TaskTracker;
 
-use crate::collector::{BleDeviceReader, DeviceReader};
+use crate::collector::{BleDeviceReader, DeviceReader, Lifecycle};
 use crate::config::{Config, default_config_path};
 
 /// Shared application state.
@@ -154,9 +153,10 @@ impl AppState {
 
     /// Signal that the device configuration has changed.
     ///
-    /// Reload notifications are sent even when the collector is temporarily
-    /// idle so a no-device startup or an empty-device config can recover
-    /// once devices are added again.
+    /// A started collector applies the change, also while it has no devices,
+    /// so devices added to an empty config are polled. It restarts only the
+    /// devices that were added, removed, or had their address or poll interval
+    /// changed. A stopped collector ignores the signal.
     pub async fn on_devices_changed(&self) {
         self.collector.signal_reload();
     }
@@ -173,28 +173,26 @@ impl AppState {
 }
 
 /// State for tracking and controlling the collector.
+///
+/// The collector's tasks are started and stopped through
+/// [`Collector`](crate::collector::Collector).
 pub struct CollectorState {
-    /// Whether the collector is currently running.
+    /// Whether the collector is polling at least one device.
     running: AtomicBool,
-    /// When the collector was started (Unix timestamp).
+    /// When the collector last went from not running to running (Unix
+    /// timestamp; 0 while it isn't running).
     started_at: AtomicU64,
-    /// Channel to signal collector tasks to stop.
-    stop_tx: watch::Sender<bool>,
-    /// Receiver for stop signal (cloned by collector tasks).
-    stop_rx: watch::Receiver<bool>,
-    /// Channel to signal configuration reload.
+    /// Reload signal; the value counts device configuration changes.
     reload_tx: watch::Sender<u64>,
-    /// Receiver for reload signal.
-    reload_rx: watch::Receiver<u64>,
-    /// Per-device collection stats.
+    /// Per-device collection stats, in config order.
     pub device_stats: RwLock<Vec<DeviceCollectionStats>>,
-    /// Shared JoinSet for device polling tasks.
-    ///
-    /// This allows both the initial collector start and the reload watcher
-    /// to track spawned tasks, ensuring proper cleanup on stop.
-    pub device_tasks: Mutex<JoinSet<()>>,
-    /// Handle for the reload watcher task.
-    pub reload_watcher: Mutex<Option<JoinHandle<()>>>,
+    /// The collector's current generation of tasks. Only `Collector::start`,
+    /// `Collector::stop` (with `Collector::shutdown`) and the reload watcher
+    /// lock it.
+    pub(crate) lifecycle: Mutex<Lifecycle>,
+    /// Bluetooth polls in flight, including those a stopped collector left to
+    /// finish. Shutdown waits for them.
+    pub(crate) polls: TaskTracker,
     /// How the collector reads devices: over Bluetooth, or a fake in tests.
     reader: Arc<dyn DeviceReader>,
 }
@@ -202,18 +200,13 @@ pub struct CollectorState {
 impl CollectorState {
     /// Create a new collector state.
     pub fn new() -> Self {
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let (reload_tx, reload_rx) = watch::channel(0u64);
         Self {
             running: AtomicBool::new(false),
             started_at: AtomicU64::new(0),
-            stop_tx,
-            stop_rx,
-            reload_tx,
-            reload_rx,
+            reload_tx: watch::Sender::new(0),
             device_stats: RwLock::new(Vec::new()),
-            device_tasks: Mutex::new(JoinSet::new()),
-            reload_watcher: Mutex::new(None),
+            lifecycle: Mutex::new(Lifecycle::default()),
+            polls: TaskTracker::new(),
             reader: Arc::new(BleDeviceReader),
         }
     }
@@ -237,31 +230,19 @@ impl CollectorState {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Atomically try to transition from not-running to running.
-    /// Returns `true` if the transition succeeded (was not running, now is).
-    /// Returns `false` if already running.
-    pub fn try_start(&self) -> bool {
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
-            self.started_at.store(now, Ordering::SeqCst);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Mark the collector as started.
-    pub fn set_running(&self, running: bool) {
-        self.running.store(running, Ordering::SeqCst);
-        if running {
-            let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
-            self.started_at.store(now, Ordering::SeqCst);
-        } else {
-            self.started_at.store(0, Ordering::SeqCst);
+    /// Record whether the collector is polling any device.
+    ///
+    /// The start time is set only when the collector goes from not running to
+    /// running, so device edits don't reset the uptime, and cleared when it
+    /// stops.
+    pub(crate) fn set_running(&self, running: bool) {
+        match (self.running.swap(running, Ordering::SeqCst), running) {
+            (false, true) => {
+                let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
+                self.started_at.store(now, Ordering::SeqCst);
+            }
+            (true, false) => self.started_at.store(0, Ordering::SeqCst),
+            _ => {}
         }
     }
 
@@ -275,94 +256,21 @@ impl CollectorState {
         }
     }
 
-    /// Get a receiver for the stop signal.
-    pub fn subscribe_stop(&self) -> watch::Receiver<bool> {
-        self.stop_rx.clone()
-    }
-
-    /// Signal all collector tasks to stop.
-    pub fn signal_stop(&self) {
-        let _ = self.stop_tx.send(true);
-        self.running.store(false, Ordering::SeqCst);
-        self.started_at.store(0, Ordering::SeqCst);
-    }
-
-    /// Reset the stop signal (for restarting).
-    pub fn reset_stop(&self) {
-        let _ = self.stop_tx.send(false);
-    }
-
     /// Get a receiver for the reload signal.
+    ///
+    /// The receiver is woken only by reloads signalled after this call.
     pub fn subscribe_reload(&self) -> watch::Receiver<u64> {
-        self.reload_rx.clone()
+        self.reload_tx.subscribe()
     }
 
     /// Signal the collector to reload its configuration.
     ///
     /// This is used when devices are added, removed, or modified via the API.
-    /// The collector will restart its tasks with the new configuration.
+    /// A started collector restarts only the devices whose address or poll
+    /// interval changed. The signal is recorded even while nothing listens.
     pub fn signal_reload(&self) {
-        // Increment the counter to trigger the reload
-        let current = *self.reload_rx.borrow();
-        let _ = self.reload_tx.send(current.wrapping_add(1));
-    }
-
-    /// Wait for all device tasks to complete, with a timeout.
-    ///
-    /// Returns `true` if all tasks stopped cleanly within the timeout,
-    /// `false` if the timeout was reached and tasks were aborted.
-    pub async fn wait_for_device_tasks(&self, timeout: Duration) -> bool {
-        let wait_result = tokio::time::timeout(timeout, async {
-            let mut tasks = self.device_tasks.lock().await;
-            while tasks.join_next().await.is_some() {}
-        })
-        .await;
-
-        if wait_result.is_err() {
-            // Timeout - abort remaining tasks
-            let mut tasks = self.device_tasks.lock().await;
-            tasks.abort_all();
-            false
-        } else {
-            true
-        }
-    }
-
-    /// Spawn a device task into the shared JoinSet.
-    pub async fn spawn_device_task<F>(&self, future: F)
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let mut tasks = self.device_tasks.lock().await;
-        tasks.spawn(future);
-    }
-
-    /// Replace the reload watcher task with a new handle.
-    pub async fn set_reload_watcher(&self, handle: JoinHandle<()>) {
-        let mut watcher = self.reload_watcher.lock().await;
-        if let Some(existing) = watcher.replace(handle) {
-            existing.abort();
-        }
-    }
-
-    /// Wait for the reload watcher to exit, aborting it on timeout.
-    pub async fn wait_for_reload_watcher(&self, timeout: Duration) -> bool {
-        let mut handle = {
-            let mut watcher = self.reload_watcher.lock().await;
-            watcher.take()
-        };
-
-        let Some(handle) = handle.as_mut() else {
-            return true;
-        };
-
-        match tokio::time::timeout(timeout, &mut *handle).await {
-            Ok(_) => true,
-            Err(_) => {
-                handle.abort();
-                false
-            }
-        }
+        self.reload_tx
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 }
 
@@ -453,8 +361,9 @@ mod tests {
         assert!(collector.is_running());
         assert!(collector.started_at().is_some());
 
-        collector.signal_stop();
+        collector.set_running(false);
         assert!(!collector.is_running());
+        assert!(collector.started_at().is_none());
     }
 
     #[tokio::test]
@@ -528,33 +437,12 @@ mod tests {
     }
 
     #[test]
-    fn test_collector_state_subscribe_stop() {
+    fn subscribe_reload_does_not_replay_earlier_signals() {
         let collector = CollectorState::new();
+        collector.signal_reload();
 
-        // Get multiple receivers
-        let rx1 = collector.subscribe_stop();
-        let rx2 = collector.subscribe_stop();
-
-        // Both should see the initial value (false)
-        assert!(!*rx1.borrow());
-        assert!(!*rx2.borrow());
-    }
-
-    #[test]
-    fn test_collector_state_stop_and_reset() {
-        let collector = CollectorState::new();
-        let rx = collector.subscribe_stop();
-
-        // Initially not stopped
-        assert!(!*rx.borrow());
-
-        // Signal stop
-        collector.signal_stop();
-        assert!(*rx.borrow());
-
-        // Reset
-        collector.reset_stop();
-        assert!(!*rx.borrow());
+        let rx = collector.subscribe_reload();
+        assert!(!rx.has_changed().unwrap());
     }
 
     #[test]
@@ -568,10 +456,14 @@ mod tests {
         assert!(collector.is_running());
         assert!(collector.started_at().is_some());
 
-        // Setting running again keeps a start time
+        // Marking a running collector as running keeps its start time. Pretend
+        // it has been running since 2023-11-14.
+        collector.started_at.store(1_700_000_000, Ordering::SeqCst);
         collector.set_running(true);
-        assert!(collector.is_running());
-        assert!(collector.started_at().is_some());
+        assert_eq!(
+            collector.started_at().map(|t| t.unix_timestamp()),
+            Some(1_700_000_000)
+        );
 
         collector.set_running(false);
         assert!(!collector.is_running());
@@ -780,27 +672,5 @@ mod tests {
         // Signal reload again
         collector.signal_reload();
         assert_eq!(*rx.borrow(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_collector_state_reload_with_receiver() {
-        let collector = CollectorState::new();
-        let mut rx = collector.subscribe_reload();
-
-        // Start a task that waits for reload
-        let handle = tokio::spawn(async move {
-            rx.changed().await.unwrap();
-            *rx.borrow()
-        });
-
-        // Give the task time to start waiting
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Signal reload
-        collector.signal_reload();
-
-        // Task should complete with the new value
-        let result = handle.await.unwrap();
-        assert_eq!(result, 1);
     }
 }

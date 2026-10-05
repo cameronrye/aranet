@@ -210,8 +210,10 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
+use tokio::task::JoinHandle;
 use tower_http::trace::TraceLayer;
 
 pub mod api;
@@ -259,6 +261,10 @@ pub struct RunOptions {
 /// debug, everything else in this crate at info. Shared by `init_tracing()` and
 /// its tests so the tests exercise the same filter production runs under.
 const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug";
+
+/// How long shutdown waits for background tasks after signalling them to
+/// stop, before aborting the ones left.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// Initialize the default tracing subscriber used by the service binaries.
 pub fn init_tracing() -> anyhow::Result<()> {
@@ -365,14 +371,15 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         });
     }
 
-    let collector = if !options.no_collector {
-        let collector = Collector::new(Arc::clone(&state));
-        collector.start().await;
-        Some(collector)
+    // Background tasks that stop on `AppState::signal_shutdown`; shutdown
+    // waits for them.
+    let background: Vec<JoinHandle<()>> = Vec::new();
+
+    if !options.no_collector {
+        Collector::new(Arc::clone(&state)).start().await;
     } else {
         tracing::info!("Background collector disabled");
-        None
-    };
+    }
 
     #[cfg(feature = "mqtt")]
     {
@@ -421,14 +428,14 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(collector, state))
+    .with_graceful_shutdown(shutdown_signal(Arc::clone(&state), background))
     .await?;
 
     Ok(())
 }
 
 /// Wait for shutdown signal and perform cleanup.
-async fn shutdown_signal(mut collector: Option<Collector>, state: Arc<AppState>) {
+async fn shutdown_signal(state: Arc<AppState>, background: Vec<JoinHandle<()>>) {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!("Failed to install Ctrl+C handler: {}", e);
@@ -459,14 +466,34 @@ async fn shutdown_signal(mut collector: Option<Collector>, state: Arc<AppState>)
 
     tracing::info!("Shutdown signal received, stopping services...");
 
-    if let Some(ref mut collector) = collector {
-        collector.stop().await;
-    }
-
-    state.signal_shutdown();
-    state.collector.signal_stop();
+    stop_background_work(&state, background).await;
 
     tracing::info!("Graceful shutdown complete");
+}
+
+/// Stop the collector for good, whether it was started at startup or through
+/// the API, then signal every background task to stop and wait for them.
+///
+/// A collector start that arrives after this began (the server keeps serving
+/// until shutdown returns) starts nothing. Bluetooth polls still in flight get
+/// `POLL_DRAIN_TIMEOUT` to disconnect and store their reading. `background`
+/// gets `SHUTDOWN_GRACE`, after which the tasks left are aborted.
+pub(crate) async fn stop_background_work(state: &Arc<AppState>, background: Vec<JoinHandle<()>>) {
+    Collector::new(Arc::clone(state)).shutdown().await;
+    state.signal_shutdown();
+
+    state.collector.polls.close();
+    if tokio::time::timeout(collector::POLL_DRAIN_TIMEOUT, state.collector.polls.wait())
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            "Bluetooth polls still running after {}s; not waiting for them",
+            collector::POLL_DRAIN_TIMEOUT.as_secs()
+        );
+    }
+
+    collector::join_or_abort("background task", background, SHUTDOWN_GRACE).await;
 }
 
 #[cfg(test)]
@@ -476,6 +503,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
     use tower::ServiceExt;
+
+    use crate::test_support::{FakeReader, TestState};
 
     #[derive(Clone, Default)]
     struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -541,6 +570,176 @@ mod tests {
         assert!(
             directives.contains("aranet_service=info") && directives.contains("tower_http=debug"),
             "default directives missing from filter: {directives}"
+        );
+    }
+
+    /// A config that monitors one device every 60 s.
+    fn one_device_config() -> Config {
+        Config {
+            devices: vec![DeviceConfig {
+                address: "Aranet4 AAAAA".to_string(),
+                alias: None,
+                poll_interval: 60,
+            }],
+            ..Config::default()
+        }
+    }
+
+    /// `POST /api/collector/start` through the API router.
+    async fn post_collector_start(state: &Arc<AppState>) -> StatusCode {
+        api::router()
+            .with_state(Arc::clone(state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/collector/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_collector_started_through_api() {
+        let reader = FakeReader::new();
+        let t = TestState::with_reader(one_device_config(), reader.clone());
+        assert_eq!(post_collector_start(&t.state).await, StatusCode::OK);
+        reader.wait_for_reads(1).await;
+
+        stop_background_work(&t.state, Vec::new()).await;
+
+        assert!(!t.state.collector.is_running());
+        assert!(*t.state.subscribe_shutdown().borrow());
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            reader.reads().len(),
+            1,
+            "the collector kept polling after shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collector_start_during_shutdown_starts_nothing() {
+        let reader = FakeReader::new();
+        let t = TestState::with_reader(one_device_config(), reader.clone());
+        // A background task that ignores the signal keeps the shutdown busy
+        // for `SHUTDOWN_GRACE`, as a slow sink would. The server still serves
+        // requests meanwhile.
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        let shutdown = tokio::spawn({
+            let state = Arc::clone(&t.state);
+            async move { stop_background_work(&state, vec![stuck]).await }
+        });
+        let mut signalled = t.state.subscribe_shutdown();
+        signalled.wait_for(|down| *down).await.unwrap();
+
+        assert_eq!(post_collector_start(&t.state).await, StatusCode::OK);
+        assert!(
+            !shutdown.is_finished(),
+            "the start was handled after the shutdown, not during it"
+        );
+        assert!(
+            !t.state.collector.is_running(),
+            "a start during shutdown started the collector"
+        );
+
+        shutdown.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(
+            reader.reads().is_empty(),
+            "a collector started during shutdown polled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_background_work_signals_then_aborts_stragglers() {
+        let t = TestState::with_reader(Config::default(), FakeReader::new());
+        let mut shutdown = t.state.subscribe_shutdown();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let prompt = tokio::spawn(async move {
+            let _ = shutdown.changed().await;
+            // Reached only if the signal comes before shutdown gives up on this task.
+            let _ = done_tx.send(());
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+
+        let begun = tokio::time::Instant::now();
+        stop_background_work(&t.state, vec![prompt, stuck]).await;
+
+        let waited = begun.elapsed();
+        assert!(
+            waited >= SHUTDOWN_GRACE && waited <= SHUTDOWN_GRACE + Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+        assert!(
+            done_rx.await.is_ok(),
+            "the task that stops on the shutdown signal was aborted: the signal came after the join"
+        );
+        assert!(rx.await.is_err(), "the stuck task was not aborted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_background_work_drains_polls_in_flight() {
+        let reader = FakeReader::new();
+        reader.hold("Aranet4 AAAAA");
+        let t = TestState::with_reader(one_device_config(), reader.clone());
+        assert_eq!(post_collector_start(&t.state).await, StatusCode::OK);
+        reader.wait_for_reads(1).await;
+
+        let begun = tokio::time::Instant::now();
+        let shutdown = tokio::spawn({
+            let state = Arc::clone(&t.state);
+            async move { stop_background_work(&state, Vec::new()).await }
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown did not wait for the Bluetooth poll in flight"
+        );
+
+        reader.release("Aranet4 AAAAA");
+        shutdown.await.unwrap();
+        let waited = begun.elapsed();
+        assert!(
+            waited < collector::POLL_DRAIN_TIMEOUT,
+            "shutdown returned {waited:?} after it began, not when the poll finished"
+        );
+        let reads = reader.reads();
+        assert!(
+            reads[0].finished.is_some() && reads[0].ok,
+            "shutdown cancelled the poll mid-read"
+        );
+        let stored = t
+            .state
+            .with_store_read(|store| store.count_readings(Some("Aranet4 AAAAA")))
+            .await
+            .unwrap();
+        assert_eq!(stored, 1, "the drained poll did not store its reading");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_background_work_gives_up_on_a_hung_poll() {
+        let reader = FakeReader::new();
+        // Never released: the poll outlives the drain.
+        reader.hold("Aranet4 AAAAA");
+        let t = TestState::with_reader(one_device_config(), reader.clone());
+        assert_eq!(post_collector_start(&t.state).await, StatusCode::OK);
+        reader.wait_for_reads(1).await;
+
+        let begun = tokio::time::Instant::now();
+        stop_background_work(&t.state, Vec::new()).await;
+
+        let waited = begun.elapsed();
+        assert!(
+            waited >= collector::POLL_DRAIN_TIMEOUT
+                && waited <= collector::POLL_DRAIN_TIMEOUT + Duration::from_secs(1),
+            "waited {waited:?} for a poll that never ends"
         );
     }
 }
