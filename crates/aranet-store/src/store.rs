@@ -3375,6 +3375,33 @@ invalid-timestamp,test-device,800,22.5,1013.25,45,
 
         // Batches of 3, 3, 3 and 1.
         assert_eq!(store.prune_readings_in_batches(cutoff, 3).unwrap(), 10);
+        // The last statement deleted only the final row, so the seam used
+        // batches of 3, not one statement for all ten.
+        assert_eq!(store.conn.changes(), 1);
+        assert_eq!(
+            reading_times(&store),
+            [cutoff, cutoff + time::Duration::minutes(1)]
+        );
+        assert_eq!(store.prune_readings(cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_prune_readings_removes_all_older_rows_across_real_batches() {
+        // `aranet cache prune` calls prune_readings, and the test above calls
+        // it only when nothing is left to delete, so this test crosses its
+        // real batch boundary.
+        let store = Store::open_in_memory().unwrap();
+        let t0 = prune_t0();
+        let older = PRUNE_BATCH_ROWS + 1;
+        insert_readings_every_minute(&store, t0, i64::from(older) + 2);
+        let cutoff = t0 + time::Duration::minutes(i64::from(older));
+
+        // A full batch, then one reading.
+        assert_eq!(store.prune_readings(cutoff).unwrap(), u64::from(older));
+        // Its last statement deleted only that one reading, so it didn't
+        // delete the whole backlog in one statement.
+        assert_eq!(store.conn.changes(), 1);
+        // The newer readings are left, including the one at the cutoff.
         assert_eq!(
             reading_times(&store),
             [cutoff, cutoff + time::Duration::minutes(1)]
