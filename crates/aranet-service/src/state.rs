@@ -195,6 +195,9 @@ pub struct CollectorState {
     pub(crate) polls: TaskTracker,
     /// How the collector reads devices: over Bluetooth, or a fake in tests.
     reader: Arc<dyn DeviceReader>,
+    /// Desktop alerts and their per-device cooldowns.
+    #[cfg(feature = "notifications")]
+    pub(crate) notifier: crate::collector::Notifier,
 }
 
 impl CollectorState {
@@ -208,6 +211,8 @@ impl CollectorState {
             lifecycle: Mutex::new(Lifecycle::default()),
             polls: TaskTracker::new(),
             reader: Arc::new(BleDeviceReader),
+            #[cfg(feature = "notifications")]
+            notifier: crate::collector::Notifier::desktop(),
         }
     }
 
@@ -277,6 +282,14 @@ impl CollectorState {
 impl Default for CollectorState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, feature = "notifications"))]
+impl CollectorState {
+    /// This state, with its alerts going to `notifier` instead of the desktop.
+    pub(crate) fn with_notifier(self, notifier: crate::collector::Notifier) -> Self {
+        Self { notifier, ..self }
     }
 }
 
