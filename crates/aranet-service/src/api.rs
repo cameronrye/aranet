@@ -1237,17 +1237,30 @@ async fn get_current_reading(
     }))
 }
 
-/// Query parameters for readings.
+/// Query parameters for the paged data endpoints.
 #[derive(Debug, Deserialize, Default)]
 pub struct ReadingsQuery {
+    /// Include rows at or after this Unix timestamp.
     pub since: Option<i64>,
+    /// Include rows at or before this Unix timestamp.
     pub until: Option<i64>,
+    /// Rows per page, 1 to [`MAX_QUERY_LIMIT`]. [`DEFAULT_QUERY_LIMIT`] when omitted.
     pub limit: Option<u32>,
+    /// Rows to skip, at most [`MAX_QUERY_OFFSET`]. 0 when omitted.
     pub offset: Option<u32>,
 }
 
-/// Maximum allowed limit for query results.
-const MAX_QUERY_LIMIT: u32 = 10_000;
+/// Rows a data endpoint returns when the request has no `limit`.
+pub const DEFAULT_QUERY_LIMIT: u32 = 1_000;
+
+/// Largest accepted `limit`.
+pub const MAX_QUERY_LIMIT: u32 = 10_000;
+
+/// Largest accepted `offset`.
+///
+/// The store clamps larger offsets to this value, so paging past it would
+/// return the same page forever. Use `since` and `until` to go further back.
+pub const MAX_QUERY_OFFSET: u32 = aranet_store::MAX_QUERY_LIMIT;
 
 impl ReadingsQuery {
     fn parse_timestamp(
@@ -1272,7 +1285,10 @@ impl ReadingsQuery {
     }
 
     /// Validate the query parameters.
-    /// Returns an error if timestamps are invalid, `since > until`, or `limit` exceeds the maximum.
+    ///
+    /// Returns [`AppError::BadRequest`] if a timestamp is out of range,
+    /// `since > until`, `limit` is 0 or above [`MAX_QUERY_LIMIT`], or `offset`
+    /// is above [`MAX_QUERY_OFFSET`].
     pub fn validate(&self) -> Result<(), AppError> {
         let since = self.since_datetime()?;
         let until = self.until_datetime()?;
@@ -1286,6 +1302,9 @@ impl ReadingsQuery {
                 until.unix_timestamp()
             )));
         }
+        if self.limit == Some(0) {
+            return Err(AppError::BadRequest("limit must be at least 1".to_string()));
+        }
         if let Some(limit) = self.limit
             && limit > MAX_QUERY_LIMIT
         {
@@ -1294,7 +1313,26 @@ impl ReadingsQuery {
                 limit, MAX_QUERY_LIMIT
             )));
         }
+        if let Some(offset) = self.offset
+            && offset > MAX_QUERY_OFFSET
+        {
+            return Err(AppError::BadRequest(format!(
+                "offset {} exceeds maximum of {}; use since/until to go further back",
+                offset, MAX_QUERY_OFFSET
+            )));
+        }
         Ok(())
+    }
+
+    /// The requested page as `(limit, offset)`: `limit` defaults to
+    /// [`DEFAULT_QUERY_LIMIT`] and `offset` to 0.
+    ///
+    /// Call [`Self::validate`] first; it bounds both values.
+    pub fn page(&self) -> (u32, u32) {
+        (
+            self.limit.unwrap_or(DEFAULT_QUERY_LIMIT),
+            self.offset.unwrap_or(0),
+        )
     }
 }
 
@@ -1307,6 +1345,26 @@ pub struct PaginatedResponse<T> {
     pub pagination: PaginationMeta,
 }
 
+impl<T> PaginatedResponse<T> {
+    /// Build one page from rows fetched with a limit of `limit + 1`.
+    ///
+    /// The extra row only shows that another page exists: `has_more` is set
+    /// and the row is dropped.
+    pub fn from_rows(mut rows: Vec<T>, limit: u32, offset: u32) -> Self {
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        Self {
+            pagination: PaginationMeta {
+                count: rows.len(),
+                offset,
+                limit,
+                has_more,
+            },
+            data: rows,
+        }
+    }
+}
+
 /// Pagination metadata.
 #[derive(Debug, Serialize)]
 pub struct PaginationMeta {
@@ -1314,183 +1372,124 @@ pub struct PaginationMeta {
     pub count: usize,
     /// Offset from the beginning.
     pub offset: u32,
-    /// Maximum items requested (if specified).
-    pub limit: Option<u32>,
+    /// Page size used: the requested `limit`, or [`DEFAULT_QUERY_LIMIT`].
+    pub limit: u32,
     /// Whether there are more items available.
     pub has_more: bool,
 }
 
-/// Get readings for a device.
+/// Get readings for a device, newest first.
 ///
-/// Returns a paginated response with readings and metadata about the results.
+/// Returns one page of readings and pagination metadata. Rows with the same
+/// timestamp are ordered by row id, so offset paging returns each row once.
 ///
 /// # Query Parameters
 ///
 /// - `since`: Unix timestamp to filter readings from (inclusive)
 /// - `until`: Unix timestamp to filter readings until (inclusive)
-/// - `limit`: Maximum number of readings to return
-/// - `offset`: Number of readings to skip (for pagination)
+/// - `limit`: Readings per page, 1 to 10000 (default 1000)
+/// - `offset`: Readings to skip, at most 1000000 (default 0); use `since` and
+///   `until` to go further back
 ///
 /// Query parameters are validated before the database is queried.
 ///
 /// # Errors
 ///
-/// - Returns [`AppError::BadRequest`] if `since > until`
+/// - Returns [`AppError::BadRequest`] for an invalid timestamp, `since > until`,
+///   or a `limit` or `offset` out of range
 /// - Returns [`AppError::Store`] if the database query fails
 async fn get_readings(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(params): Query<ReadingsQuery>,
 ) -> Result<Json<PaginatedResponse<aranet_store::StoredReading>>, AppError> {
-    // Validate query parameters
     params.validate()?;
+    let (limit, offset) = params.page();
 
     let mut query = aranet_store::ReadingQuery::new().device(&id);
-
     if let Some(dt) = params.since_datetime()? {
         query = query.since(dt);
     }
     if let Some(dt) = params.until_datetime()? {
         query = query.until(dt);
     }
+    // One row past the page shows whether there is another page. `validate`
+    // capped `limit` at MAX_QUERY_LIMIT, so `limit + 1` can't overflow.
+    let query = query.limit(limit + 1).offset(offset);
 
-    // Request one extra item to determine if there are more
-    let request_limit = params.limit.map(|l| l + 1);
-    if let Some(limit) = request_limit {
-        query = query.limit(limit);
-    }
-    if let Some(offset) = params.offset {
-        query = query.offset(offset);
-    }
-
-    let mut readings = state
+    let rows = state
         .with_store_read(move |store| store.query_readings(&query))
         .await?;
-
-    // Check if there are more items
-    let has_more = params.limit.is_some_and(|l| readings.len() > l as usize);
-    if has_more {
-        readings.pop(); // Remove the extra item
-    }
-
-    Ok(Json(PaginatedResponse {
-        pagination: PaginationMeta {
-            count: readings.len(),
-            offset: params.offset.unwrap_or(0),
-            limit: params.limit,
-            has_more,
-        },
-        data: readings,
-    }))
+    Ok(Json(PaginatedResponse::from_rows(rows, limit, offset)))
 }
 
-/// Get history for a device.
+/// Get history for a device, newest first.
 ///
-/// Returns a paginated response with history records and metadata.
+/// Returns one page of history records and pagination metadata. `since`,
+/// `until`, `limit` and `offset` work as for the readings endpoint: without
+/// `limit`, the newest 1000 records are returned.
 ///
 /// # Errors
 ///
-/// - Returns [`AppError::BadRequest`] if `since > until`
+/// - Returns [`AppError::BadRequest`] for an invalid timestamp, `since > until`,
+///   or a `limit` or `offset` out of range
 /// - Returns [`AppError::Store`] if the database query fails
 async fn get_history(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(params): Query<ReadingsQuery>,
 ) -> Result<Json<PaginatedResponse<aranet_store::StoredHistoryRecord>>, AppError> {
-    // Validate query parameters
     params.validate()?;
+    let (limit, offset) = params.page();
 
     let mut query = aranet_store::HistoryQuery::new().device(&id);
-
     if let Some(dt) = params.since_datetime()? {
         query = query.since(dt);
     }
     if let Some(dt) = params.until_datetime()? {
         query = query.until(dt);
     }
+    // One row past the page shows whether there is another page.
+    let query = query.limit(limit + 1).offset(offset);
 
-    // Request one extra item to determine if there are more
-    let request_limit = params.limit.map(|l| l + 1);
-    if let Some(limit) = request_limit {
-        query = query.limit(limit);
-    }
-    if let Some(offset) = params.offset {
-        query = query.offset(offset);
-    }
-
-    let mut history = state
+    let rows = state
         .with_store_read(move |store| store.query_history(&query))
         .await?;
-
-    // Check if there are more items
-    let has_more = params.limit.is_some_and(|l| history.len() > l as usize);
-    if has_more {
-        history.pop(); // Remove the extra item
-    }
-
-    Ok(Json(PaginatedResponse {
-        pagination: PaginationMeta {
-            count: history.len(),
-            offset: params.offset.unwrap_or(0),
-            limit: params.limit,
-            has_more,
-        },
-        data: history,
-    }))
+    Ok(Json(PaginatedResponse::from_rows(rows, limit, offset)))
 }
 
-/// Get all readings across devices.
+/// Get readings across all devices, newest first.
 ///
-/// Returns a paginated response with readings from all devices.
+/// Returns one page of readings and pagination metadata. `since`, `until`,
+/// `limit` and `offset` work as for the per-device readings endpoint: without
+/// `limit`, the newest 1000 readings are returned.
 ///
 /// # Errors
 ///
-/// - Returns [`AppError::BadRequest`] if `since > until`
+/// - Returns [`AppError::BadRequest`] for an invalid timestamp, `since > until`,
+///   or a `limit` or `offset` out of range
 /// - Returns [`AppError::Store`] if the database query fails
 async fn get_all_readings(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReadingsQuery>,
 ) -> Result<Json<PaginatedResponse<aranet_store::StoredReading>>, AppError> {
-    // Validate query parameters
     params.validate()?;
+    let (limit, offset) = params.page();
 
     let mut query = aranet_store::ReadingQuery::new();
-
     if let Some(dt) = params.since_datetime()? {
         query = query.since(dt);
     }
     if let Some(dt) = params.until_datetime()? {
         query = query.until(dt);
     }
+    // One row past the page shows whether there is another page.
+    let query = query.limit(limit + 1).offset(offset);
 
-    // Request one extra item to determine if there are more
-    let request_limit = params.limit.map(|l| l + 1);
-    if let Some(limit) = request_limit {
-        query = query.limit(limit);
-    }
-    if let Some(offset) = params.offset {
-        query = query.offset(offset);
-    }
-
-    let mut readings = state
+    let rows = state
         .with_store_read(move |store| store.query_readings(&query))
         .await?;
-
-    // Check if there are more items
-    let has_more = params.limit.is_some_and(|l| readings.len() > l as usize);
-    if has_more {
-        readings.pop(); // Remove the extra item
-    }
-
-    Ok(Json(PaginatedResponse {
-        pagination: PaginationMeta {
-            count: readings.len(),
-            offset: params.offset.unwrap_or(0),
-            limit: params.limit,
-            has_more,
-        },
-        data: readings,
-    }))
+    Ok(Json(PaginatedResponse::from_rows(rows, limit, offset)))
 }
 
 /// Application error type.
@@ -2046,6 +2045,223 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response_body(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["pagination"]["limit"], 10);
+        assert_eq!(json["pagination"]["offset"], 0);
+    }
+
+    // ==================== Paging ====================
+
+    /// The three paged data endpoints, for device `d` where they take one.
+    const PAGED_ENDPOINTS: [&str; 3] = [
+        "/api/devices/d/readings",
+        "/api/readings",
+        "/api/devices/d/history",
+    ];
+
+    /// GET `uri` from the API router; returns the status and the JSON body.
+    async fn get_json(state: &Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = router()
+            .with_state(Arc::clone(state))
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let json = serde_json::from_str(&response_body(response).await).unwrap();
+        (status, json)
+    }
+
+    /// Timestamp of the first seeded row (2023-11-14T22:13:20Z).
+    fn paging_base() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+    }
+
+    /// Store `count` readings for device `d`, oldest first and `spacing_secs`
+    /// apart. Reading `i` has CO2 `400 + i`. Returns the row ids in insert order.
+    async fn seed_readings(state: &AppState, count: u16, spacing_secs: i64) -> Vec<i64> {
+        let base = paging_base();
+        state
+            .with_store_write(move |store| {
+                (0..count)
+                    .map(|i| {
+                        let offset = time::Duration::seconds(spacing_secs * i64::from(i));
+                        let reading = aranet_types::CurrentReading {
+                            co2: 400 + i,
+                            captured_at: Some(base + offset),
+                            ..Default::default()
+                        };
+                        store.insert_reading("d", &reading)
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Store `count` history records for device `d`, oldest first, with CO2
+    /// `400 + i`. They are 60 s apart: the store treats records less than 30 s
+    /// apart as the same measurement.
+    async fn seed_history(state: &AppState, count: u16) {
+        let base = paging_base();
+        let records: Vec<aranet_types::HistoryRecord> = (0..count)
+            .map(|i| aranet_types::HistoryRecord {
+                timestamp: base + time::Duration::seconds(60 * i64::from(i)),
+                co2: 400 + i,
+                temperature: 21.0,
+                pressure: 1013.0,
+                humidity: 45,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            })
+            .collect();
+        let inserted = state
+            .with_store_write(move |store| store.insert_history("d", &records))
+            .await
+            .unwrap();
+        assert_eq!(inserted, usize::from(count));
+    }
+
+    /// `endpoint` serves 1001 rows with CO2 400..=1400. Without `limit` it
+    /// returns the newest 1000 and says there is more; `offset=1000` returns
+    /// the last row and ends paging.
+    async fn assert_default_page_size(state: &Arc<AppState>, endpoint: &str) {
+        let (status, json) = get_json(state, endpoint).await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}");
+        let data = json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1000, "{endpoint}");
+        assert_eq!(data[0]["co2"], 1400, "{endpoint}: newest first");
+        assert_eq!(data[999]["co2"], 401, "{endpoint}");
+        assert_eq!(json["pagination"]["count"], 1000, "{endpoint}");
+        assert_eq!(json["pagination"]["limit"], 1000, "{endpoint}");
+        assert_eq!(json["pagination"]["offset"], 0, "{endpoint}");
+        assert_eq!(json["pagination"]["has_more"], true, "{endpoint}");
+
+        let uri = format!("{endpoint}?offset=1000");
+        let (status, json) = get_json(state, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let data = json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1, "{uri}");
+        assert_eq!(data[0]["co2"], 400, "{uri}");
+        assert_eq!(json["pagination"]["count"], 1, "{uri}");
+        assert_eq!(json["pagination"]["limit"], 1000, "{uri}");
+        assert_eq!(json["pagination"]["offset"], 1000, "{uri}");
+        assert_eq!(json["pagination"]["has_more"], false, "{uri}");
+    }
+
+    #[tokio::test]
+    async fn test_readings_default_page_size() {
+        let t = create_test_state();
+        seed_readings(&t.state, 1001, 60).await;
+        assert_default_page_size(&t.state, "/api/devices/d/readings").await;
+    }
+
+    #[tokio::test]
+    async fn test_all_readings_default_page_size() {
+        let t = create_test_state();
+        seed_readings(&t.state, 1001, 60).await;
+        assert_default_page_size(&t.state, "/api/readings").await;
+    }
+
+    #[tokio::test]
+    async fn test_history_default_page_size() {
+        let t = create_test_state();
+        seed_history(&t.state, 1001).await;
+        assert_default_page_size(&t.state, "/api/devices/d/history").await;
+    }
+
+    #[tokio::test]
+    async fn test_limit_zero_is_rejected() {
+        let t = create_test_state();
+        seed_readings(&t.state, 3, 60).await;
+        seed_history(&t.state, 3).await;
+
+        for endpoint in PAGED_ENDPOINTS {
+            let uri = format!("{endpoint}?limit=0");
+            let (status, json) = get_json(&t.state, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(json["error"], "limit must be at least 1", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_offset_above_cap_is_rejected() {
+        let t = create_test_state();
+
+        for endpoint in PAGED_ENDPOINTS {
+            let uri = format!("{endpoint}?offset=1000000");
+            let (status, _) = get_json(&t.state, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+
+            let uri = format!("{endpoint}?offset=1000001");
+            let (status, json) = get_json(&t.state, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                json["error"],
+                "offset 1000001 exceeds maximum of 1000000; use since/until to go further back",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_limit_above_max_is_rejected() {
+        let t = create_test_state();
+
+        for endpoint in PAGED_ENDPOINTS {
+            let uri = format!("{endpoint}?limit=10000");
+            let (status, json) = get_json(&t.state, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(json["pagination"]["limit"], 10000, "{uri}");
+
+            let uri = format!("{endpoint}?limit=10001");
+            let (status, json) = get_json(&t.state, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                json["error"], "limit 10001 exceeds maximum of 10000",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explicit_limit_is_reported() {
+        let t = create_test_state();
+        seed_readings(&t.state, 8, 60).await;
+        seed_history(&t.state, 8).await;
+
+        for endpoint in PAGED_ENDPOINTS {
+            let uri = format!("{endpoint}?limit=5");
+            let (status, json) = get_json(&t.state, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(json["data"].as_array().unwrap().len(), 5, "{uri}");
+            assert_eq!(json["data"][0]["co2"], 407, "{uri}");
+            assert_eq!(json["pagination"]["count"], 5, "{uri}");
+            assert_eq!(json["pagination"]["limit"], 5, "{uri}");
+            assert_eq!(json["pagination"]["has_more"], true, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paging_with_equal_timestamps_returns_each_row_once() {
+        let t = create_test_state();
+        let mut ids = seed_readings(&t.state, 5, 0).await;
+        ids.reverse(); // newest first: the highest id first
+
+        for endpoint in ["/api/devices/d/readings", "/api/readings"] {
+            let mut seen = Vec::new();
+            for offset in [0, 2, 4] {
+                let uri = format!("{endpoint}?limit=2&offset={offset}");
+                let (status, json) = get_json(&t.state, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                for row in json["data"].as_array().unwrap() {
+                    seen.push(row["id"].as_i64().unwrap());
+                }
+            }
+            assert_eq!(seen, ids, "{endpoint}: every row once, by id descending");
+        }
     }
 
     #[test]
@@ -2102,6 +2318,40 @@ mod tests {
         let error = query.validate().unwrap_err();
         assert!(matches!(error, AppError::BadRequest(_)));
         assert!(error.to_string().contains("Invalid 'since' timestamp"));
+    }
+
+    #[test]
+    fn test_readings_query_page_defaults() {
+        assert_eq!(ReadingsQuery::default().page(), (1000, 0));
+        assert_eq!(DEFAULT_QUERY_LIMIT, 1000);
+
+        let query = ReadingsQuery {
+            limit: Some(5),
+            offset: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(query.page(), (5, 10));
+    }
+
+    #[test]
+    fn test_paginated_response_from_rows_drops_the_probe_row() {
+        // `limit + 1` rows came back: the extra row only shows there is another page.
+        let page = PaginatedResponse::from_rows(vec![30, 20, 10], 2, 4);
+        assert_eq!(page.data, [30, 20]);
+        assert_eq!(page.pagination.count, 2);
+        assert_eq!(page.pagination.limit, 2);
+        assert_eq!(page.pagination.offset, 4);
+        assert!(page.pagination.has_more);
+
+        // `limit` rows or fewer: this is the last page.
+        let last = PaginatedResponse::from_rows(vec![30, 20], 2, 6);
+        assert_eq!(last.data, [30, 20]);
+        assert!(!last.pagination.has_more);
+
+        let empty = PaginatedResponse::<u8>::from_rows(Vec::new(), 2, 8);
+        assert!(empty.data.is_empty());
+        assert_eq!(empty.pagination.count, 0);
+        assert!(!empty.pagination.has_more);
     }
 
     #[test]

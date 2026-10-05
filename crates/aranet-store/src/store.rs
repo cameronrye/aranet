@@ -3205,6 +3205,54 @@ invalid-timestamp,test-device,800,22.5,1013.25,45,
         assert_eq!(store.count_history(None).unwrap(), 8);
     }
 
+    // ==================== Query Plan Tests ====================
+
+    /// The `EXPLAIN QUERY PLAN` details for `sql` bound to `params`, one per line.
+    fn query_plan(store: &Store, sql: &str, params: &[&dyn rusqlite::ToSql]) -> String {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let details: Vec<String> = stmt
+            .query_map(params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|detail| detail.unwrap())
+            .collect();
+        details.join("\n")
+    }
+
+    #[test]
+    fn test_paged_queries_do_not_sort() {
+        // The `id` tie-breaker must not turn a page into a sort of the whole
+        // table: each index ends in the rowid, so it already has that order.
+        // Which index is used is left open, so ST-13 (Phase 4) can drop the
+        // redundant `idx_history_device_time`.
+        let store = Store::open_in_memory().unwrap();
+        let readings = [
+            ReadingQuery::new().device("d").limit(1001),
+            ReadingQuery::new().limit(1001),
+        ];
+        for query in readings {
+            let (_, params) = query.build_where();
+            let params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let plan = query_plan(&store, &query.build_sql(), &params);
+            assert!(plan.contains(" INDEX "), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+
+        let history = [
+            HistoryQuery::new().device("d").limit(1001),
+            HistoryQuery::new().limit(1001),
+        ];
+        for query in history {
+            let (_, params) = query.build_where();
+            let params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let plan = query_plan(&store, &query.build_sql(), &params);
+            assert!(plan.contains(" INDEX "), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+    }
+
     // ==================== Edge Cases ====================
 
     #[test]

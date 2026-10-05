@@ -295,6 +295,8 @@ async fn test_get_all_readings() {
     // Response is paginated: { pagination: {...}, data: [...] }
     let data = json["data"].as_array().unwrap();
     assert_eq!(data.len(), 2);
+    assert_eq!(json["pagination"]["limit"], 1000);
+    assert_eq!(json["pagination"]["has_more"], false);
 }
 
 #[tokio::test]
@@ -324,6 +326,9 @@ async fn test_get_device_readings() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     // Response is paginated: { pagination: {...}, data: [...] }
     assert!(!json["data"].as_array().unwrap().is_empty());
+    assert_eq!(json["pagination"]["limit"], 1000);
+    assert_eq!(json["pagination"]["offset"], 0);
+    assert_eq!(json["pagination"]["has_more"], false);
 }
 
 #[tokio::test]
@@ -352,6 +357,8 @@ async fn test_get_device_history_without_current_reading() {
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["pagination"]["limit"], 1000);
+    assert_eq!(json["pagination"]["has_more"], false);
 }
 
 #[tokio::test]
