@@ -241,6 +241,29 @@ mod tests {
             .unwrap()
     }
 
+    /// Most probes a test sends while it waits for a retention pass to delete
+    /// a batch. Correct code needs two.
+    const MAX_PROBES: u64 = 100;
+
+    /// Fail, instead of probing forever, when a retention pass deletes
+    /// nothing. Call it after each probe that found every old reading still
+    /// there, with `pass_ended` read before that probe started: a pass that
+    /// had ended by then deleted nothing. `probes` counts those probes so far.
+    async fn fail_if_pass_deletes_nothing(
+        pass: &mut JoinHandle<aranet_store::Result<PruneReport>>,
+        pass_ended: bool,
+        probes: u64,
+    ) {
+        if pass_ended {
+            let outcome = pass.await;
+            panic!("the retention pass ended before deleting any old reading: {outcome:?}");
+        }
+        assert!(
+            probes < MAX_PROBES,
+            "the retention pass deleted no old reading in {MAX_PROBES} probes"
+        );
+    }
+
     #[tokio::test]
     async fn prune_once_deletes_only_rows_older_than_cutoff() {
         let t = TestState::in_memory();
@@ -360,14 +383,16 @@ mod tests {
         insert_readings_at(&t.state, "old", now - time::Duration::days(30), old_rows).await;
 
         let state = Arc::clone(&t.state);
-        let pass =
+        let mut pass =
             tokio::spawn(async move { prune_once(&state, &keep_days(Some(7), None), now).await });
 
         // Each probe is a store write, so it queues first-come first-served
         // with the pass's batches and runs between two of them. The first
         // probe that finds a batch gone signals shutdown while it still holds
         // the writer, so no batch runs between its count and the signal.
+        let mut probes = 0;
         let left_at_shutdown = loop {
+            let pass_ended = pass.is_finished();
             let state = Arc::clone(&t.state);
             let left = t
                 .state
@@ -383,6 +408,8 @@ mod tests {
             if left < old_rows {
                 break left;
             }
+            probes += 1;
+            fail_if_pass_deletes_nothing(&mut pass, pass_ended, probes).await;
         };
 
         let report = tokio::time::timeout(Duration::from_secs(10), pass)
@@ -415,7 +442,7 @@ mod tests {
         insert_readings_at(&t.state, "old", now - time::Duration::days(30), old_rows).await;
 
         let state = Arc::clone(&t.state);
-        let pass =
+        let mut pass =
             tokio::spawn(async move { prune_once(&state, &keep_days(Some(7), None), now).await });
 
         // Collector inserts, one at a time, until one runs after a batch. It
@@ -423,6 +450,7 @@ mod tests {
         // first-served, so it runs before the next batch.
         let mut inserted = 0;
         let left_at_insert = loop {
+            let pass_ended = pass.is_finished();
             let left = t
                 .state
                 .with_store_write(move |store| {
@@ -439,6 +467,7 @@ mod tests {
             if left < old_rows {
                 break left;
             }
+            fail_if_pass_deletes_nothing(&mut pass, pass_ended, inserted).await;
         };
         assert!(
             left_at_insert > 0,
