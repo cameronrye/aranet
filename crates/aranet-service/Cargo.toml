@@ -85,6 +85,8 @@ hostname = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Database tests: a second connection that holds a lock, and SQLite error codes.
+rusqlite = { version = "0.35", features = ["bundled"] }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

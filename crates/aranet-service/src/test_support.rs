@@ -63,6 +63,29 @@ impl TestState {
         Self { state, dir }
     }
 
+    /// Like [`Self::with_config`], but the store is a database file at
+    /// [`Self::db_path`], as in production: reads go through the read-only
+    /// connection pool, and a second connection can lock the file.
+    pub(crate) fn file_backed(mut config: Config) -> Self {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        config.storage.path = dir.path().join("data.db");
+        let store =
+            aranet_store::Store::open(&config.storage.path).expect("create the test database");
+        let state = AppState::with_collector(
+            store,
+            config,
+            dir.path().join("server.toml"),
+            CollectorState::with_reader(FakeReader::new()),
+        );
+        Self { state, dir }
+    }
+
+    /// The database file of a [`Self::file_backed`] state: `data.db` in
+    /// [`Self::dir`]. Other constructors never create it.
+    pub(crate) fn db_path(&self) -> PathBuf {
+        self.dir.path().join("data.db")
+    }
+
     /// Where the state saves its config: `server.toml` in [`Self::dir`].
     pub(crate) fn config_path(&self) -> PathBuf {
         self.dir.path().join("server.toml")

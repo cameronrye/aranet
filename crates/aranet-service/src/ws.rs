@@ -42,7 +42,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // Send initial snapshot of latest readings for all devices
     // This ensures clients immediately see current state without waiting for next poll
-    // Collect all events while holding the lock, then release before sending
+    // Build all events in one database call, then send them
     let snapshot: Vec<String> = match state
         .with_store_read(|store| {
             let mut events = Vec::new();

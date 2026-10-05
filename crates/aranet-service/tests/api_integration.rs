@@ -354,6 +354,32 @@ async fn test_get_device_history_without_current_reading() {
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn file_backed_readings_endpoint_sees_writes() {
+    // A database file, as in production: reads go through the read-only pool.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("data.db");
+    let mut config = Config::default();
+    config.storage.path = db_path.clone();
+    let store = aranet_store::Store::open(&db_path).unwrap();
+    let state = AppState::with_config_path(store, config, dir.path().join("server.toml"));
+    let router = aranet_service::api::router().with_state(Arc::clone(&state));
+
+    insert_test_reading(&state, "Aranet4 FILE1", Some("Office"), 812).await;
+
+    let (status, body) = get(&router, "/api/devices/Aranet4%20FILE1/readings").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let data = json["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["co2"], 812);
+
+    // Close every connection before the directory is deleted (Windows).
+    drop(router);
+    drop(state);
+    drop(dir);
+}
+
 // ==========================================================================
 // Collector control endpoints
 // ==========================================================================
