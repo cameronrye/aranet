@@ -113,14 +113,6 @@ impl AppState {
         })
     }
 
-    /// Save the current configuration to disk.
-    ///
-    /// This should be called after any configuration changes made via the API.
-    pub async fn save_config(&self) -> Result<(), crate::config::ConfigError> {
-        let config = self.config.read().await;
-        config.save(&self.config_path)
-    }
-
     /// Run a read-only store operation on a blocking thread.
     ///
     /// For a file-backed store, `f` runs on one of at most four read-only

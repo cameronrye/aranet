@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aranet_store::TomlFile;
 use serde::{Deserialize, Serialize};
 
 /// Push a validation error onto `$errors` with the given field and message.
@@ -74,32 +75,54 @@ impl Config {
         })
     }
 
-    /// Save configuration to a file.
+    /// Write this configuration to `path`, changing only the keys whose values
+    /// differ from what the file holds.
+    ///
+    /// Comments, key order and keys this version doesn't know are kept, and
+    /// settings still at their defaults are not added. The file is replaced
+    /// atomically and is readable only by its owner (0600 on Unix). A file that
+    /// doesn't parse is an error and is left unchanged.
+    ///
+    /// Everything in `self` that differs from the file is written, including
+    /// command-line overrides held in a running configuration. A running service
+    /// changes its file with [`Config::save_devices`] or [`Config::update_file`].
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
-        let content = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
+        let path = path.as_ref();
+        TomlFile::<Config>::open(path)
+            .and_then(|file| file.save(self))
+            .map(|_| ())
+            .map_err(|e| config_file_error(path, e))
+    }
 
-        // Create parent directories if needed
-        if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write {
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
+    /// Apply `change` to the configuration stored at `path` (not to a running
+    /// configuration) and write back only the keys it changed.
+    ///
+    /// A missing file reads as the defaults. Returns whether the file was
+    /// written: `false` means nothing changed and the file was not touched. A
+    /// file that doesn't parse is an error and is left unchanged.
+    pub fn update_file<P: AsRef<Path>>(
+        path: P,
+        change: impl FnOnce(&mut Config),
+    ) -> Result<bool, ConfigError> {
+        let path = path.as_ref();
+        let file = TomlFile::<Config>::open(path).map_err(|e| config_file_error(path, e))?;
+        let mut desired = file.value().clone();
+        change(&mut desired);
+        file.save(&desired).map_err(|e| config_file_error(path, e))
+    }
 
-        std::fs::write(path.as_ref(), content).map_err(|e| ConfigError::Write {
-            path: path.as_ref().to_path_buf(),
-            source: e,
-        })?;
-
-        // Restrict permissions to owner-only since config may contain API keys
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(path.as_ref(), perms);
-        }
-
-        Ok(())
+    /// Store `devices` as the device list in the file at `path`, leaving every
+    /// other setting as the file has it.
+    ///
+    /// The API saves device changes through this, because the running
+    /// configuration differs from the file (`--bind`, `--database`, defaults) and
+    /// none of that belongs in it. The whole list is written, so it replaces
+    /// edits made to `[[devices]]` by hand while the service runs.
+    pub fn save_devices<P: AsRef<Path>>(
+        path: P,
+        devices: &[DeviceConfig],
+    ) -> Result<(), ConfigError> {
+        Self::update_file(path, |config| config.devices = devices.to_vec()).map(|_| ())
     }
 
     /// Validate the configuration and return any errors.
@@ -1014,6 +1037,22 @@ pub enum ConfigError {
     Validation(Vec<ValidationError>),
 }
 
+/// The [`ConfigError`] for a failed read or write of the config file at `path`.
+fn config_file_error(path: &Path, error: aranet_store::TomlFileError) -> ConfigError {
+    use aranet_store::TomlFileError;
+    match error {
+        TomlFileError::Read { path, source } => ConfigError::Read { path, source },
+        TomlFileError::Parse { path, source } => ConfigError::Parse { path, source },
+        TomlFileError::Serialize(source) => ConfigError::Serialize(source),
+        TomlFileError::Write { path, source } => ConfigError::Write { path, source },
+        // `TomlFileError` is `#[non_exhaustive]`.
+        other => ConfigError::Write {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(other.to_string()),
+        },
+    }
+}
+
 /// A single validation error with context.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{field}: {message}")]
@@ -1116,6 +1155,93 @@ mod tests {
         assert_eq!(loaded.devices[0].address, "AA:BB:CC:DD:EE:FF");
         assert_eq!(loaded.devices[0].alias, Some("Test Device".to_string()));
         assert_eq!(loaded.devices[0].poll_interval, 30);
+    }
+
+    #[test]
+    fn test_save_replaces_file_atomically() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("server.toml");
+        let original = "[server]\nbind = \"127.0.0.1:8080\"\n";
+        std::fs::write(&config_path, original).unwrap();
+        // A hard link keeps the old contents only if the file was replaced, not
+        // truncated and rewritten in place (which a crash could leave half-written).
+        let link = temp_dir.path().join("server.toml.link");
+        std::fs::hard_link(&config_path, &link).unwrap();
+
+        let mut config = Config::load(&config_path).unwrap();
+        config.server.bind = "127.0.0.1:9090".to_string();
+        config.save(&config_path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "[server]\nbind = \"127.0.0.1:9090\"\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_file_is_owner_only_from_creation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("server.toml");
+        std::fs::write(&config_path, "").unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let old_inode = std::fs::metadata(&config_path).unwrap().ino();
+
+        let mut config = Config::default();
+        config.security.api_key = Some("k".repeat(32));
+        config.save(&config_path).unwrap();
+
+        let metadata = std::fs::metadata(&config_path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        // A new file, created 0600: the key was never readable by other users, not
+        // even between writing the file and tightening its mode.
+        assert_ne!(metadata.ino(), old_inode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_leaves_symlink_in_place() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real = temp_dir.path().join("real.toml");
+        std::fs::write(&real, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+        let link = temp_dir.path().join("server.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut config = Config::load(&link).unwrap();
+        config.server.bind = "127.0.0.1:9090".to_string();
+        config.save(&link).unwrap();
+
+        let link_type = std::fs::symlink_metadata(&link).unwrap().file_type();
+        assert!(link_type.is_symlink());
+        assert_eq!(Config::load(&real).unwrap().server.bind, "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn test_update_file_changes_only_the_named_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("server.toml");
+        let original = r#"# Aranet service
+[server]
+bind = "127.0.0.1:8080" # local only
+
+[storage]
+path = "/data/aranet.db"
+"#;
+        std::fs::write(&config_path, original).unwrap();
+
+        let written =
+            Config::update_file(&config_path, |config| config.server.broadcast_buffer = 200)
+                .unwrap();
+
+        assert!(written);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original.replace("# local only\n", "# local only\nbroadcast_buffer = 200\n")
+        );
+        assert!(!Config::update_file(&config_path, |_| {}).unwrap());
     }
 
     #[test]
