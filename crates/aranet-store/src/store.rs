@@ -3382,6 +3382,26 @@ invalid-timestamp,test-device,800,22.5,1013.25,45,
         assert_eq!(store.prune_readings(cutoff).unwrap(), 0);
     }
 
+    #[test]
+    fn test_prune_history_removes_all_older_rows_across_batches() {
+        // `aranet cache prune` calls prune_history, so this crosses its real
+        // batch boundary: history is inserted in one transaction, so a batch's
+        // worth of rows is cheap.
+        let store = Store::open_in_memory().unwrap();
+        let t0 = prune_t0();
+        let older = PRUNE_BATCH_ROWS + 1;
+        insert_history_every_minute(&store, t0, i64::from(older) + 1);
+        let cutoff = t0 + time::Duration::minutes(i64::from(older));
+
+        // A full batch, then one record.
+        assert_eq!(store.prune_history(cutoff).unwrap(), u64::from(older));
+        // Its last statement deleted only that one record, so it didn't
+        // delete the whole backlog in one statement.
+        assert_eq!(store.conn.changes(), 1);
+        assert_eq!(history_times(&store), [cutoff]);
+        assert_eq!(store.prune_history(cutoff).unwrap(), 0);
+    }
+
     // ==================== Query Plan Tests ====================
 
     /// The `EXPLAIN QUERY PLAN` details for `sql` bound to `params`, one per line.
