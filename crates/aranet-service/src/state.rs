@@ -33,6 +33,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::collector::{BleDeviceReader, DeviceReader};
 use crate::config::{Config, default_config_path};
 
 /// Shared application state.
@@ -173,6 +174,8 @@ pub struct CollectorState {
     pub device_tasks: Mutex<JoinSet<()>>,
     /// Handle for the reload watcher task.
     pub reload_watcher: Mutex<Option<JoinHandle<()>>>,
+    /// How the collector reads devices: over Bluetooth, or a fake in tests.
+    reader: Arc<dyn DeviceReader>,
 }
 
 impl CollectorState {
@@ -190,7 +193,13 @@ impl CollectorState {
             device_stats: RwLock::new(Vec::new()),
             device_tasks: Mutex::new(JoinSet::new()),
             reload_watcher: Mutex::new(None),
+            reader: Arc::new(BleDeviceReader),
         }
+    }
+
+    /// The reader the collector polls devices through.
+    pub(crate) fn reader(&self) -> &Arc<dyn DeviceReader> {
+        &self.reader
     }
 
     /// Check if the collector is running.
