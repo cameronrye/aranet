@@ -1862,6 +1862,15 @@ mod backoff_tests {
             "only {} of B's 50 ticks in [600, 3600) s were read on time; late reads at {late:?} s",
             on_time.len()
         );
+        // A tick that falls inside one of A's attempts is read late, not lost, so
+        // B still reads once per tick.
+        let reads = on_time.len() + late.len();
+        assert_eq!(
+            reads,
+            50,
+            "B lost {} of its 50 readings in [600, 3600) s; on-time reads at {on_time:?} s, late reads at {late:?} s",
+            50_usize.saturating_sub(reads)
+        );
     }
 
     #[tokio::test(start_paused = true)]
