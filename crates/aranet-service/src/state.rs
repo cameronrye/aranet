@@ -687,3 +687,35 @@ mod tests {
         assert_eq!(*rx.borrow(), 2);
     }
 }
+
+/// Database access through `with_store_read` and `with_store_write`.
+#[cfg(test)]
+mod store_tests {
+    use aranet_store::Store;
+
+    use super::AppState;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn memory_database_reads_see_writes() {
+        // `aranet-service run --database :memory:` opens the store like this.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(":memory:").unwrap();
+        let state =
+            AppState::with_config_path(store, Config::default(), dir.path().join("server.toml"));
+
+        state
+            .with_store_write(|store| store.upsert_device("Aranet4 17C3C", None).map(|_| ()))
+            .await
+            .unwrap();
+        let devices = state
+            .with_store_read(|store| store.list_devices())
+            .await
+            .unwrap();
+        assert_eq!(
+            devices.len(),
+            1,
+            "reads must see the database the writes went to"
+        );
+    }
+}

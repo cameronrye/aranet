@@ -183,10 +183,16 @@ impl Store {
         // Initialize schema
         schema::initialize(&conn)?;
 
-        Ok(Self {
-            conn,
-            path: Some(path.to_path_buf()),
-        })
+        // SQLite reports an empty file name for in-memory and temporary
+        // databases (":memory:", "" and "file:...?mode=memory"). A second
+        // connection to such a name opens a different, empty database, so the
+        // store has no path to offer.
+        let path = match conn.path() {
+            Some(name) if !name.is_empty() => Some(path.to_path_buf()),
+            _ => None,
+        };
+
+        Ok(Self { conn, path })
     }
 
     /// Open the database at the platform-specific default location.
@@ -231,7 +237,10 @@ impl Store {
 
     /// Return the database path for file-backed stores.
     ///
-    /// In-memory stores return `None`.
+    /// In-memory and temporary databases return `None`: those from
+    /// [`Store::open_in_memory`], and those [`Store::open`] opens for
+    /// `":memory:"`, `""` or a `file:` URI with `mode=memory`. They can't be
+    /// opened a second time.
     pub fn database_path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -1908,6 +1917,22 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let devices = store.list_devices().unwrap();
         assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn test_open_memory_has_no_database_path() {
+        // `aranet-service --database :memory:` reaches `Store::open` like this.
+        // None of these names a file that a second connection could open.
+        for name in [":memory:", "", "file:aranet-store-test?mode=memory"] {
+            let store = Store::open(name).unwrap();
+            assert_eq!(store.database_path(), None, "{name:?}");
+        }
+        assert_eq!(Store::open_in_memory().unwrap().database_path(), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.database_path(), Some(path.as_path()));
     }
 
     #[test]
