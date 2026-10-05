@@ -28,6 +28,11 @@
 //! - `WS /api/ws` - Real-time readings stream
 //! - `GET /`, `GET /dashboard` - Embedded dashboard shell
 //!
+//! The readings and history endpoints return one page, newest first: 1000 rows
+//! unless `limit` asks for 1 to 10000. `pagination.has_more` says whether
+//! another page exists. Fetch it with `offset` (at most 1000000), or narrow the
+//! range with `since` and `until`.
+//!
 //! # Configuration
 //!
 //! The service reads configuration from `~/.config/aranet/server.toml`:

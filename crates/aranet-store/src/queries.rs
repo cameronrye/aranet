@@ -192,8 +192,7 @@ impl ReadingQuery {
             "SELECT id, device_id, captured_at, co2, temperature, pressure, humidity, \
              battery, status, radon, radiation_rate, radiation_total, \
              radon_avg_24h, radon_avg_7d, radon_avg_30d \
-             FROM readings {} ORDER BY captured_at {}",
-            where_clause, order
+             FROM readings {where_clause} ORDER BY captured_at {order}, id {order}"
         );
 
         match (self.limit, self.offset) {
@@ -357,7 +356,7 @@ impl HistoryQuery {
         let (where_clause, _) = self.build_where();
         let order = if self.newest_first { "DESC" } else { "ASC" };
 
-        let mut sql = format!("{select} {where_clause} ORDER BY timestamp {order}");
+        let mut sql = format!("{select} {where_clause} ORDER BY timestamp {order}, id {order}");
 
         match (self.limit, self.offset) {
             (Some(limit), Some(offset)) => {
@@ -592,6 +591,21 @@ mod tests {
         assert!(sql.contains("radon_avg_30d"));
     }
 
+    #[test]
+    fn test_reading_query_breaks_timestamp_ties_by_id() {
+        let newest = ReadingQuery::new().build_sql();
+        assert!(
+            newest.contains("ORDER BY captured_at DESC, id DESC"),
+            "{newest}"
+        );
+
+        let oldest = ReadingQuery::new().oldest_first().build_sql();
+        assert!(
+            oldest.contains("ORDER BY captured_at ASC, id ASC"),
+            "{oldest}"
+        );
+    }
+
     // ==================== HistoryQuery Tests ====================
 
     #[test]
@@ -651,6 +665,21 @@ mod tests {
     fn test_history_query_oldest_first() {
         let query = HistoryQuery::new().oldest_first();
         assert!(!query.newest_first);
+    }
+
+    #[test]
+    fn test_history_query_breaks_timestamp_ties_by_id() {
+        let newest = HistoryQuery::new().build_sql();
+        assert!(
+            newest.contains("ORDER BY timestamp DESC, id DESC"),
+            "{newest}"
+        );
+
+        let oldest = HistoryQuery::new().oldest_first().build_sql();
+        assert!(
+            oldest.contains("ORDER BY timestamp ASC, id ASC"),
+            "{oldest}"
+        );
     }
 
     #[test]
