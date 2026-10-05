@@ -487,7 +487,7 @@ pub(crate) async fn stop_background_work(state: &Arc<AppState>, background: Vec<
         .await
         .is_err()
     {
-        tracing::debug!(
+        tracing::info!(
             "Bluetooth polls still running after {}s; not waiting for them",
             collector::POLL_DRAIN_TIMEOUT.as_secs()
         );
