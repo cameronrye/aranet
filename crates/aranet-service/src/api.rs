@@ -6,18 +6,22 @@
 //!
 //! All async handlers that access shared state acquire locks in a consistent order:
 //!
-//! - **`state.store`** (Mutex): Acquired for database operations. Held briefly during
-//!   queries; avoid long-running operations while holding this lock.
 //! - **`state.config`** (RwLock): Read lock for `get_*` endpoints, write lock for mutations.
 //!   Multiple readers allowed; writers are exclusive.
 //! - **`state.collector.device_stats`** (RwLock): Per-device collection statistics.
 //!
 //! ## Lock Ordering
 //!
-//! When multiple locks are needed, acquire in this order to prevent deadlocks:
-//! 1. `config` (if needed)
-//! 2. `store` (if needed)
-//! 3. `device_stats` (if needed)
+//! When both locks are needed, acquire `config` first, then `device_stats`.
+//!
+//! ## Database Access
+//!
+//! The database is not a lock that handlers take. [`AppState::with_store_read`] and
+//! [`AppState::with_store_write`] run the query on tokio's blocking thread pool (reads on
+//! one of a few read-only connections), so a slow query, or another process holding the
+//! database's write lock for up to 5 seconds, doesn't hold up other requests. Don't hold
+//! `config` or `device_stats` across one of these calls: a waiting query would keep the
+//! lock held too.
 //!
 //! ## Error Handling
 //!
@@ -157,7 +161,7 @@ pub struct PlatformInfo {
 /// - Collector status and device health
 /// - Platform information
 ///
-/// Note: This endpoint acquires locks on store and device_stats.
+/// Note: This endpoint queries the database and reads device_stats.
 /// For high-frequency monitoring, prefer `/api/health`.
 async fn health_detailed(State(state): State<Arc<AppState>>) -> Json<DetailedHealthResponse> {
     // Check database health
@@ -285,7 +289,8 @@ fn write_metric_family(
 
 /// # Lock Acquisition
 ///
-/// Acquires read locks on config, store, and device_stats to gather metrics.
+/// Takes read locks on config and device_stats, one at a time, and queries the
+/// database to gather metrics.
 async fn prometheus_metrics(
     State(state): State<Arc<AppState>>,
 ) -> Result<
@@ -1067,10 +1072,6 @@ impl From<aranet_store::StoredDevice> for DeviceResponse {
 
 /// List all devices.
 ///
-/// # Lock Acquisition
-///
-/// Acquires the store mutex for the duration of the database query.
-///
 /// # Errors
 ///
 /// Returns [`AppError::Store`] if the database query fails.
@@ -1087,7 +1088,10 @@ async fn get_device(
     Path(id): Path<String>,
 ) -> Result<Json<DeviceResponse>, AppError> {
     let device = state
-        .with_store_read(|store| store.get_device(&id))
+        .with_store_read({
+            let id = id.clone();
+            move |store| store.get_device(&id)
+        })
         .await?
         .ok_or(AppError::NotFound(format!("Device not found: {}", id)))?;
     Ok(Json(device.into()))
@@ -1204,7 +1208,10 @@ async fn get_current_reading(
     Path(id): Path<String>,
 ) -> Result<Json<CurrentReadingResponse>, AppError> {
     let reading = state
-        .with_store_read(|store| store.get_latest_reading(&id))
+        .with_store_read({
+            let id = id.clone();
+            move |store| store.get_latest_reading(&id)
+        })
         .await?
         .ok_or(AppError::NotFound(format!(
             "No readings for device: {}",
@@ -1324,10 +1331,7 @@ pub struct PaginationMeta {
 /// - `limit`: Maximum number of readings to return
 /// - `offset`: Number of readings to skip (for pagination)
 ///
-/// # Lock Acquisition
-///
-/// Acquires the store mutex for the duration of the database query.
-/// Query parameters are validated before the lock is acquired.
+/// Query parameters are validated before the database is queried.
 ///
 /// # Errors
 ///
@@ -1360,7 +1364,7 @@ async fn get_readings(
     }
 
     let mut readings = state
-        .with_store_read(|store| store.query_readings(&query))
+        .with_store_read(move |store| store.query_readings(&query))
         .await?;
 
     // Check if there are more items
@@ -1415,7 +1419,7 @@ async fn get_history(
     }
 
     let mut history = state
-        .with_store_read(|store| store.query_history(&query))
+        .with_store_read(move |store| store.query_history(&query))
         .await?;
 
     // Check if there are more items
@@ -1469,7 +1473,7 @@ async fn get_all_readings(
     }
 
     let mut readings = state
-        .with_store_read(|store| store.query_readings(&query))
+        .with_store_read(move |store| store.query_readings(&query))
         .await?;
 
     // Check if there are more items

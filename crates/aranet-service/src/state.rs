@@ -34,15 +34,14 @@ use tokio_util::task::TaskTracker;
 
 use crate::collector::{BleDeviceReader, DeviceReader, Lifecycle};
 use crate::config::{Config, default_config_path};
+use crate::db::StoreAccess;
 
 /// Shared application state.
 pub struct AppState {
-    /// The data store (wrapped in Mutex for thread-safe access).
-    pub store: Mutex<Store>,
-    /// File-backed database path for opening parallel read connections.
-    ///
-    /// In-memory stores leave this as `None` and fall back to the shared mutex.
-    store_path: Option<PathBuf>,
+    /// The database: one writer connection and, for a file-backed store, a
+    /// pool of read-only connections. Use [`AppState::with_store_read`] and
+    /// [`AppState::with_store_write`].
+    store: StoreAccess,
     /// Configuration (RwLock for runtime updates).
     pub config: RwLock<Config>,
     /// Path to the configuration file (for saving changes).
@@ -101,10 +100,8 @@ impl AppState {
         let buffer_size = config.server.broadcast_buffer;
         let (readings_tx, _) = broadcast::channel(buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let store_path = store.database_path().map(PathBuf::from);
         Arc::new(Self {
-            store: Mutex::new(store),
-            store_path,
+            store: StoreAccess::new(store),
             config: RwLock::new(config),
             config_path,
             readings_tx,
@@ -124,31 +121,45 @@ impl AppState {
         config.save(&self.config_path)
     }
 
-    /// Execute a read-only store operation.
+    /// Run a read-only store operation on a blocking thread.
     ///
-    /// File-backed stores open a separate connection per call so concurrent API reads
-    /// do not block on the shared write mutex. In-memory stores fall back to the shared
-    /// store because they cannot be reopened.
+    /// For a file-backed store, `f` runs on one of at most four read-only
+    /// connections (`PRAGMA query_only = ON`), so reads run in parallel with
+    /// each other and with writes, and a statement that would change the
+    /// database fails with SQLite's read-only error. An in-memory store has only
+    /// its one connection, so `f` runs there, after the writes queued before it.
+    ///
+    /// `f` runs on tokio's blocking thread pool, never on the async runtime, so
+    /// a query that waits for another process's database lock (up to 5 seconds)
+    /// doesn't hold up other requests. That is why `f` must be `Send + 'static`:
+    /// move owned values into it. A panic in `f` resumes in the caller.
     pub async fn with_store_read<T, F>(&self, f: F) -> aranet_store::Result<T>
     where
-        F: FnOnce(&Store) -> aranet_store::Result<T>,
+        F: FnOnce(&Store) -> aranet_store::Result<T> + Send + 'static,
+        T: Send + 'static,
     {
-        if let Some(path) = &self.store_path {
-            let store = Store::open(path)?;
-            f(&store)
-        } else {
-            let store = self.store.lock().await;
-            f(&store)
-        }
+        self.store.read(f).await
     }
 
-    /// Execute a write-capable store operation through the shared connection.
+    /// Run a store operation that may write, on a blocking thread.
+    ///
+    /// Writes use the service's single writer connection, one at a time, in the
+    /// order they were requested. As with [`AppState::with_store_read`], `f`
+    /// runs on tokio's blocking thread pool and must be `Send + 'static`, and a
+    /// panic in `f` resumes in the caller. `f` runs to the end even if the
+    /// caller stops waiting for it.
     pub async fn with_store_write<T, F>(&self, f: F) -> aranet_store::Result<T>
     where
-        F: FnOnce(&Store) -> aranet_store::Result<T>,
+        F: FnOnce(&Store) -> aranet_store::Result<T> + Send + 'static,
+        T: Send + 'static,
     {
-        let store = self.store.lock().await;
-        f(&store)
+        self.store.write(f).await
+    }
+
+    /// How many read-only database connections have been opened so far.
+    #[cfg(test)]
+    pub(crate) fn read_connections_opened(&self) -> usize {
+        self.store.read_connections_opened()
     }
 
     /// Signal that the device configuration has changed.
@@ -691,10 +702,16 @@ mod tests {
 /// Database access through `with_store_read` and `with_store_write`.
 #[cfg(test)]
 mod store_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use aranet_store::Store;
 
     use super::AppState;
     use crate::config::Config;
+    use crate::db::READ_POOL_SIZE;
+    use crate::test_support::TestState;
 
     #[tokio::test]
     async fn memory_database_reads_see_writes() {
@@ -717,5 +734,213 @@ mod store_tests {
             1,
             "reads must see the database the writes went to"
         );
+    }
+
+    fn assert_read_only_error(err: aranet_store::Error) {
+        match err {
+            aranet_store::Error::Database(e) => {
+                assert_eq!(
+                    e.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ReadOnly),
+                    "{e}"
+                )
+            }
+            other => panic!("expected SQLite's read-only error, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_closures_run_off_the_runtime_thread() {
+        // A current-thread runtime: the test body runs on the only runtime thread.
+        let runtime_thread = std::thread::current().id();
+        for t in [
+            TestState::in_memory(),
+            TestState::file_backed(Config::default()),
+        ] {
+            let read = t
+                .state
+                .with_store_read(|_| Ok(std::thread::current().id()))
+                .await
+                .unwrap();
+            let write = t
+                .state
+                .with_store_write(|_| Ok(std::thread::current().id()))
+                .await
+                .unwrap();
+            assert_ne!(read, runtime_thread, "a read ran on the runtime thread");
+            assert_ne!(write, runtime_thread, "a write ran on the runtime thread");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_waiting_on_sqlite_lock_does_not_block_runtime() {
+        let t = TestState::file_backed(Config::default());
+        // Another process, such as `aranet sync`, holds the write lock.
+        let blocker = rusqlite::Connection::open(t.db_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let state = Arc::clone(&t.state);
+        let write = tokio::spawn(async move {
+            state
+                .with_store_write(|store| store.upsert_device("x", None).map(|_| ()))
+                .await
+        });
+        // The spawned task runs while this one yields. Its write must wait for
+        // the lock on another thread, not in SQLite's 5 s busy handler on the
+        // only runtime thread.
+        tokio::task::yield_now().await;
+        assert!(
+            !write.is_finished(),
+            "the write finished while the database was locked"
+        );
+
+        blocker.execute_batch("COMMIT").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the write finishes once the lock is released")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn reads_use_query_only_connections() {
+        let t = TestState::file_backed(Config::default());
+        let err = t
+            .state
+            .with_store_read(|store| store.upsert_device("x", None).map(|_| ()))
+            .await
+            .expect_err("a read connection must refuse writes");
+        assert_read_only_error(err);
+
+        let devices = t
+            .state
+            .with_store_write(|store| store.list_devices())
+            .await
+            .unwrap();
+        assert!(devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_closure_panic_resumes_in_caller_and_writer_stays_usable() {
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
+        let err = tokio::spawn(async move {
+            state
+                .with_store_write(|_| -> aranet_store::Result<()> { panic!("boom") })
+                .await
+        })
+        .await
+        .expect_err("the closure's panic reaches the caller");
+        assert_eq!(err.into_panic().downcast_ref::<&str>(), Some(&"boom"));
+
+        t.state
+            .with_store_write(|store| store.upsert_device("x", None).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settle_waits_for_store_jobs() {
+        // Collector tests run on the paused clock and check what a poll stored
+        // right after `settle()`. That only holds while a running blocking job
+        // keeps the paused clock from jumping ahead.
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
+        let write = tokio::spawn(async move {
+            state
+                .with_store_write(|store| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    store.upsert_device("x", None).map(|_| ())
+                })
+                .await
+        });
+
+        crate::test_support::settle().await;
+        assert!(
+            write.is_finished(),
+            "settle() returned before the write did"
+        );
+        write.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_pool_is_bounded_and_reused() {
+        let t = TestState::file_backed(Config::default());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let mut reads = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let state = Arc::clone(&t.state);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            reads.spawn(async move {
+                state
+                    .with_store_read(move |store| {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(now, Ordering::SeqCst);
+                        // Runs on a blocking thread: hold the connection so the
+                        // other reads queue for the pool.
+                        std::thread::sleep(Duration::from_millis(20));
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        store.list_devices().map(|_| ())
+                    })
+                    .await
+            });
+        }
+        while let Some(read) = reads.join_next().await {
+            read.unwrap().unwrap();
+        }
+
+        let max = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            (1..=READ_POOL_SIZE).contains(&max),
+            "{max} reads ran at once"
+        );
+        let opened = t.state.read_connections_opened();
+        assert!(
+            (1..=READ_POOL_SIZE).contains(&opened),
+            "{opened} read connections were opened"
+        );
+
+        for _ in 0..20 {
+            t.state
+                .with_store_read(|store| store.list_devices().map(|_| ()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            t.state.read_connections_opened(),
+            opened,
+            "sequential reads reuse idle connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_closure_panic_closes_its_connection_and_releases_its_permit() {
+        let t = TestState::file_backed(Config::default());
+        for _ in 0..=READ_POOL_SIZE {
+            let state = Arc::clone(&t.state);
+            let err = tokio::spawn(async move {
+                state
+                    .with_store_read(|_| -> aranet_store::Result<()> { panic!("boom") })
+                    .await
+            })
+            .await
+            .expect_err("the closure's panic reaches the caller");
+            assert!(err.is_panic());
+        }
+
+        // A permit that a panic leaked would make this read wait forever.
+        let devices = tokio::time::timeout(
+            Duration::from_secs(5),
+            t.state.with_store_read(|store| store.list_devices()),
+        )
+        .await
+        .expect("a read after panicked reads gets a connection")
+        .unwrap();
+        assert!(devices.is_empty());
+        // Each panicked read opened a connection and closed it again.
+        assert_eq!(t.state.read_connections_opened(), READ_POOL_SIZE + 2);
     }
 }

@@ -716,7 +716,10 @@ async fn poll_once(
 
     // Store the reading
     let stored = state
-        .with_store_write(|store| store.insert_reading(&address, &reading))
+        .with_store_write({
+            let address = address.clone();
+            move |store| store.insert_reading(&address, &reading)
+        })
         .await
         .map(|row_id| StoredReading::from_reading_with_id(&address, &reading, row_id))
         .map_err(CollectorError::Store);

@@ -220,6 +220,7 @@ pub mod api;
 pub mod collector;
 pub mod config;
 pub mod dashboard;
+mod db;
 pub mod middleware;
 pub mod state;
 pub mod ws;
@@ -352,7 +353,11 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     config.validate()?;
 
     tracing::info!("Opening database at {:?}", config.storage.path);
-    let store = aranet_store::Store::open(&config.storage.path)?;
+    // Opening creates the file and migrates the schema, and can wait for
+    // another process's lock: like every database call, it runs on a
+    // blocking thread.
+    let db_path = config.storage.path.clone();
+    let store = db::run_blocking(move || aranet_store::Store::open(db_path)).await?;
     let state = AppState::with_config_path(store, config.clone(), config_path);
 
     let security_config = Arc::new(config.security.clone());
