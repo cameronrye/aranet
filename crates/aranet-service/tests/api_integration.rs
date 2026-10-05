@@ -833,6 +833,25 @@ async fn test_add_device_does_not_persist_runtime_overrides_or_drop_comments() {
 }
 
 #[tokio::test]
+async fn test_update_config_does_not_persist_runtime_overrides_or_drop_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("server.toml");
+    let original = "# Aranet service\n[server]\n# Only this machine\nbind = \"127.0.0.1:8080\" # default port\n";
+    std::fs::write(&config_path, original).unwrap();
+    let (app, _state) = app_for_config_file(&config_path);
+
+    let devices = format!(r#"{{"devices": [{OFFICE_DEVICE}]}}"#);
+    let (status, body) = put(&app, "/api/config", &devices).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let saved = std::fs::read_to_string(&config_path).unwrap();
+    for leaked in ["127.0.0.1:9999", "override.db", "[storage]", "[security]"] {
+        assert!(!saved.contains(leaked), "{leaked:?} written to:\n{saved}");
+    }
+    assert_eq!(saved, format!("{original}{OFFICE_DEVICE_TOML}"));
+}
+
+#[tokio::test]
 async fn test_update_device_keeps_comment_on_its_entry() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("server.toml");
