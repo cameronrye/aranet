@@ -314,9 +314,9 @@ pub const MAX_RETENTION_DAYS: u32 = 36_500;
 /// small batches. It never runs `VACUUM`, so the database file stops growing
 /// but doesn't shrink. To shrink it, stop the service and run
 /// `sqlite3 <database> 'VACUUM;'`. (`aranet cache prune --vacuum` shrinks it
-/// too, but it first deletes cached history older than its `--older-than`
-/// age, whatever these limits say.) Changes take effect when the service
-/// restarts.
+/// too, but it first deletes cached history, and readings unless
+/// `--history-only` is given, older than its `--older-than` age, whatever
+/// these limits say.) Changes take effect when the service restarts.
 ///
 /// ```toml
 /// [storage.retention]
