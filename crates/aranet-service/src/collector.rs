@@ -44,10 +44,24 @@
 //!
 //! ## Error Handling
 //!
-//! Connection and read errors are tracked per-device and logged with progressive
-//! quieting: errors are logged at WARN level for the first 3 failures, then at
-//! ERROR level once, then silently retried. This prevents log spam for devices
-//! that are temporarily unavailable.
+//! A failed poll (a connect, read or store error, or a poll that timed out) is
+//! counted in the device's statistics and retried with exponential backoff:
+//! after the n-th failure in a row, the next attempt comes
+//! `poll_interval × 2^(n-1)` after the failed poll ended, capped at 5 minutes
+//! or at the poll interval, whichever is longer. One successful poll restores
+//! the normal cadence. A sensor that is switched off or out of range costs about
+//! 30 s of Bluetooth scanning per attempt, during which no other device can
+//! be polled, so backing off keeps it from occupying the adapter.
+//!
+//! A poll that overruns its interval is followed by one poll straight away, and
+//! the interval counts from there
+//! ([`MissedTickBehavior::Delay`](tokio::time::MissedTickBehavior::Delay)), so
+//! missed ticks never fire back to back.
+//!
+//! Failures are logged at WARN for the first three attempts, at ERROR on the
+//! fourth ("reducing log frequency") and on every 12th after that (about hourly
+//! at the 5-minute cap), and at DEBUG otherwise. Each line names the device and
+//! the time until the next attempt.
 //!
 //! # Example
 //!
@@ -87,6 +101,67 @@ const DEVICE_STAGGER_SECS: u64 = 5;
 /// the sensor and then waits for BlueZ's service discovery, takes up to about
 /// 177 s.
 pub(crate) const BLE_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Longest wait between attempts to poll a device whose polls keep failing,
+/// unless its poll interval is longer.
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Delay before the next attempt after the `failures`-th consecutive failure
+/// (`failures >= 1`): the poll interval, doubled for each failure after the
+/// first, capped at `MAX_BACKOFF` or the poll interval, whichever is longer.
+///
+/// An unreachable sensor costs about 30 s of Bluetooth scanning per
+/// attempt, during which no other device can be polled, so it must not be
+/// retried every interval.
+pub(crate) fn backoff_delay(poll_interval: Duration, failures: u32) -> Duration {
+    let cap = MAX_BACKOFF.max(poll_interval);
+    poll_interval
+        .saturating_mul(2u32.saturating_pow(failures.saturating_sub(1).min(16)))
+        .min(cap)
+}
+
+/// Log level for the `failures`-th consecutive failure: WARN for 1-3, ERROR at
+/// 4 and every 12th after, otherwise `None` (logged at DEBUG).
+///
+/// Every 12th failure is about once an hour once the delay has reached
+/// `MAX_BACKOFF`.
+pub(crate) fn failure_log_level(failures: u32) -> Option<tracing::Level> {
+    match failures {
+        1..=3 => Some(tracing::Level::WARN),
+        4 => Some(tracing::Level::ERROR),
+        n if n > 4 && n.is_multiple_of(12) => Some(tracing::Level::ERROR),
+        _ => None,
+    }
+}
+
+/// Log the `failures`-th consecutive failed poll of `address` at the level
+/// `failure_log_level` picks, with the error text and the time until the next
+/// attempt.
+fn log_poll_failure(address: &str, error: &str, failures: u32, next_attempt: Duration) {
+    let next = next_attempt.as_secs();
+    match failure_log_level(failures) {
+        Some(tracing::Level::WARN) => {
+            warn!(
+                "Failed to poll {address}: {error} (attempt {failures}); next attempt in {next}s"
+            );
+        }
+        Some(_) if failures == 4 => {
+            error!(
+                "Failed to poll {address} after {failures} attempts, reducing log frequency; next attempt in {next}s"
+            );
+        }
+        Some(_) => {
+            error!(
+                "Failed to poll {address} ({failures} consecutive failures): {error}; next attempt in {next}s"
+            );
+        }
+        None => {
+            debug!(
+                "Failed to poll {address} ({failures} consecutive failures): {error}; next attempt in {next}s"
+            );
+        }
+    }
+}
 
 /// How long `stop` and a reload wait for cancelled tasks before aborting them.
 /// Cancelled tasks exit at their next `select!`, so this is a safety net.
@@ -491,6 +566,10 @@ async fn collect_device(
     );
 
     let mut ticker = tokio::time::interval_at(Instant::now() + first_poll, poll_interval);
+    // A poll that overran the interval is followed by one poll straight away,
+    // and the interval counts from there, instead of every missed tick firing
+    // back to back (the default, `Burst`).
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_failures = 0u32;
 
     loop {
@@ -583,23 +662,12 @@ async fn collect_device(
                 })
                 .await;
 
-                if consecutive_failures <= 3 {
-                    warn!(
-                        "Failed to poll {}: {} (attempt {})",
-                        address, e, consecutive_failures
-                    );
-                } else if consecutive_failures == 4 {
-                    error!(
-                        "Failed to poll {} after {} attempts, reducing log frequency",
-                        address, consecutive_failures
-                    );
-                } else if consecutive_failures.is_multiple_of(100) {
-                    error!(
-                        "Failed to poll {} ({} consecutive failures): {}",
-                        address, consecutive_failures, e
-                    );
-                }
-                // Continue trying - the device may come back online
+                // Back off: the next attempt comes `delay` after this failed
+                // poll ended (`reset_after` counts from now), not at the next
+                // tick. This also drops any tick that fell due while it ran.
+                let delay = backoff_delay(poll_interval, consecutive_failures);
+                ticker.reset_after(delay);
+                log_poll_failure(&address, &e, consecutive_failures, delay);
             }
         }
     }
@@ -1616,5 +1684,219 @@ mod tests {
             .expect("stop waited for the reload watcher it had cancelled");
         assert_eq!(stopped.unwrap(), CollectorStopResult::Stopped);
         assert!(!collector.is_running());
+    }
+}
+
+/// SV-9: devices whose polls keep failing back off, and the poll ticker never
+/// bursts. Every test runs on tokio's paused clock with a `FakeReader`, so the
+/// schedules are exact; `sleep` lets virtual time pass timer by timer.
+#[cfg(test)]
+mod backoff_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::time::{Instant, sleep, sleep_until};
+
+    use super::{Collector, CollectorStartResult, backoff_delay, failure_log_level};
+    use crate::config::{Config, DeviceConfig};
+    use crate::test_support::{FakeReader, TestState, settle};
+
+    /// The device that fails in every test that sets it failing.
+    const A: &str = "Aranet4 AAAAA";
+    /// A device that always answers at once.
+    const B: &str = "Aranet4 BBBBB";
+
+    fn secs(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    /// A config with these `(address, poll_interval)` devices, in this order. The
+    /// collector staggers their first polls 5 s apart.
+    fn config_with(devices: &[(&str, u64)]) -> Config {
+        Config {
+            devices: devices
+                .iter()
+                .map(|&(address, poll_interval)| DeviceConfig {
+                    address: address.to_string(),
+                    alias: None,
+                    poll_interval,
+                })
+                .collect(),
+            ..Config::default()
+        }
+    }
+
+    /// Start a collector that reads through `reader`. Returns the fixture (keep it
+    /// alive for the whole test), the collector and the instant it was started.
+    async fn start(config: Config, reader: &Arc<FakeReader>) -> (TestState, Collector, Instant) {
+        let t = TestState::with_reader(config, reader.clone());
+        let collector = Collector::new(Arc::clone(&t.state));
+        let t0 = Instant::now();
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        (t, collector, t0)
+    }
+
+    /// When each read of `address` started, in seconds after `t0`.
+    fn start_secs(reader: &FakeReader, address: &str, t0: Instant) -> Vec<f64> {
+        reader
+            .reads_of(address)
+            .iter()
+            .map(|read| (read.started - t0).as_secs_f64())
+            .collect()
+    }
+
+    /// Whether `actual` has as many entries as `expected` and each is within 1 s.
+    fn near(actual: &[f64], expected: &[u32]) -> bool {
+        actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected)
+                .all(|(&actual, &expected)| (actual - f64::from(expected)).abs() <= 1.0)
+    }
+
+    #[track_caller]
+    fn assert_starts(reader: &FakeReader, address: &str, t0: Instant, expected: &[u32]) {
+        let actual = start_secs(reader, address, t0);
+        assert!(
+            near(&actual, expected),
+            "reads of {address} started at {actual:?} s, expected {expected:?} s (±1 s)"
+        );
+    }
+
+    #[test]
+    fn backoff_delay_table() {
+        assert_eq!(backoff_delay(secs(60), 1), secs(60));
+        assert_eq!(backoff_delay(secs(60), 2), secs(120));
+        assert_eq!(backoff_delay(secs(60), 3), secs(240));
+        assert_eq!(backoff_delay(secs(60), 4), secs(300));
+        assert_eq!(backoff_delay(secs(60), u32::MAX), secs(300));
+        assert_eq!(backoff_delay(secs(10), 1), secs(10));
+        assert_eq!(backoff_delay(secs(10), 6), secs(300));
+        // An interval above the cap is never stretched.
+        assert_eq!(backoff_delay(secs(3600), 1), secs(3600));
+        assert_eq!(backoff_delay(secs(3600), 5), secs(3600));
+    }
+
+    #[test]
+    fn failure_log_level_table() {
+        use tracing::Level;
+
+        for failures in 1..=3 {
+            assert_eq!(
+                failure_log_level(failures),
+                Some(Level::WARN),
+                "failure {failures}"
+            );
+        }
+        assert_eq!(failure_log_level(4), Some(Level::ERROR));
+        for failures in 5..=11 {
+            assert_eq!(failure_log_level(failures), None, "failure {failures}");
+        }
+        for failures in [12, 24, 36] {
+            assert_eq!(
+                failure_log_level(failures),
+                Some(Level::ERROR),
+                "failure {failures}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failing_device_is_backed_off() {
+        let reader = FakeReader::new();
+        reader.set_failing(A, true);
+        let (_t, _collector, t0) = start(config_with(&[(A, 60)]), &reader).await;
+
+        sleep(secs(1800)).await;
+
+        // Each read fails at once. The next one waits 60, 120, 240 s, then 300 s
+        // (the cap) every time.
+        assert_starts(&reader, A, t0, &[0, 60, 180, 420, 720, 1020, 1320, 1620]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_failing_device_does_not_burst() {
+        let reader = FakeReader::new();
+        reader.set_failing(A, true);
+        // Every attempt overruns the 10 s interval tenfold.
+        reader.set_latency(A, secs(100));
+        let (_t, _collector, t0) = start(config_with(&[(A, 10)]), &reader).await;
+
+        sleep(secs(3600)).await;
+
+        // Each gap is the 100 s read plus a delay counted from its end: 10, 20,
+        // 40, 80, 160 s, then 300 s.
+        let starts = start_secs(&reader, A, t0);
+        let gaps: Vec<f64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let expected = [110, 120, 140, 180, 260, 400, 400, 400, 400, 400, 400];
+        assert!(
+            near(&gaps, &expected),
+            "reads of {A} started {gaps:?} s apart, expected {expected:?} s (±1 s)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_device_keeps_cadence_next_to_unreachable_one() {
+        let reader = FakeReader::new();
+        // A is out of range: each attempt holds the Bluetooth permit for 60 s of
+        // scanning and then fails. B answers at once.
+        reader.set_failing(A, true);
+        reader.set_latency(A, secs(60));
+        let (_t, _collector, t0) = start(config_with(&[(A, 60), (B, 60)]), &reader).await;
+
+        sleep(secs(3600)).await;
+
+        // B's ticks fall at 5 + 60k s, 50 of them in [600 s, 3600 s). A read that
+        // starts more than 1 s after its tick waited for A's attempt to end.
+        let (on_time, late): (Vec<f64>, Vec<f64>) = start_secs(&reader, B, t0)
+            .into_iter()
+            .filter(|start| (600.0..3600.0).contains(start))
+            .partition(|start| {
+                let offset = (start - 5.0).rem_euclid(60.0);
+                offset <= 1.0 || offset >= 59.0
+            });
+        assert!(
+            on_time.len() >= 40,
+            "only {} of B's 50 ticks in [600, 3600) s were read on time; late reads at {late:?} s",
+            on_time.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_resets_backoff() {
+        let reader = FakeReader::new();
+        reader.set_failing(A, true);
+        let (_t, _collector, t0) = start(config_with(&[(A, 60)]), &reader).await;
+
+        // The third failure, at 180 s, puts the next attempt 240 s later.
+        reader.wait_for_reads(3).await;
+        settle().await;
+        reader.set_failing(A, false);
+        sleep_until(t0 + secs(510)).await;
+
+        // The success at 420 s restores the 60 s cadence.
+        assert_starts(&reader, A, t0, &[0, 60, 180, 420, 480]);
+        let ok: Vec<bool> = reader.reads_of(A).iter().map(|read| read.ok).collect();
+        assert_eq!(ok, [false, false, false, true, true]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_first_poll_does_not_burst() {
+        let reader = FakeReader::new();
+        // The first read overruns the ticks at 60 and 120 s; later reads are instant.
+        reader.set_latency(A, secs(130));
+        let (_t, _collector, t0) = start(config_with(&[(A, 60)]), &reader).await;
+        reader.wait_for_reads(1).await;
+        reader.set_latency(A, Duration::ZERO);
+
+        sleep_until(t0 + secs(400)).await;
+
+        let starts = start_secs(&reader, A, t0);
+        assert!(
+            starts.windows(2).all(|pair| pair[1] - pair[0] >= 59.0),
+            "reads of {A} started at {starts:?} s; two were less than 59 s apart"
+        );
+        // One read when the slow one ends, then every 60 s from there.
+        assert_starts(&reader, A, t0, &[0, 130, 190, 250, 310, 370]);
     }
 }
