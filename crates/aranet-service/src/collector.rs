@@ -959,7 +959,9 @@ mod notifications {
 
     /// Every test here dispatches through a fake `show`, never the desktop.
     /// They run on real time: a running `spawn_blocking` job would stop a
-    /// paused clock from advancing.
+    /// paused clock from advancing. The one exception starts the collector on
+    /// the paused clock, like the other collector tests; its `show` returns at
+    /// once.
     #[cfg(test)]
     mod tests {
         use std::sync::Arc;
@@ -972,9 +974,10 @@ mod notifications {
         use tokio::time::timeout;
 
         use super::{Notifier, ShowFn, alert_message, notify_if_needed};
+        use crate::collector::{Collector, CollectorStartResult};
         use crate::config::{Config, DeviceConfig, NotificationConfig};
         use crate::state::CollectorState;
-        use crate::test_support::TestState;
+        use crate::test_support::{FakeReader, TestState, settle};
 
         const A: &str = "AA:BB:CC:DD:EE:FF";
         const B: &str = "11:22:33:44:55:66";
@@ -1255,6 +1258,51 @@ mod notifications {
 
             let last = t.state.collector.notifier.last.lock().unwrap();
             assert!(last.is_empty(), "an alert was dispatched: {last:?}");
+        }
+
+        /// The tests above call `notify_if_needed` and `maybe_notify`
+        /// themselves. This one checks that the collector calls the notifier
+        /// after a successful poll.
+        #[tokio::test(start_paused = true)]
+        async fn collector_poll_over_threshold_shows_one_alert() {
+            let (show, mut alerts) = recording_show();
+            let reader = FakeReader::new();
+            reader.set_reading(
+                A,
+                CurrentReading {
+                    co2: 1500,
+                    ..CurrentReading::default()
+                },
+            );
+            let t = TestState::with_collector(
+                config_with_alias("Office"),
+                CollectorState::with_reader(reader.clone())
+                    .with_notifier(Notifier::with_show(show)),
+            );
+            let collector = Collector::new(Arc::clone(&t.state));
+
+            assert_eq!(collector.start().await, CollectorStartResult::Started);
+            // A's first poll is due at once. settle() lets it finish, and the
+            // show() job it dispatched too: a running spawn_blocking job stops
+            // the paused clock.
+            settle().await;
+
+            assert_eq!(reader.reads_of(A).len(), 1);
+            assert_eq!(
+                alerts.try_recv(),
+                Ok((
+                    "Aranet Alert: Office".to_string(),
+                    "CO\u{2082}: 1500 ppm (threshold: 1000)".to_string()
+                )),
+                "the collector showed no alert, or the wrong one, for A's first poll"
+            );
+            assert_eq!(
+                alerts.try_recv(),
+                Err(TryRecvError::Empty),
+                "A's first poll showed more than one alert"
+            );
+
+            collector.stop().await;
         }
     }
 }
