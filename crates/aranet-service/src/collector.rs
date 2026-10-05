@@ -532,45 +532,32 @@ use notifications::check_and_notify;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::TestState;
 
-    fn test_config_path() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "aranet-service-collector-test-{}-{}.toml",
-            std::process::id(),
-            nanos
-        ))
-    }
-
-    fn create_test_state() -> Arc<AppState> {
-        let store = aranet_store::Store::open_in_memory().unwrap();
-        let config = Config::default();
-        AppState::with_config_path(store, config, test_config_path())
+    fn create_test_state() -> TestState {
+        TestState::in_memory()
     }
 
     #[test]
     fn test_collector_new() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let collector = Collector::new(Arc::clone(&state));
         assert!(!collector.is_running());
     }
 
     #[test]
     fn test_collector_is_running_initially_false() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let collector = Collector::new(state);
         assert!(!collector.is_running());
     }
 
     #[tokio::test]
     async fn test_collector_start_no_devices() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let collector = Collector::new(Arc::clone(&state));
 
         // Start with no devices configured
@@ -593,7 +580,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_devices_changed_signals_reload_when_collector_is_idle() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let collector = Collector::new(Arc::clone(&state));
         assert_eq!(
             collector.start().await,
@@ -613,7 +601,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_start_with_devices_initializes_stats() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Add a device to config
         {
@@ -647,7 +636,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_stop() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         state.collector.set_running(true);
 
         let collector = Collector::new(Arc::clone(&state));
@@ -715,7 +705,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_device_stat() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Initialize stats
         {
@@ -749,7 +740,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_device_stat_nonexistent_device() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Initialize stats with one device
         {
@@ -788,7 +780,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ble_semaphore_serializes_access() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Acquire the single permit
         let permit = state.ble_semaphore.acquire().await.unwrap();
@@ -813,7 +806,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_multiple_devices() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Add multiple devices
         {

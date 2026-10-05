@@ -222,6 +222,9 @@ pub mod middleware;
 pub mod state;
 pub mod ws;
 
+#[cfg(test)]
+mod test_support;
+
 pub use collector::Collector;
 pub use config::{
     Config, ConfigError, DeviceConfig, InfluxDbConfig, MqttConfig, NotificationConfig,

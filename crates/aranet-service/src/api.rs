@@ -1529,9 +1529,7 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use axum::{
@@ -1543,26 +1541,13 @@ mod tests {
     use time::Duration;
     use tower::ServiceExt;
 
-    use crate::config::{Config, SecurityConfig};
+    use crate::config::SecurityConfig;
     use crate::middleware::RateLimitState;
+    use crate::test_support::TestState;
     use aranet_types::HistoryRecord;
 
-    fn test_config_path() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "aranet-service-api-unit-test-{}-{}.toml",
-            std::process::id(),
-            nanos
-        ))
-    }
-
-    fn create_test_state() -> Arc<AppState> {
-        let store = aranet_store::Store::open_in_memory().unwrap();
-        let config = Config::default();
-        AppState::with_config_path(store, config, test_config_path())
+    fn create_test_state() -> TestState {
+        TestState::in_memory()
     }
 
     async fn response_body(response: axum::response::Response) -> String {
@@ -1595,19 +1580,21 @@ mod tests {
             .unwrap()
     }
 
-    fn create_full_app(security: SecurityConfig) -> axum::Router {
-        let state = create_test_state();
-        crate::app(
-            state,
+    fn create_full_app(security: SecurityConfig) -> (axum::Router, TestState) {
+        let t = create_test_state();
+        let app = crate::app(
+            Arc::clone(&t.state),
             Arc::new(security.clone()),
             Arc::new(RateLimitState::new()),
         )
-        .layer(crate::middleware::cors_layer(&security))
+        .layer(crate::middleware::cors_layer(&security));
+        (app, t)
     }
 
     #[tokio::test]
     async fn test_health_endpoint() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1632,7 +1619,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_devices_empty() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1655,7 +1643,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_device_not_found() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1678,7 +1667,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_current_reading_not_found() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1696,7 +1686,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_readings_empty() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1720,7 +1711,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_all_readings_empty() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1744,7 +1736,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_history_empty() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1768,7 +1761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_app_requires_api_key_for_protected_routes() {
-        let app = create_full_app(create_security_config());
+        let (app, _t) = create_full_app(create_security_config());
 
         let response = app
             .oneshot(request_with_connect_info(
@@ -1785,7 +1778,7 @@ mod tests {
     async fn test_full_app_accepts_api_key_header() {
         let security = create_security_config();
         let expected_key = security.api_key.clone().unwrap();
-        let app = create_full_app(security);
+        let (app, _t) = create_full_app(security);
 
         let response = app
             .oneshot(
@@ -1814,7 +1807,7 @@ mod tests {
             ..create_security_config()
         };
         security.rate_limit_requests = 1;
-        let app = create_full_app(security);
+        let (app, _t) = create_full_app(security);
 
         let first = app
             .clone()
@@ -1846,7 +1839,7 @@ mod tests {
             ..create_security_config()
         };
         security.rate_limit_enabled = false;
-        let app = create_full_app(security);
+        let (app, _t) = create_full_app(security);
 
         let response = app
             .oneshot(
@@ -1877,7 +1870,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_readings_invalid_since_returns_bad_request() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1895,7 +1889,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_history_invalid_until_returns_bad_request() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1913,7 +1908,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_all_readings_invalid_since_returns_bad_request() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -1931,43 +1927,44 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_history_respects_offset() {
-        let state = create_test_state();
-        {
-            let store = state.store.lock().await;
-            let records = vec![
-                HistoryRecord {
-                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(60),
-                    co2: 100,
-                    temperature: 20.0,
-                    pressure: 1000.0,
-                    humidity: 40,
-                    radon: None,
-                    radiation_rate: None,
-                    radiation_total: None,
-                },
-                HistoryRecord {
-                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(120),
-                    co2: 200,
-                    temperature: 21.0,
-                    pressure: 1001.0,
-                    humidity: 41,
-                    radon: None,
-                    radiation_rate: None,
-                    radiation_total: None,
-                },
-                HistoryRecord {
-                    timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(180),
-                    co2: 300,
-                    temperature: 22.0,
-                    pressure: 1002.0,
-                    humidity: 42,
-                    radon: None,
-                    radiation_rate: None,
-                    radiation_total: None,
-                },
-            ];
-            store.insert_history("test-device", &records).unwrap();
-        }
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
+        let records = vec![
+            HistoryRecord {
+                timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(60),
+                co2: 100,
+                temperature: 20.0,
+                pressure: 1000.0,
+                humidity: 40,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+            HistoryRecord {
+                timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(120),
+                co2: 200,
+                temperature: 21.0,
+                pressure: 1001.0,
+                humidity: 41,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+            HistoryRecord {
+                timestamp: OffsetDateTime::UNIX_EPOCH + Duration::seconds(180),
+                co2: 300,
+                temperature: 22.0,
+                pressure: 1002.0,
+                humidity: 42,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            },
+        ];
+        state
+            .with_store_write(move |store| store.insert_history("test-device", &records))
+            .await
+            .unwrap();
         let app = router().with_state(state);
 
         let response = app
@@ -1994,7 +1991,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_readings_query_params() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         // Test with query parameters
@@ -2105,7 +2103,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_status_endpoint() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -2132,7 +2131,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_config_endpoint() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -2157,7 +2157,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_device_endpoint() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(Arc::clone(&state));
 
         let request_body = serde_json::json!({
@@ -2190,7 +2191,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_duplicate_device() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Add first device
         {
@@ -2226,7 +2228,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_device_endpoint() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Add a device first
         {
@@ -2268,7 +2271,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_device_rejected_update_leaves_config_unchanged() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         {
             let mut config = state.config.write().await;
             config.devices.push(DeviceConfig {
@@ -2300,7 +2304,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_nonexistent_device() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let request_body = serde_json::json!({
@@ -2324,7 +2329,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_device_endpoint() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Add a device first
         {
@@ -2354,7 +2360,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_nonexistent_device() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -2373,7 +2380,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_start_stop() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(Arc::clone(&state));
 
         // Start collector with no configured devices
@@ -2400,7 +2408,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_start_stop_with_configured_device() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         {
             let mut config = state.config.write().await;
             config.devices.push(DeviceConfig {
@@ -2453,7 +2462,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_start_already_running() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         state.collector.set_running(true);
 
         let app = router().with_state(state);
@@ -2480,7 +2490,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_stop_not_running() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -2505,7 +2516,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_config_with_devices() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let request_body = serde_json::json!({
@@ -2647,7 +2659,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_device_lifecycle() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(Arc::clone(&state));
 
         // 1. Add a device
@@ -2749,7 +2762,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_json_body() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -2770,7 +2784,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_required_field() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         // Missing required "address" field
@@ -2795,7 +2810,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_case_insensitive_device_lookup() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Add device with uppercase
         {
@@ -2831,34 +2847,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_data_endpoints_with_stored_data() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Insert some data into the store
-        {
-            let store = state.store.lock().await;
-            store
-                .upsert_device("test-sensor", Some("Test Sensor"))
-                .unwrap();
-
-            let reading = aranet_types::CurrentReading {
-                co2: 750,
-                temperature: 23.5,
-                pressure: 1015.0,
-                humidity: 48,
-                battery: 90,
-                status: aranet_types::Status::Green,
-                interval: 60,
-                age: 5,
-                captured_at: Some(time::OffsetDateTime::now_utc()),
-                radon: None,
-                radiation_rate: None,
-                radiation_total: None,
-                radon_avg_24h: None,
-                radon_avg_7d: None,
-                radon_avg_30d: None,
-            };
-            store.insert_reading("test-sensor", &reading).unwrap();
-        }
+        let reading = aranet_types::CurrentReading {
+            co2: 750,
+            temperature: 23.5,
+            pressure: 1015.0,
+            humidity: 48,
+            battery: 90,
+            status: aranet_types::Status::Green,
+            interval: 60,
+            age: 5,
+            captured_at: Some(time::OffsetDateTime::now_utc()),
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+            radon_avg_24h: None,
+            radon_avg_7d: None,
+            radon_avg_30d: None,
+        };
+        state
+            .with_store_write(move |store| {
+                store.upsert_device("test-sensor", Some("Test Sensor"))?;
+                store.insert_reading("test-sensor", &reading)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         // Test list devices
         let app = router().with_state(Arc::clone(&state));
@@ -2916,7 +2933,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_response_format() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -2941,7 +2959,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_api_requests() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Spawn multiple concurrent requests
         let mut handles = Vec::new();
@@ -2973,7 +2992,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_detailed_endpoint() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         let app = router().with_state(state);
 
         let response = app
@@ -3011,30 +3031,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_staleness_threshold_default_when_no_collector_stats() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
         // Insert a reading with a known captured_at in the past (>180s ago → stale)
-        {
-            let store = state.store.lock().await;
-            let reading = aranet_types::CurrentReading {
-                co2: 500,
-                temperature: 22.0,
-                pressure: 1013.0,
-                humidity: 50,
-                battery: 80,
-                status: aranet_types::Status::Green,
-                interval: 60,
-                age: 0,
-                captured_at: Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(200)),
-                radon: None,
-                radiation_rate: None,
-                radiation_total: None,
-                radon_avg_24h: None,
-                radon_avg_7d: None,
-                radon_avg_30d: None,
-            };
-            store.insert_reading("Aranet4 AABB0", &reading).unwrap();
-        }
+        let reading = aranet_types::CurrentReading {
+            co2: 500,
+            temperature: 22.0,
+            pressure: 1013.0,
+            humidity: 50,
+            battery: 80,
+            status: aranet_types::Status::Green,
+            interval: 60,
+            age: 0,
+            captured_at: Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(200)),
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+            radon_avg_24h: None,
+            radon_avg_7d: None,
+            radon_avg_30d: None,
+        };
+        state
+            .with_store_write(move |store| store.insert_reading("Aranet4 AABB0", &reading))
+            .await
+            .unwrap();
 
         let app = router().with_state(state);
 
@@ -3060,29 +3081,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_staleness_threshold_fresh_reading() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
 
-        {
-            let store = state.store.lock().await;
-            let reading = aranet_types::CurrentReading {
-                co2: 400,
-                temperature: 21.0,
-                pressure: 1013.0,
-                humidity: 45,
-                battery: 90,
-                status: aranet_types::Status::Green,
-                interval: 60,
-                age: 0,
-                captured_at: Some(time::OffsetDateTime::now_utc()),
-                radon: None,
-                radiation_rate: None,
-                radiation_total: None,
-                radon_avg_24h: None,
-                radon_avg_7d: None,
-                radon_avg_30d: None,
-            };
-            store.insert_reading("Aranet4 AABB1", &reading).unwrap();
-        }
+        let reading = aranet_types::CurrentReading {
+            co2: 400,
+            temperature: 21.0,
+            pressure: 1013.0,
+            humidity: 45,
+            battery: 90,
+            status: aranet_types::Status::Green,
+            interval: 60,
+            age: 0,
+            captured_at: Some(time::OffsetDateTime::now_utc()),
+            radon: None,
+            radiation_rate: None,
+            radiation_total: None,
+            radon_avg_24h: None,
+            radon_avg_7d: None,
+            radon_avg_30d: None,
+        };
+        state
+            .with_store_write(move |store| store.insert_reading("Aranet4 AABB1", &reading))
+            .await
+            .unwrap();
 
         let app = router().with_state(state);
 
@@ -3107,7 +3129,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_detailed_status_degraded_when_collector_stopped() {
-        let state = create_test_state();
+        let t = create_test_state();
+        let state = Arc::clone(&t.state);
         // Collector is not running by default
 
         let app = router().with_state(state);

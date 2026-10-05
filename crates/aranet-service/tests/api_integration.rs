@@ -4,9 +4,7 @@
 //! and exercise every REST endpoint.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
@@ -20,37 +18,37 @@ use aranet_service::state::AppState;
 use aranet_service::{ReadingEvent, app};
 use aranet_store::Store;
 use aranet_types::{CurrentReading, HistoryRecord, Status};
+use tempfile::TempDir;
 use time::OffsetDateTime;
 
-fn test_config_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "aranet-service-api-test-{}-{}.toml",
-        std::process::id(),
-        nanos
-    ))
-}
-
-/// Create a test app with an in-memory store and default config.
-/// Includes MockConnectInfo so rate limiting middleware can extract client IP.
-fn test_app() -> (axum::Router, Arc<AppState>) {
+/// Create a test app with an in-memory store and `config`.
+///
+/// The config file is `server.toml` and `storage.path` is `data.db`, both in
+/// the returned temporary directory, which is deleted when it is dropped: bind
+/// it as `_dir`, never as `_`. `let (app, state, _dir)` drops the directory
+/// first; that is safe only because the store is in memory and the config
+/// file is closed after each save. Includes MockConnectInfo so rate limiting
+/// middleware can extract client IP.
+fn test_app_with_config(mut config: Config) -> (axum::Router, Arc<AppState>, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    config.storage.path = dir.path().join("data.db");
     let store = Store::open_in_memory().unwrap();
-    let config = Config::default();
-    let state = AppState::with_config_path(store, config.clone(), test_config_path());
     let security_config = Arc::new(config.security.clone());
+    let state = AppState::with_config_path(store, config, dir.path().join("server.toml"));
     let rate_limit_state = Arc::new(RateLimitState::new());
     let router = app(Arc::clone(&state), security_config, rate_limit_state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-    (router, state)
+    (router, state, dir)
+}
+
+/// Create a test app with an in-memory store and default config.
+fn test_app() -> (axum::Router, Arc<AppState>, TempDir) {
+    test_app_with_config(Config::default())
 }
 
 /// Create a test app with API key authentication enabled.
-fn test_app_with_auth() -> (axum::Router, Arc<AppState>) {
-    let store = Store::open_in_memory().unwrap();
-    let config = Config {
+fn test_app_with_auth() -> (axum::Router, Arc<AppState>, TempDir) {
+    test_app_with_config(Config {
         security: SecurityConfig {
             api_key_enabled: true,
             api_key: Some("test-api-key-that-is-at-least-32-characters-long".to_string()),
@@ -58,13 +56,7 @@ fn test_app_with_auth() -> (axum::Router, Arc<AppState>) {
             ..Default::default()
         },
         ..Default::default()
-    };
-    let state = AppState::with_config_path(store, config.clone(), test_config_path());
-    let security_config = Arc::new(config.security.clone());
-    let rate_limit_state = Arc::new(RateLimitState::new());
-    let router = app(Arc::clone(&state), security_config, rate_limit_state)
-        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-    (router, state)
+    })
 }
 
 /// Helper to make GET requests and return (status, body_string).
@@ -165,9 +157,11 @@ async fn get_with_key(app: &axum::Router, path: &str, key: &str) -> (StatusCode,
 
 /// Insert a test reading into the store.
 async fn insert_test_reading(state: &AppState, device_id: &str, alias: Option<&str>, co2: u16) {
+    let device_id = device_id.to_owned();
+    let alias = alias.map(str::to_owned);
     state
-        .with_store_write(|store| {
-            store.upsert_device(device_id, alias)?;
+        .with_store_write(move |store| {
+            store.upsert_device(&device_id, alias.as_deref())?;
             let reading = CurrentReading {
                 co2,
                 temperature: 22.5,
@@ -179,7 +173,7 @@ async fn insert_test_reading(state: &AppState, device_id: &str, alias: Option<&s
                 age: 10,
                 ..Default::default()
             };
-            store.insert_reading(device_id, &reading)?;
+            store.insert_reading(&device_id, &reading)?;
             Ok(())
         })
         .await
@@ -192,7 +186,7 @@ async fn insert_test_reading(state: &AppState, device_id: &str, alias: Option<&s
 
 #[tokio::test]
 async fn test_health_endpoint() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/api/health").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -204,7 +198,7 @@ async fn test_health_endpoint() {
 
 #[tokio::test]
 async fn test_health_detailed_endpoint() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/api/health/detailed").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -220,7 +214,7 @@ async fn test_health_detailed_endpoint() {
 
 #[tokio::test]
 async fn test_list_devices_empty() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/api/devices").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -230,7 +224,7 @@ async fn test_list_devices_empty() {
 
 #[tokio::test]
 async fn test_list_devices_with_data() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     insert_test_reading(&state, "Aranet4 12345", Some("Office"), 800).await;
 
     let (status, body) = get(&app, "/api/devices").await;
@@ -242,7 +236,7 @@ async fn test_list_devices_with_data() {
 
 #[tokio::test]
 async fn test_get_device() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     insert_test_reading(&state, "Aranet4 12345", Some("Office"), 800).await;
 
     let (status, body) = get(&app, "/api/devices/Aranet4%2012345").await;
@@ -253,14 +247,14 @@ async fn test_get_device() {
 
 #[tokio::test]
 async fn test_get_device_not_found() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, _) = get(&app, "/api/devices/nonexistent").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn test_get_current_reading() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     insert_test_reading(&state, "Aranet4 12345", Some("Office"), 800).await;
 
     let (status, body) = get(&app, "/api/devices/Aranet4%2012345/current").await;
@@ -274,7 +268,7 @@ async fn test_get_current_reading() {
 
 #[tokio::test]
 async fn test_get_current_reading_not_found() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     // Device exists but no readings
     state
         .with_store_write(|store| store.upsert_device("empty-device", None).map(|_| ()))
@@ -291,7 +285,7 @@ async fn test_get_current_reading_not_found() {
 
 #[tokio::test]
 async fn test_get_all_readings() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     insert_test_reading(&state, "Aranet4 AAAAA", Some("Office"), 800).await;
     insert_test_reading(&state, "Aranet4 BBBBB", Some("Kitchen"), 600).await;
 
@@ -305,7 +299,7 @@ async fn test_get_all_readings() {
 
 #[tokio::test]
 async fn test_get_latest_device_readings() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     insert_test_reading(&state, "Aranet4 AAAAA", Some("Office"), 800).await;
     insert_test_reading(&state, "Aranet4 BBBBB", Some("Kitchen"), 600).await;
 
@@ -322,7 +316,7 @@ async fn test_get_latest_device_readings() {
 
 #[tokio::test]
 async fn test_get_device_readings() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     insert_test_reading(&state, "Aranet4 12345", Some("Office"), 800).await;
 
     let (status, body) = get(&app, "/api/devices/Aranet4%2012345/readings").await;
@@ -334,7 +328,7 @@ async fn test_get_device_readings() {
 
 #[tokio::test]
 async fn test_get_device_history_without_current_reading() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     state
         .with_store_write(|store| {
             store.upsert_device("Aranet4 HIST1", Some("Archive"))?;
@@ -366,7 +360,7 @@ async fn test_get_device_history_without_current_reading() {
 
 #[tokio::test]
 async fn test_collector_stop_when_not_running() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = post(&app, "/api/collector/stop", "").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -380,7 +374,7 @@ async fn test_collector_stop_when_not_running() {
 
 #[tokio::test]
 async fn test_get_config() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/api/config").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -391,7 +385,7 @@ async fn test_get_config() {
 
 #[tokio::test]
 async fn test_add_device() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
     let body = r#"{"address": "Aranet4 12345", "alias": "Office", "poll_interval": 60}"#;
     let (status, resp) = post(&app, "/api/config/devices", body).await;
 
@@ -409,8 +403,10 @@ async fn test_add_device() {
 async fn test_add_device_fails_when_config_cannot_be_saved() {
     let store = Store::open_in_memory().unwrap();
     let config = Config::default();
-    let bad_parent = tempfile::NamedTempFile::new().unwrap();
-    let config_path = bad_parent.path().join("server.toml");
+    // A file where the config's parent directory should be, so saving fails.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("not-a-dir"), b"").unwrap();
+    let config_path = dir.path().join("not-a-dir").join("server.toml");
     let state = AppState::with_config_path(store, config.clone(), config_path);
     let security_config = Arc::new(config.security.clone());
     let rate_limit_state = Arc::new(RateLimitState::new());
@@ -432,7 +428,7 @@ async fn test_add_device_fails_when_config_cannot_be_saved() {
 
 #[tokio::test]
 async fn test_add_duplicate_device() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
 
     // Add initial config
     {
@@ -452,7 +448,7 @@ async fn test_add_duplicate_device() {
 
 #[tokio::test]
 async fn test_update_device_preserves_alias_when_omitted() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
 
     {
         let mut config = state.config.write().await;
@@ -482,7 +478,7 @@ async fn test_update_device_preserves_alias_when_omitted() {
 
 #[tokio::test]
 async fn test_update_device_can_clear_alias_with_null() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
 
     {
         let mut config = state.config.write().await;
@@ -510,7 +506,7 @@ async fn test_update_device_can_clear_alias_with_null() {
 
 #[tokio::test]
 async fn test_remove_device() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
 
     // Add a device first
     {
@@ -532,7 +528,7 @@ async fn test_remove_device() {
 
 #[tokio::test]
 async fn test_remove_device_not_found() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, _) = delete(&app, "/api/config/devices/nonexistent").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -543,7 +539,7 @@ async fn test_remove_device_not_found() {
 
 #[tokio::test]
 async fn test_get_status() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/api/status").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -558,7 +554,7 @@ async fn test_get_status() {
 
 #[tokio::test]
 async fn test_dashboard_root() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -568,7 +564,7 @@ async fn test_dashboard_root() {
 
 #[tokio::test]
 async fn test_dashboard_route() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/dashboard").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -577,7 +573,7 @@ async fn test_dashboard_route() {
 
 #[tokio::test]
 async fn test_dashboard_root_is_public_when_auth_enabled() {
-    let (app, _) = test_app_with_auth();
+    let (app, _, _dir) = test_app_with_auth();
     let (status, body) = get(&app, "/").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -586,7 +582,7 @@ async fn test_dashboard_root_is_public_when_auth_enabled() {
 
 #[tokio::test]
 async fn test_dashboard_route_is_public_when_auth_enabled() {
-    let (app, _) = test_app_with_auth();
+    let (app, _, _dir) = test_app_with_auth();
     let (status, body) = get(&app, "/dashboard").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -595,7 +591,7 @@ async fn test_dashboard_route_is_public_when_auth_enabled() {
 
 #[tokio::test]
 async fn test_dashboard_history_uses_cached_history_endpoint() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/dashboard").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -612,7 +608,7 @@ async fn test_dashboard_history_uses_cached_history_endpoint() {
 
 #[tokio::test]
 async fn test_health_no_auth_required() {
-    let (app, _) = test_app_with_auth();
+    let (app, _, _dir) = test_app_with_auth();
     let (status, _) = get(&app, "/api/health").await;
 
     // Health endpoint should work without auth
@@ -621,7 +617,7 @@ async fn test_health_no_auth_required() {
 
 #[tokio::test]
 async fn test_api_requires_auth_when_enabled() {
-    let (app, _) = test_app_with_auth();
+    let (app, _, _dir) = test_app_with_auth();
     let (status, _) = get(&app, "/api/devices").await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -629,7 +625,7 @@ async fn test_api_requires_auth_when_enabled() {
 
 #[tokio::test]
 async fn test_api_with_valid_key() {
-    let (app, _) = test_app_with_auth();
+    let (app, _, _dir) = test_app_with_auth();
     let (status, _) = get_with_key(
         &app,
         "/api/devices",
@@ -642,7 +638,7 @@ async fn test_api_with_valid_key() {
 
 #[tokio::test]
 async fn test_api_with_invalid_key() {
-    let (app, _) = test_app_with_auth();
+    let (app, _, _dir) = test_app_with_auth();
     let (status, _) = get_with_key(&app, "/api/devices", "wrong-key").await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -650,7 +646,7 @@ async fn test_api_with_invalid_key() {
 
 #[tokio::test]
 async fn test_api_auth_query_param_only_for_ws() {
-    let (app, _) = test_app_with_auth();
+    let (app, _, _dir) = test_app_with_auth();
     // Token query parameter is only allowed for WebSocket routes, not REST
     let (status, _) = get(
         &app,
@@ -668,7 +664,7 @@ async fn test_api_auth_query_param_only_for_ws() {
 
 #[tokio::test]
 async fn test_broadcast_reading_updates_api() {
-    let (app, state) = test_app();
+    let (app, state, _dir) = test_app();
 
     // Insert a device first
     state
@@ -732,7 +728,7 @@ async fn test_broadcast_reading_updates_api() {
 
 #[tokio::test]
 async fn test_prometheus_metrics_disabled_by_default() {
-    let (app, _) = test_app();
+    let (app, _, _dir) = test_app();
     let (status, body) = get(&app, "/metrics").await;
 
     // When prometheus is disabled, should return 404 or empty
@@ -742,14 +738,9 @@ async fn test_prometheus_metrics_disabled_by_default() {
 
 #[tokio::test]
 async fn test_prometheus_metrics_enabled() {
-    let store = Store::open_in_memory().unwrap();
     let mut config = Config::default();
     config.prometheus.enabled = true;
-    let state = AppState::with_config_path(store, config.clone(), test_config_path());
-    let security_config = Arc::new(config.security.clone());
-    let rate_limit_state = Arc::new(RateLimitState::new());
-    let router = app(Arc::clone(&state), security_config, rate_limit_state)
-        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    let (router, state, _dir) = test_app_with_config(config);
 
     // Insert a reading so metrics have data
     insert_test_reading(&state, "Aranet4 AAAAA", Some("Office"), 800).await;

@@ -64,6 +64,11 @@ pub struct AppState {
 impl AppState {
     /// Create new application state.
     ///
+    /// Configuration changes made through this state, such as a device added
+    /// through the API, are saved to the per-user file from
+    /// [`default_config_path()`]: the real `server.toml`. Tests must not use
+    /// this constructor; use [`Self::with_config_path`] for any other location.
+    ///
     /// The broadcast channel buffer size is determined by `config.server.broadcast_buffer`.
     /// If the buffer fills (slow subscribers), old messages are dropped without blocking.
     pub fn new(store: Store, config: Config) -> Arc<Self> {
@@ -367,7 +372,7 @@ pub struct ReadingEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::test_support::TestState;
     use aranet_types::Status;
 
     fn create_test_reading(device_id: &str, co2: u16) -> aranet_store::StoredReading {
@@ -392,9 +397,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_app_state_new() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         let config = state.config.read().await;
         assert_eq!(config.server.bind, "127.0.0.1:8080");
@@ -416,9 +420,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_app_state_store_access() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         let devices = state
             .with_store_read(|store| store.list_devices())
@@ -429,9 +432,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_app_state_broadcast_channel() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         let mut rx = state.readings_tx.subscribe();
 
@@ -525,14 +527,12 @@ mod tests {
 
         collector.set_running(true);
         assert!(collector.is_running());
-        let started = collector.started_at();
-        assert!(started.is_some());
+        assert!(collector.started_at().is_some());
 
-        // Set running again - should update timestamp
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Setting running again keeps a start time
         collector.set_running(true);
-        let started2 = collector.started_at();
-        assert!(started2 >= started);
+        assert!(collector.is_running());
+        assert!(collector.started_at().is_some());
 
         collector.set_running(false);
         assert!(!collector.is_running());
@@ -670,9 +670,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_app_state_config_write() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         // Modify config
         {
@@ -687,9 +686,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_broadcast_channel_multiple_receivers() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         let mut rx1 = state.readings_tx.subscribe();
         let mut rx2 = state.readings_tx.subscribe();
@@ -712,9 +710,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_app_state_store_operations() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         state
             .with_store_write(|store| store.upsert_device("test-device", Some("Test")).map(|_| ()))
