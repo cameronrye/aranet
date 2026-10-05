@@ -205,6 +205,37 @@ mod tests {
             .unwrap()
     }
 
+    /// Store `count` readings for `device`, all captured at `captured_at`, in
+    /// one store write.
+    async fn insert_readings_at(
+        state: &AppState,
+        device: &'static str,
+        captured_at: OffsetDateTime,
+        count: u64,
+    ) {
+        state
+            .with_store_write(move |store| {
+                let reading = CurrentReading {
+                    captured_at: Some(captured_at),
+                    ..Default::default()
+                };
+                for _ in 0..count {
+                    store.insert_reading(device, &reading)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Readings stored for `device`.
+    async fn readings_of(state: &AppState, device: &'static str) -> u64 {
+        state
+            .with_store_read(move |store| store.count_readings(Some(device)))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn prune_once_deletes_only_rows_older_than_cutoff() {
         let t = TestState::in_memory();
@@ -312,6 +343,111 @@ mod tests {
         assert_eq!(report, PruneReport::default());
         // Nothing was deleted: the next start deletes both rows.
         assert_eq!(counts(&t.state).await, (1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_once_stops_within_a_batch_of_shutdown_mid_pass() {
+        let t = TestState::in_memory();
+        let now = fixed_now();
+        let batch = u64::from(PRUNE_BATCH_ROWS);
+        // Three full batches and one row.
+        let old_rows = 3 * batch + 1;
+        insert_readings_at(&t.state, "old", now - time::Duration::days(30), old_rows).await;
+
+        let state = Arc::clone(&t.state);
+        let pass =
+            tokio::spawn(async move { prune_once(&state, &keep_days(Some(7), None), now).await });
+
+        // Each probe is a store write, so it queues first-come first-served
+        // with the pass's batches and runs between two of them. The first
+        // probe that finds a batch gone signals shutdown while it still holds
+        // the writer, so no batch runs between its count and the signal.
+        let left_at_shutdown = loop {
+            let state = Arc::clone(&t.state);
+            let left = t
+                .state
+                .with_store_write(move |store| {
+                    let left = store.count_readings(Some("old"))?;
+                    if left < old_rows {
+                        state.signal_shutdown();
+                    }
+                    Ok(left)
+                })
+                .await
+                .unwrap();
+            if left < old_rows {
+                break left;
+            }
+        };
+
+        let report = tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("the pass stops after shutdown")
+            .expect("the pass does not panic")
+            .unwrap();
+        // A batch that read the flag before the signal still runs, but no
+        // later one starts.
+        let deleted_after_shutdown = report.readings - (old_rows - left_at_shutdown);
+        assert!(
+            deleted_after_shutdown <= batch,
+            "{deleted_after_shutdown} readings deleted after shutdown, more than one batch"
+        );
+        // The rest is left for the next start.
+        let left = readings_of(&t.state, "old").await;
+        assert_eq!(left, old_rows - report.readings);
+        assert!(
+            left > 0,
+            "the pass deleted every old reading after shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_once_lets_queued_writes_run_between_batches() {
+        let t = TestState::in_memory();
+        let now = fixed_now();
+        // Three full batches and one row.
+        let old_rows = 3 * u64::from(PRUNE_BATCH_ROWS) + 1;
+        insert_readings_at(&t.state, "old", now - time::Duration::days(30), old_rows).await;
+
+        let state = Arc::clone(&t.state);
+        let pass =
+            tokio::spawn(async move { prune_once(&state, &keep_days(Some(7), None), now).await });
+
+        // Collector inserts, one at a time, until one runs after a batch. It
+        // queued while that batch held the writer, which is first-come
+        // first-served, so it runs before the next batch.
+        let mut inserted = 0;
+        let left_at_insert = loop {
+            let left = t
+                .state
+                .with_store_write(move |store| {
+                    let reading = CurrentReading {
+                        captured_at: Some(now),
+                        ..Default::default()
+                    };
+                    store.insert_reading("dev", &reading)?;
+                    store.count_readings(Some("old"))
+                })
+                .await
+                .unwrap();
+            inserted += 1;
+            if left < old_rows {
+                break left;
+            }
+        };
+        assert!(
+            left_at_insert > 0,
+            "the insert waited until the whole pass had finished"
+        );
+
+        let report = tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("the pass finishes")
+            .expect("the pass does not panic")
+            .unwrap();
+        assert_eq!(report.readings, old_rows);
+        assert_eq!(readings_of(&t.state, "old").await, 0);
+        assert_eq!(readings_of(&t.state, "dev").await, inserted);
     }
 
     #[tokio::test(start_paused = true)]
