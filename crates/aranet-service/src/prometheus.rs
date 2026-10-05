@@ -428,8 +428,7 @@ pub enum PushError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use aranet_store::Store;
+    use crate::test_support::TestState;
     use aranet_types::{CurrentReading, Status};
 
     #[test]
@@ -445,49 +444,50 @@ mod tests {
     /// - An Aranet4 device should emit all sensor metrics.
     #[tokio::test]
     async fn test_metrics_filtered_by_device_capability() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         // Insert an Aranet4 device with a reading.
-        {
-            let store = state.store.lock().await;
-            store
-                .upsert_device("Aranet4 AAAAA", Some("Aranet4 AAAAA"))
-                .unwrap();
-            let reading = CurrentReading {
-                co2: 800,
-                temperature: 22.5,
-                pressure: 1013.2,
-                humidity: 45,
-                battery: 85,
-                status: Status::Green,
-                interval: 300,
-                age: 60,
-                ..Default::default()
-            };
-            store.insert_reading("Aranet4 AAAAA", &reading).unwrap();
-        }
+        let reading = CurrentReading {
+            co2: 800,
+            temperature: 22.5,
+            pressure: 1013.2,
+            humidity: 45,
+            battery: 85,
+            status: Status::Green,
+            interval: 300,
+            age: 60,
+            ..Default::default()
+        };
+        state
+            .with_store_write(move |store| {
+                store.upsert_device("Aranet4 AAAAA", Some("Aranet4 AAAAA"))?;
+                store.insert_reading("Aranet4 AAAAA", &reading)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         // Insert an Aranet2 device with a reading (no CO2 or pressure).
-        {
-            let store = state.store.lock().await;
-            store
-                .upsert_device("Aranet2 BBBBB", Some("Aranet2 BBBBB"))
-                .unwrap();
-            let reading = CurrentReading {
-                co2: 0,
-                temperature: 21.0,
-                pressure: 0.0,
-                humidity: 55,
-                battery: 90,
-                status: Status::Green,
-                interval: 300,
-                age: 60,
-                ..Default::default()
-            };
-            store.insert_reading("Aranet2 BBBBB", &reading).unwrap();
-        }
+        let reading = CurrentReading {
+            co2: 0,
+            temperature: 21.0,
+            pressure: 0.0,
+            humidity: 55,
+            battery: 90,
+            status: Status::Green,
+            interval: 300,
+            age: 60,
+            ..Default::default()
+        };
+        state
+            .with_store_write(move |store| {
+                store.upsert_device("Aranet2 BBBBB", Some("Aranet2 BBBBB"))?;
+                store.insert_reading("Aranet2 BBBBB", &reading)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         let metrics = generate_metrics(&state).await;
 
@@ -535,9 +535,8 @@ mod tests {
     /// Verify that poll duration metric is emitted when stats have a value.
     #[tokio::test]
     async fn test_poll_duration_metric_emitted() {
-        let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
-        let state = AppState::new(store, config);
+        let t = TestState::in_memory();
+        let state = Arc::clone(&t.state);
 
         // Add device stats with a poll duration.
         {
