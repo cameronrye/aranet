@@ -373,7 +373,8 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
 
     // Background tasks that stop on `AppState::signal_shutdown`; shutdown
     // waits for them.
-    let background: Vec<JoinHandle<()>> = Vec::new();
+    #[cfg_attr(not(feature = "prometheus"), allow(unused_mut))]
+    let mut background: Vec<JoinHandle<()>> = Vec::new();
 
     if !options.no_collector {
         Collector::new(Arc::clone(&state)).start().await;
@@ -392,7 +393,9 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     {
         use crate::prometheus::PrometheusPusher;
         let prometheus_pusher = PrometheusPusher::new(Arc::clone(&state));
-        prometheus_pusher.start().await;
+        if let Some(handle) = prometheus_pusher.start().await {
+            background.push(handle);
+        }
     }
 
     {

@@ -54,25 +54,28 @@ impl PrometheusPusher {
 
     /// Start the Prometheus push gateway client.
     ///
-    /// This spawns a background task that periodically pushes metrics to the
-    /// configured push gateway URL.
+    /// Spawns a background task that pushes metrics to the configured push
+    /// gateway every `push_interval` seconds until
+    /// [`AppState::signal_shutdown`] is called.
     ///
-    /// Returns immediately; pushing happens in the background.
-    pub async fn start(&self) {
+    /// Returns the task's handle, or `None` when Prometheus or its push gateway
+    /// isn't configured and nothing was started. After signalling shutdown,
+    /// await the handle to let a push that is in flight finish.
+    pub async fn start(&self) -> Option<tokio::task::JoinHandle<()>> {
         let config = self.state.config.read().await;
         let prometheus_config = config.prometheus.clone();
         drop(config);
 
         if !prometheus_config.enabled {
             debug!("Prometheus metrics endpoint is enabled but push gateway is not configured");
-            return;
+            return None;
         }
 
         let push_gateway = match &prometheus_config.push_gateway {
             Some(url) if !url.is_empty() => url.clone(),
             _ => {
                 debug!("Prometheus push gateway URL not configured");
-                return;
+                return None;
             }
         };
 
@@ -84,9 +87,9 @@ impl PrometheusPusher {
         let state = Arc::clone(&self.state);
         let shutdown_rx = self.state.subscribe_shutdown();
 
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             run_prometheus_pusher(state, prometheus_config, push_gateway, shutdown_rx).await;
-        });
+        }))
     }
 }
 
@@ -107,6 +110,10 @@ async fn run_prometheus_pusher(
 
     let push_interval = Duration::from_secs(config.push_interval);
     let mut interval = tokio::time::interval(push_interval);
+    // A push can take up to the client's 30 s timeout, longer than the shortest
+    // push interval (10 s). After a slow push, push once and count the interval
+    // from there instead of catching up with back-to-back pushes (`Burst`).
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Job name for the push gateway
     let job_name = "aranet-service";
@@ -564,5 +571,63 @@ mod tests {
             metrics.contains("1234"),
             "Poll duration should contain the value"
         );
+    }
+
+    #[tokio::test]
+    async fn prometheus_pusher_disabled_returns_none() {
+        // Off, the default.
+        let t = TestState::in_memory();
+        assert!(
+            PrometheusPusher::new(Arc::clone(&t.state))
+                .start()
+                .await
+                .is_none()
+        );
+
+        // On, but with no push gateway (only `/metrics` is served), or an empty one.
+        for push_gateway in [None, Some(String::new())] {
+            let t = TestState::with_config(crate::config::Config {
+                prometheus: PrometheusConfig {
+                    enabled: true,
+                    push_gateway,
+                    push_interval: 10,
+                },
+                ..crate::config::Config::default()
+            });
+            assert!(
+                PrometheusPusher::new(Arc::clone(&t.state))
+                    .start()
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prometheus_pusher_handle_stops_on_shutdown() {
+        // A loopback port that nothing listens on, so every push fails at once.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("reserve a loopback port")
+            .port();
+        let t = TestState::with_config(crate::config::Config {
+            prometheus: PrometheusConfig {
+                enabled: true,
+                push_gateway: Some(format!("http://127.0.0.1:{port}")),
+                push_interval: 10,
+            },
+            ..crate::config::Config::default()
+        });
+
+        let handle = PrometheusPusher::new(Arc::clone(&t.state))
+            .start()
+            .await
+            .expect("a configured push gateway starts the pusher");
+        t.state.signal_shutdown();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the pusher stops within 5 s of the shutdown signal")
+            .expect("the pusher task doesn't panic");
     }
 }
