@@ -877,10 +877,13 @@ async fn test_add_device_refuses_to_overwrite_unparseable_config() {
     let (status, body) = post(&app, "/api/config/devices", OFFICE_DEVICE).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(
-        body.contains("Failed to save configuration: Failed to parse config file"),
-        "{body}"
-    );
+    // The response names the file but quotes none of it; the parse error,
+    // with the offending line, goes only to the service log.
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let message = json["error"].as_str().unwrap_or_default();
+    let named = format!("config file {} is not valid TOML", config_path.display());
+    assert!(message.contains(&named), "{body}");
+    assert!(!message.contains("[server"), "{body}");
     assert_eq!(std::fs::read_to_string(&config_path).unwrap(), broken);
     assert!(state.config.read().await.devices.is_empty());
 }
