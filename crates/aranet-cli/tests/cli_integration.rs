@@ -1436,6 +1436,46 @@ fn test_missing_required_args() {
     );
 }
 
+/// `aranet server --daemon` must check the configuration before it detaches.
+/// The detached process's output goes nowhere, so it used to print "started"
+/// for a server that had already failed.
+#[test]
+fn test_server_daemon_reports_invalid_bind() {
+    let env = TestEnv::new();
+    // The service's default config path ignores ARANET_CONFIG_DIR, so pass
+    // --config (the file needn't exist). --database and --no-collector keep a
+    // server that does start inside this environment and away from Bluetooth.
+    let server_config = env.config_dir.join("server.toml");
+    let db_path = env.db_path();
+    let output = env.run(&[
+        "server",
+        "--daemon",
+        "--no-collector",
+        "--bind",
+        "localhost:8080",
+        "--config",
+        server_config.to_str().expect("UTF-8 temp path"),
+        "--database",
+        db_path.to_str().expect("UTF-8 temp path"),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "--daemon accepted an invalid bind address\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("invalid bind address 'localhost:8080'"),
+        "should explain what is wrong with the bind address: {stderr}"
+    );
+    assert!(
+        !stdout.contains("started"),
+        "nothing was started, but the output says so: {stdout}"
+    );
+    assert!(!db_path.exists(), "the database was created");
+}
+
 #[test]
 #[ignore = "requires BLE hardware"]
 fn test_invalid_device() {
