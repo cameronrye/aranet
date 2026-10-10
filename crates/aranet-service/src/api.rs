@@ -1580,7 +1580,7 @@ mod tests {
 
     use crate::config::{Config, SecurityConfig};
     use crate::middleware::RateLimitState;
-    use crate::test_support::{FakeReader, TestState, settle};
+    use crate::test_support::{CapturedLogs, FakeReader, TestState, settle};
     use aranet_types::HistoryRecord;
 
     fn create_test_state() -> TestState {
@@ -2550,44 +2550,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
-    /// Log lines written on this thread at `WARN` or above, as plain text,
-    /// while the value [`LogCapture::start`] returns is alive.
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl LogCapture {
-        fn start(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
-            // tracing caches whether anything wants a log statement the first
-            // time it runs. While only one dispatcher is registered it asks just
-            // the default of the thread that got there first, so another test's
-            // thread could cache "never" for a line this capture expects. With a
-            // second, silent dispatcher registered first, it asks both.
-            let silent = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
-            let writer = self.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            (tracing::subscriber::set_default(subscriber), silent)
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn test_config_save_error_keeps_file_text_out_of_the_response() {
         let t = create_test_state();
@@ -2598,11 +2560,9 @@ mod tests {
         let app = router().with_state(Arc::clone(&t.state));
         let device = r#"{"address":"AA:BB:CC:DD:EE:FF"}"#;
 
-        let logs = LogCapture::default();
-        let (status, json) = {
-            let _capture = logs.start();
-            call_json(&app, "POST", "/api/config/devices", Some(device)).await
-        };
+        let (logs, capture) = CapturedLogs::start();
+        let (status, json) = call_json(&app, "POST", "/api/config/devices", Some(device)).await;
+        drop(capture);
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let body = json.to_string();
@@ -2636,11 +2596,9 @@ mod tests {
             source: std::io::Error::other(SelfCheck(reason)),
         };
 
-        let logs = LogCapture::default();
-        let response = {
-            let _capture = logs.start();
-            config_save_error(error)
-        };
+        let (logs, capture) = CapturedLogs::start();
+        let response = config_save_error(error);
+        drop(capture);
 
         let message = match response {
             AppError::Internal(message) => message,
