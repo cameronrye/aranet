@@ -43,6 +43,7 @@
 //! bind = "127.0.0.1:8080"
 //!
 //! [storage]
+//! # A leading "~" is expanded to the home directory.
 //! path = "~/.local/share/aranet/data.db"
 //!
 //! [[devices]]
@@ -224,7 +225,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -363,13 +364,16 @@ pub fn app(
 }
 
 /// Load the service configuration: read the config file, apply the
-/// command-line overrides and validate the result.
+/// command-line overrides, expand `~` in `storage.path` and validate the
+/// result.
 ///
 /// The file is [`RunOptions::config`], or [`config::default_config_path`] when
-/// that is `None`. A file that doesn't exist gives the defaults.
-/// [`RunOptions::bind`] and [`RunOptions::database`] replace `server.bind` and
-/// `storage.path` in the returned config only; they are never written to the
-/// file.
+/// that is `None`. A file that doesn't exist gives the defaults; a file that
+/// exists but can't be read, or whose directory can't be searched, is an
+/// error. [`RunOptions::bind`] and [`RunOptions::database`] replace
+/// `server.bind` and `storage.path`. A leading `~` in `storage.path` becomes
+/// the home directory. The overrides and the expanded path exist only in the
+/// returned config; they are never written to the file.
 ///
 /// Errors wrap [`ConfigError`]; use `anyhow::Error::downcast_ref` to inspect
 /// them.
@@ -395,10 +399,15 @@ fn prepare_config(options: &RunOptions, _save_generated_key: bool) -> anyhow::Re
         .clone()
         .unwrap_or_else(config::default_config_path);
 
-    let mut config = if path.exists() {
-        Config::load(&path)?
-    } else {
-        Config::default()
+    // `Path::exists` reports "missing" when it can't tell, for example when
+    // the directory can't be searched, which silently gave the defaults.
+    let mut config = match path.try_exists() {
+        Ok(true) => Config::load(&path)?,
+        Ok(false) => {
+            tracing::info!("No config file at {}; using defaults", path.display());
+            Config::default()
+        }
+        Err(source) => return Err(ConfigError::Read { path, source }.into()),
     };
 
     if let Some(bind) = &options.bind {
@@ -408,10 +417,42 @@ fn prepare_config(options: &RunOptions, _save_generated_key: bool) -> anyhow::Re
         config.storage.path = database.clone();
     }
 
+    let expanded = config::expand_home(&config.storage.path);
+    if let Some(legacy) = unexpanded_database(Path::new("."), &config.storage.path, &expanded) {
+        tracing::warn!(
+            "Found a database at {}, created by an earlier version that did not expand '~'; \
+             the service now uses {}. To keep the old data, stop the service and move the \
+             old file there (this replaces the database at that path) or merge the two; \
+             otherwise remove the old file",
+            legacy.display(),
+            expanded.display()
+        );
+    }
+    config.storage.path = expanded;
+
     config.validate()?;
 
     tracing::info!("Using config {}", path.display());
     Ok(LoadedConfig { config, path })
+}
+
+/// The database that an earlier version, which didn't expand `~`, created for
+/// `raw` under `cwd`, for as long as it is there.
+///
+/// It is reported even when `expanded` exists, because the first start of
+/// this version creates a new database there. It isn't reported when it is
+/// the file at `expanded` itself, for example through a `~` symlink to the
+/// home directory.
+fn unexpanded_database(cwd: &Path, raw: &Path, expanded: &Path) -> Option<PathBuf> {
+    if !raw.starts_with("~") || raw == expanded {
+        return None;
+    }
+    let legacy = cwd.join(raw);
+    let same_file = matches!(
+        (legacy.canonicalize(), expanded.canonicalize()),
+        (Ok(old), Ok(new)) if old == new
+    );
+    (legacy.exists() && !same_file).then_some(legacy)
 }
 
 /// Run the HTTP service until shutdown.
@@ -1023,6 +1064,121 @@ mod tests {
             0,
             "check_config created a file"
         );
+    }
+
+    /// `Path::exists` is false when it can't check, so a config file in a
+    /// directory the service can't search used to count as missing, and the
+    /// service ran on the defaults without a word.
+    #[cfg(unix)]
+    #[test]
+    fn load_config_fails_on_unreadable_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Gives the directory its permissions back, so the `TempDir` can be
+        /// deleted even when an assertion fails.
+        struct RestoreMode<'a>(&'a std::path::Path);
+        impl Drop for RestoreMode<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let config_path = locked.join("server.toml");
+        std::fs::write(&config_path, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestoreMode(&locked);
+
+        if std::fs::read_dir(&locked).is_ok() {
+            // Root ignores directory permissions (the aranet-ci image runs as root).
+            eprintln!("skipped: running as root");
+            return;
+        }
+
+        let result = load_config(&RunOptions {
+            config: Some(config_path.clone()),
+            ..Default::default()
+        });
+
+        let Err(err) = result else {
+            panic!("an unreadable config file fell back to the defaults");
+        };
+        assert!(
+            format!("{err:#}").contains(&config_path.display().to_string()),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn load_config_expands_home_in_storage_path() {
+        let home = dirs::home_dir().expect("a home directory");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        let contents = "[storage]\npath = \"~/aranet-load-config-test/data.db\"\n";
+        std::fs::write(&config_path, contents).unwrap();
+
+        let loaded = load_config(&RunOptions {
+            config: Some(config_path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            loaded.config.storage.path,
+            home.join("aranet-load-config-test").join("data.db")
+        );
+        // Runtime only: the file keeps its `~`.
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), contents);
+    }
+
+    #[test]
+    fn unexpanded_database_is_reported_until_it_is_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        let raw = std::path::Path::new("~/aranet/data.db");
+        let expanded = dir.path().join("home").join("aranet").join("data.db");
+
+        // Nothing at ./~/aranet/data.db: nothing to report.
+        assert_eq!(unexpanded_database(&cwd, raw, &expanded), None);
+
+        // An earlier version created ./~/aranet/data.db.
+        let legacy = cwd.join("~").join("aranet").join("data.db");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"").unwrap();
+        assert_eq!(
+            unexpanded_database(&cwd, raw, &expanded),
+            Some(legacy.clone())
+        );
+
+        // The first start then opens a new database at the expanded path. The
+        // old file is still reported on every later start.
+        std::fs::create_dir_all(expanded.parent().unwrap()).unwrap();
+        std::fs::write(&expanded, b"").unwrap();
+        assert_eq!(
+            unexpanded_database(&cwd, raw, &expanded),
+            Some(legacy.clone())
+        );
+
+        // Once the old file is moved there (or removed), the warning stops.
+        std::fs::rename(&legacy, &expanded).unwrap();
+        assert_eq!(unexpanded_database(&cwd, raw, &expanded), None);
+
+        // A `~` in the working directory that links to the home directory
+        // holds no second database.
+        #[cfg(unix)]
+        {
+            let linked_cwd = dir.path().join("linked");
+            std::fs::create_dir(&linked_cwd).unwrap();
+            std::os::unix::fs::symlink(dir.path().join("home"), linked_cwd.join("~")).unwrap();
+            assert!(linked_cwd.join(raw).exists());
+            assert_eq!(unexpanded_database(&linked_cwd, raw, &expanded), None);
+        }
+
+        // Paths without a leading `~` are never reported.
+        let plain = std::path::Path::new("aranet/data.db");
+        assert_eq!(unexpanded_database(&cwd, plain, plain), None);
     }
 
     /// Write `dir/server.toml` with `bind` and a database at `dir/sub/aranet.db`.
