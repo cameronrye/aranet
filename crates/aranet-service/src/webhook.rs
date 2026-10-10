@@ -793,6 +793,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn webhook_error_body_is_sanitised_before_it_is_logged() {
+        // A 500 whose body would start a forged log line (the newline),
+        // reverse the text after it (U+202E) and flood the log (over 256
+        // characters).
+        let body = format!("bad\nrequest\u{202e}{}", "x".repeat(300));
+        let server =
+            RecordingServer::start(vec![("/hook", Reply::StatusWithBody(500, body))]).await;
+        let url = server.url("/hook");
+        let policy = RetryPolicy {
+            attempts: 1,
+            base_delay: Duration::ZERO,
+        };
+
+        let (logs, _g) = CapturedLogs::start();
+        let delivered = send_webhook_with_retry(
+            &test_client(),
+            &endpoint_label(0, &url),
+            &url,
+            &HashMap::new(),
+            &co2_payload(),
+            policy,
+        )
+        .await;
+
+        assert!(!delivered);
+        // Both characters became spaces, and the log line ends after the
+        // body's first 256 characters and a `…`.
+        let logs = logs.text();
+        let logged = format!(
+            "Webhook returned error 500: bad request {}…\n",
+            "x".repeat(244)
+        );
+        assert!(logs.contains(&logged), "{logs:?}");
+        assert!(!logs.contains('\u{202e}'), "{logs:?}");
+    }
+
     /// The dispatcher against a loopback endpoint, on real time. A module of
     /// its own, so that its imports can't clash with the ones above.
     mod dispatcher {
@@ -968,6 +1005,32 @@ mod tests {
             // The delivery hangs until its 10 s request timeout; shutdown
             // cancels it once the 500 ms grace is over.
             shut_down(&t, dispatcher).await;
+        }
+
+        #[tokio::test]
+        async fn webhook_log_numbers_an_endpoint_by_its_place_in_the_config() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![("/co2", Reply::Status(200))]).await;
+            // The first endpoint doesn't want CO2 alerts; the second does.
+            let t = TestState::with_config(webhook_config(vec![
+                endpoint(server.url("/battery"), "battery_low"),
+                endpoint(server.url("/co2"), "co2_high"),
+            ]));
+            let dispatcher = start_dispatcher(&t, WebhookSettings::default()).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            let requests = server.wait_for_requests(1).await;
+            assert_eq!(requests[0].path, "/co2");
+
+            // Shutdown lets the delivery that reached the endpoint finish, so
+            // its log line is written by the time the dispatcher returns.
+            shut_down(&t, dispatcher).await;
+            let text = logs.text();
+            let line = format!(
+                "Sent co2_high webhook for {X} to endpoint #2 ({}/…)",
+                server.url("")
+            );
+            assert!(text.contains(&line), "{text}");
         }
     }
 }

@@ -967,5 +967,39 @@ mod tests {
                 "{text}"
             );
         }
+
+        #[tokio::test]
+        async fn influxdb_error_body_is_sanitised_before_it_is_logged() {
+            let (logs, _guard) = CapturedLogs::start();
+            // A 500 whose body would start a forged log line (the newline),
+            // reverse the text after it (U+202E) and flood the log (over 256
+            // characters).
+            let body = format!("bad\nrequest\u{202e}{}", "x".repeat(300));
+            let server =
+                RecordingServer::start(vec![(WRITE, Reply::StatusWithBody(500, body))]).await;
+            let t = TestState::with_config(influx_config(&server));
+            let settings = InfluxSettings {
+                base_backoff: Duration::from_secs(60),
+                ..InfluxSettings::default()
+            };
+            let writer = start_writer(&t, settings).await;
+
+            t.state.readings_tx.send(test_event(DEVICE, 801)).unwrap();
+            wait_until("the writer to log the failed write", || {
+                logs.text().contains("Failed to write 1 lines to InfluxDB")
+            })
+            .await;
+            shut_down(&t, writer).await;
+
+            // Both characters became spaces, and the body ends after its
+            // first 256 characters and a `…`.
+            let logs = logs.text();
+            let logged = format!(
+                "InfluxDB returned error 500: bad request {}…; retrying in 60s\n",
+                "x".repeat(244)
+            );
+            assert!(logs.contains(&logged), "{logs:?}");
+            assert!(!logs.contains('\u{202e}'), "{logs:?}");
+        }
     }
 }
