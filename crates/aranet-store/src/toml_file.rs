@@ -22,6 +22,10 @@ const MAX_SYMLINK_HOPS: usize = 40;
 /// The message says what failed and names the file; the reason is the error's
 /// [`source`](std::error::Error::source), so print the whole chain (anyhow's
 /// `{:#}` or `{:?}`).
+///
+/// A TOML parse error quotes the line it failed on, so the chain can contain
+/// text from the file. Show it to the file's owner or write it to a log, and
+/// give anyone else only the message.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TomlFileError {
@@ -51,7 +55,9 @@ pub enum TomlFileError {
     Write {
         /// The file.
         path: PathBuf,
-        /// Why writing failed.
+        /// Why writing failed. When [`TomlFile::save`] refused its own text
+        /// because it did not read back as the intended values, this error's
+        /// source is the parse error, or names the top-level keys that differ.
         source: io::Error,
     },
 }
@@ -131,7 +137,8 @@ impl<T: Serialize + DeserializeOwned> TomlFile<T> {
     /// kept, and settings left at their defaults are not added. Returns `Ok(false)`
     /// without touching the file when nothing changed. The new text must read back
     /// as `desired` before it is written, atomically and owner-only, with
-    /// [`write_private`].
+    /// [`write_private`]. If it doesn't, the file is left alone and the
+    /// [`TomlFileError::Write`] that comes back says why in its source chain.
     pub fn save(mut self, desired: &T) -> Result<bool, TomlFileError> {
         let before = toml::Table::try_from(&self.value)?;
         let after = toml::Table::try_from(desired)?;
@@ -151,19 +158,17 @@ impl<T: Serialize + DeserializeOwned> TomlFile<T> {
         // Keep a CRLF file CRLF, unless that would change a multi-line string.
         if self.original.contains("\r\n") {
             let crlf = rendered.replace('\n', "\r\n");
-            if reads_back::<T>(&crlf, &after)? {
+            if read_back_failure::<T>(&crlf, &after)?.is_none() {
                 rendered = crlf;
             }
         }
         if rendered == self.original {
             return Ok(false);
         }
-        if !reads_back::<T>(&rendered, &after)? {
+        if let Some(reason) = read_back_failure::<T>(&rendered, &after)? {
             return Err(TomlFileError::Write {
                 path: self.path,
-                source: io::Error::other(
-                    "rendered TOML does not read back as the intended values; the file was not changed",
-                ),
+                source: io::Error::other(NotReadBack(reason)),
             });
         }
         if let Err(source) = write_private(&self.path, rendered.as_bytes()) {
@@ -176,15 +181,46 @@ impl<T: Serialize + DeserializeOwned> TomlFile<T> {
     }
 }
 
-/// Whether `text` parses as `T` and serialises to `expected`.
-fn reads_back<T: Serialize + DeserializeOwned>(
+/// The [`io::Error`] inside the [`TomlFileError::Write`] that [`TomlFile::save`]
+/// returns when it refuses to write the text it rendered. Its source says why.
+#[derive(Debug, thiserror::Error)]
+#[error("rendered TOML does not read back as the intended values; the file was not changed")]
+struct NotReadBack(#[source] ReadBackFailure);
+
+/// How rendered text fails to read back as the values it was rendered from.
+#[derive(Debug, thiserror::Error)]
+enum ReadBackFailure {
+    /// It is not valid TOML, or doesn't match the type.
+    #[error(transparent)]
+    Parse(toml::de::Error),
+    /// It parses, but these top-level keys hold other values than intended. Only
+    /// the names are given: a value may be a password or a token.
+    #[error("these top-level keys read back with other values: {0:?}")]
+    Differs(Vec<String>),
+}
+
+/// How `text`, parsed as `T` and serialised again, differs from `expected`, or
+/// `None` when it gives exactly `expected`.
+fn read_back_failure<T: Serialize + DeserializeOwned>(
     text: &str,
     expected: &toml::Table,
-) -> Result<bool, TomlFileError> {
-    match toml::from_str::<T>(text) {
-        Ok(value) => Ok(toml::Table::try_from(&value)? == *expected),
-        Err(_) => Ok(false),
+) -> Result<Option<ReadBackFailure>, TomlFileError> {
+    let value = match toml::from_str::<T>(text) {
+        Ok(value) => value,
+        Err(e) => return Ok(Some(ReadBackFailure::Parse(e))),
+    };
+    let actual = toml::Table::try_from(&value)?;
+    if actual == *expected {
+        return Ok(None);
     }
+    let unexpected = actual.keys().filter(|key| !expected.contains_key(*key));
+    let differing = expected
+        .keys()
+        .chain(unexpected)
+        .filter(|key| expected.get(*key) != actual.get(*key))
+        .cloned()
+        .collect();
+    Ok(Some(ReadBackFailure::Differs(differing)))
 }
 
 /// The comment lines above a top-level `[table]`, or above the first entry of a
@@ -844,6 +880,77 @@ value = 1
         let error = TomlFile::<Settings>::open(&path).unwrap_err();
         assert!(matches!(error, TomlFileError::Parse { .. }), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "x = [1,\n");
+    }
+
+    /// The messages of `error` and of each error below it, outermost first.
+    fn error_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+        std::iter::successors(Some(error), |e| e.source())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    const NOT_READ_BACK: &str =
+        "rendered TOML does not read back as the intended values; the file was not changed";
+
+    #[derive(Default, Serialize, Deserialize)]
+    #[serde(default)]
+    struct Aliased {
+        #[serde(alias = "colour")]
+        color: String,
+    }
+
+    #[test]
+    fn save_says_why_the_rendered_text_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(dir.path(), "colour = \"red\"\n");
+        let file = TomlFile::<Aliased>::open(&path).unwrap();
+        // The file names the field by its alias, so the save adds the field's
+        // own name next to it, and the rendered text has the field twice.
+        let desired = Aliased {
+            color: "blue".to_string(),
+        };
+
+        let error = file.save(&desired).unwrap_err();
+
+        let chain = error_chain(&error);
+        assert_eq!(chain[0], format!("Failed to write {}", path.display()));
+        assert_eq!(chain[1], NOT_READ_BACK);
+        assert!(
+            chain
+                .get(2)
+                .is_some_and(|reason| reason.contains("duplicate field `color`")),
+            "{chain:#?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "colour = \"red\"\n");
+    }
+
+    #[derive(Default, Serialize, Deserialize)]
+    #[serde(default)]
+    struct WriteOnly {
+        kept: i64,
+        #[serde(skip_deserializing)]
+        lost: i64,
+    }
+
+    #[test]
+    fn save_names_the_keys_that_read_back_differently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(dir.path(), "kept = 1\n");
+        let file = TomlFile::<WriteOnly>::open(&path).unwrap();
+        // `lost` is written but never read, so it reads back as its default.
+        let desired = WriteOnly { kept: 2, lost: 5 };
+
+        let error = file.save(&desired).unwrap_err();
+
+        let chain = error_chain(&error);
+        assert_eq!(chain[0], format!("Failed to write {}", path.display()));
+        assert_eq!(chain[1], NOT_READ_BACK);
+        assert_eq!(
+            chain.get(2).map(String::as_str),
+            Some(r#"these top-level keys read back with other values: ["lost"]"#),
+            "{chain:#?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "kept = 1\n");
     }
 
     #[test]
