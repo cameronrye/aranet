@@ -31,6 +31,11 @@ scrape_configs:
     metrics_path: /metrics
     scrape_interval: 60s
     scrape_timeout: 10s
+    # With security.api_key_enabled = true in server.toml, send the key as a
+    # bearer token:
+    # authorization:
+    #   type: Bearer
+    #   credentials: <your API key>
 
   # Alternative: If running aranet-service outside Docker
   # - job_name: 'aranet-local'

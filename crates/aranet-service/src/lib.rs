@@ -68,7 +68,8 @@
 //!
 //! ```toml
 //! [security]
-//! # Require X-API-Key header for protected API, WebSocket, and metrics requests
+//! # Require the key (X-API-Key header, or Authorization: Bearer <key>) for
+//! # protected API, WebSocket, and metrics requests
 //! api_key_enabled = true
 //! # At least 32 characters. Leave it out and the service generates a key when
 //! # it starts and saves it here.

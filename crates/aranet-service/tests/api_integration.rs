@@ -982,6 +982,39 @@ async fn test_prometheus_metrics_enabled() {
     assert!(body.contains("aranet_collector_running"));
 }
 
+#[tokio::test]
+async fn test_metrics_accept_bearer_token_when_auth_enabled() {
+    let key = "test-api-key-that-is-at-least-32-characters-long";
+    let mut config = Config::default();
+    config.prometheus.enabled = true;
+    config.security.api_key_enabled = true;
+    config.security.api_key = Some(key.to_string());
+    config.security.rate_limit_enabled = false;
+    let (app, _state, _dir) = test_app_with_config(config);
+
+    // What Prometheus sends with `authorization: { type: Bearer, credentials: <key> }`.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("Authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("aranet_collector_running"), "{body}");
+
+    let (status, body) = get(&app, "/metrics").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("Authorization: Bearer"), "{body}");
+}
+
 // ==========================================================================
 // Config file persistence
 // ==========================================================================

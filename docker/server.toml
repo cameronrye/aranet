@@ -20,7 +20,8 @@ allowed_hosts = ["aranet-service"]
 # The service refuses to listen on a network address such as 0.0.0.0 without
 # API key authentication unless this is set. In the container that is safe
 # only because the compose files publish port 8080 on 127.0.0.1. Before you
-# publish it on any other address, set api_key_enabled = true instead.
+# publish it on any other address, set api_key_enabled = true instead, and give
+# Prometheus the key (see the aranet job in prometheus.yml).
 allow_unauthenticated_network = true
 
 [prometheus]
