@@ -1,7 +1,7 @@
 //! Server configuration.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use aranet_store::TomlFile;
 use serde::{Deserialize, Serialize};
@@ -300,7 +300,8 @@ impl ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Database file path.
+    /// Database file path. A leading `~` is expanded to the home directory
+    /// when the service loads its configuration.
     pub path: PathBuf,
     /// Deletion of old rows (`[storage.retention]`). Off by default, and not
     /// written to the file while off.
@@ -1212,6 +1213,31 @@ pub fn default_config_path() -> PathBuf {
         .join("server.toml")
 }
 
+/// Expand a leading `~` path component to `home`.
+///
+/// `~` becomes `home` and `~/x` becomes `home/x`. Every other path, including
+/// `~user/x`, is returned unchanged, and so is every path when `home` is
+/// `None`.
+pub(crate) fn expand_home_with(path: &Path, home: Option<&Path>) -> PathBuf {
+    let mut components = path.components();
+    match (components.next(), home) {
+        (Some(Component::Normal(first)), Some(home)) if first == "~" => {
+            let rest = components.as_path();
+            if rest.as_os_str().is_empty() {
+                home.to_path_buf()
+            } else {
+                home.join(rest)
+            }
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// [`expand_home_with`] with the current user's home directory.
+pub(crate) fn expand_home(path: &Path) -> PathBuf {
+    expand_home_with(path, dirs::home_dir().as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,6 +1451,37 @@ path = "/data/aranet.db"
     fn test_default_config_path() {
         let path = default_config_path();
         assert!(path.ends_with("aranet/server.toml"));
+    }
+
+    #[test]
+    fn expand_home_table() {
+        let home = Path::new("/home/u");
+        let cases = [
+            ("~", Some(home), home.to_path_buf()),
+            ("~/a/b", Some(home), home.join("a").join("b")),
+            ("/abs", Some(home), PathBuf::from("/abs")),
+            ("rel/x", Some(home), PathBuf::from("rel/x")),
+            ("~user/x", Some(home), PathBuf::from("~user/x")),
+            ("rel/~/x", Some(home), PathBuf::from("rel/~/x")),
+            ("~/a", None, PathBuf::from("~/a")),
+        ];
+        for (path, home, expected) in cases {
+            assert_eq!(
+                expand_home_with(Path::new(path), home),
+                expected,
+                "{path} with home {home:?}"
+            );
+        }
+        // Exactly the home directory, without a trailing separator.
+        assert_eq!(
+            expand_home_with(Path::new("~"), Some(home)).as_os_str(),
+            home.as_os_str()
+        );
+
+        // `expand_home` uses the current user's home directory.
+        let real_home = dirs::home_dir().expect("a home directory");
+        assert_eq!(expand_home(Path::new("~/x")), real_home.join("x"));
+        assert_eq!(expand_home(Path::new("rel/x")), PathBuf::from("rel/x"));
     }
 
     #[test]
