@@ -283,6 +283,217 @@ impl DeviceReader for FakeReader {
     }
 }
 
+/// Log output captured on the current thread, for tests that check what the
+/// service writes to its logs.
+///
+/// [`CapturedLogs::start`] installs a thread-local default subscriber that
+/// records every event from this crate, at every level, as plain text. On the
+/// default `#[tokio::test]` runtime (current thread), tasks the test spawns run
+/// on the test's thread, so their events are captured too. Don't use it with
+/// the multi-thread flavour.
+///
+/// Other tests log the same lines on their own threads, with no subscriber.
+/// `start` calls [`register_silent_dispatcher`] first, so that none of those
+/// threads can hide a line from the capture.
+#[derive(Clone)]
+pub(crate) struct CapturedLogs {
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl CapturedLogs {
+    /// Start capturing. Capturing stops when the returned guard is dropped.
+    ///
+    /// The filter is `aranet_service=trace`, not the production
+    /// `DEFAULT_LOG_DIRECTIVES`, which logs this crate at `info`, so a secret
+    /// in a debug line is caught too.
+    pub(crate) fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        register_silent_dispatcher();
+        let logs = Self {
+            buf: Arc::default(),
+        };
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("aranet_service=trace"))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    /// Everything captured so far.
+    pub(crate) fn text(&self) -> String {
+        let buf = self
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Keep a second, silent dispatcher registered for the rest of the test run.
+///
+/// Call this before a test installs a thread-local subscriber and checks its
+/// output. [`CapturedLogs::start`] does.
+///
+/// The first time a log statement runs, tracing caches whether any subscriber
+/// wants it, for the whole process. While only one dispatcher is registered,
+/// it asks just the default subscriber of the thread that got there first. A
+/// test thread with no subscriber then caches "never", and a capture on
+/// another thread misses the line until the next dispatcher registers. With
+/// this second dispatcher, which wants nothing, a line that a capture wants is
+/// cached as "sometimes", and every event is checked against its own thread's
+/// subscriber. Registering a dispatcher also recomputes every cached answer,
+/// so a line cached as "never" before the capture started is fixed too.
+pub(crate) fn register_silent_dispatcher() {
+    static SILENT: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SILENT.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
+}
+
+/// How a [`RecordingServer`] route answers.
+pub(crate) enum Reply {
+    /// This status code with an empty body, every time.
+    Status(u16),
+}
+
+/// One request that a [`RecordingServer`] route received.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordedRequest {
+    /// The request path, without the query string.
+    pub(crate) path: String,
+    /// The request body.
+    pub(crate) body: String,
+}
+
+/// A loopback HTTP server that stands in for a webhook, InfluxDB or push
+/// gateway endpoint.
+///
+/// Each route answers `POST` as its [`Reply`] says and records the request.
+/// Any other path gets 404 and is not recorded. The server stops when the
+/// value is dropped.
+pub(crate) struct RecordingServer {
+    addr: std::net::SocketAddr,
+    requests: Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+    notify: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingServer {
+    /// Serve `routes`, each a path and its reply, on `127.0.0.1:0`.
+    pub(crate) async fn start(routes: Vec<(&'static str, Reply)>) -> Self {
+        let requests: Arc<std::sync::Mutex<Vec<RecordedRequest>>> = Arc::default();
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let mut router: axum::Router = axum::Router::new();
+        for (path, reply) in routes {
+            let Reply::Status(code) = reply;
+            let status = axum::http::StatusCode::from_u16(code).expect("a valid status code");
+            let requests = Arc::clone(&requests);
+            let notify = Arc::clone(&notify);
+            let handler = move |uri: axum::http::Uri, body: String| async move {
+                requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(RecordedRequest {
+                        path: uri.path().to_owned(),
+                        body,
+                    });
+                notify.notify_waiters();
+                status
+            };
+            router = router.route(path, axum::routing::post(handler));
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("read the bound address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("the recording server failed");
+        });
+        Self {
+            addr,
+            requests,
+            notify,
+            task,
+        }
+    }
+
+    /// The URL of `path` on this server: `http://127.0.0.1:<port><path>`.
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    /// The requests received so far, oldest first.
+    pub(crate) fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Wait until at least `n` requests have arrived, and return all of them.
+    /// Panics after 5 s.
+    pub(crate) async fn wait_for_requests(&self, n: usize) -> Vec<RecordedRequest> {
+        let arrived = async {
+            loop {
+                // Created before the check, so a request recorded between the
+                // check and the `.await` still wakes this loop.
+                let notified = self.notify.notified();
+                let requests = self.requests();
+                if requests.len() >= n {
+                    return requests;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for {n} requests; received {:?}",
+                    self.requests()
+                )
+            })
+    }
+}
+
+impl Drop for RecordingServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A loopback URL that refuses connections: `http://127.0.0.1:<port><path>`
+/// for a port that was just bound and released again.
+pub(crate) async fn closed_port_url(path: &str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let port = listener
+        .local_addr()
+        .expect("read the bound address")
+        .port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}{path}")
+}
+
 mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -429,5 +640,104 @@ mod tests {
 
         reader.set_failing("Aranet4 AAAAA", false);
         assert!(reader.read_current("Aranet4 AAAAA").await.is_ok());
+    }
+
+    #[test]
+    fn captured_logs_record_every_level_as_plain_text() {
+        let (logs, guard) = CapturedLogs::start();
+        tracing::trace!("a trace line");
+        tracing::info!(attempt = 2, "an info line");
+        drop(guard);
+        tracing::info!("a line after the guard");
+
+        let text = logs.text();
+        assert!(text.contains("TRACE"), "{text}");
+        assert!(text.contains("a trace line"), "{text}");
+        assert!(text.contains("an info line attempt=2"), "{text}");
+        assert!(!text.contains('\u{1b}'), "ANSI colours in {text:?}");
+        assert!(!text.contains("after the guard"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn recording_server_records_posts_and_answers_as_scripted() {
+        let server = RecordingServer::start(vec![
+            ("/ok", Reply::Status(204)),
+            ("/fail", Reply::Status(500)),
+        ])
+        .await;
+        let urls = [
+            server.url("/ok"),
+            server.url("/fail?x=1"),
+            server.url("/unknown"),
+        ];
+        // Send from another task, so `wait_for_requests` really waits.
+        let sender = tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let mut statuses = Vec::new();
+            for url in urls {
+                let response = client
+                    .post(url.as_str())
+                    .body(format!("body for {url}"))
+                    .send()
+                    .await
+                    .expect("the server answers");
+                statuses.push(response.status().as_u16());
+            }
+            statuses
+        });
+
+        let requests = server.wait_for_requests(2).await;
+        assert_eq!(sender.await.unwrap(), [204, 500, 404]);
+
+        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["/ok", "/fail"], "paths exclude the query");
+        assert_eq!(
+            requests[1].body,
+            format!("body for {}", server.url("/fail?x=1"))
+        );
+        assert_eq!(server.requests().len(), 2, "unknown paths aren't recorded");
+    }
+
+    #[tokio::test]
+    async fn closed_port_url_refuses_connections() {
+        let url = closed_port_url("/x").await;
+        assert!(
+            url.starts_with("http://127.0.0.1:") && url.ends_with("/x"),
+            "{url}"
+        );
+
+        let error = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+            .post(&url)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+        assert!(error.is_connect(), "{error:?}");
+    }
+
+    #[test]
+    fn captured_logs_see_lines_another_thread_reached_first() {
+        /// A log statement that only this test reaches.
+        fn log_line(n: u32) {
+            tracing::warn!("line {n} from a shared log statement");
+        }
+
+        let (logs, _guard) = CapturedLogs::start();
+        // A thread without a subscriber, such as another test's, reaches the
+        // statement first.
+        std::thread::spawn(|| log_line(1)).join().unwrap();
+        log_line(2);
+
+        let text = logs.text();
+        assert!(
+            text.contains("line 2 from a shared log statement"),
+            "{text}"
+        );
+        assert!(!text.contains("line 1"), "{text}");
     }
 }

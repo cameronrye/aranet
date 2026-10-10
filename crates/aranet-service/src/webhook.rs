@@ -49,6 +49,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::config::WebhookConfig;
+use crate::redact::{redact_url, sanitize_body};
 use crate::state::{AppState, ReadingEvent};
 
 /// Webhook dispatcher that monitors readings and fires alerts.
@@ -169,8 +170,9 @@ async fn run_webhook_dispatcher(
                             let matching_endpoints: Vec<_> = config
                                 .endpoints
                                 .iter()
-                                .filter(|endpoint| endpoint.events.iter().any(|event| event == &payload.event))
-                                .cloned()
+                                .enumerate()
+                                .filter(|(_, endpoint)| endpoint.events.iter().any(|event| event == &payload.event))
+                                .map(|(index, endpoint)| (endpoint_label(index, &endpoint.url), endpoint.clone()))
                                 .collect();
 
                             if matching_endpoints.is_empty() {
@@ -181,15 +183,17 @@ async fn run_webhook_dispatcher(
                                 continue;
                             }
 
-                            let results = join_all(matching_endpoints.into_iter().map(|endpoint| {
+                            let results = join_all(matching_endpoints.into_iter().map(|(label, endpoint)| {
                                 let client = client.clone();
                                 let payload = payload.clone();
                                 async move {
                                     send_webhook_with_retry(
                                         &client,
+                                        &label,
                                         &endpoint.url,
                                         &endpoint.headers,
                                         &payload,
+                                        RetryPolicy::DEFAULT,
                                     )
                                     .await
                                 }
@@ -293,37 +297,63 @@ fn evaluate_thresholds(
     alerts
 }
 
-/// Maximum number of delivery attempts per webhook (initial + retries).
-const MAX_WEBHOOK_ATTEMPTS: u32 = 3;
+/// How many times a webhook delivery is attempted, and how long to wait
+/// between attempts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetryPolicy {
+    /// Attempts in total, including the first.
+    pub(crate) attempts: u32,
+    /// The wait after the first failed attempt, doubled after each further one.
+    pub(crate) base_delay: Duration,
+}
 
-/// Send a webhook with exponential backoff retry.
+impl RetryPolicy {
+    /// Three attempts, 2 s and then 4 s apart.
+    pub(crate) const DEFAULT: RetryPolicy = RetryPolicy {
+        attempts: 3,
+        base_delay: Duration::from_secs(2),
+    };
+}
+
+/// How the logs name a webhook endpoint: its 1-based position in
+/// `webhooks.endpoints`, and its URL reduced to `scheme://host[:port]/…`.
+/// Slack and Discord webhook URLs carry their secret in the path, and an ntfy
+/// topic URL is the secret.
+fn endpoint_label(index: usize, url: &str) -> String {
+    format!("endpoint #{} ({})", index + 1, redact_url(url))
+}
+
+/// Send a webhook, retrying with exponential backoff.
 ///
-/// Attempts delivery up to [`MAX_WEBHOOK_ATTEMPTS`] times with delays of
-/// 2s, 4s between retries. Logs a warning on each failed attempt and an
-/// error if all attempts are exhausted.
+/// Makes up to `policy.attempts` attempts, waiting `policy.base_delay` after
+/// the first failure and twice as long after each further one, and logs a
+/// warning for each failed attempt. The log lines name the endpoint by `label`
+/// (see [`endpoint_label`]). Returns whether an attempt succeeded.
 async fn send_webhook_with_retry(
     client: &Client,
+    label: &str,
     url: &str,
     headers: &HashMap<String, String>,
     payload: &WebhookPayload,
+    policy: RetryPolicy,
 ) -> bool {
-    let mut delay = Duration::from_secs(2);
+    let mut delay = policy.base_delay;
 
-    for attempt in 1..=MAX_WEBHOOK_ATTEMPTS {
+    for attempt in 1..=policy.attempts {
         match send_webhook(client, url, headers, payload).await {
             Ok(()) => {
                 info!(
                     "Sent {} webhook for {} to {}",
-                    payload.event, payload.device_id, url
+                    payload.event, payload.device_id, label
                 );
                 return true;
             }
-            Err(e) if attempt < MAX_WEBHOOK_ATTEMPTS => {
+            Err(e) if attempt < policy.attempts => {
                 warn!(
                     "Webhook to {} failed (attempt {}/{}): {}. Retrying in {}s",
-                    url,
+                    label,
                     attempt,
-                    MAX_WEBHOOK_ATTEMPTS,
+                    policy.attempts,
                     e,
                     delay.as_secs()
                 );
@@ -333,7 +363,7 @@ async fn send_webhook_with_retry(
             Err(e) => {
                 warn!(
                     "Webhook to {} failed after {} attempts: {}",
-                    url, MAX_WEBHOOK_ATTEMPTS, e
+                    label, policy.attempts, e
                 );
             }
         }
@@ -358,14 +388,14 @@ async fn send_webhook(
         request = request.header(key.as_str(), value.as_str());
     }
 
-    let response = request.send().await.map_err(WebhookError::Request)?;
+    let response = request.send().await.map_err(WebhookError::from)?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(WebhookError::Response {
             status: status.as_u16(),
-            body,
+            body: sanitize_body(&body),
         });
     }
 
@@ -373,18 +403,31 @@ async fn send_webhook(
 }
 
 /// Errors that can occur when sending webhooks.
+///
+/// Their text is safe to log: a request error converted with `From` carries no
+/// URL, and a stored response body is at most 256 characters, with line
+/// breaks, control characters and bidi controls replaced by spaces.
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
     #[error("Request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[source] reqwest::Error),
     #[error("Webhook returned error {status}: {body}")]
     Response { status: u16, body: String },
+}
+
+impl From<reqwest::Error> for WebhookError {
+    /// Drops the URL that reqwest attaches to its errors: their `Display` and
+    /// `Debug` output print it, and webhook URLs often contain their secret.
+    fn from(e: reqwest::Error) -> Self {
+        Self::Request(e.without_url())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{WebhookConfig, WebhookEndpoint};
+    use crate::test_support::{CapturedLogs, RecordingServer, Reply, closed_port_url};
     use aranet_types::Status;
 
     fn test_reading(co2: u16, battery: u8) -> ReadingEvent {
@@ -525,5 +568,100 @@ mod tests {
         assert!(endpoint.events.iter().any(|e| e == "co2_high"));
         assert!(endpoint.events.iter().any(|e| e == "battery_low"));
         assert!(!endpoint.events.iter().any(|e| e == "radon_high"));
+    }
+
+    fn co2_payload() -> WebhookPayload {
+        let event = test_reading(1500, 85);
+        WebhookPayload {
+            event: "co2_high".to_string(),
+            device_id: event.device_id,
+            alias: None,
+            value: 1500.0,
+            threshold: 1000.0,
+            unit: "ppm".to_string(),
+            reading: event.reading,
+            timestamp: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn test_client() -> Client {
+        Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn webhook_logs_never_contain_endpoint_secret() {
+        let server = RecordingServer::start(vec![
+            ("/hook/SECRET-OK", Reply::Status(204)),
+            ("/hook/SECRET-PATH", Reply::Status(500)),
+        ])
+        .await;
+        let urls = [
+            server.url("/hook/SECRET-OK"),
+            server.url("/hook/SECRET-PATH"),
+            closed_port_url("/hook/SECRET-2?token=SECRET-3").await,
+        ];
+        let policy = RetryPolicy {
+            attempts: 2,
+            base_delay: Duration::ZERO,
+        };
+        let (client, headers, payload) = (test_client(), HashMap::new(), co2_payload());
+
+        let (logs, _g) = CapturedLogs::start();
+        let mut delivered = Vec::new();
+        for (index, url) in urls.iter().enumerate() {
+            let label = endpoint_label(index, url);
+            delivered.push(
+                send_webhook_with_retry(&client, &label, url, &headers, &payload, policy).await,
+            );
+        }
+
+        let logs = logs.text();
+        assert!(
+            !logs.contains("SECRET"),
+            "an endpoint secret reached the logs:\n{logs}"
+        );
+        assert_eq!(delivered, [true, false, false]);
+        let paths: Vec<String> = server.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            paths,
+            ["/hook/SECRET-OK", "/hook/SECRET-PATH", "/hook/SECRET-PATH"],
+            "requests still go to the full URL, and the 500 is retried once"
+        );
+        let base = server.url("");
+        for line in [
+            format!("Sent co2_high webhook for Aranet4 12345 to endpoint #1 ({base}/…)"),
+            format!(
+                "Webhook to endpoint #2 ({base}/…) failed (attempt 1/2): Webhook returned error 500"
+            ),
+            format!("Webhook to endpoint #2 ({base}/…) failed after 2 attempts"),
+            "Webhook to endpoint #3 (http://127.0.0.1:".to_string(),
+        ] {
+            assert!(logs.contains(&line), "missing {line:?} in:\n{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_error_display_has_no_url() {
+        let url = closed_port_url("/hook/SECRET-PATH?token=SECRET-QUERY").await;
+        let request_error = test_client()
+            .post(&url)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+        assert!(
+            request_error.url().is_some(),
+            "reqwest attaches the URL to its errors"
+        );
+
+        let error = WebhookError::from(request_error);
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !text.contains("/hook") && !text.contains("SECRET"),
+                "the endpoint URL leaked into the error: {text}"
+            );
+        }
     }
 }

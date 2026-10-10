@@ -50,6 +50,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::config::InfluxDbConfig;
+use crate::redact::{redact_url, sanitize_body};
 use crate::state::{AppState, ReadingEvent};
 
 /// InfluxDB writer that exports readings to InfluxDB.
@@ -77,7 +78,10 @@ impl InfluxDbWriter {
             return;
         }
 
-        info!("Starting InfluxDB writer to {}", influxdb_config.url);
+        info!(
+            "Starting InfluxDB writer to {}",
+            redact_url(&influxdb_config.url)
+        );
 
         let state = Arc::clone(&self.state);
         let shutdown_rx = self.state.subscribe_shutdown();
@@ -236,14 +240,14 @@ async fn write_line(
         request = request.header("Authorization", format!("Token {}", token));
     }
 
-    let response = request.send().await.map_err(InfluxDbError::Request)?;
+    let response = request.send().await.map_err(InfluxDbError::from)?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(InfluxDbError::Response {
             status: status.as_u16(),
-            body,
+            body: sanitize_body(&body),
         });
     }
 
@@ -312,17 +316,30 @@ fn escape_line_protocol(s: &str, special: &[char]) -> String {
 }
 
 /// Errors that can occur when writing to InfluxDB.
+///
+/// Their text is safe to log: a request error converted with `From` carries no
+/// URL, and a stored response body is at most 256 characters, with line
+/// breaks, control characters and bidi controls replaced by spaces.
 #[derive(Debug, thiserror::Error)]
 pub enum InfluxDbError {
     #[error("Request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[source] reqwest::Error),
     #[error("InfluxDB returned error {status}: {body}")]
     Response { status: u16, body: String },
+}
+
+impl From<reqwest::Error> for InfluxDbError {
+    /// Drops the URL that reqwest attaches to its errors: their `Display` and
+    /// `Debug` output print it, and it can carry a secret path or query.
+    fn from(e: reqwest::Error) -> Self {
+        Self::Request(e.without_url())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{CapturedLogs, TestState, closed_port_url};
     use aranet_types::Status;
     use time::OffsetDateTime;
 
@@ -535,5 +552,61 @@ mod tests {
         assert_eq!(urlencoding("my org"), "my%20org");
         assert_eq!(urlencoding("a&b"), "a%26b");
         assert_eq!(urlencoding("simple"), "simple");
+    }
+
+    #[tokio::test]
+    async fn influxdb_write_error_has_no_url() {
+        // InfluxDB behind a reverse proxy that routes on a secret path prefix.
+        let config = InfluxDbConfig {
+            enabled: true,
+            url: closed_port_url("/influxdb-SECRET").await,
+            ..Default::default()
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let error = write_line(&client, &config, "aranet co2=800i 1711612800")
+            .await
+            .expect_err("nothing listens on the port");
+
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !text.contains("SECRET") && !text.contains("/api/v2/write"),
+                "the InfluxDB URL leaked into the error: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn influxdb_start_log_hides_userinfo_and_path() {
+        let url = closed_port_url("/influxdb-SECRET-PATH").await.replacen(
+            "http://",
+            "http://admin:SECRET-PW@",
+            1,
+        );
+        let t = TestState::with_config(crate::config::Config {
+            influxdb: InfluxDbConfig {
+                enabled: true,
+                url,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let (logs, _g) = CapturedLogs::start();
+        InfluxDbWriter::new(Arc::clone(&t.state)).start().await;
+        t.state.signal_shutdown();
+
+        let logs = logs.text();
+        assert!(
+            !logs.contains("SECRET"),
+            "the InfluxDB URL leaked into the logs:\n{logs}"
+        );
+        assert!(
+            logs.contains("Starting InfluxDB writer to http://127.0.0.1:"),
+            "start not logged:\n{logs}"
+        );
     }
 }

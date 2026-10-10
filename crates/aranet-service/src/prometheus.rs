@@ -39,6 +39,7 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
 use crate::config::PrometheusConfig;
+use crate::redact::{redact_url, sanitize_body};
 use crate::state::AppState;
 
 /// Prometheus push gateway client.
@@ -81,7 +82,8 @@ impl PrometheusPusher {
 
         info!(
             "Starting Prometheus pusher to {} (interval: {}s)",
-            push_gateway, prometheus_config.push_interval
+            redact_url(&push_gateway),
+            prometheus_config.push_interval
         );
 
         let state = Arc::clone(&self.state);
@@ -391,14 +393,14 @@ async fn push_metrics(
         .body(metrics.to_string())
         .send()
         .await
-        .map_err(PushError::Request)?;
+        .map_err(PushError::from)?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(PushError::Response {
             status: status.as_u16(),
-            body,
+            body: sanitize_body(&body),
         });
     }
 
@@ -424,18 +426,31 @@ fn escape_label_value(s: &str) -> String {
 }
 
 /// Errors that can occur when pushing metrics.
+///
+/// Their text is safe to log: a request error converted with `From` carries no
+/// URL, and a stored response body is at most 256 characters, with line
+/// breaks, control characters and bidi controls replaced by spaces.
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("Request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[source] reqwest::Error),
     #[error("Push gateway returned error {status}: {body}")]
     Response { status: u16, body: String },
+}
+
+impl From<reqwest::Error> for PushError {
+    /// Drops the URL that reqwest attaches to its errors: their `Display` and
+    /// `Debug` output print it, and it can carry a secret path or query.
+    fn from(e: reqwest::Error) -> Self {
+        Self::Request(e.without_url())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestState;
+    use crate::test_support::{CapturedLogs, closed_port_url};
     use aranet_types::{CurrentReading, Status};
 
     #[test]
@@ -629,5 +644,55 @@ mod tests {
             .await
             .expect("the pusher stops within 5 s of the shutdown signal")
             .expect("the pusher task doesn't panic");
+    }
+
+    #[tokio::test]
+    async fn push_error_log_hides_gateway_userinfo() {
+        // A push gateway behind a proxy that wants basic auth and routes on a
+        // secret path prefix.
+        let gateway = closed_port_url("/gateway-SECRET-PATH").await.replacen(
+            "http://",
+            "http://user:SECRET@",
+            1,
+        );
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let error = push_metrics(&client, &gateway, "aranet-service", "")
+            .await
+            .expect_err("nothing listens on the gateway port");
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !text.contains("SECRET"),
+                "the gateway URL leaked into the error: {text}"
+            );
+        }
+
+        let mut config = crate::config::Config::default();
+        config.prometheus.enabled = true;
+        config.prometheus.push_gateway = Some(gateway);
+        let t = TestState::with_config(config);
+        let (logs, _g) = CapturedLogs::start();
+        let pusher = PrometheusPusher::new(Arc::clone(&t.state))
+            .start()
+            .await
+            .expect("a push gateway is configured");
+        t.state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), pusher)
+            .await
+            .expect("the pusher stops at shutdown")
+            .expect("the pusher task didn't panic");
+
+        let logs = logs.text();
+        assert!(
+            !logs.contains("SECRET"),
+            "the gateway URL leaked into the logs:\n{logs}"
+        );
+        assert!(
+            logs.contains("Starting Prometheus pusher to http://127.0.0.1:"),
+            "start not logged:\n{logs}"
+        );
     }
 }
