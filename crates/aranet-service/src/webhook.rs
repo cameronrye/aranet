@@ -26,10 +26,12 @@
 //! once, so a slow or unreachable endpoint never delays other alerts or the
 //! readings after it. An endpoint gets up to three attempts, each with a 10 s
 //! timeout, 2 s and then 4 s apart. At most 16 alerts are delivered at the
-//! same time, and only one per device and event; an alert beyond that is
-//! dropped with a warning. The cooldown starts once an alert has reached at
-//! least one endpoint. When the service stops, deliveries still running get
-//! 5 s to finish.
+//! same time, and only one per device and event. An alert over the limit of
+//! 16 is dropped, with a warning at most once a minute. An alert for a device
+//! and event that is still being delivered is skipped, with a line in the
+//! debug log only. The cooldown starts once an alert has reached at least one
+//! endpoint. When the service stops, deliveries still running get 5 s to
+//! finish.
 //!
 //! # Payload Format
 //!
