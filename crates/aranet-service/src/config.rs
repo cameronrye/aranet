@@ -1657,6 +1657,29 @@ path = "/data/aranet.db"
     }
 
     #[test]
+    fn generated_api_keys_use_all_32_random_bytes() {
+        let keys: Vec<String> = (0..64).map(|_| generate_api_key().unwrap()).collect();
+
+        // Every character changes from key to key, so no byte is left
+        // unfilled. (A random character repeats in all 64 keys once in 16^63.)
+        for position in 0..64 {
+            let first = keys[0].as_bytes()[position];
+            assert!(
+                keys.iter().any(|key| key.as_bytes()[position] != first),
+                "character {position} is the same in 64 keys"
+            );
+        }
+
+        // The two characters of a byte differ somewhere, so both of its
+        // halves are written.
+        assert!(
+            keys.iter()
+                .any(|key| key.as_bytes().chunks(2).any(|pair| pair[0] != pair[1])),
+            "both characters of every byte are the same"
+        );
+    }
+
+    #[test]
     fn allowed_hosts_validation() {
         let with_hosts = |hosts: &[&str]| SecurityConfig {
             allowed_hosts: hosts.iter().map(|host| host.to_string()).collect(),

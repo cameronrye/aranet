@@ -1501,4 +1501,101 @@ mod tests {
             .collect();
         assert_eq!(names, ["server.toml"]);
     }
+
+    #[test]
+    fn load_config_saves_no_key_for_a_short_key_or_an_invalid_config() {
+        for (contents, field) in [
+            // A key that is set but too short is rejected, never replaced.
+            (
+                "[security]\napi_key_enabled = true\napi_key = \"too-short\"\n",
+                "security.api_key",
+            ),
+            // A key is saved only once the rest of the config is valid.
+            (
+                "[server]\nbind = \"localhost:8080\"\n\n[security]\napi_key_enabled = true\n",
+                "server.bind",
+            ),
+        ] {
+            let (_dir, path, options) = auth_config_file(contents);
+
+            let Err(err) = load_config(&options) else {
+                panic!("{field}: the config was accepted");
+            };
+
+            match err.downcast_ref::<ConfigError>() {
+                Some(ConfigError::Validation(errors)) => assert!(
+                    errors.iter().any(|error| error.field == field),
+                    "{errors:?}"
+                ),
+                _ => panic!("expected a validation error, got: {err:#}"),
+            }
+            assert!(
+                std::fs::read_to_string(&path).unwrap() == contents,
+                "{field}: the config file was changed"
+            );
+        }
+    }
+
+    #[test]
+    fn load_config_replaces_an_empty_api_key_with_a_random_one() {
+        let generated_key = |contents: &str| {
+            let (_dir, path, options) = auth_config_file(contents);
+            let key = load_config(&options)
+                .unwrap()
+                .config
+                .security
+                .api_key
+                .unwrap();
+            (key, std::fs::read_to_string(&path).unwrap())
+        };
+
+        let (key, saved) = generated_key("[security]\napi_key_enabled = true\napi_key = \"\"\n");
+        assert!(looks_generated(&key), "the empty key was kept");
+        assert!(
+            saved.contains(&format!("api_key = \"{key}\"")),
+            "the key was not saved"
+        );
+        assert_eq!(
+            saved.matches("api_key = ").count(),
+            1,
+            "the empty key is still in the file"
+        );
+
+        // Every file gets a key of its own, never check_config's placeholder.
+        let (other, _) = generated_key("[security]\napi_key_enabled = true\n");
+        assert!(key != other, "two config files got the same key");
+        assert!(
+            key != "0".repeat(64) && other != "0".repeat(64),
+            "the placeholder was saved as the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_logs_startup_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        // The port is taken, so run() stops right after the warnings.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = taken.local_addr().unwrap().to_string();
+        let config = write_server_toml(dir.path(), &bind);
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("\n[security]\nallowed_hosts = [\"*\"]\ncors_origins = [\"*/\"]\n");
+        std::fs::write(&config, contents).unwrap();
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+
+        let err = run_until_error(config).await;
+
+        assert!(
+            format!("{err:#}").starts_with(&format!("failed to listen on {bind}: ")),
+            "{err:#}"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("security.allowed_hosts contains \"*\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("security.cors_origins contains \"*\""),
+            "{text}"
+        );
+    }
 }
