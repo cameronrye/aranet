@@ -482,6 +482,93 @@ fn test_config_init_writes_owner_only_commented_template() {
     assert_eq!(theme, Some("light"), "{edited}");
 }
 
+/// The comment lines of a config file's text, in order.
+fn comment_lines(text: &str) -> Vec<&str> {
+    text.lines().filter(|line| line.starts_with('#')).collect()
+}
+
+#[test]
+fn test_config_init_template_takes_updates_under_its_headers() {
+    let env = TestEnv::new();
+
+    let output = env.run(&["config", "init"]);
+    assert!(
+        output.status.success(),
+        "config init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let template = fs::read_to_string(env.config_path()).expect("read config");
+
+    // A section key and a root-level key, written by the updater into the template.
+    for args in [
+        ["alias", "set", "office", "AA:BB:CC:DD:EE:FF"],
+        ["config", "set", "fahrenheit", "true"],
+    ] {
+        let output = env.run(&args);
+        assert!(
+            output.status.success(),
+            "`aranet {}` should succeed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let text = fs::read_to_string(env.config_path()).expect("read config");
+    let written: toml::Table = toml::from_str(&text).expect("config should stay valid TOML");
+
+    // The alias went under the template's own `[aliases]` header: every header is there
+    // once, in its place, and nothing else became active. Which line the root-level key
+    // is on is left open: today it is the first one, above the title, and that may change.
+    let fahrenheit = "fahrenheit = true";
+    let mut active: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert_eq!(
+        active.iter().filter(|line| **line == fahrenheit).count(),
+        1,
+        "{text}"
+    );
+    active.retain(|line| *line != fahrenheit);
+    assert_eq!(
+        active,
+        [
+            "[aliases]",
+            "office = \"AA:BB:CC:DD:EE:FF\"",
+            "[behavior]",
+            "[gui]"
+        ],
+        "{text}"
+    );
+    let aliases = written["aliases"].as_table().expect("[aliases] table");
+    assert_eq!(aliases.len(), 1, "{text}");
+    assert_eq!(
+        aliases.get("office").and_then(toml::Value::as_str),
+        Some("AA:BB:CC:DD:EE:FF")
+    );
+
+    // The template's comments are all kept, in order. Among them are the title and the
+    // commented default of the setting that is now live.
+    for comment in [
+        "# aranet CLI configuration. Uncomment a setting to change it.",
+        "# fahrenheit = false",
+    ] {
+        assert!(
+            text.lines().any(|line| line == comment),
+            "{comment:?} is gone:\n{text}"
+        );
+    }
+    assert_eq!(comment_lines(&text), comment_lines(&template), "{text}");
+
+    let output = env.run(&["config", "get", "fahrenheit"]);
+    assert!(
+        output.status.success(),
+        "config get should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
+}
+
 #[test]
 fn test_config_show_redacts_service_api_key() {
     let env = TestEnv::new();
