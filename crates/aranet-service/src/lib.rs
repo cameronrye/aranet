@@ -653,7 +653,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     let _mdns_handle = {
         use crate::mdns::MdnsAdvertiser;
         let advertiser = MdnsAdvertiser::new(Arc::clone(&state));
-        advertiser.start().await
+        advertiser.start(bound).await
     };
 
     let app = app(
