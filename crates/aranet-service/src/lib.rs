@@ -1691,6 +1691,39 @@ mod tests {
         assert!(!dir.path().join("data.db").exists());
     }
 
+    /// The refusal's first remedy works on its own: with `api_key_enabled =
+    /// true` and no key in the file, a network bind loads, because the key
+    /// is generated before the configuration is validated.
+    #[test]
+    fn test_load_config_accepts_network_bind_with_auth_enabled_and_no_key() {
+        // load_config doesn't listen, so the port is never bound.
+        let (_dir, path, options) = auth_config_file(
+            "[server]\nbind = \"0.0.0.0:8080\"\n\n[security]\napi_key_enabled = true\n",
+        );
+
+        // No message below prints the loaded config, the error or the file:
+        // each may hold the generated key.
+        let Ok(loaded) = load_config(&options) else {
+            panic!("load_config failed for a network bind with api_key_enabled = true and no key");
+        };
+        assert_eq!(loaded.config.server.bind, "0.0.0.0:8080");
+        let key = loaded
+            .config
+            .security
+            .api_key
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            looks_generated(key),
+            "the loaded config has no key of the generated form"
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains(&format!("api_key = \"{key}\"")),
+            "the file does not hold the generated key"
+        );
+    }
+
     #[test]
     fn test_unauthenticated_network_warning() {
         let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
