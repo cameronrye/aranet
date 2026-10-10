@@ -1139,6 +1139,27 @@ async fn test_removing_first_of_two_devices_keeps_shipped_comments() {
 #[cfg(unix)]
 #[test]
 fn test_startup_warns_about_database_in_tilde_directory() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    /// The binary stops at validation within milliseconds. The limit turns a
+    /// regression that starts serving into a failure, instead of a test that
+    /// hangs with a server running.
+    const START_LIMIT: Duration = Duration::from_secs(10);
+
+    /// Read a pipe to its end on a thread of its own, so that the binary
+    /// never waits for room in it.
+    fn collect(mut pipe: impl Read + Send + 'static) -> JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            // On an error, what was read so far is still worth showing.
+            let _ = pipe.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let cwd = dir.path().join("cwd");
@@ -1157,7 +1178,7 @@ fn test_startup_warns_about_database_in_tilde_directory() {
     .unwrap();
 
     let start = || {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_aranet-service"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_aranet-service"))
             .arg("--config")
             .arg(&config)
             .args(["--bind", "localhost:8080", "--no-collector", "run"])
@@ -1165,13 +1186,34 @@ fn test_startup_warns_about_database_in_tilde_directory() {
             .env("HOME", &home)
             .env("NO_COLOR", "1")
             .env_remove("RUST_LOG")
-            .stdin(std::process::Stdio::null())
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("failed to start aranet-service");
-        let output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        let stdout = collect(child.stdout.take().expect("stdout is piped"));
+        let stderr = collect(child.stderr.take().expect("stderr is piped"));
+
+        let deadline = Instant::now() + START_LIMIT;
+        let exited = loop {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                // Stop it and reap it before failing, so that no server is
+                // left running.
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // The binary is gone, so both pipes are at their end.
+        let output = format!("{}{}", stdout.join().unwrap(), stderr.join().unwrap());
+        assert!(
+            exited,
+            "aranet-service was still running after {START_LIMIT:?} and was stopped; \
+             its output:\n{output}"
         );
         assert!(
             output.contains("invalid bind address 'localhost:8080'"),
