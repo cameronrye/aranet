@@ -1,7 +1,12 @@
 //! Embedded web dashboard for monitoring Aranet sensors.
 
 use crate::state::AppState;
-use axum::{Router, response::Html, routing::get};
+use axum::{
+    Router,
+    http::header,
+    response::{Html, IntoResponse},
+    routing::get,
+};
 use std::sync::Arc;
 
 /// Create the dashboard router.
@@ -11,8 +16,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/dashboard", get(dashboard_page))
 }
 
-async fn dashboard_page() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+/// Serve the dashboard. `Referrer-Policy: no-referrer` keeps the page's URL,
+/// which can carry `?token=<API key>` until the script removes it, out of the
+/// `Referer` header of the requests the page makes.
+async fn dashboard_page() -> impl IntoResponse {
+    (
+        [(header::REFERRER_POLICY, "no-referrer")],
+        Html(DASHBOARD_HTML),
+    )
 }
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -148,8 +159,28 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
 <script>
 const API = window.location.origin;
-const params = new URLSearchParams(window.location.search);
-let apiToken = params.get('token') || window.sessionStorage.getItem('aranet_api_token') || '';
+
+// Take an API key passed as ?token=... or #token=... out of the address bar
+// and the history entry. A repeated token is ignored. decodeURIComponent,
+// unlike URLSearchParams, keeps '+' as '+', so base64 keys work.
+function takeUrlToken() {
+  const values = [];
+  for (const part of [window.location.search, window.location.hash]) {
+    for (const param of part.slice(1).split('&')) {
+      if (param.startsWith('token=')) values.push(param.slice('token='.length));
+    }
+  }
+  if (values.length === 0) return '';
+  window.history.replaceState(null, '', window.location.pathname);
+  if (values.length !== 1) return '';
+  try {
+    return decodeURIComponent(values[0]);
+  } catch (_) {
+    return values[0];
+  }
+}
+
+let apiToken = takeUrlToken() || window.sessionStorage.getItem('aranet_api_token') || '';
 let ws;
 let deviceData = {};
 

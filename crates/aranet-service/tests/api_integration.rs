@@ -758,6 +758,38 @@ async fn test_dashboard_history_uses_cached_history_endpoint() {
     assert!(body.contains("fetchJson('/api/devices')"));
 }
 
+#[tokio::test]
+async fn test_dashboard_sends_no_referrer() {
+    let (app, _state, _dir) = test_app();
+    for path in ["/", "/dashboard"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("referrer-policy")
+                .map(|value| value.to_str().unwrap()),
+            Some("no-referrer"),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_dashboard_scrubs_url_token() {
+    let (app, _state, _dir) = test_app();
+    let (status, body) = get(&app, "/dashboard").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("history.replaceState"));
+    assert!(body.contains("decodeURIComponent"));
+    assert!(!body.contains("new URLSearchParams(window.location.search)"));
+}
+
 // ==========================================================================
 // Authentication
 // ==========================================================================
