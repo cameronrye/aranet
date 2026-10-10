@@ -428,8 +428,9 @@ fn escape_label_value(s: &str) -> String {
 /// Errors that can occur when pushing metrics.
 ///
 /// Their text is safe to log: a request error converted with `From` carries no
-/// URL, and a stored response body is at most 256 characters, with line
-/// breaks, control characters and bidi controls replaced by spaces.
+/// URL, and a stored response body keeps only its first 256 characters,
+/// followed by `…` when it was longer (so 257 at most), with line breaks,
+/// control characters and bidi controls replaced by spaces.
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("Request failed: {0}")]
