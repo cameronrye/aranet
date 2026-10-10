@@ -790,6 +790,21 @@ async fn test_dashboard_scrubs_url_token() {
     assert!(!body.contains("new URLSearchParams(window.location.search)"));
 }
 
+#[tokio::test]
+async fn test_dashboard_keeps_only_the_path_and_reads_the_url_token_first() {
+    let (app, _state, _dir) = test_app();
+    let (status, body) = get(&app, "/dashboard").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Only the path stays in the address bar and the history entry: keeping
+    // the query or the fragment would keep the token.
+    assert!(body.contains("window.history.replaceState(null, '', window.location.pathname);"));
+    // The URL is read, and so cleaned, even when a token is already stored.
+    assert!(body.contains(
+        "let apiToken = takeUrlToken() || window.sessionStorage.getItem('aranet_api_token') || '';"
+    ));
+}
+
 // ==========================================================================
 // Authentication
 // ==========================================================================
@@ -1476,4 +1491,63 @@ async fn cross_site_websocket_upgrade_is_refused() {
         own.starts_with("HTTP/1.1 101"),
         "the own origin got {own:?}"
     );
+}
+
+#[tokio::test]
+async fn layers_answer_preflights_first_and_rate_limit_refused_requests() {
+    let origin = "http://localhost:3000";
+    let one_request = |api_key: Option<&str>| SecurityConfig {
+        api_key_enabled: api_key.is_some(),
+        api_key: api_key.map(str::to_string),
+        rate_limit_requests: 1,
+        cors_origins: vec![origin.to_string()],
+        ..SecurityConfig::default()
+    };
+
+    // CORS is the outermost layer. It answers a listed origin's preflights
+    // itself: they carry no API key, and they don't use up the page's
+    // requests.
+    let (app, _state, _dir) = test_app_with_config(Config {
+        security: one_request(Some("test-api-key-that-is-at-least-32-characters-long")),
+        ..Config::default()
+    });
+    for attempt in 1..=3 {
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/collector/stop")
+            .header("Host", "127.0.0.1:8080")
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", "POST")
+            .header("Access-Control-Request-Headers", "x-api-key")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "preflight {attempt}");
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .map(|value| value.to_str().unwrap()),
+            Some(origin),
+            "preflight {attempt}"
+        );
+    }
+
+    // The rate limiter sits outside the Host and Origin checks, so a refused
+    // request counts like any other.
+    let (app, _state, _dir) = test_app_with_config(Config {
+        security: one_request(None),
+        ..Config::default()
+    });
+    let refused = || {
+        Request::builder()
+            .uri("/api/devices")
+            .header("Host", "evil.example:8080")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, body) = send_request(&app, refused()).await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{body}");
+    let (status, body) = send_request(&app, refused()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
 }

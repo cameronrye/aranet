@@ -1942,6 +1942,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_full_app_empty_host_target_authority_and_machine_name() {
+        /// Status of `GET uri` with `Host: host`, with authentication off.
+        async fn status(app: &axum::Router, uri: &str, host: &str) -> StatusCode {
+            let mut request = request_with_connect_info(axum::http::Method::GET, uri);
+            request.headers_mut().insert("Host", host.parse().unwrap());
+            app.clone().oneshot(request).await.unwrap().status()
+        }
+
+        let security = SecurityConfig {
+            rate_limit_enabled: false,
+            ..SecurityConfig::default()
+        };
+        let (app, _t) = create_full_app(security);
+
+        // An empty Host counts as absent, which HTTP/1.1 allows for a request
+        // target without an authority.
+        assert_eq!(status(&app, "/api/health", "").await, StatusCode::OK);
+
+        // The authority of an absolute-form target is the host that is
+        // checked, whatever the Host header says.
+        assert_eq!(
+            status(
+                &app,
+                "http://evil.example:8080/api/health",
+                "localhost:8080"
+            )
+            .await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+
+        // What a browser on the local network sends for http://<name>:8080 and
+        // http://<name>.local:8080.
+        let Some(name) = crate::mdns::machine_hostname() else {
+            eprintln!("skipped: this machine's host name can't be read");
+            return;
+        };
+        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            eprintln!("skipped: {name:?} is not a plain host name");
+            return;
+        }
+        for host in [
+            name.clone(),
+            format!("{name}:8080"),
+            format!("{name}.local:8080"),
+        ] {
+            assert_eq!(
+                status(&app, "/api/health", &host).await,
+                StatusCode::OK,
+                "Host: {host}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_get_readings_invalid_since_returns_bad_request() {
         let t = create_test_state();
         let state = Arc::clone(&t.state);

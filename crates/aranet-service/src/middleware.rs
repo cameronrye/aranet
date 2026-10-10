@@ -1057,4 +1057,65 @@ mod tests {
         });
         assert!(authenticated.startup_warnings().is_empty());
     }
+
+    #[test]
+    fn origin_policy_near_misses_and_spaced_star() {
+        let defaults = policy(SecurityConfig::default());
+
+        // Only `localhost` itself and names under `.localhost` are local.
+        for host in ["notlocalhost", "evil-localhost:8080", "localhost.example"] {
+            assert!(!defaults.allows_host(host), "{host} should be rejected");
+        }
+
+        // An origin is the service's own only when its whole authority is the
+        // Host: a longer name that starts with it, another port and a missing
+        // port are all other origins.
+        assert!(defaults.allows_origin("http://myhost", Some("myhost")));
+        for (origin, host) in [
+            ("http://myhost.evil.example", "myhost"),
+            ("http://myhost:8080", "myhost"),
+            ("http://127.0.0.1:80801", "127.0.0.1:8080"),
+            ("http://127.0.0.1", "127.0.0.1:8080"),
+            ("http://my", "myhost"),
+        ] {
+            assert!(
+                !defaults.allows_origin(origin, Some(host)),
+                "{origin} should be rejected for Host {host}"
+            );
+        }
+
+        // Only exactly the two origins that 0.2 saved are warned about: a list
+        // that was extended or cut down was written on purpose.
+        let near_old_default: [&[&str]; 3] = [
+            &["http://localhost"],
+            &["http://127.0.0.1"],
+            &[
+                "http://localhost",
+                "http://127.0.0.1",
+                "http://localhost:3000",
+            ],
+        ];
+        for origins in near_old_default {
+            let policy = policy(SecurityConfig {
+                cors_origins: origins.iter().map(|origin| origin.to_string()).collect(),
+                ..SecurityConfig::default()
+            });
+            let warnings = policy.startup_warnings();
+            assert!(warnings.is_empty(), "{origins:?}: {warnings:?}");
+        }
+
+        // `app()` also takes configs that were never validated. There a "*"
+        // with spaces around it means every host, as it does in
+        // `cors_origins`, and is warned about.
+        for entry in [" *", "* "] {
+            let policy = policy(SecurityConfig {
+                allowed_hosts: vec![entry.to_string()],
+                ..SecurityConfig::default()
+            });
+            assert!(policy.allows_host("evil.example:8080"), "{entry:?}");
+            let warnings = policy.startup_warnings();
+            assert_eq!(warnings.len(), 1, "{entry:?}: {warnings:?}");
+            assert!(warnings[0].starts_with("security.allowed_hosts contains \"*\""));
+        }
+    }
 }
