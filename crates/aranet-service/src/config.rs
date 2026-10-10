@@ -1639,14 +1639,16 @@ path = "/data/aranet.db"
     fn generate_api_key_is_64_hex_and_unique() {
         let first = generate_api_key().unwrap();
         let second = generate_api_key().unwrap();
+        // A failed assertion must not print a key: the messages say what was
+        // wrong, and the keys are compared without assert_ne!.
         for key in [&first, &second] {
-            assert_eq!(key.len(), 64, "{key}");
+            assert_eq!(key.len(), 64, "a generated key has the wrong length");
             assert!(
                 key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-                "{key}"
+                "a generated key has characters other than 0-9 and a-f"
             );
         }
-        assert_ne!(first, second);
+        assert!(first != second, "two generated keys are the same");
 
         let security = SecurityConfig {
             api_key_enabled: true,

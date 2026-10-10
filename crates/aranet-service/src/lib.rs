@@ -1411,12 +1411,20 @@ mod tests {
 
         let loaded = load_config(&options).unwrap();
         let key = loaded.config.security.api_key.clone().unwrap();
-        assert!(looks_generated(&key), "{key:?}");
+        // A failed assertion must not print the key, so the messages below
+        // say what was wrong and leave out the key and the file that holds it.
+        assert!(
+            looks_generated(&key),
+            "the generated key is not 64 lowercase hex characters"
+        );
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("# keep\n"), "{saved}");
-        assert!(saved.contains(&format!("api_key = \"{key}\"")), "{saved}");
-        assert!(!saved.contains("data.db"), "an override was saved: {saved}");
+        assert!(saved.starts_with("# keep\n"), "the comment was lost");
+        assert!(
+            saved.contains(&format!("api_key = \"{key}\"")),
+            "the file has no api_key line with the generated key"
+        );
+        assert!(!saved.contains("data.db"), "an override was saved");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1424,8 +1432,15 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
 
-        let again = load_config(&options).unwrap();
-        assert_eq!(again.config.security.api_key.as_deref(), Some(key.as_str()));
+        // Not unwrap(): a parse error quotes a line of the file, and the file
+        // now holds the key.
+        let Ok(again) = load_config(&options) else {
+            panic!("the file with the saved key could not be loaded again");
+        };
+        assert!(
+            again.config.security.api_key.as_deref() == Some(key.as_str()),
+            "the second load did not return the saved key"
+        );
     }
 
     #[test]
@@ -1440,15 +1455,18 @@ mod tests {
             .api_key
             .unwrap();
 
+        // Neither message prints the log: when the key was logged, the log
+        // holds it.
         let text = logs.text();
         assert!(
             text.contains(&format!(
                 "Generated an API key and saved it to {}",
                 path.display()
             )),
-            "{text}"
+            "the log does not say that a key was generated and saved to {}",
+            path.display()
         );
-        assert!(!text.contains(&key), "the key was logged: {text}");
+        assert!(!text.contains(&key), "the key reached the log");
     }
 
     #[cfg(unix)]
@@ -1480,11 +1498,20 @@ mod tests {
             return;
         };
 
-        let error = format!("{:#}", result.unwrap_err());
+        // Not unwrap_err(): it would print the loaded config, which holds the
+        // generated key.
+        let Err(error) = result else {
+            panic!("loading succeeded although the key could not be saved");
+        };
+        let error = format!("{error:#}");
         assert!(error.contains("could not be saved"), "{error}");
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.contains("security.api_key"), "{error}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // Not assert_eq!: a file that was changed after all may hold the key.
+        assert!(
+            std::fs::read_to_string(&path).unwrap() == original,
+            "the config file was changed although the key could not be saved"
+        );
     }
 
     #[test]
@@ -1494,7 +1521,11 @@ mod tests {
 
         check_config(&options).unwrap();
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // Not assert_eq!: a file that was written after all may hold a key.
+        assert!(
+            std::fs::read_to_string(&path).unwrap() == original,
+            "check_config changed the config file"
+        );
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
