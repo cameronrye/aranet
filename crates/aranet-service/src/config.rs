@@ -582,6 +582,9 @@ pub struct MqttConfig {
     /// MQTT broker URL (e.g., "mqtt://localhost:1883" or "mqtts://broker.example.com:8883").
     pub broker: String,
     /// Topic prefix for published messages (e.g., "aranet" -> "aranet/{device}/co2").
+    ///
+    /// While MQTT is enabled, the prefix can't contain control characters or
+    /// the MQTT wildcards `+` and `#`.
     #[serde(default = "default_topic_prefix")]
     pub topic_prefix: String,
     /// MQTT client ID.
@@ -606,6 +609,9 @@ pub struct MqttConfig {
     #[serde(default)]
     pub homeassistant: bool,
     /// Home Assistant discovery topic prefix.
+    ///
+    /// While MQTT is enabled and `homeassistant` is `true`, the prefix can't
+    /// contain control characters or the MQTT wildcards `+` and `#`.
     #[serde(default = "default_ha_discovery_prefix")]
     pub ha_discovery_prefix: String,
 }
@@ -1029,6 +1035,11 @@ pub struct InfluxDbConfig {
     /// Bucket name (InfluxDB 2.x) or database name (1.x).
     pub bucket: String,
     /// Measurement name for sensor readings.
+    ///
+    /// Write the name plain (`air quality`, not `air\ quality`): its spaces and
+    /// commas are escaped for you. While the exporter is enabled, the name
+    /// can't contain control characters or backslashes and can't start with
+    /// `_` or `#`.
     #[serde(default = "default_influxdb_measurement")]
     pub measurement: String,
     /// Write precision.
