@@ -327,6 +327,28 @@ mod tests {
         }
     }
 
+    /// Authentication alone decides, whatever the opt-out says: the opt-out
+    /// allows listening without a key, not announcing it.
+    #[test]
+    fn test_should_advertise_ignores_the_opt_out() {
+        let bound: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert!(
+            !should_advertise(bound, &SecurityConfig::default()),
+            "advertised without authentication"
+        );
+
+        let authenticated_and_opted_out = SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("0123456789abcdef".repeat(4)),
+            allow_unauthenticated_network: true,
+            ..Default::default()
+        };
+        assert!(
+            should_advertise(bound, &authenticated_and_opted_out),
+            "the opt-out stopped an authenticated service from advertising"
+        );
+    }
+
     #[test]
     fn machine_name_is_first_label_lowercased() {
         assert_eq!(

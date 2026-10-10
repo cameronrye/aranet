@@ -2323,6 +2323,59 @@ path = "/data/aranet.db"
         assert!(errors.is_empty(), "with the opt-out: {errors:?}");
     }
 
+    /// The whole refusal, as the service prints it at startup.
+    #[test]
+    fn test_unauthenticated_network_bind_message() {
+        let errors = all_validation_errors(&config_listening_on("0.0.0.0:8080"));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].to_string(),
+            "server.bind: refusing to listen on 0.0.0.0:8080 without API-key authentication: \
+             set security.api_key_enabled = true, bind to 127.0.0.1, or set \
+             security.allow_unauthenticated_network = true if a firewall or authenticating \
+             proxy protects the port"
+        );
+    }
+
+    /// The rule looks only at `api_key_enabled`: an enabled key that is missing
+    /// or too short is reported as that, and the bind is not refused as well.
+    #[test]
+    fn test_network_bind_with_unusable_key_reports_only_the_key() {
+        for (case, key) in [
+            ("no key", None),
+            ("a short key", Some("too-short".to_string())),
+        ] {
+            let mut config = config_listening_on("0.0.0.0:8080");
+            config.security.api_key_enabled = true;
+            config.security.api_key = key;
+            let errors = all_validation_errors(&config);
+            let fields: Vec<_> = errors.iter().map(|error| error.field.as_str()).collect();
+            assert_eq!(fields, ["security.api_key"], "{case}");
+        }
+    }
+
+    /// The opt-out is written to the config file like any other setting.
+    #[test]
+    fn test_opt_out_is_written_to_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+
+        let written = Config::update_file(&path, |config| {
+            config.security.allow_unauthenticated_network = true;
+        })
+        .unwrap();
+
+        assert!(written, "the file was not changed");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("allow_unauthenticated_network = true"),
+            "{saved}"
+        );
+        let errors = all_validation_errors(&Config::load(&path).unwrap());
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
     /// The Docker image bakes in docker/server.toml, so a config the service
     /// refuses would make the container exit at startup.
     #[test]

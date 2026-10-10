@@ -1287,4 +1287,63 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
     }
+
+    /// An `Authorization` value that can't be read as text carries no token:
+    /// the request is refused like one without the header, and on `/api/ws`
+    /// the query token still counts.
+    #[tokio::test]
+    async fn test_unreadable_authorization_header_carries_no_token() {
+        // 0xE9 is not visible ASCII, so `HeaderValue::to_str` fails.
+        let mut unreadable = format!("Bearer {CONFIGURED_KEY}").into_bytes();
+        unreadable.push(0xe9);
+        for (uri, expected) in [
+            ("/api/devices".to_string(), StatusCode::UNAUTHORIZED),
+            (format!("/api/ws?token={CONFIGURED_KEY}"), StatusCode::OK),
+        ] {
+            let app = Router::new()
+                .route("/api/devices", get(|| async { StatusCode::OK }))
+                .route("/api/ws", get(|| async { StatusCode::OK }))
+                .layer(axum::middleware::from_fn_with_state(
+                    test_security_config(),
+                    api_key_auth,
+                ));
+            let request = Request::builder()
+                .uri(&uri)
+                .header("Authorization", unreadable.as_slice())
+                .body(Body::empty())
+                .unwrap();
+            let status = app.oneshot(request).await.unwrap().status();
+            // The path only: the query holds the key.
+            let path = uri.split('?').next().unwrap_or_default();
+            assert_eq!(status, expected, "{path}");
+        }
+    }
+
+    /// The whole hint of a 401, which names every way to send the key.
+    #[tokio::test]
+    async fn test_unauthorized_hint_names_every_way_to_send_the_key() {
+        let app = Router::new()
+            .route("/api/devices", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_security_config(),
+                api_key_auth,
+            ));
+        let request = Request::builder()
+            .uri("/api/devices")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["hint"],
+            "Provide the API key in the X-API-Key header or as Authorization: Bearer <key>, \
+             or use the 'token' query parameter only for /api/ws"
+        );
+    }
 }
