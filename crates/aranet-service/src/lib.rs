@@ -1725,4 +1725,33 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn test_unauthenticated_network_warning_text_and_cause() {
+        let bound: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let opted_out = SecurityConfig {
+            allow_unauthenticated_network: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            unauthenticated_network_warning(bound, &opted_out).as_deref(),
+            Some(
+                "Listening on 0.0.0.0:8080 without API-key authentication \
+                 (security.allow_unauthenticated_network = true): anyone who can reach this \
+                 port can read the readings and change the configuration"
+            )
+        );
+
+        // With authentication on, the opt-out isn't what lets the service
+        // listen, so there is nothing to warn about even when it is set.
+        let authenticated_and_opted_out = SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("0123456789abcdef".repeat(4)),
+            ..opted_out
+        };
+        assert!(
+            unauthenticated_network_warning(bound, &authenticated_and_opted_out).is_none(),
+            "warned although authentication is on"
+        );
+    }
 }
