@@ -1153,5 +1153,64 @@ mod tests {
                 "a delivery that failed started the cooldown:\n{text}"
             );
         }
+
+        #[tokio::test]
+        async fn webhook_cooldown_starts_when_one_of_two_endpoints_is_reached() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![
+                ("/broken", Reply::Status(500)),
+                ("/ok", Reply::Status(200)),
+            ])
+            .await;
+            // Both endpoints want CO2 alerts, and the first refuses every one.
+            let t = TestState::with_config(webhook_config(vec![
+                endpoint(server.url("/broken"), "co2_high"),
+                endpoint(server.url("/ok"), "co2_high"),
+            ]));
+            // One attempt per endpoint, so the delivery ends as soon as both
+            // endpoints have answered.
+            let settings = WebhookSettings {
+                retry: RetryPolicy {
+                    attempts: 1,
+                    base_delay: Duration::ZERO,
+                },
+                ..WebhookSettings::default()
+            };
+            let dispatcher = start_dispatcher(&t, settings).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            server.wait_for_requests(2).await;
+            // Each endpoint's answer has its own log line, and the delivery
+            // returns with the later of the two without waiting on anything
+            // else. So, as in `wait_until_delivered`, the delivery has ended
+            // by the time the test can see both lines.
+            let refused = format!(
+                "Webhook to endpoint #1 ({}/…) failed after 1 attempts",
+                server.url("")
+            );
+            let sent = format!("Sent co2_high webhook for {X} to endpoint #2 ");
+            wait_until("both endpoints to answer", || {
+                let text = logs.text();
+                text.contains(&refused) && text.contains(&sent)
+            })
+            .await;
+
+            // Still over the threshold, a moment into the 300 s cooldown.
+            t.state.readings_tx.send(reading_for(X, 1600, 80)).unwrap();
+            wait_until_readings_taken(&t).await;
+
+            // Shutdown lets a delivery that was started finish, so a second
+            // alert would have reached the endpoints by the time the
+            // dispatcher returns.
+            shut_down(&t, dispatcher).await;
+            let text = logs.text();
+            assert!(
+                text.contains(&format!("Skipping co2_high alert for {X} (cooldown: ")),
+                "an alert that reached one of its two endpoints started no cooldown:\n{text}"
+            );
+            let mut paths: Vec<String> = server.requests().into_iter().map(|r| r.path).collect();
+            paths.sort();
+            assert_eq!(paths, ["/broken", "/ok"], "{:?}", server.requests());
+        }
     }
 }
