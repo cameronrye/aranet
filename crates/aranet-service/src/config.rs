@@ -141,6 +141,8 @@ impl Config {
     ///   discovery on, the discovery prefix) has no control characters or
     ///   wildcards, and the InfluxDB measurement name has no control characters
     ///   or backslashes and doesn't start with `_` or `#`
+    /// - A non-loopback bind address has API-key authentication, unless
+    ///   `security.allow_unauthenticated_network` is set
     ///
     /// # Example
     ///
@@ -161,6 +163,25 @@ impl Config {
 
         // Validate security config
         errors.extend(self.security.validate());
+
+        // Never serve an unauthenticated API beyond this machine by accident.
+        // `to_canonical` makes an IPv4-mapped loopback (`[::ffff:127.0.0.1]`)
+        // count as loopback. A bind that isn't an `IP:port` has its own error.
+        if let Some(addr) = self.server.socket_addr()
+            && !addr.ip().to_canonical().is_loopback()
+            && !self.security.api_key_enabled
+            && !self.security.allow_unauthenticated_network
+        {
+            validate!(
+                errors,
+                "server.bind",
+                "refusing to listen on {} without API-key authentication: set \
+                 security.api_key_enabled = true, bind to 127.0.0.1, or set \
+                 security.allow_unauthenticated_network = true if a firewall or \
+                 authenticating proxy protects the port",
+                self.server.bind
+            );
+        }
 
         // Validate devices
         let mut seen_addresses = std::collections::HashSet::new();
@@ -417,6 +438,14 @@ pub struct SecurityConfig {
     /// one ([`generate_api_key`]) when it starts and saves it to its config
     /// file.
     pub api_key: Option<String>,
+    /// Allow listening on a non-loopback address without API-key authentication.
+    ///
+    /// Only for ports protected by a firewall or an authenticating reverse
+    /// proxy. Without it, [`Config::validate`] refuses a `server.bind` that isn't
+    /// a loopback address while `api_key_enabled` is false. The service logs a
+    /// warning at startup when this setting is what lets it listen.
+    #[serde(default)]
+    pub allow_unauthenticated_network: bool,
     /// Enable rate limiting.
     pub rate_limit_enabled: bool,
     /// Maximum requests per window.
@@ -480,6 +509,7 @@ impl Default for SecurityConfig {
         Self {
             api_key_enabled: false,
             api_key: None,
+            allow_unauthenticated_network: false,
             // Rate limiting enabled by default to prevent DoS attacks
             rate_limit_enabled: true,
             rate_limit_requests: default_rate_limit_requests(),
@@ -2212,6 +2242,99 @@ path = "/data/aranet.db"
         let display = format!("{}", error);
         assert!(display.contains("server.bind"));
         assert!(display.contains("devices[0].address"));
+    }
+
+    // ==========================================================================
+    // Network exposure tests
+    // ==========================================================================
+
+    /// A default config that listens on `bind`.
+    fn config_listening_on(bind: &str) -> Config {
+        Config {
+            server: ServerConfig {
+                bind: bind.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The errors `config.validate()` reports, or none when it is valid.
+    fn all_validation_errors(config: &Config) -> Vec<ValidationError> {
+        match config.validate() {
+            Ok(()) => Vec::new(),
+            Err(ConfigError::Validation(errors)) => errors,
+            Err(e) => panic!("expected a validation result, got {e}"),
+        }
+    }
+
+    #[test]
+    fn test_unauthenticated_network_bind_is_refused() {
+        for bind in ["0.0.0.0:8080", "[::]:8080", "192.168.1.10:8080"] {
+            let errors = all_validation_errors(&config_listening_on(bind));
+            assert_eq!(errors.len(), 1, "{bind}: {errors:?}");
+            assert_eq!(errors[0].field, "server.bind", "{bind}");
+            let message = &errors[0].message;
+            for fix in [
+                bind,
+                "security.api_key_enabled = true",
+                "127.0.0.1",
+                "security.allow_unauthenticated_network = true",
+            ] {
+                assert!(message.contains(fix), "{bind}: {message:?} lacks {fix:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_loopback_binds_need_no_auth() {
+        for bind in [
+            "127.0.0.1:8080",
+            "127.1.2.3:8080",
+            "[::1]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            let errors = all_validation_errors(&config_listening_on(bind));
+            assert!(errors.is_empty(), "{bind}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn test_network_bind_allowed_with_auth_or_opt_out() {
+        let mut authenticated = config_listening_on("0.0.0.0:8080");
+        authenticated.security.api_key_enabled = true;
+        authenticated.security.api_key = Some("0123456789abcdef".repeat(4));
+        let errors = all_validation_errors(&authenticated);
+        assert!(errors.is_empty(), "with an API key: {errors:?}");
+
+        // Parsed from TOML, so this also pins the key's name in server.toml.
+        let opted_out: Config = toml::from_str(
+            r#"
+            [server]
+            bind = "[::]:8080"
+
+            [security]
+            allow_unauthenticated_network = true
+            "#,
+        )
+        .unwrap();
+        let errors = all_validation_errors(&opted_out);
+        assert!(errors.is_empty(), "with the opt-out: {errors:?}");
+    }
+
+    /// The Docker image bakes in docker/server.toml, so a config the service
+    /// refuses would make the container exit at startup.
+    #[test]
+    fn docker_server_toml_validates() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !repo.join("crates/aranet-service/Cargo.toml").is_file() {
+            return; // not a repository checkout: the published crate has no docker/
+        }
+        let config =
+            Config::load(repo.join("docker/server.toml")).unwrap_or_else(|e| panic!("{e}"));
+        if let Err(e) = config.validate() {
+            panic!("the Docker image would exit at startup with docker/server.toml: {e}");
+        }
     }
 
     // ==========================================================================

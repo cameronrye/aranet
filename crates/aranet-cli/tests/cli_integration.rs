@@ -1476,6 +1476,37 @@ fn test_server_daemon_reports_invalid_bind() {
     assert!(!db_path.exists(), "the database was created");
 }
 
+#[test]
+fn test_server_daemon_refuses_unauthenticated_network_bind() {
+    let env = TestEnv::new();
+    let config = env.config_dir.join("server.toml");
+    let database = env.data_dir.join("server.db");
+
+    // 192.0.2.1 (TEST-NET-1, RFC 5737) is never a local address, so a daemon
+    // that starts anyway fails to listen and exits instead of serving.
+    let output = env.run(&[
+        "server",
+        "--daemon",
+        "--no-collector",
+        "--bind",
+        "192.0.2.1:8080",
+        "--config",
+        config.to_str().unwrap(),
+        "--database",
+        database.to_str().unwrap(),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the daemon started on a network address without authentication:\n{stdout}{stderr}"
+    );
+    assert!(stderr.contains("allow_unauthenticated_network"), "{stderr}");
+    assert!(!stdout.contains("started"), "{stdout}");
+    assert!(!database.exists());
+}
+
 /// Before it detaches, `aranet server --daemon` must check the configuration
 /// the detached server will get: the file `--config` names, with `--database`
 /// applied to it. A mistake in that file is reported, and a value that the

@@ -80,6 +80,12 @@
 //! rate_limit_window_secs = 60 # window duration
 //! ```
 //!
+//! The service refuses to listen on an address other than loopback (such as
+//! `0.0.0.0` or a LAN address) while `api_key_enabled` is false. Set
+//! `allow_unauthenticated_network = true` under `[security]` only when a
+//! firewall or an authenticating reverse proxy protects the port; the service
+//! then logs a warning at startup.
+//!
 //! The dashboard shell routes (`/` and `/dashboard`) remain public so browsers can
 //! load the UI. Protected API, metrics, and WebSocket requests still honor the
 //! configured security settings.
@@ -533,6 +539,19 @@ fn unexpanded_database(cwd: &Path, raw: &Path, expanded: &Path) -> Option<PathBu
     (legacy.exists() && !same_file).then_some(legacy)
 }
 
+/// The warning [`run`] logs when the service listens on `bound`, a network
+/// address, without API-key authentication. [`Config::validate`] allows that
+/// only with `security.allow_unauthenticated_network`.
+fn unauthenticated_network_warning(bound: SocketAddr, security: &SecurityConfig) -> Option<String> {
+    (!security.api_key_enabled && !bound.ip().to_canonical().is_loopback()).then(|| {
+        format!(
+            "Listening on {bound} without API-key authentication \
+             (security.allow_unauthenticated_network = true): anyone who can reach \
+             this port can read the readings and change the configuration"
+        )
+    })
+}
+
 /// Run the HTTP service until shutdown.
 ///
 /// Loads the configuration with [`load_config`] and listens on `server.bind`
@@ -553,6 +572,9 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to listen on {addr}"))?;
     let bound = listener.local_addr()?;
+    if let Some(warning) = unauthenticated_network_warning(bound, &config.security) {
+        tracing::warn!("{warning}");
+    }
     tracing::info!("Listening on {bound}");
 
     tracing::info!("Opening database at {:?}", config.storage.path);
@@ -1627,6 +1649,79 @@ mod tests {
         assert!(
             text.contains("security.cors_origins contains \"*\""),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn test_load_config_refuses_bind_override_without_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        std::fs::write(&config_path, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+        let options = RunOptions {
+            config: Some(config_path),
+            bind: Some("0.0.0.0:8080".into()),
+            database: Some(dir.path().join("data.db")),
+            ..Default::default()
+        };
+
+        // The file on its own is valid: the --bind override is what is refused.
+        let file_only = RunOptions {
+            bind: None,
+            ..options.clone()
+        };
+        load_config(&file_only).expect("a loopback bind needs no API key");
+
+        let Err(error) = load_config(&options) else {
+            panic!("load_config accepted --bind 0.0.0.0:8080 without an API key");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("server.bind") && message.contains("allow_unauthenticated_network"),
+            "{message}"
+        );
+        // `aranet server --daemon` and `service install` check with this.
+        let Err(error) = check_config(&options) else {
+            panic!("check_config accepted --bind 0.0.0.0:8080 without an API key");
+        };
+        assert!(
+            format!("{error:#}").contains("allow_unauthenticated_network"),
+            "{error:#}"
+        );
+        assert!(!dir.path().join("data.db").exists());
+    }
+
+    #[test]
+    fn test_unauthenticated_network_warning() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let opted_out = SecurityConfig {
+            allow_unauthenticated_network: true,
+            ..Default::default()
+        };
+        for bind in ["0.0.0.0:8080", "[::]:8080", "192.168.1.10:8080"] {
+            let warning = unauthenticated_network_warning(addr(bind), &opted_out)
+                .unwrap_or_else(|| panic!("no warning for {bind}"));
+            assert!(
+                warning.contains(bind) && warning.contains("allow_unauthenticated_network"),
+                "{warning}"
+            );
+        }
+
+        // Nothing to warn about on loopback, or with authentication on.
+        for bind in ["127.0.0.1:8080", "[::1]:8080", "[::ffff:127.0.0.1]:8080"] {
+            assert_eq!(
+                unauthenticated_network_warning(addr(bind), &opted_out),
+                None,
+                "{bind}"
+            );
+        }
+        let authenticated = SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("0123456789abcdef".repeat(4)),
+            ..Default::default()
+        };
+        assert_eq!(
+            unauthenticated_network_warning(addr("0.0.0.0:8080"), &authenticated),
+            None
         );
     }
 }
