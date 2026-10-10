@@ -428,7 +428,9 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     {
         use crate::webhook::WebhookDispatcher;
         let webhook_dispatcher = WebhookDispatcher::new(Arc::clone(&state));
-        webhook_dispatcher.start().await;
+        if let Some(handle) = webhook_dispatcher.start().await {
+            background.push(handle);
+        }
     }
 
     {
@@ -524,6 +526,38 @@ pub(crate) async fn stop_background_work(state: &Arc<AppState>, background: Vec<
     }
 
     collector::join_or_abort("background task", background, SHUTDOWN_GRACE).await;
+}
+
+/// Counts what a sink had to drop, and says when to warn about it: at most
+/// once a minute, so an outage that drops data on every reading can't flood
+/// the log.
+#[derive(Debug, Default)]
+pub(crate) struct DropLog {
+    /// Items dropped since the sink started.
+    pub(crate) dropped: u64,
+    last_warn: Option<std::time::Instant>,
+}
+
+impl DropLog {
+    /// Shortest time between two warnings.
+    const WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Count one dropped item. Returns `true` when the caller should warn
+    /// now, with [`Self::dropped`] as the total.
+    pub(crate) fn record(&mut self) -> bool {
+        self.record_at(std::time::Instant::now())
+    }
+
+    fn record_at(&mut self, now: std::time::Instant) -> bool {
+        self.dropped += 1;
+        let due = self
+            .last_warn
+            .is_none_or(|last| now.duration_since(last) >= Self::WARN_INTERVAL);
+        if due {
+            self.last_warn = Some(now);
+        }
+        due
+    }
 }
 
 #[cfg(test)]
@@ -773,5 +807,81 @@ mod tests {
                 && waited <= collector::POLL_DRAIN_TIMEOUT + Duration::from_secs(1),
             "waited {waited:?} for a poll that never ends"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_background_work_awaits_sink_handles() {
+        let config = Config {
+            webhooks: WebhookConfig {
+                enabled: true,
+                endpoints: vec![WebhookEndpoint {
+                    url: crate::test_support::closed_port_url("/hook").await,
+                    events: vec!["co2_high".to_string()],
+                    headers: std::collections::HashMap::new(),
+                }],
+                ..WebhookConfig::default()
+            },
+            ..Config::default()
+        };
+        let t = crate::test_support::TestState::with_config(config);
+
+        let mut background = Vec::new();
+        if let Some(handle) = webhook::WebhookDispatcher::new(Arc::clone(&t.state))
+            .start()
+            .await
+        {
+            background.push(handle);
+        }
+        let sinks = background.len();
+        assert_eq!(sinks, 1, "every enabled sink returns its handle");
+        crate::test_support::wait_until("every sink to subscribe to readings", || {
+            t.state.readings_tx.receiver_count() == sinks
+        })
+        .await;
+
+        // A task that ignores shutdown, and so must be aborted.
+        let (stuck_tx, stuck_rx) = tokio::sync::oneshot::channel::<()>();
+        background.push(tokio::spawn(async move {
+            let _stuck_tx = stuck_tx;
+            std::future::pending::<()>().await;
+        }));
+
+        let begun = tokio::time::Instant::now();
+        let stopping = tokio::spawn({
+            let state = Arc::clone(&t.state);
+            async move { stop_background_work(&state, background).await }
+        });
+
+        // The sinks stop as soon as shutdown is signalled, long before the
+        // grace period that the stuck task runs into.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            t.state.readings_tx.receiver_count(),
+            0,
+            "a sink was still running 1 s after shutdown"
+        );
+        assert!(!stopping.is_finished());
+
+        stopping.await.unwrap();
+        let waited = begun.elapsed();
+        assert!(
+            waited >= SHUTDOWN_GRACE && waited <= SHUTDOWN_GRACE + Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+        assert!(stuck_rx.await.is_err(), "the stuck task was not aborted");
+    }
+
+    #[test]
+    fn drop_log_warns_at_most_once_a_minute() {
+        let mut drops = DropLog::default();
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+
+        assert!(drops.record_at(at(0)), "the first drop warns");
+        assert!(!drops.record_at(at(1)));
+        assert!(!drops.record_at(at(59)));
+        assert!(drops.record_at(at(60)), "a minute later it warns again");
+        assert!(!drops.record_at(at(61)));
+        assert_eq!(drops.dropped, 5);
     }
 }

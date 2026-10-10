@@ -20,6 +20,17 @@
 //! events = ["co2_high"]
 //! ```
 //!
+//! # Delivery
+//!
+//! Each alert is delivered in the background, to all of its endpoints at
+//! once, so a slow or unreachable endpoint never delays other alerts or the
+//! readings after it. An endpoint gets up to three attempts, each with a 10 s
+//! timeout, 2 s and then 4 s apart. At most 16 alerts are delivered at the
+//! same time, and only one per device and event; an alert beyond that is
+//! dropped with a warning. The cooldown starts once an alert has reached at
+//! least one endpoint. When the service stops, deliveries still running get
+//! 5 s to finish.
+//!
 //! # Payload Format
 //!
 //! Webhooks send a JSON POST with the following structure:
@@ -46,9 +57,11 @@ use reqwest::Client;
 use serde::Serialize;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
-use crate::config::WebhookConfig;
+use crate::DropLog;
+use crate::config::{WebhookConfig, WebhookEndpoint};
 use crate::redact::{redact_url, sanitize_body};
 use crate::state::{AppState, ReadingEvent};
 
@@ -66,20 +79,28 @@ impl WebhookDispatcher {
     /// Start the webhook dispatcher.
     ///
     /// Spawns a background task that listens to the readings broadcast channel
-    /// and sends webhook notifications when thresholds are exceeded.
-    pub async fn start(&self) {
+    /// and sends webhook notifications when thresholds are exceeded. Returns the
+    /// task's handle, or `None` when webhooks are disabled or no endpoint is
+    /// configured. The task stops when the service shuts down, after giving
+    /// deliveries still in progress 5 s to finish.
+    pub async fn start(&self) -> Option<JoinHandle<()>> {
+        self.start_with(WebhookSettings::default()).await
+    }
+
+    /// [`Self::start`] with non-default timeouts and limits.
+    pub(crate) async fn start_with(&self, settings: WebhookSettings) -> Option<JoinHandle<()>> {
         let config = self.state.config.read().await;
         let webhook_config = config.webhooks.clone();
         drop(config);
 
         if !webhook_config.enabled {
             info!("Webhook notifications are disabled");
-            return;
+            return None;
         }
 
         if webhook_config.endpoints.is_empty() {
             info!("No webhook endpoints configured");
-            return;
+            return None;
         }
 
         info!(
@@ -90,9 +111,40 @@ impl WebhookDispatcher {
         let state = Arc::clone(&self.state);
         let shutdown_rx = self.state.subscribe_shutdown();
 
-        tokio::spawn(async move {
-            run_webhook_dispatcher(state, webhook_config, shutdown_rx).await;
-        });
+        Some(tokio::spawn(run_webhook_dispatcher(
+            state,
+            webhook_config,
+            shutdown_rx,
+            settings,
+        )))
+    }
+}
+
+/// Most alerts delivered at the same time. Alerts beyond this are dropped.
+pub(crate) const MAX_IN_FLIGHT_DELIVERIES: usize = 16;
+
+/// Timeouts and limits of the webhook dispatcher.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WebhookSettings {
+    /// Attempts per endpoint, and the wait between them.
+    pub(crate) retry: RetryPolicy,
+    /// Timeout of one request to an endpoint, connecting included.
+    pub(crate) request_timeout: Duration,
+    /// Most alerts delivered at the same time.
+    pub(crate) max_in_flight: usize,
+    /// How long shutdown waits for deliveries still in progress before
+    /// cancelling them.
+    pub(crate) shutdown_grace: Duration,
+}
+
+impl Default for WebhookSettings {
+    fn default() -> Self {
+        Self {
+            retry: RetryPolicy::DEFAULT,
+            request_timeout: Duration::from_secs(10),
+            max_in_flight: MAX_IN_FLIGHT_DELIVERIES,
+            shutdown_grace: Duration::from_secs(5),
+        }
     }
 }
 
@@ -119,13 +171,27 @@ pub struct WebhookPayload {
     pub timestamp: OffsetDateTime,
 }
 
+/// A device and alert event, such as `("Aranet4 17C3C", "co2_high")`: the
+/// unit of the cooldown and of the in-flight check.
+type AlertKey = (String, String);
+
 /// Run the webhook dispatcher loop.
+///
+/// The loop only evaluates readings and hands alerts off: each alert is
+/// delivered by its own task in `deliveries`, so a slow or unreachable
+/// endpoint never delays other alerts, later readings or shutdown. At most
+/// `settings.max_in_flight` alerts are delivered at once, and only one per
+/// [`AlertKey`]; an alert beyond the limit is dropped with a warning (at most
+/// one a minute) and doesn't start the cooldown. The cooldown starts when a
+/// delivery reaches at least one endpoint. On shutdown, deliveries still
+/// running get `settings.shutdown_grace` to finish and are then cancelled.
 async fn run_webhook_dispatcher(
     state: Arc<AppState>,
     config: WebhookConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    settings: WebhookSettings,
 ) {
-    let client = match Client::builder().timeout(Duration::from_secs(30)).build() {
+    let client = match Client::builder().timeout(settings.request_timeout).build() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create HTTP client for webhooks: {e}");
@@ -136,11 +202,39 @@ async fn run_webhook_dispatcher(
     let mut readings_rx = state.readings_tx.subscribe();
     let cooldown = Duration::from_secs(config.cooldown_secs);
 
-    // Track last alert time per (device_id, event) to enforce cooldown
-    let mut last_alert: HashMap<(String, String), OffsetDateTime> = HashMap::new();
+    // When each (device_id, event) last reached an endpoint, for the cooldown.
+    let mut last_alert: HashMap<AlertKey, OffsetDateTime> = HashMap::new();
+    // Alerts being delivered, by the task delivering them.
+    let mut deliveries: JoinSet<bool> = JoinSet::new();
+    let mut in_flight: HashMap<tokio::task::Id, AlertKey> = HashMap::new();
+    let mut drops = DropLog::default();
 
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                info!("Webhook dispatcher received stop signal");
+                break;
+            }
+            Some(joined) = deliveries.join_next_with_id(), if !deliveries.is_empty() => {
+                let (id, delivered) = match joined {
+                    Ok((id, delivered)) => (id, delivered),
+                    Err(e) => {
+                        warn!("Webhook delivery task failed: {e}");
+                        (e.id(), false)
+                    }
+                };
+                if let Some((device_id, event)) = in_flight.remove(&id) {
+                    if delivered {
+                        last_alert.insert((device_id, event), OffsetDateTime::now_utc());
+                    } else {
+                        warn!(
+                            "All webhook deliveries failed for {} alert on {}",
+                            event, device_id
+                        );
+                    }
+                }
+            }
             result = readings_rx.recv() => {
                 match result {
                     Ok(event) => {
@@ -167,7 +261,15 @@ async fn run_webhook_dispatcher(
                                 }
                             }
 
-                            let matching_endpoints: Vec<_> = config
+                            if in_flight.values().any(|pending| *pending == key) {
+                                debug!(
+                                    "Skipping {} alert for {} (the previous one is still being delivered)",
+                                    payload.event, payload.device_id
+                                );
+                                continue;
+                            }
+
+                            let endpoints: Vec<(String, WebhookEndpoint)> = config
                                 .endpoints
                                 .iter()
                                 .enumerate()
@@ -175,7 +277,7 @@ async fn run_webhook_dispatcher(
                                 .map(|(index, endpoint)| (endpoint_label(index, &endpoint.url), endpoint.clone()))
                                 .collect();
 
-                            if matching_endpoints.is_empty() {
+                            if endpoints.is_empty() {
                                 debug!(
                                     "No webhook endpoints configured for {} alerts",
                                     payload.event
@@ -183,31 +285,24 @@ async fn run_webhook_dispatcher(
                                 continue;
                             }
 
-                            let results = join_all(matching_endpoints.into_iter().map(|(label, endpoint)| {
-                                let client = client.clone();
-                                let payload = payload.clone();
-                                async move {
-                                    send_webhook_with_retry(
-                                        &client,
-                                        &label,
-                                        &endpoint.url,
-                                        &endpoint.headers,
-                                        &payload,
-                                        RetryPolicy::DEFAULT,
-                                    )
-                                    .await
+                            if deliveries.len() >= settings.max_in_flight {
+                                if drops.record() {
+                                    warn!(
+                                        "{} webhook deliveries already in flight; dropping new alerts ({} dropped so far)",
+                                        deliveries.len(),
+                                        drops.dropped
+                                    );
                                 }
-                            }))
-                            .await;
-
-                            if results.into_iter().any(|delivered| delivered) {
-                                last_alert.insert(key, now);
-                            } else {
-                                warn!(
-                                    "All webhook deliveries failed for {} alert on {}",
-                                    payload.event, payload.device_id
-                                );
+                                continue;
                             }
+
+                            let task = deliveries.spawn(deliver(
+                                client.clone(),
+                                endpoints,
+                                payload,
+                                settings.retry,
+                            ));
+                            in_flight.insert(task.id(), key);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -219,16 +314,49 @@ async fn run_webhook_dispatcher(
                     }
                 }
             }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!("Webhook dispatcher received stop signal");
-                    break;
-                }
-            }
         }
     }
 
+    if !deliveries.is_empty() {
+        let finished = tokio::time::timeout(settings.shutdown_grace, async {
+            while deliveries.join_next().await.is_some() {}
+        })
+        .await;
+        if finished.is_err() {
+            warn!(
+                "Cancelling {} webhook deliveries still running {}s after shutdown",
+                deliveries.len(),
+                settings.shutdown_grace.as_secs_f32()
+            );
+        }
+    }
+    // Dropping the set aborts any delivery still running.
+    drop(deliveries);
+
     info!("Webhook dispatcher stopped");
+}
+
+/// Send one alert to its endpoints, each given with its log label, at the same
+/// time. Returns `true` when at least one endpoint accepted it.
+async fn deliver(
+    client: Client,
+    endpoints: Vec<(String, WebhookEndpoint)>,
+    payload: WebhookPayload,
+    retry: RetryPolicy,
+) -> bool {
+    join_all(endpoints.iter().map(|(label, endpoint)| {
+        send_webhook_with_retry(
+            &client,
+            label,
+            &endpoint.url,
+            &endpoint.headers,
+            &payload,
+            retry,
+        )
+    }))
+    .await
+    .into_iter()
+    .any(|delivered| delivered)
 }
 
 async fn configured_alias(state: &AppState, device_id: &str) -> Option<String> {
@@ -662,6 +790,184 @@ mod tests {
                 !text.contains("/hook") && !text.contains("SECRET"),
                 "the endpoint URL leaked into the error: {text}"
             );
+        }
+    }
+
+    /// The dispatcher against a loopback endpoint, on real time. A module of
+    /// its own, so that its imports can't clash with the ones above.
+    mod dispatcher {
+        use super::*;
+        use crate::config::Config;
+        use crate::test_support::{CapturedLogs, RecordingServer, Reply, TestState, wait_until};
+
+        const X: &str = "Aranet4 XXXXX";
+        const Y: &str = "Aranet4 YYYYY";
+
+        fn reading_for(device_id: &str, co2: u16, battery: u8) -> ReadingEvent {
+            let mut event = test_reading(co2, battery);
+            event.device_id = device_id.to_string();
+            event.reading.device_id = device_id.to_string();
+            event
+        }
+
+        fn endpoint(url: String, event: &str) -> WebhookEndpoint {
+            WebhookEndpoint {
+                url,
+                events: vec![event.to_string()],
+                headers: HashMap::new(),
+            }
+        }
+
+        /// Webhooks on, with the default thresholds (CO2 1000 ppm, battery
+        /// 10 %) and cooldown (300 s).
+        fn webhook_config(endpoints: Vec<WebhookEndpoint>) -> Config {
+            Config {
+                webhooks: WebhookConfig {
+                    enabled: true,
+                    endpoints,
+                    ..WebhookConfig::default()
+                },
+                ..Config::default()
+            }
+        }
+
+        /// The default settings, but only 500 ms for deliveries still running
+        /// at shutdown, so a test that ends with a hanging delivery ends fast.
+        fn test_settings() -> WebhookSettings {
+            WebhookSettings {
+                shutdown_grace: Duration::from_millis(500),
+                ..WebhookSettings::default()
+            }
+        }
+
+        /// Start the dispatcher and wait until it listens for readings.
+        async fn start_dispatcher(t: &TestState, settings: WebhookSettings) -> JoinHandle<()> {
+            let handle = WebhookDispatcher::new(Arc::clone(&t.state))
+                .start_with(settings)
+                .await
+                .expect("webhooks are enabled");
+            wait_until("the dispatcher to subscribe to readings", || {
+                t.state.readings_tx.receiver_count() >= 1
+            })
+            .await;
+            handle
+        }
+
+        /// Wait until the dispatcher has taken every reading sent so far.
+        async fn wait_until_readings_taken(t: &TestState) {
+            wait_until("the dispatcher to take every reading", || {
+                t.state.readings_tx.is_empty()
+            })
+            .await;
+        }
+
+        /// Signal shutdown and wait for the dispatcher to return.
+        async fn shut_down(t: &TestState, dispatcher: JoinHandle<()>) {
+            t.state.signal_shutdown();
+            tokio::time::timeout(Duration::from_secs(5), dispatcher)
+                .await
+                .expect("the dispatcher stops within 5 s of shutdown")
+                .expect("the dispatcher does not panic");
+        }
+
+        fn device_of(request: &crate::test_support::RecordedRequest) -> String {
+            let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            body["device_id"].as_str().unwrap().to_string()
+        }
+
+        #[tokio::test]
+        async fn webhook_slow_endpoint_does_not_delay_other_alerts() {
+            let server =
+                RecordingServer::start(vec![("/slow", Reply::Hang), ("/fast", Reply::Status(200))])
+                    .await;
+            let t = TestState::with_config(webhook_config(vec![
+                endpoint(server.url("/slow"), "co2_high"),
+                endpoint(server.url("/fast"), "battery_low"),
+            ]));
+            let dispatcher = start_dispatcher(&t, test_settings()).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            t.state.readings_tx.send(reading_for(Y, 500, 5)).unwrap();
+
+            // X's CO2 alert hangs at /slow; Y's battery alert must not wait
+            // behind it.
+            let requests = server.wait_for_requests(2).await;
+            let fast: Vec<_> = requests.iter().filter(|r| r.path == "/fast").collect();
+            assert_eq!(fast.len(), 1, "{requests:?}");
+            assert_eq!(device_of(fast[0]), Y);
+
+            shut_down(&t, dispatcher).await;
+        }
+
+        #[tokio::test]
+        async fn webhook_same_alert_not_duplicated_while_in_flight() {
+            let server = RecordingServer::start(vec![("/slow", Reply::Hang)]).await;
+            let t = TestState::with_config(webhook_config(vec![endpoint(
+                server.url("/slow"),
+                "co2_high",
+            )]));
+            let dispatcher = start_dispatcher(&t, test_settings()).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            server.wait_for_requests(1).await;
+            // The first alert is still being delivered, so its cooldown hasn't
+            // started, and a second one must not be sent.
+            t.state.readings_tx.send(reading_for(X, 1600, 80)).unwrap();
+            wait_until_readings_taken(&t).await;
+
+            // Shutdown gives deliveries 500 ms, long enough for a second
+            // request to reach the server if one had been started.
+            shut_down(&t, dispatcher).await;
+            assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+        }
+
+        #[tokio::test]
+        async fn webhook_in_flight_is_bounded() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![("/slow", Reply::Hang)]).await;
+            let t = TestState::with_config(webhook_config(vec![endpoint(
+                server.url("/slow"),
+                "co2_high",
+            )]));
+            let dispatcher = start_dispatcher(&t, test_settings()).await;
+
+            for i in 0..40 {
+                let device = format!("Aranet4 {i:05}");
+                t.state
+                    .readings_tx
+                    .send(reading_for(&device, 1500, 80))
+                    .unwrap();
+            }
+            server.wait_for_requests(MAX_IN_FLIGHT_DELIVERIES).await;
+            wait_until_readings_taken(&t).await;
+
+            shut_down(&t, dispatcher).await;
+            assert_eq!(server.requests().len(), MAX_IN_FLIGHT_DELIVERIES);
+            assert_eq!(server.max_in_flight(), MAX_IN_FLIGHT_DELIVERIES);
+            // 24 alerts were dropped, and the warning is rate-limited.
+            let text = logs.text();
+            assert_eq!(
+                text.matches("webhook deliveries already in flight").count(),
+                1,
+                "{text}"
+            );
+        }
+
+        #[tokio::test]
+        async fn webhook_dispatcher_stops_promptly_on_shutdown() {
+            let server = RecordingServer::start(vec![("/slow", Reply::Hang)]).await;
+            let t = TestState::with_config(webhook_config(vec![endpoint(
+                server.url("/slow"),
+                "co2_high",
+            )]));
+            let dispatcher = start_dispatcher(&t, test_settings()).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            server.wait_for_requests(1).await;
+
+            // The delivery hangs until its 10 s request timeout; shutdown
+            // cancels it once the 500 ms grace is over.
+            shut_down(&t, dispatcher).await;
         }
     }
 }
