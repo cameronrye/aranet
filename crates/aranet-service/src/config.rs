@@ -1843,6 +1843,51 @@ path = "/data/aranet.db"
     }
 
     #[test]
+    fn forbidden_text_chars_are_exactly_the_documented_set() {
+        // Both ends of every range that `is_forbidden_text_char`'s doc lists,
+        // and its two single code points.
+        for c in [
+            '\u{0}', '\u{1f}', '\u{7f}', '\u{9f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{202e}',
+            '\u{2066}', '\u{2069}',
+        ] {
+            assert!(
+                is_forbidden_text_char(c),
+                "U+{:04X} must be refused",
+                u32::from(c)
+            );
+        }
+
+        // The nearest code points outside each range are allowed, and so are
+        // characters that turn up in aliases: a typographic apostrophe
+        // (U+2019), a no-break space (U+00A0) and a zero-width space (U+200B).
+        for c in [
+            ' ', '~', '\u{a0}', '\u{2027}', '\u{202f}', '\u{2065}', '\u{206a}', '\u{2019}',
+            '\u{200b}',
+        ] {
+            assert!(
+                !is_forbidden_text_char(c),
+                "U+{:04X} must be allowed",
+                u32::from(c)
+            );
+        }
+
+        // Nothing in between differs either: a code point is refused exactly
+        // when the doc lists it.
+        for c in '\0'..=char::MAX {
+            let documented = matches!(
+                u32::from(c),
+                0x00..=0x1f | 0x7f..=0x9f | 0x2028 | 0x2029 | 0x202a..=0x202e | 0x2066..=0x2069
+            );
+            assert_eq!(
+                is_forbidden_text_char(c),
+                documented,
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+    }
+
+    #[test]
     fn test_duplicate_device_addresses() {
         let config = Config {
             server: ServerConfig::default(),
