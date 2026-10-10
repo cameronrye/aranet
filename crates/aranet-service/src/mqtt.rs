@@ -567,8 +567,16 @@ fn parse_broker_url(url: &str) -> Result<(String, u16, bool), String> {
 /// Sanitize a device name for use in MQTT topic.
 ///
 /// MQTT topics cannot contain '#' or '+' wildcards, and should avoid spaces.
+/// MQTT also forbids U+0000 and advises against other control characters, so
+/// every control character becomes '_' too.
 fn sanitize_topic_segment(s: &str) -> String {
-    s.replace(['#', '+', ' ', '/'], "_")
+    s.chars()
+        .map(|c| match c {
+            '#' | '+' | ' ' | '/' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -627,5 +635,19 @@ mod tests {
     fn test_sanitize_topic_segment_normal() {
         assert_eq!(sanitize_topic_segment("office"), "office");
         assert_eq!(sanitize_topic_segment("kitchen-sensor"), "kitchen-sensor");
+    }
+
+    #[test]
+    fn sanitize_topic_segment_replaces_control_characters() {
+        // MQTT forbids U+0000 in topic names and advises against other controls.
+        assert_eq!(sanitize_topic_segment("Office\u{0}"), "Office_");
+        assert_eq!(sanitize_topic_segment("a\nb\r\tc\u{7f}"), "a_b__c_");
+        assert_eq!(sanitize_topic_segment("a\u{85}b"), "a_b");
+        // Real names keep everything but the characters MQTT needs replaced.
+        assert_eq!(
+            sanitize_topic_segment("Aranet\u{2622} 30ED1"),
+            "Aranet\u{2622}_30ED1"
+        );
+        assert_eq!(sanitize_topic_segment("Küche"), "Küche");
     }
 }

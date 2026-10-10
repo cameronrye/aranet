@@ -21,8 +21,20 @@
 //! Readings are written as:
 //!
 //! ```text
-//! aranet,device=Office,address=Aranet4_17C3C co2=450i,temperature=22.5,humidity=45i,pressure=1013.2,battery=85i 1711612800
+//! aranet,device=Office,address=Aranet4\ 17C3C co2=450i,temperature=22.50,humidity=45i,pressure=1013.20,battery=85i 1711612800
 //! ```
+//!
+//! The measurement name and the tag values are escaped as the line protocol
+//! reference specifies: backslashes, commas and spaces (and `=` in tag values)
+//! get a backslash, and control characters, which line protocol can't hold,
+//! become an escaped space. An alias can therefore never add tags or start a
+//! second point. The `device` tag is left out when it would be empty.
+//!
+//! InfluxDB 1.x and 2.x don't read `\\` back as one backslash in a tag value
+//! or a measurement, and they treat a separator after any backslash as
+//! escaped. Config validation therefore refuses backslashes in device
+//! addresses, aliases and the measurement name, so every line reads the same
+//! on InfluxDB 1.x, 2.x and 3.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,10 +144,16 @@ async fn configured_alias(state: &AppState, device_id: &str) -> Option<String> {
 /// Convert a reading event to InfluxDB line protocol.
 fn to_line_protocol(config: &InfluxDbConfig, event: &ReadingEvent, alias: Option<&str>) -> String {
     let reading = &event.reading;
-    let measurement = &config.measurement;
+    let measurement = escape_measurement(&config.measurement);
 
-    // Tags
+    // Tags. InfluxDB rejects a line with an empty tag value, so an empty alias
+    // leaves the device tag out.
     let device_tag = escape_tag_value(alias.unwrap_or(&event.device_id));
+    let device_tag = if device_tag.is_empty() {
+        String::new()
+    } else {
+        format!(",device={device_tag}")
+    };
     let address_tag = escape_tag_value(&event.device_id);
 
     // Build field set - only include non-zero/available fields
@@ -176,7 +194,7 @@ fn to_line_protocol(config: &InfluxDbConfig, event: &ReadingEvent, alias: Option
 
     let timestamp = timestamp_for_precision(reading.captured_at, &config.precision);
 
-    format!("{measurement},device={device_tag},address={address_tag} {field_set} {timestamp}")
+    format!("{measurement}{device_tag},address={address_tag} {field_set} {timestamp}")
 }
 
 fn timestamp_for_precision(timestamp: time::OffsetDateTime, precision: &str) -> i128 {
@@ -244,11 +262,43 @@ fn urlencoding(s: &str) -> String {
 }
 
 /// Escape a tag value for InfluxDB line protocol.
-/// Tag values cannot contain spaces, commas, or equals signs unescaped.
+///
+/// Backslashes are doubled first, as the line protocol reference specifies, so
+/// on InfluxDB 3 a value can't escape the separator after it. Commas, equals
+/// signs and spaces then get a backslash, so a value can't end its tag early.
+/// Line protocol can't hold a newline or any other control character in a tag
+/// value, so each becomes an escaped space and a value can never start a second
+/// point.
+///
+/// InfluxDB 1.x and 2.x don't unescape `\\`: they would store a backslash
+/// doubled, and they reject a line whose tag value ends in one. That is why
+/// `DeviceConfig::validate` rejects backslashes, as well as control characters,
+/// in addresses and aliases; the escaping here is the second line of defence.
 fn escape_tag_value(s: &str) -> String {
-    s.replace(' ', "\\ ")
-        .replace(',', "\\,")
-        .replace('=', "\\=")
+    escape_line_protocol(s, &['\\', ',', '=', ' '])
+}
+
+/// Escape a measurement name for InfluxDB line protocol: backslashes, commas
+/// and spaces get a backslash, and control characters become an escaped space.
+fn escape_measurement(s: &str) -> String {
+    escape_line_protocol(s, &['\\', ',', ' '])
+}
+
+/// Put a backslash before each character in `special` (which includes the
+/// backslash itself) and turn every control character into an escaped space.
+fn escape_line_protocol(s: &str, special: &[char]) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        if special.contains(&c) {
+            escaped.push('\\');
+            escaped.push(c);
+        } else if c.is_control() {
+            escaped.push_str("\\ ");
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
 }
 
 /// Errors that can occur when writing to InfluxDB.
@@ -347,6 +397,93 @@ mod tests {
         assert_eq!(escape_tag_value("Office"), "Office");
         assert_eq!(escape_tag_value("Living Room"), "Living\\ Room");
         assert_eq!(escape_tag_value("a,b=c"), "a\\,b\\=c");
+    }
+
+    #[test]
+    fn escape_tag_table() {
+        for (input, expected) in [
+            ("a=b", "a\\=b"),
+            ("Living Room", "Living\\ Room"),
+            ("a,b", "a\\,b"),
+            // A backslash is doubled before anything else is escaped, as the
+            // line protocol reference specifies.
+            ("a\\b", "a\\\\b"),
+            ("Office\\", "Office\\\\"),
+            ("a\\ b", "a\\\\\\ b"),
+            // Line protocol can't hold control characters: each becomes an
+            // escaped space.
+            ("a\nb", "a\\ b"),
+            ("a\r\n\tb\u{0}", "a\\ \\ \\ b\\ "),
+            // Everything else passes through.
+            ("AranetRn+ 306B8", "AranetRn+\\ 306B8"),
+            ("Küche \u{2622}", "Küche\\ \u{2622}"),
+        ] {
+            assert_eq!(escape_tag_value(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn alias_newline_cannot_inject_points() {
+        let config = InfluxDbConfig::default();
+        let event = test_event("Aranet4 12345", 800);
+
+        let line = to_line_protocol(&config, &event, Some("Office\nevil,device=x co2=1i 0"));
+
+        assert!(!line.contains('\n'), "{line:?}");
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        assert!(
+            line.starts_with(
+                "aranet,device=Office\\ evil\\,device\\=x\\ co2\\=1i\\ 0,address=Aranet4\\ 12345 co2=800i,"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn trailing_backslash_does_not_escape_separator() {
+        let config = InfluxDbConfig::default();
+        let event = test_event("Aranet4 12345", 800);
+
+        // The line protocol reference (and InfluxDB 3) reads `\\` as one
+        // literal backslash, so the comma after it still separates the tags.
+        // InfluxDB 1.x and 2.x reject this line instead, which is why
+        // `DeviceConfig::validate` keeps backslashes out of aliases.
+        let line = to_line_protocol(&config, &event, Some("Office\\"));
+
+        assert!(
+            line.starts_with("aranet,device=Office\\\\,address=Aranet4\\ 12345 co2=800i,"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn measurement_is_escaped() {
+        let config = InfluxDbConfig {
+            measurement: "air quality,x".to_string(),
+            ..Default::default()
+        };
+        let event = test_event("Aranet4 12345", 800);
+
+        let line = to_line_protocol(&config, &event, Some("Office"));
+
+        assert!(
+            line.starts_with("air\\ quality\\,x,device=Office,address=Aranet4\\ 12345 "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn empty_alias_omits_device_tag() {
+        let config = InfluxDbConfig::default();
+        let event = test_event("Aranet4 12345", 800);
+
+        // InfluxDB rejects a line with an empty tag value.
+        let line = to_line_protocol(&config, &event, Some(""));
+
+        assert!(
+            line.starts_with("aranet,address=Aranet4\\ 12345 co2=800i,"),
+            "{line}"
+        );
     }
 
     #[test]
