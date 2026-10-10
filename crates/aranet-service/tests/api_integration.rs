@@ -803,6 +803,35 @@ async fn test_dashboard_keeps_only_the_path_and_reads_the_url_token_first() {
     assert!(body.contains(
         "let apiToken = takeUrlToken() || window.sessionStorage.getItem('aranet_api_token') || '';"
     ));
+
+    // The statements of takeUrlToken, in the order they run. What they do is
+    // checked by the Node cases in the implementation plan (Phase 3b Task 13,
+    // Step 28), which are run by hand: cargo has no JavaScript engine. This
+    // test only guards the script's text between runs of them. When it fails,
+    // run those cases against the new script, then update the text here.
+    let mut script = body.as_str();
+    for statement in [
+        // `?token=` and `#token=` are both read,
+        "for (const part of [window.location.search, window.location.hash]) {",
+        // without the leading `?` or `#`,
+        "for (const param of part.slice(1).split('&')) {",
+        // and `tokenx=` is another parameter.
+        "if (param.startsWith('token=')) values.push(param.slice('token='.length));",
+        // A URL without a token is left as it is.
+        "if (values.length === 0) return '';",
+        // A repeated token is ignored, after it has left the address bar.
+        "window.history.replaceState(null, '', window.location.pathname);",
+        "if (values.length !== 1) return '';",
+        // The token is percent-decoded, and `+` stays `+`.
+        "return decodeURIComponent(values[0]);",
+        // A malformed escape gives the token as it is written.
+        "return values[0];",
+    ] {
+        let Some((_, rest)) = script.split_once(statement) else {
+            panic!("the dashboard script no longer has, in this order: {statement}");
+        };
+        script = rest;
+    }
 }
 
 // ==========================================================================
