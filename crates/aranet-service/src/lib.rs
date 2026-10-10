@@ -237,6 +237,7 @@ pub mod config;
 pub mod dashboard;
 mod db;
 pub mod middleware;
+mod redact;
 mod retention;
 pub mod state;
 pub mod ws;
@@ -550,6 +551,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_span_omits_query_string() {
+        // API tests on other threads reach the same log statements.
+        crate::test_support::register_silent_dispatcher();
         let captured = Captured::default();
         let writer = captured.clone();
         // Use the same directives init_tracing() applies in production (rather
