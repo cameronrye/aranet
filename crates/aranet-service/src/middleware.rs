@@ -3,7 +3,6 @@
 //! This module provides middleware for:
 //! - API key authentication
 //! - Rate limiting
-//! - Input sanitization
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -285,47 +284,6 @@ pub fn cors_layer(config: &SecurityConfig) -> CorsLayer {
     }
 }
 
-/// Sanitize a device name to prevent XSS and injection attacks.
-///
-/// This removes or escapes potentially dangerous characters while preserving
-/// the essential information needed to identify devices.
-///
-/// # Examples
-///
-/// ```
-/// use aranet_service::middleware::sanitize_device_name;
-///
-/// assert_eq!(sanitize_device_name("Aranet4 12345"), "Aranet4 12345");
-/// assert_eq!(sanitize_device_name("<script>alert('xss')</script>"), "scriptalertxssscript");
-/// assert_eq!(sanitize_device_name("Device\"with'quotes"), "Devicewithquotes");
-/// ```
-pub fn sanitize_device_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| {
-            // Allow alphanumeric, spaces, dashes, underscores, colons (for MAC addresses)
-            c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_' || *c == ':'
-        })
-        .take(64) // Limit length
-        .collect()
-}
-
-/// Validate and sanitize a device identifier.
-///
-/// Returns an error if the identifier is empty or contains only invalid characters.
-pub fn validate_device_id(id: &str) -> Result<String, &'static str> {
-    let sanitized = sanitize_device_name(id);
-
-    if sanitized.is_empty() {
-        return Err("Device ID cannot be empty");
-    }
-
-    if sanitized.len() < 3 {
-        return Err("Device ID too short");
-    }
-
-    Ok(sanitized)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,61 +302,6 @@ mod tests {
             rate_limit_enabled: false,
             ..Default::default()
         })
-    }
-
-    #[test]
-    fn test_sanitize_device_name_normal() {
-        assert_eq!(sanitize_device_name("Aranet4 12345"), "Aranet4 12345");
-        assert_eq!(
-            sanitize_device_name("AA:BB:CC:DD:EE:FF"),
-            "AA:BB:CC:DD:EE:FF"
-        );
-        assert_eq!(sanitize_device_name("office-sensor_1"), "office-sensor_1");
-    }
-
-    #[test]
-    fn test_sanitize_device_name_xss() {
-        assert_eq!(
-            sanitize_device_name("<script>alert('xss')</script>"),
-            "scriptalertxssscript"
-        );
-        assert_eq!(sanitize_device_name("onclick=\"evil()\""), "onclickevil");
-        // Colons are allowed for MAC addresses, so "data:" is preserved
-        assert_eq!(
-            sanitize_device_name("data:text/html,<script>"),
-            "data:texthtmlscript"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_device_name_length() {
-        let long_name = "a".repeat(100);
-        let sanitized = sanitize_device_name(&long_name);
-        assert_eq!(sanitized.len(), 64);
-    }
-
-    #[test]
-    fn test_sanitize_device_name_empty() {
-        assert_eq!(sanitize_device_name(""), "");
-        assert_eq!(sanitize_device_name("<>"), "");
-    }
-
-    #[test]
-    fn test_validate_device_id_valid() {
-        assert!(validate_device_id("Aranet4 12345").is_ok());
-        assert!(validate_device_id("AA:BB:CC:DD:EE:FF").is_ok());
-    }
-
-    #[test]
-    fn test_validate_device_id_empty() {
-        assert!(validate_device_id("").is_err());
-        assert!(validate_device_id("<>").is_err());
-    }
-
-    #[test]
-    fn test_validate_device_id_too_short() {
-        assert!(validate_device_id("AB").is_err());
-        assert!(validate_device_id("A").is_err());
     }
 
     #[test]
