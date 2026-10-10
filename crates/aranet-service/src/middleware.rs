@@ -2,9 +2,11 @@
 //!
 //! This module provides middleware for:
 //! - API key authentication
+//! - Host and Origin checks while authentication is off (DNS rebinding and
+//!   cross-site requests)
 //! - Rate limiting
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,7 +14,7 @@ use std::time::{Duration, Instant};
 use axum::{
     Json,
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header, uri::Authority},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -204,6 +206,239 @@ pub async fn api_key_auth(
     }
 }
 
+/// Who may use the service while API-key authentication is off.
+///
+/// Without authentication, anything that can send the service a request can
+/// read and change it, and a browser sends requests on behalf of every web
+/// page its user visits. [`origin_guard`] therefore only lets through:
+///
+/// - requests whose `Host` is `localhost` or `*.localhost`, an IP address,
+///   this machine's name or `<name>.local`, or a name listed in
+///   `security.allowed_hosts`. This stops DNS rebinding, where a page's own
+///   host name is made to resolve to the service.
+/// - requests without an `Origin` header (curl, the CLI, the TUI and the
+///   GUI), same-origin requests (the dashboard) and requests from origins
+///   listed in `security.cors_origins`. This stops cross-site requests,
+///   including WebSocket connections and body-less form posts, which CORS
+///   alone doesn't block.
+#[derive(Debug, Clone)]
+pub struct OriginPolicy {
+    active: bool,
+    any_host: bool,
+    hosts: HashSet<String>,
+    any_origin: bool,
+    origins: HashSet<String>,
+}
+
+impl OriginPolicy {
+    /// Build the policy for `config`. `machine_hostname` is this machine's
+    /// name, which is allowed as a host together with `<name>.local`. The
+    /// policy is inactive when `config` enables API-key authentication.
+    pub fn new(config: &SecurityConfig, machine_hostname: Option<&str>) -> Self {
+        // Normalise first and then look for "*", so that an entry such as
+        // "*/" or " *" means what `cors_layer` makes of it.
+        let mut hosts: HashSet<String> = config
+            .allowed_hosts
+            .iter()
+            .map(String::as_str)
+            .map(normalize_host_name)
+            .collect();
+        let any_host = hosts.remove("*");
+        if let Some(name) = machine_hostname
+            .map(normalize_host_name)
+            .filter(|name| !name.is_empty())
+        {
+            hosts.insert(format!("{name}.local"));
+            hosts.insert(name);
+        }
+        let mut origins: HashSet<String> = config
+            .cors_origins
+            .iter()
+            .map(String::as_str)
+            .map(normalize_origin)
+            .collect();
+        let any_origin = origins.remove("*");
+        Self {
+            active: !config.api_key_enabled,
+            any_host,
+            hosts,
+            any_origin,
+            origins,
+        }
+    }
+
+    /// Whether a request for `host`, a `Host` header value that may include a
+    /// port, may reach the service.
+    pub fn allows_host(&self, host: &str) -> bool {
+        if self.any_host {
+            return true;
+        }
+        let Some(name) = host_name(host) else {
+            return false;
+        };
+        name == "localhost"
+            || name.ends_with(".localhost")
+            || is_ip_literal(&name)
+            || self.hosts.contains(&name)
+    }
+
+    /// Whether a request carrying `Origin: origin` may reach the service.
+    /// `host` is the request's `Host` value: an origin whose host and port
+    /// equal it is the service's own. `null` is never allowed.
+    pub fn allows_origin(&self, origin: &str, host: Option<&str>) -> bool {
+        let origin = normalize_origin(origin);
+        if origin == "null" {
+            return false;
+        }
+        // Compare the text, not parsed ports, so the service's own origin is
+        // recognised behind TLS proxies and port mappings.
+        let same_origin = host.is_some_and(|host| {
+            origin
+                .split_once("://")
+                .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host))
+        });
+        same_origin || self.any_origin || self.origins.contains(&origin)
+    }
+
+    /// Settings that let other web pages use the service while API-key
+    /// authentication is off, as warnings for the service to log at startup.
+    /// Empty when authentication is on.
+    pub fn startup_warnings(&self) -> Vec<&'static str> {
+        let mut warnings = Vec::new();
+        if !self.active {
+            return warnings;
+        }
+        if self.any_host {
+            warnings.push(
+                "security.allowed_hosts contains \"*\" while API-key authentication is off: web \
+                 pages can reach this service through DNS rebinding. Enable \
+                 security.api_key_enabled or list only the host names you use.",
+            );
+        }
+        if self.any_origin {
+            warnings.push(
+                "security.cors_origins contains \"*\" while API-key authentication is off: any web \
+                 page you visit can read and control this service. Enable \
+                 security.api_key_enabled or list only the origins that need access.",
+            );
+        }
+        // Until 0.3.0 every save through the API wrote the old default into
+        // server.toml. Under the Origin check it would trust port-80 pages.
+        let old_default = HashSet::from([
+            "http://localhost".to_string(),
+            "http://127.0.0.1".to_string(),
+        ]);
+        if self.origins == old_default {
+            warnings.push(
+                "security.cors_origins is [\"http://localhost\", \"http://127.0.0.1\"], the default \
+                 that aranet-service 0.2 and earlier saved to server.toml: while API-key \
+                 authentication is off, pages served on port 80 of this machine can use this \
+                 service. Delete the cors_origins line unless you need those origins.",
+            );
+        }
+        warnings
+    }
+}
+
+/// The host name in a `Host` value: lowercase, without port or trailing dot.
+/// IPv6 addresses keep their brackets. `None` if the value doesn't parse.
+fn host_name(host: &str) -> Option<String> {
+    let authority: Authority = host.parse().ok()?;
+    Some(normalize_host_name(authority.host()))
+}
+
+fn normalize_host_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether a host name is an IPv4 address or a bracketed IPv6 address.
+fn is_ip_literal(name: &str) -> bool {
+    name.strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(name)
+        .parse::<IpAddr>()
+        .is_ok()
+}
+
+/// An origin as browsers send it: lowercase, without a trailing `/`.
+fn normalize_origin(origin: &str) -> String {
+    origin.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Refuse requests for other host names (421) and cross-site browser requests
+/// (403) while API-key authentication is off; see [`OriginPolicy`].
+///
+/// 421 rather than 403 for the host check, because the TUI and GUI report
+/// every 403 as an API-key problem. When authentication is on, this does
+/// nothing: the API key already keeps other web pages out, and authenticated
+/// deployments behind a proxy may use any host name.
+pub async fn origin_guard(
+    State(policy): State<Arc<OriginPolicy>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !policy.active {
+        return next.run(request).await;
+    }
+
+    // An absolute-form request target (and HTTP/2's `:authority`) carries the
+    // host in the URI; otherwise it is the Host header. Browsers always send
+    // one, so a request with neither passes.
+    let host = request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str().to_owned())
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::HOST)
+                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        })
+        .filter(|host| !host.is_empty());
+
+    if let Some(host) = &host
+        && !policy.allows_host(host)
+    {
+        let name = host_name(host).unwrap_or_else(|| host.clone());
+        warn!(
+            "Refused {} {}: host {:?} is not allowed while API-key authentication is off",
+            request.method(),
+            request.uri().path(),
+            name
+        );
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Host '{name}' is not allowed"),
+                "hint": "add it to security.allowed_hosts or enable API-key authentication"
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(origin) = request.headers().get(header::ORIGIN) {
+        let origin = String::from_utf8_lossy(origin.as_bytes());
+        if !policy.allows_origin(&origin, host.as_deref()) {
+            warn!(
+                "Refused {} {} from origin {:?}: not the service's own origin or listed in security.cors_origins",
+                request.method(),
+                request.uri().path(),
+                origin
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Cross-origin request blocked",
+                    "hint": "add the page origin to security.cors_origins or enable API-key authentication"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
 /// Rate limiting middleware.
 ///
 /// Limits requests per IP address within a time window.
@@ -260,22 +495,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Build a CORS layer from the security configuration.
 ///
-/// By default, only localhost origins are allowed. If `cors_origins` contains `"*"`,
-/// all origins are permitted (not recommended for production).
+/// Only the origins in `cors_origins` get CORS headers, compared as browsers
+/// send them (lowercase, without a trailing `/`); the list is empty by
+/// default. If `cors_origins` contains `"*"`, all origins are permitted (not
+/// recommended; the service warns about it at startup while API-key
+/// authentication is off).
 pub fn cors_layer(config: &SecurityConfig) -> CorsLayer {
-    if config.cors_origins.iter().any(|o| o == "*") {
-        warn!(
-            "CORS is configured to allow all origins ('*'). This is not recommended for production."
-        );
+    // Normalise first and then look for "*": an entry such as "*/" or " *"
+    // becomes "*", which `AllowOrigin::list` refuses with a panic.
+    let origins: Vec<String> = config
+        .cors_origins
+        .iter()
+        .map(String::as_str)
+        .map(normalize_origin)
+        .collect();
+    if origins.iter().any(|origin| origin == "*") {
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
             .allow_headers(Any)
     } else {
-        let origins: Vec<HeaderValue> = config
-            .cors_origins
+        let origins: Vec<HeaderValue> = origins
             .iter()
-            .filter_map(|o| o.parse().ok())
+            .filter_map(|origin| origin.parse().ok())
             .collect();
         CorsLayer::new()
             .allow_origin(origins)
@@ -415,7 +657,7 @@ mod tests {
     #[test]
     fn test_cors_layer_default() {
         let config = SecurityConfig::default();
-        assert_eq!(config.cors_origins.len(), 2);
+        assert!(config.cors_origins.is_empty());
         let _layer = cors_layer(&config);
     }
 
@@ -585,5 +827,234 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn policy(config: SecurityConfig) -> OriginPolicy {
+        OriginPolicy::new(&config, Some("myhost"))
+    }
+
+    #[test]
+    fn origin_policy_allows_local_hosts() {
+        let policy = policy(SecurityConfig::default());
+        for host in [
+            "localhost",
+            "localhost:8080",
+            "LOCALHOST",
+            "localhost.:8080",
+            "foo.localhost",
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "10.0.0.5",
+            "myhost",
+            "MyHost:8080",
+            "myhost.local:8080",
+        ] {
+            assert!(policy.allows_host(host), "{host} should be allowed");
+        }
+    }
+
+    #[test]
+    fn origin_policy_rejects_foreign_hosts() {
+        let policy = policy(SecurityConfig::default());
+        for host in [
+            "evil.example:8080",
+            "localhost.evil.example",
+            "127.0.0.1.nip.io",
+            "myhost.example.com",
+            "7f000001.rbndr.us:8080",
+            "bad host",
+        ] {
+            assert!(!policy.allows_host(host), "{host} should be rejected");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_extend_and_star_disables() {
+        let listed = policy(SecurityConfig {
+            allowed_hosts: vec!["Aranet-Service".to_string()],
+            ..SecurityConfig::default()
+        });
+        assert!(listed.allows_host("aranet-service:8080"));
+        assert!(listed.allows_host("ARANET-SERVICE"));
+        assert!(!listed.allows_host("evil.example"));
+
+        let any = policy(SecurityConfig {
+            allowed_hosts: vec!["*".to_string()],
+            ..SecurityConfig::default()
+        });
+        assert!(any.allows_host("evil.example:8080"));
+    }
+
+    #[test]
+    fn origin_same_origin_listed_null_star() {
+        let own = policy(SecurityConfig::default());
+        let host = Some("127.0.0.1:8080");
+        assert!(own.allows_origin("http://127.0.0.1:8080", host));
+        assert!(own.allows_origin("HTTP://127.0.0.1:8080/", host));
+        assert!(own.allows_origin("https://127.0.0.1:8080", host));
+        assert!(!own.allows_origin("http://localhost:8080", host));
+        assert!(!own.allows_origin("http://127.0.0.1:9000", host));
+        assert!(!own.allows_origin("https://evil.example", host));
+        assert!(!own.allows_origin("null", host));
+        assert!(!own.allows_origin("http://127.0.0.1:8080", None));
+
+        let listed = policy(SecurityConfig {
+            cors_origins: vec!["HTTP://LocalHost:3000/".to_string()],
+            ..SecurityConfig::default()
+        });
+        assert!(listed.allows_origin("http://localhost:3000", host));
+        assert!(listed.allows_origin("http://localhost:3000", None));
+        assert!(!listed.allows_origin("http://localhost:3001", host));
+
+        let any = policy(SecurityConfig {
+            cors_origins: vec!["*".to_string()],
+            ..SecurityConfig::default()
+        });
+        assert!(any.allows_origin("https://evil.example", host));
+        assert!(!any.allows_origin("null", host));
+    }
+
+    /// Status of a request with a foreign `Host` and `Origin` through
+    /// `origin_guard` alone.
+    async fn guarded_status(config: SecurityConfig) -> StatusCode {
+        let policy = Arc::new(OriginPolicy::new(&config, None));
+        Router::new()
+            .route("/api/devices", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(policy, origin_guard))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .header("Host", "evil.example")
+                    .header("Origin", "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn inactive_when_api_key_enabled() {
+        let authenticated = SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("1234567890abcdef1234567890abcdef".to_string()),
+            ..SecurityConfig::default()
+        };
+        assert!(!OriginPolicy::new(&authenticated, None).active);
+        assert_eq!(guarded_status(authenticated).await, StatusCode::OK);
+
+        assert!(OriginPolicy::new(&SecurityConfig::default(), None).active);
+        assert_eq!(
+            guarded_status(SecurityConfig::default()).await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    /// The `Access-Control-Allow-Origin` value that `cors_layer(config)`
+    /// answers a preflight from `origin` with.
+    async fn preflight_allow_origin(config: &SecurityConfig, origin: &str) -> Option<String> {
+        let response = Router::new()
+            .route("/api/devices", get(|| async { StatusCode::OK }))
+            .layer(cors_layer(config))
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::OPTIONS)
+                    .uri("/api/devices")
+                    .header("Origin", origin)
+                    .header("Access-Control-Request-Method", "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|value| value.to_str().unwrap().to_owned())
+    }
+
+    #[tokio::test]
+    async fn cors_layer_matches_normalised_origins() {
+        let config = SecurityConfig {
+            cors_origins: vec!["HTTP://LocalHost:3000/".to_string()],
+            ..SecurityConfig::default()
+        };
+        assert_eq!(
+            preflight_allow_origin(&config, "http://localhost:3000")
+                .await
+                .as_deref(),
+            Some("http://localhost:3000")
+        );
+        assert_eq!(
+            preflight_allow_origin(&config, "http://localhost:3001").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn star_variants_mean_every_origin() {
+        // Each normalises to "*", which `AllowOrigin::list` panics on.
+        for entry in ["*", "*/", " *", "* "] {
+            let config = SecurityConfig {
+                cors_origins: vec![entry.to_string()],
+                ..SecurityConfig::default()
+            };
+            assert_eq!(
+                preflight_allow_origin(&config, "https://evil.example")
+                    .await
+                    .as_deref(),
+                Some("*"),
+                "{entry:?}"
+            );
+            let policy = policy(config);
+            assert!(
+                policy.allows_origin("https://evil.example", None),
+                "{entry:?}"
+            );
+            assert_eq!(policy.startup_warnings().len(), 1, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn startup_warnings_name_what_opens_the_service() {
+        let defaults = policy(SecurityConfig::default());
+        assert!(defaults.startup_warnings().is_empty());
+        let listed = policy(SecurityConfig {
+            allowed_hosts: vec!["aranet-service".to_string()],
+            cors_origins: vec!["http://localhost:3000".to_string()],
+            ..SecurityConfig::default()
+        });
+        assert!(listed.startup_warnings().is_empty());
+
+        let open = SecurityConfig {
+            allowed_hosts: vec!["*".to_string()],
+            cors_origins: vec!["*".to_string()],
+            ..SecurityConfig::default()
+        };
+        let warnings = policy(open.clone()).startup_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("security.allowed_hosts contains \"*\""));
+        assert!(warnings[1].starts_with("security.cors_origins contains \"*\""));
+
+        // What aranet-service 0.2 saved on every device change.
+        let old_default = policy(SecurityConfig {
+            cors_origins: vec![
+                "http://localhost".to_string(),
+                "http://127.0.0.1/".to_string(),
+            ],
+            ..SecurityConfig::default()
+        });
+        let warnings = old_default.startup_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("aranet-service 0.2"), "{warnings:?}");
+
+        // With authentication on, none of them lets a web page in.
+        let authenticated = policy(SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some("1234567890abcdef1234567890abcdef".to_string()),
+            ..open
+        });
+        assert!(authenticated.startup_warnings().is_empty());
     }
 }
