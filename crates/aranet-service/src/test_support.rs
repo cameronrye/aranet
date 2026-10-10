@@ -368,6 +368,8 @@ pub(crate) fn register_silent_dispatcher() {
 pub(crate) enum Reply {
     /// This status code with an empty body, every time.
     Status(u16),
+    /// This status code with this response body, every time.
+    StatusWithBody(u16, String),
     /// These status codes in turn, one per request, and then the last one
     /// again for every later request.
     Sequence(Vec<u16>),
@@ -430,6 +432,8 @@ impl Drop for InFlightGuard {
 impl RecordingServer {
     /// Serve `routes`, each a path and its reply, on `127.0.0.1:0`.
     pub(crate) async fn start(routes: Vec<(&'static str, Reply)>) -> Self {
+        use axum::response::IntoResponse;
+
         let requests: Arc<std::sync::Mutex<Vec<RecordedRequest>>> = Arc::default();
         let notify = Arc::new(tokio::sync::Notify::new());
         let in_flight: Arc<InFlight> = Arc::default();
@@ -438,10 +442,15 @@ impl RecordingServer {
         for (path, reply) in routes {
             let status =
                 |code| axum::http::StatusCode::from_u16(code).expect("a valid status code");
+            // The body sent with every answer, for the reply that has one.
+            let response_body = match &reply {
+                Reply::StatusWithBody(_, body) => Some(body.clone()),
+                _ => None,
+            };
             // The answer to each request in turn, the last one repeating for
             // every later request. `None` leaves the request waiting.
             let script: Arc<Vec<Option<axum::http::StatusCode>>> = Arc::new(match reply {
-                Reply::Status(code) => vec![Some(status(code))],
+                Reply::Status(code) | Reply::StatusWithBody(code, _) => vec![Some(status(code))],
                 Reply::Sequence(codes) => {
                     assert!(!codes.is_empty(), "a Reply::Sequence needs a status");
                     codes.into_iter().map(|code| Some(status(code))).collect()
@@ -463,9 +472,10 @@ impl RecordingServer {
                         body,
                     });
                 notify.notify_waiters();
-                match script[turn.min(script.len() - 1)] {
-                    Some(status) => status,
-                    None => std::future::pending().await,
+                match (script[turn.min(script.len() - 1)], response_body) {
+                    (Some(status), Some(text)) => (status, text).into_response(),
+                    (Some(status), None) => status.into_response(),
+                    (None, _) => std::future::pending().await,
                 }
             };
             router = router.route(path, axum::routing::post(handler));

@@ -450,7 +450,7 @@ impl From<reqwest::Error> for PushError {
 mod tests {
     use super::*;
     use crate::test_support::TestState;
-    use crate::test_support::{CapturedLogs, closed_port_url};
+    use crate::test_support::{CapturedLogs, RecordingServer, Reply, closed_port_url, wait_until};
     use aranet_types::{CurrentReading, Status};
 
     #[test]
@@ -694,5 +694,48 @@ mod tests {
             logs.contains("Starting Prometheus pusher to http://127.0.0.1:"),
             "start not logged:\n{logs}"
         );
+    }
+
+    #[tokio::test]
+    async fn push_error_body_is_sanitised_before_it_is_logged() {
+        let (logs, _g) = CapturedLogs::start();
+        // A 500 whose body would start a forged log line (the newline),
+        // reverse the text after it (U+202E) and flood the log (over 256
+        // characters).
+        let body = format!("bad\nrequest\u{202e}{}", "x".repeat(300));
+        let server = RecordingServer::start(vec![(
+            "/metrics/job/aranet-service",
+            Reply::StatusWithBody(500, body),
+        )])
+        .await;
+        let mut config = crate::config::Config::default();
+        config.prometheus.enabled = true;
+        config.prometheus.push_gateway = Some(server.url(""));
+        let t = TestState::with_config(config);
+
+        // The pusher pushes once as soon as it starts.
+        let pusher = PrometheusPusher::new(Arc::clone(&t.state))
+            .start()
+            .await
+            .expect("a push gateway is configured");
+        wait_until("the pusher to log the failed push", || {
+            logs.text().contains("Failed to push metrics to Prometheus")
+        })
+        .await;
+        t.state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), pusher)
+            .await
+            .expect("the pusher stops within 5 s of shutdown")
+            .expect("the pusher task doesn't panic");
+
+        // Both characters became spaces, and the log line ends after the
+        // body's first 256 characters and a `…`.
+        let logs = logs.text();
+        let logged = format!(
+            "Push gateway returned error 500: bad request {}…\n",
+            "x".repeat(244)
+        );
+        assert!(logs.contains(&logged), "{logs:?}");
+        assert!(!logs.contains('\u{202e}'), "{logs:?}");
     }
 }
