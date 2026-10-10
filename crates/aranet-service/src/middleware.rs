@@ -144,9 +144,15 @@ fn ws_query_tokens(uri: &axum::http::Uri) -> Vec<String> {
 /// The token of an `Authorization: Bearer <token>` header (RFC 6750), which is
 /// how Prometheus and most HTTP clients send a key. The scheme is matched ASCII
 /// case-insensitively, whitespace around the token is ignored, and an empty
-/// token counts as none.
+/// token counts as none. More than one `Authorization` header yields nothing,
+/// whatever their order or schemes, so the result never depends on which one
+/// is read.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let value = value.to_str().ok()?.trim();
     let (scheme, token) = value.split_once(' ')?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then(|| token.to_owned())
@@ -159,6 +165,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// header matches or, on `/api/ws`, when a `token` query parameter does:
 /// browsers can't set custom headers on a WebSocket upgrade, and a proxy in
 /// front of the service may add its own `Authorization` header.
+///
+/// Each of the three carries a key only when it is unambiguous: an `X-API-Key`
+/// header that is repeated or isn't visible ASCII carries none and, being
+/// present, still rules out the other two, and a repeated `Authorization`
+/// header or `token` parameter carries none.
 ///
 /// Returns 401 Unauthorized if the key is missing or invalid.
 pub async fn api_key_auth(
@@ -181,12 +192,15 @@ pub async fn api_key_auth(
     // SECURITY NOTE: Query parameters may be logged by reverse proxies,
     // appear in browser history, and leak via Referer headers. Prefer a
     // header (X-API-Key or Authorization: Bearer) for non-browser clients.
-    let header_key = headers
-        .get("X-API-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let provided_keys = match header_key {
-        Some(key) => vec![key],
+    let mut api_key_headers = headers.get_all("X-API-Key").iter();
+    let provided_keys = match api_key_headers.next() {
+        // With X-API-Key nothing else is tried, and it is a candidate only
+        // when it is sent once and reads as text (visible ASCII): otherwise
+        // no key is compared and the request is refused.
+        Some(value) => match (value.to_str(), api_key_headers.next()) {
+            (Ok(key), None) => vec![key.to_owned()],
+            _ => Vec::new(),
+        },
         // Without X-API-Key, a bearer token and the /api/ws query token are
         // both candidates: a proxy in front of the service may add its own
         // Authorization header to the dashboard's WebSocket upgrade.
@@ -1135,25 +1149,55 @@ mod tests {
         }
     }
 
-    /// The status of `GET uri` with `headers`, through the auth middleware
-    /// with `test_security_config()`'s key. `/api/devices` and `/api/ws` are
-    /// routed.
-    async fn auth_status(uri: &str, headers: &[(&str, &str)]) -> StatusCode {
-        let app = Router::new()
+    /// `/api/devices` and `/api/ws` behind the auth middleware with `config`.
+    fn auth_router(config: Arc<SecurityConfig>) -> Router {
+        Router::new()
             .route("/api/devices", get(|| async { StatusCode::OK }))
             .route("/api/ws", get(|| async { StatusCode::OK }))
-            .layer(axum::middleware::from_fn_with_state(
-                test_security_config(),
-                api_key_auth,
-            ));
+            .layer(axum::middleware::from_fn_with_state(config, api_key_auth))
+    }
+
+    /// The status of `GET uri` with `headers`, through [`auth_router`] with
+    /// `test_security_config()`'s key. The headers are sent in the order
+    /// given, a name given twice is sent twice, and a value may hold bytes
+    /// that aren't text.
+    async fn auth_status_bytes(uri: &str, headers: &[(&str, &[u8])]) -> StatusCode {
         let mut request = Request::builder().uri(uri);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        app.oneshot(request.body(Body::empty()).unwrap())
+        auth_router(test_security_config())
+            .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap()
             .status()
+    }
+
+    /// [`auth_status_bytes`] for header values that are text.
+    async fn auth_status(uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+        let headers: Vec<(&str, &[u8])> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_bytes()))
+            .collect();
+        auth_status_bytes(uri, &headers).await
+    }
+
+    /// One request of a table test: the case's name, the URI, the headers in
+    /// the order they are sent and the status the request must get.
+    type AuthCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a [u8])], StatusCode);
+
+    /// Sends every case and fails with the name and the status of each one
+    /// that got another status, never with a header value or a URI: either
+    /// may hold the key.
+    async fn assert_auth_cases(cases: &[AuthCase<'_>]) {
+        let mut wrong = Vec::new();
+        for (case, uri, headers, expected) in cases {
+            let status = auth_status_bytes(uri, headers).await;
+            if status != *expected {
+                wrong.push(format!("{case}: got {status}, expected {expected}"));
+            }
+        }
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
     }
 
     /// The key in `test_security_config()`.
@@ -1300,40 +1344,252 @@ mod tests {
             ("/api/devices".to_string(), StatusCode::UNAUTHORIZED),
             (format!("/api/ws?token={CONFIGURED_KEY}"), StatusCode::OK),
         ] {
-            let app = Router::new()
-                .route("/api/devices", get(|| async { StatusCode::OK }))
-                .route("/api/ws", get(|| async { StatusCode::OK }))
-                .layer(axum::middleware::from_fn_with_state(
-                    test_security_config(),
-                    api_key_auth,
-                ));
             let request = Request::builder()
                 .uri(&uri)
                 .header("Authorization", unreadable.as_slice())
                 .body(Body::empty())
                 .unwrap();
-            let status = app.oneshot(request).await.unwrap().status();
+            let status = auth_router(test_security_config())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status();
             // The path only: the query holds the key.
             let path = uri.split('?').next().unwrap_or_default();
             assert_eq!(status, expected, "{path}");
         }
     }
 
+    /// `X-API-Key` carries a key only when it is sent once and reads as text.
+    /// Whenever the header is present, nothing else is tried.
+    #[tokio::test]
+    async fn test_x_api_key_counts_only_when_sent_once_as_text() {
+        const OK: StatusCode = StatusCode::OK;
+        const REFUSED: StatusCode = StatusCode::UNAUTHORIZED;
+        let key = CONFIGURED_KEY.as_bytes();
+        let wrong: &[u8] = b"wrong-key";
+        // 0xE9 is not visible ASCII, so `HeaderValue::to_str` fails.
+        let unreadable: &[u8] = b"wr\xe9ng";
+        let bearer = format!("Bearer {CONFIGURED_KEY}");
+        let bearer = bearer.as_bytes();
+        let devices = "/api/devices";
+        let ws = format!("/api/ws?token={CONFIGURED_KEY}");
+
+        assert_auth_cases(&[
+            ("the key, once", devices, &[("X-API-Key", key)], OK),
+            (
+                "a wrong key beside a right bearer token",
+                devices,
+                &[("X-API-Key", wrong), ("Authorization", bearer)],
+                REFUSED,
+            ),
+            (
+                "an unreadable value",
+                devices,
+                &[("X-API-Key", unreadable)],
+                REFUSED,
+            ),
+            (
+                "an unreadable value beside a right bearer token",
+                devices,
+                &[("X-API-Key", unreadable), ("Authorization", bearer)],
+                REFUSED,
+            ),
+            (
+                "an unreadable value beside a right query token on /api/ws",
+                &ws,
+                &[("X-API-Key", unreadable)],
+                REFUSED,
+            ),
+            (
+                "the key, then a wrong key",
+                devices,
+                &[("X-API-Key", key), ("X-API-Key", wrong)],
+                REFUSED,
+            ),
+            (
+                "a wrong key, then the key",
+                devices,
+                &[("X-API-Key", wrong), ("X-API-Key", key)],
+                REFUSED,
+            ),
+            (
+                "the key, twice",
+                devices,
+                &[("X-API-Key", key), ("X-API-Key", key)],
+                REFUSED,
+            ),
+            (
+                "the key, then an unreadable value",
+                devices,
+                &[("X-API-Key", key), ("X-API-Key", unreadable)],
+                REFUSED,
+            ),
+            (
+                "an unreadable value, then the key",
+                devices,
+                &[("X-API-Key", unreadable), ("X-API-Key", key)],
+                REFUSED,
+            ),
+            (
+                "two wrong keys beside a right bearer token",
+                devices,
+                &[
+                    ("X-API-Key", wrong),
+                    ("X-API-Key", wrong),
+                    ("Authorization", bearer),
+                ],
+                REFUSED,
+            ),
+            (
+                "two wrong keys beside a right query token on /api/ws",
+                &ws,
+                &[("X-API-Key", wrong), ("X-API-Key", wrong)],
+                REFUSED,
+            ),
+        ])
+        .await;
+    }
+
+    /// A header value outside visible ASCII is never compared, even when it
+    /// is the configured key byte for byte: such a key can be sent only as
+    /// the `/api/ws` query token.
+    #[tokio::test]
+    async fn test_header_value_outside_visible_ascii_is_never_compared() {
+        // Valid UTF-8, so a lossy conversion of the header would give the key.
+        let key = "cl\u{e9}-567890abcdef1234567890abcdef";
+        let config = Arc::new(SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some(key.to_string()),
+            rate_limit_enabled: false,
+            ..Default::default()
+        });
+        let bearer = format!("Bearer {key}");
+        for (case, uri, header, expected) in [
+            (
+                "X-API-Key",
+                "/api/devices",
+                Some(("X-API-Key", key.as_bytes())),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "Authorization",
+                "/api/devices",
+                Some(("Authorization", bearer.as_bytes())),
+                StatusCode::UNAUTHORIZED,
+            ),
+            // The key itself can be matched: the headers are what is refused.
+            (
+                "the query token",
+                "/api/ws?token=cl%C3%A9-567890abcdef1234567890abcdef",
+                None,
+                StatusCode::OK,
+            ),
+        ] {
+            let mut request = Request::builder().uri(uri);
+            if let Some((name, value)) = header {
+                request = request.header(name, value);
+            }
+            let status = auth_router(config.clone())
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, expected, "{case}");
+        }
+    }
+
+    /// A request with more than one `Authorization` header carries no bearer
+    /// token, whatever their order or schemes. The `/api/ws` query token and
+    /// `X-API-Key` still count beside them.
+    #[tokio::test]
+    async fn test_repeated_authorization_header_carries_no_token() {
+        const OK: StatusCode = StatusCode::OK;
+        const REFUSED: StatusCode = StatusCode::UNAUTHORIZED;
+        let key = CONFIGURED_KEY.as_bytes();
+        let bearer = format!("Bearer {CONFIGURED_KEY}");
+        let bearer = bearer.as_bytes();
+        let other: &[u8] = b"Bearer proxy-token";
+        let basic: &[u8] = b"Basic dXNlcjpwYXNz";
+        let devices = "/api/devices";
+        let ws = format!("/api/ws?token={CONFIGURED_KEY}");
+
+        assert_auth_cases(&[
+            (
+                "the right bearer token, once",
+                devices,
+                &[("Authorization", bearer)],
+                OK,
+            ),
+            (
+                "another bearer token, then the right one",
+                devices,
+                &[("Authorization", other), ("Authorization", bearer)],
+                REFUSED,
+            ),
+            (
+                "the right bearer token, then another",
+                devices,
+                &[("Authorization", bearer), ("Authorization", other)],
+                REFUSED,
+            ),
+            (
+                "the right bearer token, twice",
+                devices,
+                &[("Authorization", bearer), ("Authorization", bearer)],
+                REFUSED,
+            ),
+            (
+                "Basic, then the right bearer token",
+                devices,
+                &[("Authorization", basic), ("Authorization", bearer)],
+                REFUSED,
+            ),
+            (
+                "the right bearer token, then Basic",
+                devices,
+                &[("Authorization", bearer), ("Authorization", basic)],
+                REFUSED,
+            ),
+            // A proxy's own headers still can't hide the dashboard's token.
+            (
+                "two headers beside a right query token on /api/ws",
+                &ws,
+                &[("Authorization", other), ("Authorization", basic)],
+                OK,
+            ),
+            (
+                "the right bearer token, then another, beside a wrong query token on /api/ws",
+                "/api/ws?token=wrong-key",
+                &[("Authorization", bearer), ("Authorization", other)],
+                REFUSED,
+            ),
+            (
+                "two headers beside a right X-API-Key",
+                devices,
+                &[
+                    ("Authorization", other),
+                    ("Authorization", basic),
+                    ("X-API-Key", key),
+                ],
+                OK,
+            ),
+        ])
+        .await;
+    }
+
     /// The whole hint of a 401, which names every way to send the key.
     #[tokio::test]
     async fn test_unauthorized_hint_names_every_way_to_send_the_key() {
-        let app = Router::new()
-            .route("/api/devices", get(|| async { StatusCode::OK }))
-            .layer(axum::middleware::from_fn_with_state(
-                test_security_config(),
-                api_key_auth,
-            ));
         let request = Request::builder()
             .uri("/api/devices")
             .body(Body::empty())
             .unwrap();
 
-        let response = app.oneshot(request).await.unwrap();
+        let response = auth_router(test_security_config())
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
