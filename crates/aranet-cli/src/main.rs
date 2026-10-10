@@ -25,6 +25,8 @@ mod util;
 // Config is defined in lib.rs but re-exported for main.rs use
 #[cfg(feature = "cli")]
 use aranet_cli::config;
+#[cfg(feature = "cli")]
+use aranet_cli::state::CliState;
 
 // The TUI lives in the library (`aranet_cli::tui`, which aranet-tui also uses).
 // Import it from there instead of compiling `src/tui/` a second time as a bin module.
@@ -123,7 +125,7 @@ async fn main() -> Result<()> {
     }
 
     // Load config for device resolution
-    let config = Config::load_or_default()?;
+    let mut config = Config::load_or_default()?;
 
     // Initialize tracing (write to stderr so stdout is clean for data)
     let filter = if cli.quiet {
@@ -138,6 +140,10 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+
+    // The last connected device comes from the state file, or from a legacy `last_device`
+    // in config.toml. Read after tracing starts, so `-v` shows why a state file was ignored.
+    config.apply_state(&CliState::load());
 
     let output = cli.output.as_ref();
     let no_color = cli.no_color || config.no_color || no_color_from_env();
