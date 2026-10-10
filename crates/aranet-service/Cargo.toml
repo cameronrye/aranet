@@ -78,6 +78,8 @@ notify-rust = { version = "4", optional = true }
 subtle = "2"
 # Decode WebSocket `?token=` values without turning `+` into a space
 percent-encoding = "2"
+# Generate an API key when authentication is enabled without one
+getrandom = "0.3"
 
 # mDNS service discovery
 mdns-sd = "0.11"
