@@ -1196,8 +1196,9 @@ mod tests {
 
         let metadata = std::fs::metadata(&config_path).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        // A new file, created 0600: the key was never readable by other users, not
-        // even between writing the file and tightening its mode.
+        // A new file, not the 0644 one made private after the key was written to
+        // it. aranet-store's `write_private_temp_file_is_0600_from_creation` shows
+        // that the new file is owner-only before anything is written to it.
         assert_ne!(metadata.ino(), old_inode);
     }
 
