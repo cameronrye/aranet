@@ -473,6 +473,36 @@ mod tests {
     }
 
     #[test]
+    fn measurement_keeps_equals_sign_unescaped() {
+        // Only a tag value escapes `=`. A measurement sent as `a\=b` is stored
+        // on InfluxDB 2.7.12 as a point that no query returns and on 3 Core
+        // 3.12.0 under the name `a\=b`; sent as `a=b` it is stored as `a=b` on
+        // 1.8.10, 2.7.12 and 3 Core.
+        let event = test_event("Aranet4 12345", 800);
+
+        for (text, as_measurement, as_tag_value) in [
+            ("a=b", "a=b", "a\\=b"),
+            ("a b=c,d", "a\\ b=c\\,d", "a\\ b\\=c\\,d"),
+        ] {
+            assert_eq!(escape_measurement(text), as_measurement, "{text:?}");
+            assert_eq!(escape_tag_value(text), as_tag_value, "{text:?}");
+
+            // The same text as the measurement and as the alias of one line.
+            let config = InfluxDbConfig {
+                measurement: text.to_string(),
+                ..Default::default()
+            };
+            let line = to_line_protocol(&config, &event, Some(text));
+            assert!(
+                line.starts_with(&format!(
+                    "{as_measurement},device={as_tag_value},address=Aranet4\\ 12345 "
+                )),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_alias_omits_device_tag() {
         let config = InfluxDbConfig::default();
         let event = test_event("Aranet4 12345", 800);
