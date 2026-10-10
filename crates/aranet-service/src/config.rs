@@ -427,14 +427,32 @@ pub struct SecurityConfig {
     /// are evicted to prevent unbounded memory growth from many unique IPs.
     #[serde(default = "default_rate_limit_max_entries")]
     pub rate_limit_max_entries: usize,
-    /// Allowed CORS origins.
+    /// Browser origins, other than the service's own, that may call the API.
     ///
-    /// By default, only localhost origins are allowed. Set to `["*"]` to allow
-    /// all origins (not recommended for production).
+    /// Empty by default. While API-key authentication is off, a request whose
+    /// `Origin` header is neither the service's own origin nor listed here is
+    /// refused with `403 Forbidden`, WebSocket connections included, and
+    /// `Origin: null` is always refused. Listed origins also get CORS headers.
+    /// Origins are compared as browsers send them: lowercase, with no trailing
+    /// `/`. `["*"]` allows every origin, which lets any web page you visit
+    /// control a service without authentication; the service warns about it
+    /// at startup.
     ///
-    /// Examples: `["http://localhost:3000", "http://127.0.0.1:8080"]`
+    /// Example: `["http://localhost:3000"]`
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
+    /// Extra host names the service answers while API-key authentication is
+    /// off.
+    ///
+    /// Without authentication, a request whose `Host` names any other host is
+    /// refused with `421 Misdirected Request`, so a web page can't reach the
+    /// service through DNS rebinding. `localhost` and `*.localhost`, IP
+    /// addresses, this machine's name and `<name>.local` are always allowed.
+    /// List bare host names, without scheme, port, spaces or wildcards: for
+    /// example `["aranet-service"]` for a Docker Compose service name.
+    /// `["*"]` disables the check; the service warns about it at startup.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_rate_limit_requests() -> u32 {
@@ -450,10 +468,7 @@ fn default_rate_limit_max_entries() -> usize {
 }
 
 fn default_cors_origins() -> Vec<String> {
-    vec![
-        "http://localhost".to_string(),
-        "http://127.0.0.1".to_string(),
-    ]
+    Vec::new()
 }
 
 impl Default for SecurityConfig {
@@ -467,6 +482,7 @@ impl Default for SecurityConfig {
             rate_limit_window_secs: default_rate_limit_window(),
             rate_limit_max_entries: default_rate_limit_max_entries(),
             cors_origins: default_cors_origins(),
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -509,6 +525,21 @@ impl SecurityConfig {
                     errors,
                     "security.rate_limit_window_secs",
                     "rate limit window must be at least 1 second"
+                );
+            }
+        }
+
+        for host in &self.allowed_hosts {
+            if host != "*"
+                && (host.is_empty()
+                    || host.contains(char::is_whitespace)
+                    || host.contains([':', '/', '@', '*']))
+            {
+                validate!(
+                    errors,
+                    "security.allowed_hosts",
+                    "invalid host name '{}': list bare host names without scheme, port, spaces or wildcards, such as \"aranet-service\" (localhost, IP addresses and this machine's name are always allowed)",
+                    host
                 );
             }
         }
@@ -1551,6 +1582,73 @@ path = "/data/aranet.db"
     fn test_default_config_validates() {
         let config = Config::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn security_defaults_trust_no_extra_origins_or_hosts() {
+        let defaults = SecurityConfig::default();
+        assert!(
+            defaults.cors_origins.is_empty(),
+            "{:?}",
+            defaults.cors_origins
+        );
+        assert!(
+            defaults.allowed_hosts.is_empty(),
+            "{:?}",
+            defaults.allowed_hosts
+        );
+
+        // A [security] table without the keys gets the same defaults.
+        let config: Config = toml::from_str("[security]\napi_key_enabled = false\n").unwrap();
+        assert!(config.security.cors_origins.is_empty());
+        assert!(config.security.allowed_hosts.is_empty());
+
+        // Values already saved in server.toml stay in effect.
+        let config: Config = toml::from_str(
+            "[security]\ncors_origins = [\"http://localhost\"]\nallowed_hosts = [\"aranet-service\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.security.cors_origins, ["http://localhost"]);
+        assert_eq!(config.security.allowed_hosts, ["aranet-service"]);
+    }
+
+    #[test]
+    fn allowed_hosts_validation() {
+        let with_hosts = |hosts: &[&str]| SecurityConfig {
+            allowed_hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            ..SecurityConfig::default()
+        };
+
+        let valid: [&[&str]; 4] = [
+            &[],
+            &["*"],
+            &["aranet-service"],
+            &["Aranet.Example.COM", "pi.local"],
+        ];
+        for hosts in valid {
+            let errors = with_hosts(hosts).validate();
+            assert!(errors.is_empty(), "{hosts:?}: {errors:?}");
+        }
+
+        // None of these can ever equal a Host a browser sends.
+        for host in [
+            "",
+            "  ",
+            " aranet-service",
+            "my host",
+            "*.home.arpa",
+            "aranet-*",
+            "aranet-service:8080",
+            "http://aranet-service",
+            "aranet-service/",
+            "user@aranet-service",
+            "[::1]",
+        ] {
+            let errors = with_hosts(&[host]).validate();
+            assert_eq!(errors.len(), 1, "{host:?}: {errors:?}");
+            assert_eq!(errors[0].field, "security.allowed_hosts");
+            assert!(errors[0].message.contains("bare host names"), "{errors:?}");
+        }
     }
 
     #[test]

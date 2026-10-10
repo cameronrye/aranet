@@ -13,6 +13,11 @@ broadcast_buffer = 100
 # Database path (mounted volume in Docker)
 path = "/data/aranet.db"
 
+[security]
+# Prometheus in docker-compose scrapes with `Host: aranet-service:8080`. Without
+# API-key authentication, requests for other host names get 421.
+allowed_hosts = ["aranet-service"]
+
 [prometheus]
 # Enable Prometheus metrics endpoint at /metrics
 enabled = true

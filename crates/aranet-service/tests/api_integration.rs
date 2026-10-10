@@ -1236,3 +1236,212 @@ fn test_startup_warns_about_database_in_tilde_directory() {
     assert!(!output.contains("Found a database"), "{output}");
     assert!(!home.join("old").exists(), "a database was opened");
 }
+
+// ==========================================================================
+// Host and Origin checks while API-key authentication is off
+// ==========================================================================
+
+/// Send `request` through `app` and return (status, body).
+async fn send_request(app: &axum::Router, request: Request<Body>) -> (StatusCode, String) {
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn foreign_host_is_rejected_while_unauthenticated() {
+    let (app, _state, _dir) = test_app();
+
+    // A DNS-rebinding page: its own host name now resolves to the service.
+    let request = Request::builder()
+        .uri("/api/devices")
+        .header("Host", "evil.example:8080")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(&app, request).await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["error"], "Host 'evil.example' is not allowed");
+    assert!(
+        json["hint"]
+            .as_str()
+            .unwrap()
+            .contains("security.allowed_hosts"),
+        "{body}"
+    );
+
+    // The same host in an absolute-form request target.
+    let request = Request::builder()
+        .uri("http://evil.example:8080/api/devices")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(&app, request).await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn cross_site_collector_stop_is_rejected() {
+    let (app, _state, _dir) = test_app();
+
+    // A form on another site can post here without a CORS preflight.
+    for origin in ["https://evil.example", "null"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/collector/stop")
+            .header("Host", "127.0.0.1:8080")
+            .header("Origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(&app, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["error"], "Cross-origin request blocked");
+        assert!(
+            json["hint"]
+                .as_str()
+                .unwrap()
+                .contains("security.cors_origins"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_origin_and_headerless_requests_still_work() {
+    let (app, _state, _dir) = test_app();
+
+    // curl, the CLI, the TUI and the GUI send a local Host and no Origin.
+    // `oneshot` requests have no Host at all.
+    let (status, body) = get(&app, "/api/devices").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for host in ["localhost:8080", "127.0.0.1:8080", "[::1]:8080"] {
+        let request = Request::builder()
+            .uri("/api/devices")
+            .header("Host", host)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{host}: {body}");
+    }
+
+    // Same-origin browser requests, such as a page the service serves, including body-less POSTs.
+    for (host, origin) in [
+        ("127.0.0.1:8080", "http://127.0.0.1:8080"),
+        ("localhost:8080", "http://localhost:8080"),
+        ("LocalHost:8080", "http://localhost:8080"),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/collector/stop")
+            .header("Host", host)
+            .header("Origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{origin} -> {host}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn guard_is_off_when_api_key_auth_enabled() {
+    let (app, _state, _dir) = test_app_with_auth();
+    let request = |key: Option<&str>| {
+        let mut builder = Request::builder()
+            .uri("/api/devices")
+            .header("Host", "aranet.example.com:8443")
+            .header("Origin", "https://dashboard.example.com");
+        if let Some(key) = key {
+            builder = builder.header("X-API-Key", key);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    let (status, body) = send_request(
+        &app,
+        request(Some("test-api-key-that-is-at-least-32-characters-long")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send_request(&app, request(None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[tokio::test]
+async fn shipped_docker_config_lets_prometheus_scrape() {
+    let config: Config = toml::from_str(include_str!("../../../docker/server.toml")).unwrap();
+    let (app, _state, _dir) = test_app_with_config(config);
+
+    // docker/prometheus.yml scrapes the target `aranet-service:8080`.
+    let request = Request::builder()
+        .uri("/metrics")
+        .header("Host", "aranet-service:8080")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("aranet_collector_running"), "{body}");
+}
+
+/// Send a WebSocket upgrade request for `/api/ws` with `origin` to the server
+/// at `addr`, and return the status line of the answer.
+async fn ws_upgrade_status_line(addr: SocketAddr, origin: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET /api/ws HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Origin: {origin}\r\n\
+         \r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut received = Vec::new();
+    let read_status_line = async {
+        let mut chunk = [0u8; 512];
+        while !received.windows(2).any(|pair| pair == b"\r\n") {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the connection closed before a status line arrived");
+            received.extend_from_slice(&chunk[..n]);
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), read_status_line)
+        .await
+        .expect("no answer within 5 s");
+    let text = String::from_utf8_lossy(&received);
+    text.lines().next().unwrap_or_default().to_owned()
+}
+
+#[tokio::test]
+async fn cross_site_websocket_upgrade_is_refused() {
+    // `oneshot` can't upgrade a connection (every upgrade gets 426), so serve
+    // the app on a real loopback socket.
+    let (router, _state, _dir) = test_app();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
+
+    let foreign = ws_upgrade_status_line(addr, "https://evil.example").await;
+    let own = ws_upgrade_status_line(addr, &format!("http://{addr}")).await;
+    server.abort();
+
+    assert!(
+        foreign.starts_with("HTTP/1.1 403"),
+        "a foreign origin got {foreign:?}"
+    );
+    assert!(
+        own.starts_with("HTTP/1.1 101"),
+        "the own origin got {own:?}"
+    );
+}

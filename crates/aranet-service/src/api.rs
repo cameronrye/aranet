@@ -1638,6 +1638,7 @@ mod tests {
             rate_limit_window_secs: 60,
             rate_limit_max_entries: 1024,
             cors_origins: vec!["http://localhost:3000".to_string()],
+            ..SecurityConfig::default()
         }
     }
 
@@ -1659,8 +1660,7 @@ mod tests {
             Arc::clone(&t.state),
             Arc::new(security.clone()),
             Arc::new(RateLimitState::new()),
-        )
-        .layer(crate::middleware::cors_layer(&security));
+        );
         (app, t)
     }
 

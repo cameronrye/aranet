@@ -86,10 +86,7 @@ impl MdnsAdvertiser {
             }
         };
 
-        let hostname = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "aranet-service".to_string());
+        let hostname = os_hostname().unwrap_or_else(|| "aranet-service".to_string());
 
         let instance_name = format!("Aranet Service on {}", hostname);
 
@@ -140,6 +137,27 @@ impl MdnsAdvertiser {
     }
 }
 
+/// This machine's host name as the operating system reports it, for example
+/// `Mac.local` or `raspberrypi`.
+fn os_hostname() -> Option<String> {
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+}
+
+/// This machine's name as browsers on the local network reach it: the first
+/// label of its host name, lowercase (`Mac.local` gives `mac`). The origin
+/// guard also accepts `<name>.local`.
+pub(crate) fn machine_hostname() -> Option<String> {
+    os_hostname().as_deref().and_then(first_label)
+}
+
+fn first_label(hostname: &str) -> Option<String> {
+    let label = hostname.split('.').next()?.trim().to_ascii_lowercase();
+    (!label.is_empty()).then_some(label)
+}
+
 fn build_service_info(
     service_type: &str,
     instance_name: &str,
@@ -174,5 +192,18 @@ mod tests {
         .unwrap();
 
         assert!(service_info.is_addr_auto());
+    }
+
+    #[test]
+    fn machine_name_is_first_label_lowercased() {
+        assert_eq!(
+            first_label("Camerons-Mac.local").as_deref(),
+            Some("camerons-mac")
+        );
+        assert_eq!(first_label("raspberrypi").as_deref(), Some("raspberrypi"));
+        assert_eq!(first_label("DESKTOP-1234").as_deref(), Some("desktop-1234"));
+        assert_eq!(first_label("host.example.com.").as_deref(), Some("host"));
+        assert_eq!(first_label(""), None);
+        assert_eq!(first_label(".local"), None);
     }
 }

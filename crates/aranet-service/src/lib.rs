@@ -82,6 +82,22 @@
 //! load the UI. Protected API, metrics, and WebSocket requests still honor the
 //! configured security settings.
 //!
+//! While API-key authentication is off, the service also checks where each
+//! request comes from, so that other web pages open in a browser can't use it
+//! (DNS rebinding and cross-site requests):
+//!
+//! - A `Host` other than `localhost`, an IP address, this machine's name,
+//!   `<name>.local` or a name in `allowed_hosts` gets `421 Misdirected Request`.
+//! - A request whose `Origin` is neither the service's own nor listed in
+//!   `cors_origins` gets `403 Forbidden`, WebSocket connections to `/api/ws`
+//!   included. Requests without `Origin`, such as curl's, are not affected.
+//!
+//! ```toml
+//! [security]
+//! allowed_hosts = ["aranet-service"]       # for example a Docker Compose service name
+//! cors_origins = ["http://localhost:3000"] # pages served elsewhere that call the API
+//! ```
+//!
 //! For WebSocket connections, browsers cannot set custom headers. Use the `token`
 //! query parameter only on `/api/ws` instead, URL-encoding the key (for example
 //! with `encodeURIComponent(key)` in JavaScript):
@@ -342,11 +358,22 @@ fn request_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Spa
 }
 
 /// Build the fully layered HTTP application used in production and end-to-end tests.
+///
+/// Requests pass through, outermost first: CORS (which answers preflight
+/// requests for the origins in `security.cors_origins`), request tracing, rate
+/// limiting, the Host and Origin checks that apply while API-key
+/// authentication is off ([`middleware::origin_guard`]), and API-key
+/// authentication.
 pub fn app(
     state: Arc<AppState>,
     security_config: Arc<SecurityConfig>,
     rate_limit_state: Arc<middleware::RateLimitState>,
 ) -> Router {
+    let origin_policy = Arc::new(middleware::OriginPolicy::new(
+        &security_config,
+        mdns::machine_hostname().as_deref(),
+    ));
+    let cors = middleware::cors_layer(&security_config);
     Router::new()
         .merge(api::router())
         .merge(ws::router())
@@ -356,10 +383,15 @@ pub fn app(
             middleware::api_key_auth,
         ))
         .layer(axum::middleware::from_fn_with_state(
+            origin_policy,
+            middleware::origin_guard,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
             (security_config, rate_limit_state),
             middleware::rate_limit,
         ))
         .layer(TraceLayer::new_for_http().make_span_with(request_span))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -463,6 +495,9 @@ fn unexpanded_database(cwd: &Path, raw: &Path, expanded: &Path) -> Option<PathBu
 /// Bluetooth or any integration starts.
 pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     let LoadedConfig { config, path } = load_config(&options)?;
+    for warning in middleware::OriginPolicy::new(&config.security, None).startup_warnings() {
+        tracing::warn!("{warning}");
+    }
 
     let addr = config
         .server
@@ -557,8 +592,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         Arc::clone(&state),
         Arc::clone(&security_config),
         Arc::clone(&rate_limit_state),
-    )
-    .layer(middleware::cors_layer(&config.security));
+    );
 
     axum::serve(
         listener,
