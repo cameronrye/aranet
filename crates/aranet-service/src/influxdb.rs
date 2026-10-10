@@ -1002,5 +1002,197 @@ mod tests {
             assert!(logs.contains(&logged), "{logs:?}");
             assert!(!logs.contains('\u{202e}'), "{logs:?}");
         }
+
+        #[tokio::test]
+        async fn influxdb_writes_at_most_a_batch_of_lines_per_request() {
+            let server = RecordingServer::start(vec![(WRITE, Reply::Status(204))]).await;
+            let t = TestState::with_config(influx_config(&server));
+            let settings = InfluxSettings {
+                batch_lines: 2,
+                ..InfluxSettings::default()
+            };
+            let writer = start_writer(&t, settings).await;
+
+            // All five are queued before the writer task runs again and takes
+            // its first batch.
+            let events: Vec<ReadingEvent> =
+                (801..=805).map(|co2| test_event(DEVICE, co2)).collect();
+            for event in &events {
+                t.state.readings_tx.send(event.clone()).unwrap();
+            }
+
+            // Two lines per request, oldest first, and each line once.
+            let requests = server.wait_for_requests(3).await;
+            let lines: Vec<String> = events.iter().map(line_of).collect();
+            let bodies: Vec<&str> = requests.iter().map(|r| r.body.as_str()).collect();
+            assert_eq!(
+                bodies,
+                [
+                    format!("{}\n{}", lines[0], lines[1]),
+                    format!("{}\n{}", lines[2], lines[3]),
+                    lines[4].clone(),
+                ]
+            );
+
+            shut_down(&t, writer).await;
+            assert_eq!(server.requests().len(), 3, "{:?}", server.requests());
+        }
+
+        #[tokio::test]
+        async fn influxdb_outage_longer_than_the_queue_drops_the_newest_readings() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![(WRITE, Reply::Status(503))]).await;
+            let t = TestState::with_config(influx_config(&server));
+            let settings = InfluxSettings {
+                queue_lines: 3,
+                base_backoff: Duration::from_secs(60),
+                ..InfluxSettings::default()
+            };
+            let writer = start_writer(&t, settings).await;
+            let device = |n: u16| format!("Aranet4 0000{n}");
+
+            // The writer takes the first line out of the queue and keeps it
+            // for the retry in 60 s.
+            t.state
+                .readings_tx
+                .send(test_event(&device(1), 801))
+                .unwrap();
+            server.wait_for_requests(1).await;
+
+            // The next three fill the queue, and the two after them don't fit.
+            for n in 2..=6 {
+                t.state
+                    .readings_tx
+                    .send(test_event(&device(n), 800 + n))
+                    .unwrap();
+            }
+            wait_until("the writer to take every reading", || {
+                t.state.readings_tx.is_empty()
+            })
+            .await;
+
+            shut_down(&t, writer).await;
+            let text = logs.text();
+            let queued: Vec<u16> = (1..=6)
+                .filter(|n| {
+                    text.contains(&format!("Queued reading for {} for InfluxDB", device(*n)))
+                })
+                .collect();
+            assert_eq!(queued, [1, 2, 3, 4], "{text}");
+            // Two readings were dropped, and the warning is rate-limited.
+            assert_eq!(
+                text.matches("InfluxDB write queue is full").count(),
+                1,
+                "{text}"
+            );
+            assert!(
+                text.contains("InfluxDB write queue is full (3 lines); dropped 1 readings so far"),
+                "{text}"
+            );
+            // The line being retried and the three in the queue.
+            assert!(
+                text.contains("InfluxDB writer stopped with 4 queued lines not written"),
+                "{text}"
+            );
+            // The writer was waiting to retry all along.
+            assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+        }
+
+        #[tokio::test]
+        async fn influxdb_retries_a_write_that_got_no_answer() {
+            // InfluxDB takes the request and never answers, so each write
+            // ends at the request timeout.
+            let server = RecordingServer::start(vec![(WRITE, Reply::Hang)]).await;
+            let t = TestState::with_config(influx_config(&server));
+            let settings = InfluxSettings {
+                base_backoff: Duration::from_millis(10),
+                request_timeout: Duration::from_millis(100),
+                ..InfluxSettings::default()
+            };
+            let writer = start_writer(&t, settings).await;
+
+            let event = test_event(DEVICE, 801);
+            t.state.readings_tx.send(event.clone()).unwrap();
+
+            // The line is sent again, not dropped as one that InfluxDB
+            // rejected.
+            let requests = server.wait_for_requests(2).await;
+            let line = line_of(&event);
+            assert!(
+                requests.iter().all(|request| request.body == line),
+                "{requests:?}"
+            );
+
+            shut_down(&t, writer).await;
+        }
+
+        #[tokio::test]
+        async fn influxdb_retry_delay_doubles_to_its_limit_and_starts_over_for_the_next_batch() {
+            let (logs, _guard) = CapturedLogs::start();
+            // The first line is written at its fifth attempt, the second is
+            // rejected at its second, and the third is written at its second.
+            let server = RecordingServer::start(vec![(
+                WRITE,
+                Reply::Sequence(vec![503, 503, 503, 503, 204, 503, 400, 503, 204]),
+            )])
+            .await;
+            let t = TestState::with_config(influx_config(&server));
+            let settings = InfluxSettings {
+                base_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(40),
+                ..InfluxSettings::default()
+            };
+            let writer = start_writer(&t, settings).await;
+
+            // Each line is sent once the last request for the line before it
+            // has arrived, so each is a batch of its own.
+            let started = tokio::time::Instant::now();
+            t.state.readings_tx.send(test_event(DEVICE, 801)).unwrap();
+            server.wait_for_requests(5).await;
+            let waited = started.elapsed();
+            t.state.readings_tx.send(test_event(DEVICE, 802)).unwrap();
+            server.wait_for_requests(7).await;
+            t.state.readings_tx.send(test_event(DEVICE, 803)).unwrap();
+            server.wait_for_requests(9).await;
+            shut_down(&t, writer).await;
+
+            // 10 ms, doubled twice and held at the limit of 40 ms for the
+            // first line; 10 ms again for the second, after a successful
+            // write, and for the third, after a rejected one.
+            let text = logs.text();
+            let delays: Vec<&str> = text
+                .lines()
+                .filter_map(|line| line.split_once("; retrying in "))
+                .map(|(_, delay)| delay)
+                .collect();
+            assert_eq!(
+                delays,
+                ["0.01s", "0.02s", "0.04s", "0.04s", "0.01s", "0.01s"],
+                "{text}"
+            );
+            // The writer waited that long before each retry: the fifth
+            // request can't arrive before 10 + 20 + 40 + 40 ms have passed.
+            assert!(waited >= Duration::from_millis(110), "waited {waited:?}");
+        }
+
+        #[tokio::test]
+        async fn influxdb_writer_stops_promptly_while_a_write_gets_no_answer() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![(WRITE, Reply::Hang)]).await;
+            let t = TestState::with_config(influx_config(&server));
+            let writer = start_writer(&t, InfluxSettings::default()).await;
+
+            t.state.readings_tx.send(test_event(DEVICE, 801)).unwrap();
+            server.wait_for_requests(1).await;
+
+            // The write would wait 30 s for its answer. Shutdown ends it at
+            // once, and the line counts as not written.
+            shut_down(&t, writer).await;
+            let text = logs.text();
+            assert!(
+                text.contains("InfluxDB writer stopped with 1 queued lines not written"),
+                "{text}"
+            );
+        }
     }
 }
