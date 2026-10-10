@@ -139,7 +139,7 @@ impl Config {
     /// - When enabled, the MQTT topic prefix (and, with Home Assistant
     ///   discovery on, the discovery prefix) has no control characters or
     ///   wildcards, and the InfluxDB measurement name has no control characters
-    ///   or backslashes and doesn't start with `_`
+    ///   or backslashes and doesn't start with `_` or `#`
     ///
     /// # Example
     ///
@@ -1109,6 +1109,16 @@ impl InfluxDbConfig {
                         errors,
                         "influxdb.measurement",
                         "measurement name cannot start with '_' (reserved by InfluxDB)"
+                    );
+                }
+                // The measurement starts the line, and InfluxDB reads a line
+                // that starts with `#` as a comment: 1.8.10 and 2.7.12 answer
+                // 204 and store nothing. No escape exists, so it is refused.
+                if self.measurement.starts_with('#') {
+                    validate!(
+                        errors,
+                        "influxdb.measurement",
+                        "measurement name cannot start with '#' (InfluxDB reads the line as a comment)"
                     );
                 }
             }
@@ -2284,6 +2294,47 @@ path = "/data/aranet.db"
         // A disabled exporter isn't checked.
         let disabled = InfluxDbConfig {
             measurement: "_x".to_string(),
+            ..Default::default()
+        };
+        assert!(disabled.validate().is_empty());
+    }
+
+    #[test]
+    fn influxdb_measurement_rejects_leading_hash() {
+        let with_measurement = |measurement: &str| InfluxDbConfig {
+            enabled: true,
+            org: "aranet".to_string(),
+            measurement: measurement.to_string(),
+            ..Default::default()
+        };
+
+        // InfluxDB reads a line that starts with `#` as a comment. For
+        // `#aranet`, 1.8.10 and 2.7.12 answer 204 and store nothing, and 3 Core
+        // 3.12.0 answers 400. No escape exists: `\#aranet` is stored under that
+        // name, backslash included.
+        for measurement in ["#aranet", "#"] {
+            let errors = with_measurement(measurement).validate();
+            assert_eq!(errors.len(), 1, "{measurement:?}: {errors:?}");
+            assert_eq!(errors[0].field, "influxdb.measurement");
+            assert_eq!(
+                errors[0].message,
+                "measurement name cannot start with '#' (InfluxDB reads the line as a comment)"
+            );
+        }
+
+        // Only the first character of the line matters, so a `#` further in,
+        // or after a leading space, is fine.
+        for measurement in ["a#b", " #aranet"] {
+            let errors = with_measurement(measurement).validate();
+            assert!(errors.is_empty(), "{measurement:?}: {errors:?}");
+        }
+        // An alias is a tag value, never the start of the line.
+        let errors = test_device("Aranet4 12345", Some("#Office")).validate("device");
+        assert!(errors.is_empty(), "{errors:?}");
+
+        // A disabled exporter isn't checked.
+        let disabled = InfluxDbConfig {
+            measurement: "#aranet".to_string(),
             ..Default::default()
         };
         assert!(disabled.validate().is_empty());
