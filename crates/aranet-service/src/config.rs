@@ -412,6 +412,10 @@ pub struct SecurityConfig {
     pub api_key_enabled: bool,
     /// The API key required for authentication (if enabled).
     /// Should be a secure random string of at least 32 characters.
+    ///
+    /// If authentication is enabled and no key is set, the service generates
+    /// one ([`generate_api_key`]) when it starts and saves it to its config
+    /// file.
     pub api_key: Option<String>,
     /// Enable rate limiting.
     pub rate_limit_enabled: bool,
@@ -1236,6 +1240,25 @@ fn format_validation_errors(errors: &[ValidationError]) -> String {
         .join("\n")
 }
 
+/// Generate an API key: 32 random bytes from the operating system, as 64
+/// lowercase hexadecimal characters.
+///
+/// # Errors
+///
+/// Fails only when the operating system's random number generator does.
+pub fn generate_api_key() -> anyhow::Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0u8; 32];
+    // getrandom::Error implements std::error::Error only with getrandom's
+    // `std` feature, so convert it through its Display text.
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("could not read random bytes: {e}"))?;
+    Ok(bytes
+        .iter()
+        .flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 0x0f)]])
+        .map(char::from)
+        .collect())
+}
+
 /// Default configuration file path.
 pub fn default_config_path() -> PathBuf {
     dirs::config_dir()
@@ -1610,6 +1633,27 @@ path = "/data/aranet.db"
         .unwrap();
         assert_eq!(config.security.cors_origins, ["http://localhost"]);
         assert_eq!(config.security.allowed_hosts, ["aranet-service"]);
+    }
+
+    #[test]
+    fn generate_api_key_is_64_hex_and_unique() {
+        let first = generate_api_key().unwrap();
+        let second = generate_api_key().unwrap();
+        for key in [&first, &second] {
+            assert_eq!(key.len(), 64, "{key}");
+            assert!(
+                key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{key}"
+            );
+        }
+        assert_ne!(first, second);
+
+        let security = SecurityConfig {
+            api_key_enabled: true,
+            api_key: Some(first),
+            ..SecurityConfig::default()
+        };
+        assert!(security.validate().is_empty());
     }
 
     #[test]

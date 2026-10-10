@@ -70,6 +70,8 @@
 //! [security]
 //! # Require X-API-Key header for protected API, WebSocket, and metrics requests
 //! api_key_enabled = true
+//! # At least 32 characters. Leave it out and the service generates a key when
+//! # it starts and saves it here.
 //! api_key = "your-secure-random-key-at-least-32-chars"
 //!
 //! # Rate limit requests per IP address
@@ -407,14 +409,26 @@ pub fn app(
 /// the home directory. The overrides and the expanded path exist only in the
 /// returned config; they are never written to the file.
 ///
-/// Errors wrap [`ConfigError`]; use `anyhow::Error::downcast_ref` to inspect
-/// them.
+/// If `security.api_key_enabled` is true and `security.api_key` is missing or
+/// empty, a key is generated with [`config::generate_api_key`] and, once the
+/// configuration is valid, only that key is saved to the file: owner-only on
+/// Unix (mode 0600), with the file's comments and other settings kept. The
+/// returned config holds the key. If the key can't be saved, for example to a
+/// read-only file, loading fails with an error that names the file and
+/// `security.api_key`.
+///
+/// Errors from reading, parsing or validating the configuration wrap
+/// [`ConfigError`]; use `anyhow::Error::downcast_ref` to inspect them.
 pub fn load_config(options: &RunOptions) -> anyhow::Result<LoadedConfig> {
     prepare_config(options, true)
 }
 
 /// Check the service configuration exactly as [`load_config`] does, without
 /// writing anything.
+///
+/// With authentication enabled and no key set, it validates with a
+/// placeholder key and never generates or saves one; [`load_config`]
+/// generates the key when the service starts.
 ///
 /// `aranet server --daemon` calls this before it detaches, so configuration
 /// errors reach the terminal instead of a process whose output is discarded.
@@ -425,7 +439,7 @@ pub fn check_config(options: &RunOptions) -> anyhow::Result<()> {
 
 /// The body of [`load_config`] (`save_generated_key` true) and
 /// [`check_config`] (false).
-fn prepare_config(options: &RunOptions, _save_generated_key: bool) -> anyhow::Result<LoadedConfig> {
+fn prepare_config(options: &RunOptions, save_generated_key: bool) -> anyhow::Result<LoadedConfig> {
     let path = options
         .config
         .clone()
@@ -462,7 +476,39 @@ fn prepare_config(options: &RunOptions, _save_generated_key: bool) -> anyhow::Re
     }
     config.storage.path = expanded;
 
+    // Authentication enabled without a key: fill one in before validating.
+    // load_config generates the real key now and saves it only once the config
+    // is known to be valid. check_config never writes, so it validates with a
+    // placeholder, and the key is generated when the service first starts.
+    let generated_key = if config.security.api_key_enabled
+        && config.security.api_key.as_deref().is_none_or(str::is_empty)
+    {
+        let key = if save_generated_key {
+            config::generate_api_key()?
+        } else {
+            "0".repeat(64)
+        };
+        config.security.api_key = Some(key.clone());
+        save_generated_key.then_some(key)
+    } else {
+        None
+    };
+
     config.validate()?;
+
+    if let Some(key) = generated_key {
+        // Only this key is written: comments, other settings and the
+        // --bind/--database overrides are left as they are.
+        Config::update_file(&path, |file| file.security.api_key = Some(key)).map_err(|e| {
+            anyhow::anyhow!(
+                "authentication is enabled but security.api_key is not set, and a generated key \
+                 could not be saved to {}: {e}. Set security.api_key in that file.",
+                path.display()
+            )
+        })?;
+        // Never log the key itself.
+        tracing::info!("Generated an API key and saved it to {}", path.display());
+    }
 
     tracing::info!("Using config {}", path.display());
     Ok(LoadedConfig { config, path })
@@ -1338,5 +1384,121 @@ mod tests {
             format!("{err:#}").starts_with(&format!("failed to listen on {bind}: ")),
             "{err:#}"
         );
+    }
+
+    /// A `server.toml` in a new temporary directory, and options that read it
+    /// with the database overridden into the same directory.
+    fn auth_config_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf, RunOptions) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        std::fs::write(&path, contents).unwrap();
+        let options = RunOptions {
+            config: Some(path.clone()),
+            database: Some(dir.path().join("data.db")),
+            ..RunOptions::default()
+        };
+        (dir, path, options)
+    }
+
+    fn looks_generated(key: &str) -> bool {
+        key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    #[test]
+    fn load_config_generates_and_saves_missing_api_key() {
+        let (_dir, path, options) =
+            auth_config_file("# keep\n[security]\napi_key_enabled = true\n");
+
+        let loaded = load_config(&options).unwrap();
+        let key = loaded.config.security.api_key.clone().unwrap();
+        assert!(looks_generated(&key), "{key:?}");
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("# keep\n"), "{saved}");
+        assert!(saved.contains(&format!("api_key = \"{key}\"")), "{saved}");
+        assert!(!saved.contains("data.db"), "an override was saved: {saved}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let again = load_config(&options).unwrap();
+        assert_eq!(again.config.security.api_key.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn generated_api_key_is_not_logged() {
+        let (_dir, path, options) = auth_config_file("[security]\napi_key_enabled = true\n");
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+
+        let key = load_config(&options)
+            .unwrap()
+            .config
+            .security
+            .api_key
+            .unwrap();
+
+        let text = logs.text();
+        assert!(
+            text.contains(&format!(
+                "Generated an API key and saved it to {}",
+                path.display()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&key), "the key was logged: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_config_fails_clearly_when_key_cannot_be_saved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("read-only");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let original = "[security]\napi_key_enabled = true\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Root ignores file modes (the aranet-ci image runs as root).
+        let root = std::fs::OpenOptions::new().append(true).open(&path).is_ok();
+        let result = (!root).then(|| {
+            load_config(&RunOptions {
+                config: Some(path.clone()),
+                database: Some(t.path().join("data.db")),
+                ..RunOptions::default()
+            })
+        });
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(result) = result else {
+            eprintln!("skipped: file modes don't apply to root");
+            return;
+        };
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("could not be saved"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("security.api_key"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn check_config_never_writes_a_key() {
+        let original = "[security]\napi_key_enabled = true\n";
+        let (dir, path, options) = auth_config_file(original);
+
+        check_config(&options).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["server.toml"]);
     }
 }

@@ -349,6 +349,7 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "futures",
+ "getrandom 0.3.4",
  "hostname",
  "http-body-util",
  "hyper",
