@@ -258,6 +258,13 @@ fn keep_comments_of_removed_tables(doc: &mut DocumentMut, old_prefixes: &[(Strin
 /// `toml_edit` renders a table added by [`apply_table`] before them, which would
 /// move them under the new table. Put them in front of the first added table
 /// that has a header instead, so they stay with the table they follow.
+///
+/// Only a table under a new top-level key gets them. A new entry appended to the
+/// file's last `[[array]]` is still written above the comments that follow the
+/// last entry's keys, so they end up after the new entry; no text is lost, and
+/// removing that entry again restores the file byte for byte. A new subtable of
+/// the file's last table is written above that table's trailing comments in the
+/// same way.
 fn keep_trailing_comments_with_last_table(doc: &mut DocumentMut, old_keys: &[String]) {
     let trailing = doc.trailing().as_str().unwrap_or("").to_owned();
     if trailing.trim().is_empty() {
@@ -411,7 +418,9 @@ fn insert_new(target: &mut dyn TableLike, key: &str, before: &toml::Table, new: 
 /// an entry whose first key has the same value as a wanted one (for `[[devices]]`,
 /// the address) is edited key by key; other entries are removed, and wanted
 /// entries without a match are written fresh. Comments that belong above the
-/// array stay above whichever entry is now first.
+/// array stay above whichever entry is now first. Comments after the last entry's
+/// keys at the end of the file are not part of any entry, so an appended entry
+/// is written above them (see [`keep_trailing_comments_with_last_table`]).
 fn merge_tables(tables: &mut ArrayOfTables, before: &[&toml::Table], after: &[&toml::Table]) {
     let header = take_header(tables);
     let mut sources: Vec<Option<usize>> = vec![None; after.len()];
