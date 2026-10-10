@@ -1245,9 +1245,16 @@ mod tests {
 
     /// Run the service and return its error. The limit turns a regression that
     /// starts serving into a failure instead of a hung test.
+    ///
+    /// The database override names the path `write_server_toml` puts in the
+    /// file, so it changes nothing while the file is honoured. It is there for
+    /// a regression that ignores the file: the service these tests then start
+    /// opens its database in the `TempDir`, not at the default path.
     async fn run_until_error(config: PathBuf) -> anyhow::Error {
+        let database = config.with_file_name("sub").join("aranet.db");
         let options = RunOptions {
             config: Some(config),
+            database: Some(database),
             no_collector: true,
             ..Default::default()
         };
