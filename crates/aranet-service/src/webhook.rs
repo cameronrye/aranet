@@ -1212,5 +1212,53 @@ mod tests {
             paths.sort();
             assert_eq!(paths, ["/broken", "/ok"], "{:?}", server.requests());
         }
+
+        #[tokio::test]
+        async fn webhook_slow_endpoint_does_not_delay_the_same_alert_at_other_endpoints() {
+            let server =
+                RecordingServer::start(vec![("/slow", Reply::Hang), ("/fast", Reply::Status(200))])
+                    .await;
+            // Both endpoints want CO2 alerts, and the first never answers.
+            let t = TestState::with_config(webhook_config(vec![
+                endpoint(server.url("/slow"), "co2_high"),
+                endpoint(server.url("/fast"), "co2_high"),
+            ]));
+            let dispatcher = start_dispatcher(&t, test_settings()).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+
+            // The alert goes to its endpoints at the same time: /fast gets it
+            // while /slow is still hanging.
+            let requests = server.wait_for_requests(2).await;
+            let mut paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+            paths.sort_unstable();
+            assert_eq!(paths, ["/fast", "/slow"], "{requests:?}");
+
+            shut_down(&t, dispatcher).await;
+        }
+
+        #[tokio::test]
+        async fn webhook_alert_in_flight_does_not_hold_back_another_event_of_its_device() {
+            let server =
+                RecordingServer::start(vec![("/slow", Reply::Hang), ("/fast", Reply::Status(200))])
+                    .await;
+            let t = TestState::with_config(webhook_config(vec![
+                endpoint(server.url("/slow"), "co2_high"),
+                endpoint(server.url("/fast"), "battery_low"),
+            ]));
+            let dispatcher = start_dispatcher(&t, test_settings()).await;
+
+            // One reading over both thresholds. X's CO2 alert hangs at /slow;
+            // its battery alert is another event, and must not count as the
+            // same alert still being delivered.
+            t.state.readings_tx.send(reading_for(X, 1500, 5)).unwrap();
+
+            let requests = server.wait_for_requests(2).await;
+            let fast: Vec<_> = requests.iter().filter(|r| r.path == "/fast").collect();
+            assert_eq!(fast.len(), 1, "{requests:?}");
+            assert_eq!(device_of(fast[0]), X);
+
+            shut_down(&t, dispatcher).await;
+        }
     }
 }
