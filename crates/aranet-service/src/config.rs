@@ -132,8 +132,14 @@ impl Config {
     /// - Storage path is not empty
     /// - Retention limits, when set, are 1 to 36500 days
     /// - Device addresses are not empty
+    /// - Device addresses and aliases have no control characters or
+    ///   backslashes and are at most [`MAX_DEVICE_TEXT_CHARS`] characters long
     /// - Device poll intervals are within reasonable bounds (10s - 1 hour)
     /// - No duplicate device addresses
+    /// - When enabled, the MQTT topic prefix (and, with Home Assistant
+    ///   discovery on, the discovery prefix) has no control characters or
+    ///   wildcards, and the InfluxDB measurement name has no control characters
+    ///   or backslashes and doesn't start with `_`
     ///
     /// # Example
     ///
@@ -663,8 +669,29 @@ impl MqttConfig {
                 );
             }
 
+            // rumqttc refuses to publish to a topic containing a wildcard, and
+            // MQTT forbids U+0000 in topic names.
+            let unusable = |prefix: &str| {
+                prefix
+                    .chars()
+                    .any(|c| c == '#' || c == '+' || is_forbidden_text_char(c))
+            };
             if self.topic_prefix.is_empty() {
                 validate!(errors, "mqtt.topic_prefix", "topic prefix cannot be empty");
+            } else if unusable(&self.topic_prefix) {
+                validate!(
+                    errors,
+                    "mqtt.topic_prefix",
+                    "topic prefix cannot contain control characters or MQTT wildcards"
+                );
+            }
+            // The discovery prefix is only used with Home Assistant discovery on.
+            if self.homeassistant && unusable(&self.ha_discovery_prefix) {
+                validate!(
+                    errors,
+                    "mqtt.ha_discovery_prefix",
+                    "Home Assistant discovery prefix cannot contain control characters or MQTT wildcards"
+                );
             }
 
             if self.client_id.is_empty() {
@@ -697,9 +724,11 @@ impl MqttConfig {
 /// Configuration for a device to monitor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceConfig {
-    /// Device address or name.
+    /// Device address or name. At most [`MAX_DEVICE_TEXT_CHARS`] characters,
+    /// with no control characters or backslashes.
     pub address: String,
-    /// Friendly alias for the device.
+    /// Friendly alias for the device. At most [`MAX_DEVICE_TEXT_CHARS`]
+    /// characters, with no control characters or backslashes.
     #[serde(default)]
     pub alias: Option<String>,
     /// Poll interval in seconds.
@@ -711,9 +740,61 @@ pub struct DeviceConfig {
 pub const MIN_POLL_INTERVAL: u64 = 10;
 /// Maximum poll interval in seconds (1 hour).
 pub const MAX_POLL_INTERVAL: u64 = 3600;
+/// Maximum length of a device address or alias, in characters (not bytes).
+pub const MAX_DEVICE_TEXT_CHARS: usize = 64;
 
 fn default_poll_interval() -> u64 {
     60
+}
+
+/// Whether `c` is refused in device addresses and aliases (and in the InfluxDB
+/// measurement name and the MQTT topic prefixes).
+///
+/// These are the control characters (`char::is_control`: U+0000-U+001F and
+/// U+007F-U+009F), the line and paragraph separators U+2028/U+2029, and the
+/// bidi embedding, override and isolate controls U+202A-U+202E and
+/// U+2066-U+2069. A newline would split an InfluxDB line or a log line in two,
+/// and a bidi control can make a name or a log line read differently from what
+/// it is. Everything else is allowed here: real names contain `+`
+/// (`AranetRn+ 306B8`) and non-ASCII characters (U+2622 in Aranet Radiation
+/// names), and aliases are free text such as `Küche`.
+fn is_forbidden_text_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Check a device address or alias: no forbidden characters (see
+/// `is_forbidden_text_char`), no backslash and at most
+/// [`MAX_DEVICE_TEXT_CHARS`] characters.
+///
+/// Backslashes are refused because InfluxDB 1.x and 2.x can't store one in a
+/// tag faithfully: they keep an escaped `\\` as two backslashes, and they read a
+/// separator after any backslash as escaped.
+fn validate_device_text(field: String, what: &str, value: &str, errors: &mut Vec<ValidationError>) {
+    if value.chars().any(is_forbidden_text_char) {
+        errors.push(ValidationError {
+            field: field.clone(),
+            message: format!("{what} cannot contain control characters"),
+        });
+    }
+    if value.contains('\\') {
+        errors.push(ValidationError {
+            field: field.clone(),
+            message: format!("{what} cannot contain backslashes"),
+        });
+    }
+    let chars = value.chars().count();
+    if chars > MAX_DEVICE_TEXT_CHARS {
+        errors.push(ValidationError {
+            field,
+            message: format!(
+                "{what} is too long ({chars} characters, maximum {MAX_DEVICE_TEXT_CHARS})"
+            ),
+        });
+    }
 }
 
 impl DeviceConfig {
@@ -736,16 +817,24 @@ impl DeviceConfig {
                 self.address
             );
         }
+        validate_device_text(
+            format!("{prefix}.address"),
+            "device address",
+            &self.address,
+            &mut errors,
+        );
 
         // Alias validation (if provided)
-        if let Some(alias) = &self.alias
-            && alias.is_empty()
-        {
-            validate!(
-                errors,
-                format!("{}.alias", prefix),
-                "alias cannot be empty string (use null/omit instead)"
-            );
+        if let Some(alias) = &self.alias {
+            if alias.is_empty() {
+                validate!(
+                    errors,
+                    format!("{}.alias", prefix),
+                    "alias cannot be empty string (use null/omit instead)"
+                );
+            } else {
+                validate_device_text(format!("{prefix}.alias"), "alias", alias, &mut errors);
+            }
         }
 
         // Poll interval validation
@@ -998,6 +1087,30 @@ impl InfluxDbConfig {
                     "influxdb.measurement",
                     "measurement name cannot be empty"
                 );
+            } else {
+                if self.measurement.chars().any(is_forbidden_text_char) {
+                    validate!(
+                        errors,
+                        "influxdb.measurement",
+                        "measurement name cannot contain control characters"
+                    );
+                }
+                // InfluxDB 1.x and 2.x can't store a backslash in a measurement
+                // faithfully (see `validate_device_text`).
+                if self.measurement.contains('\\') {
+                    validate!(
+                        errors,
+                        "influxdb.measurement",
+                        "measurement name cannot contain backslashes"
+                    );
+                }
+                if self.measurement.starts_with('_') {
+                    validate!(
+                        errors,
+                        "influxdb.measurement",
+                        "measurement name cannot start with '_' (reserved by InfluxDB)"
+                    );
+                }
             }
             if !["s", "ms", "us", "ns"].contains(&self.precision.as_str()) {
                 validate!(
@@ -1605,6 +1718,130 @@ path = "/data/aranet.db"
         assert!(errors[0].message.contains("too long"));
     }
 
+    fn test_device(address: &str, alias: Option<&str>) -> DeviceConfig {
+        DeviceConfig {
+            address: address.to_string(),
+            alias: alias.map(str::to_string),
+            poll_interval: 60,
+        }
+    }
+
+    /// Characters no device address or alias may contain: C0 and C1 controls
+    /// (`\u{85}` is NEL), the Unicode line and paragraph separators, and the
+    /// bidi embedding, override and isolate controls.
+    const FORBIDDEN_SAMPLES: [char; 10] = [
+        '\n', '\r', '\t', '\0', '\u{7f}', '\u{85}', '\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}',
+    ];
+
+    #[test]
+    fn device_alias_rejects_control_characters() {
+        for c in FORBIDDEN_SAMPLES {
+            let alias = format!("Office{c}X");
+            let errors = test_device("Aranet4 12345", Some(&alias)).validate("device");
+            assert_eq!(errors.len(), 1, "{c:?}: {errors:?}");
+            assert_eq!(errors[0].field, "device.alias", "{c:?}");
+            assert_eq!(
+                errors[0].message, "alias cannot contain control characters",
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_address_rejects_control_characters() {
+        for c in FORBIDDEN_SAMPLES {
+            let address = format!("Aranet4{c}12345");
+            let errors = test_device(&address, None).validate("devices[3]");
+            assert_eq!(errors.len(), 1, "{c:?}: {errors:?}");
+            assert_eq!(errors[0].field, "devices[3].address", "{c:?}");
+            assert_eq!(
+                errors[0].message, "device address cannot contain control characters",
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_text_rejects_backslashes() {
+        // InfluxDB 1.x and 2.x keep `\\` as two backslashes in a tag value and
+        // read a separator after any backslash as escaped, so no escaping can
+        // write one faithfully.
+        for alias in ["Office\\", "C:\\temp", "a\\ b"] {
+            let errors = test_device("Aranet4 12345", Some(alias)).validate("device");
+            assert_eq!(errors.len(), 1, "{alias:?}: {errors:?}");
+            assert_eq!(errors[0].field, "device.alias", "{alias:?}");
+            assert_eq!(
+                errors[0].message, "alias cannot contain backslashes",
+                "{alias:?}"
+            );
+        }
+
+        let errors = test_device("Aranet4\\12345", None).validate("devices[3]");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "devices[3].address");
+        assert_eq!(
+            errors[0].message,
+            "device address cannot contain backslashes"
+        );
+    }
+
+    #[test]
+    fn device_text_length_limit() {
+        // The limit counts characters, not bytes: 'ü' is 2 bytes in UTF-8, so
+        // this alias is 128 bytes long and still allowed.
+        let at_limit = "ü".repeat(64);
+        assert!(
+            test_device(&at_limit, Some(&at_limit))
+                .validate("device")
+                .is_empty()
+        );
+
+        let too_long = "ü".repeat(65);
+        let errors = test_device("Aranet4 12345", Some(&too_long)).validate("device");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "device.alias");
+        assert_eq!(
+            errors[0].message,
+            "alias is too long (65 characters, maximum 64)"
+        );
+
+        let errors = test_device(&"A".repeat(65), None).validate("device");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "device.address");
+        assert_eq!(
+            errors[0].message,
+            "device address is too long (65 characters, maximum 64)"
+        );
+
+        // Every problem in one value is reported.
+        let errors =
+            test_device("Aranet4 12345", Some(&format!("{too_long}\n\\"))).validate("device");
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "alias cannot contain control characters",
+                "alias cannot contain backslashes",
+                "alias is too long (67 characters, maximum 64)"
+            ]
+        );
+    }
+
+    #[test]
+    fn device_text_accepts_real_names() {
+        for name in [
+            "AranetRn+ 306B8",
+            "Aranet\u{2622} 30ED1",
+            "Küche",
+            // A CoreBluetooth peripheral identifier (the address on macOS).
+            "1f8893bf-9f7e-02b4-ef4a-7718f4f5d4be",
+            "AA:BB:CC:DD:EE:FF",
+        ] {
+            let errors = test_device(name, Some(name)).validate("device");
+            assert!(errors.is_empty(), "{name}: {errors:?}");
+        }
+    }
+
     #[test]
     fn test_duplicate_device_addresses() {
         let config = Config {
@@ -1857,6 +2094,61 @@ path = "/data/aranet.db"
     }
 
     #[test]
+    fn mqtt_prefix_validation() {
+        let config = MqttConfig {
+            enabled: true,
+            topic_prefix: "aranet/#".to_string(),
+            homeassistant: true,
+            ha_discovery_prefix: "a\u{0}".to_string(),
+            ..Default::default()
+        };
+        let errors = config.validate();
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(fields, ["mqtt.topic_prefix", "mqtt.ha_discovery_prefix"]);
+        assert_eq!(
+            errors[0].message,
+            "topic prefix cannot contain control characters or MQTT wildcards"
+        );
+        assert_eq!(
+            errors[1].message,
+            "Home Assistant discovery prefix cannot contain control characters or MQTT wildcards"
+        );
+
+        let swapped = MqttConfig {
+            enabled: true,
+            topic_prefix: "a\u{0}".to_string(),
+            homeassistant: true,
+            ha_discovery_prefix: "homeassistant/+".to_string(),
+            ..Default::default()
+        };
+        let fields: Vec<String> = swapped.validate().into_iter().map(|e| e.field).collect();
+        assert_eq!(fields, ["mqtt.topic_prefix", "mqtt.ha_discovery_prefix"]);
+
+        // The discovery prefix is only used, and only checked, with Home
+        // Assistant discovery on.
+        let no_discovery = MqttConfig {
+            enabled: true,
+            homeassistant: false,
+            ha_discovery_prefix: "x/#".to_string(),
+            ..Default::default()
+        };
+        assert!(no_discovery.validate().is_empty());
+
+        // Topic levels are fine, and a disabled publisher isn't checked.
+        let nested = MqttConfig {
+            enabled: true,
+            topic_prefix: "home/sensors/aranet".to_string(),
+            ..Default::default()
+        };
+        assert!(nested.validate().is_empty());
+        let disabled = MqttConfig {
+            topic_prefix: "aranet/#".to_string(),
+            ..Default::default()
+        };
+        assert!(disabled.validate().is_empty());
+    }
+
+    #[test]
     fn test_mqtt_config_serde() {
         let toml = r#"
             enabled = true
@@ -1902,6 +2194,54 @@ path = "/data/aranet.db"
             ..Default::default()
         };
         assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn influxdb_measurement_validation() {
+        let with_measurement = |measurement: &str| InfluxDbConfig {
+            enabled: true,
+            org: "aranet".to_string(),
+            measurement: measurement.to_string(),
+            ..Default::default()
+        };
+
+        let errors = with_measurement("_x").validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "influxdb.measurement");
+        assert_eq!(
+            errors[0].message,
+            "measurement name cannot start with '_' (reserved by InfluxDB)"
+        );
+
+        let errors = with_measurement("a\nb").validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "influxdb.measurement");
+        assert_eq!(
+            errors[0].message,
+            "measurement name cannot contain control characters"
+        );
+
+        // InfluxDB 1.x and 2.x can't read a backslash in a measurement back.
+        for measurement in ["aranet\\", "a\\b"] {
+            let errors = with_measurement(measurement).validate();
+            assert_eq!(errors.len(), 1, "{measurement:?}: {errors:?}");
+            assert_eq!(errors[0].field, "influxdb.measurement");
+            assert_eq!(
+                errors[0].message,
+                "measurement name cannot contain backslashes"
+            );
+        }
+
+        // Spaces, commas and non-ASCII are fine: the writer escapes them.
+        assert!(with_measurement("air quality,indoor").validate().is_empty());
+        assert!(with_measurement("Luftqualität").validate().is_empty());
+
+        // A disabled exporter isn't checked.
+        let disabled = InfluxDbConfig {
+            measurement: "_x".to_string(),
+            ..Default::default()
+        };
+        assert!(disabled.validate().is_empty());
     }
 
     #[test]

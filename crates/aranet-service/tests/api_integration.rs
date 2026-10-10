@@ -566,6 +566,129 @@ async fn test_remove_device_not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn test_add_device_rejects_alias_with_newline() {
+    let (app, state, dir) = test_app();
+    let config_path = dir.path().join("server.toml");
+    let file_before = std::fs::read(&config_path).ok();
+
+    // `\n` is JSON's newline escape: the handler receives a real line feed.
+    let body = r#"{"address": "Aranet4 12345", "alias": "Office\nevil", "poll_interval": 60}"#;
+    let (status, resp) = post(&app, "/api/config/devices", body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        json["error"],
+        "device.alias: alias cannot contain control characters"
+    );
+
+    assert!(state.config.read().await.devices.is_empty());
+    assert_eq!(
+        std::fs::read(&config_path).ok(),
+        file_before,
+        "a rejected device must not be saved"
+    );
+}
+
+#[tokio::test]
+async fn test_update_device_rejects_control_characters() {
+    let (app, state, dir) = test_app();
+    {
+        let mut config = state.config.write().await;
+        config.devices.push(DeviceConfig {
+            address: "Aranet4 12345".to_string(),
+            alias: Some("Office".to_string()),
+            poll_interval: 60,
+        });
+    }
+    let config_path = dir.path().join("server.toml");
+    let file_before = std::fs::read(&config_path).ok();
+
+    // U+202E RIGHT-TO-LEFT OVERRIDE would reverse the rest of a log line.
+    for alias in ["Office\u{202e}", "Office\u{0}", "a\r\nb"] {
+        let body = serde_json::json!({ "alias": alias }).to_string();
+        let (status, resp) = put(&app, "/api/config/devices/Aranet4%2012345", &body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{alias:?}: {resp}");
+        let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            json["error"], "device.alias: alias cannot contain control characters",
+            "{alias:?}"
+        );
+    }
+
+    // A trailing backslash would make InfluxDB 2.x reject every line.
+    let backslash = serde_json::json!({ "alias": "Office\\" }).to_string();
+    let (status, resp) = put(&app, "/api/config/devices/Aranet4%2012345", &backslash).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        json["error"],
+        "device.alias: alias cannot contain backslashes"
+    );
+
+    let too_long = serde_json::json!({ "alias": "a".repeat(200) }).to_string();
+    let (status, resp) = put(&app, "/api/config/devices/Aranet4%2012345", &too_long).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        json["error"],
+        "device.alias: alias is too long (200 characters, maximum 64)"
+    );
+
+    let config = state.config.read().await;
+    assert_eq!(config.devices[0].alias.as_deref(), Some("Office"));
+    assert_eq!(
+        std::fs::read(&config_path).ok(),
+        file_before,
+        "a rejected update must not be saved"
+    );
+}
+
+#[tokio::test]
+async fn test_update_config_rejects_control_characters() {
+    let (app, state, dir) = test_app();
+    {
+        let mut config = state.config.write().await;
+        config.devices.push(DeviceConfig {
+            address: "Aranet4 12345".to_string(),
+            alias: Some("Office".to_string()),
+            poll_interval: 60,
+        });
+    }
+    let config_path = dir.path().join("server.toml");
+    let file_before = std::fs::read(&config_path).ok();
+
+    let body = serde_json::json!({
+        "devices": [{"address": "Aranet4\n12345", "alias": "Office\u{0}", "poll_interval": 60}]
+    })
+    .to_string();
+    let (status, resp) = put(&app, "/api/config", &body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let error = json["error"].as_str().unwrap();
+    assert!(
+        error.contains("devices[0].address: device address cannot contain control characters"),
+        "{error}"
+    );
+    assert!(
+        error.contains("devices[0].alias: alias cannot contain control characters"),
+        "{error}"
+    );
+
+    let config = state.config.read().await;
+    assert_eq!(config.devices.len(), 1);
+    assert_eq!(config.devices[0].address, "Aranet4 12345");
+    assert_eq!(config.devices[0].alias.as_deref(), Some("Office"));
+    assert_eq!(
+        std::fs::read(&config_path).ok(),
+        file_before,
+        "a rejected config must not be saved"
+    );
+}
+
 // ==========================================================================
 // Status endpoint
 // ==========================================================================
