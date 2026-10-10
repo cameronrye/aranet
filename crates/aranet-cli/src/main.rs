@@ -776,4 +776,74 @@ mod tests {
         assert!(parse_format("").is_none());
         assert!(parse_format("invalid").is_none());
     }
+
+    // ========================================================================
+    // config_template tests
+    // ========================================================================
+
+    /// The comment lines of a config file's text, in order.
+    fn comment_lines(text: &str) -> Vec<&str> {
+        text.lines().filter(|line| line.starts_with('#')).collect()
+    }
+
+    /// The GUI saves through `Config::update`, often into the file `config init` wrote.
+    #[test]
+    fn test_config_template_takes_gui_saves_under_its_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let template = config_template().unwrap();
+        std::fs::write(&path, &template).unwrap();
+
+        // The settings panel's Auto-Sync toggle.
+        Config::update_at(&path, |c| {
+            c.behavior.auto_sync = false;
+            Ok(())
+        })
+        .unwrap();
+        // `save_gui_config` after the CO2 Warning slider: the whole `[gui]` struct, in which
+        // one value differs from the file.
+        let mut gui = Config::load_from_path(&path).unwrap().gui;
+        gui.co2_warning_threshold = 800;
+        Config::update_at(&path, move |c| {
+            c.gui = gui;
+            Ok(())
+        })
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        // Each key is under its own header and before the next one, every header is there
+        // once, and nothing else became active.
+        let active: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(
+            active,
+            [
+                "[aliases]",
+                "[behavior]",
+                "auto_sync = false",
+                "[gui]",
+                "co2_warning_threshold = 800"
+            ],
+            "{text}"
+        );
+
+        // The template's comments are all kept, in order.
+        assert_eq!(comment_lines(&text), comment_lines(&template), "{text}");
+
+        // The file loads as the defaults with those two changes.
+        let loaded = Config::load_from_path(&path).unwrap();
+        assert!(!loaded.behavior.auto_sync, "{text}");
+        assert_eq!(loaded.gui.co2_warning_threshold, 800, "{text}");
+        let mut expected = Config::default();
+        expected.behavior.auto_sync = false;
+        expected.gui.co2_warning_threshold = 800;
+        assert_eq!(
+            toml::Table::try_from(&loaded).unwrap(),
+            toml::Table::try_from(&expected).unwrap(),
+            "{text}"
+        );
+    }
 }
