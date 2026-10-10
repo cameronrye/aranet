@@ -913,6 +913,19 @@ mod tests {
             body["device_id"].as_str().unwrap().to_string()
         }
 
+        /// Wait until `device`'s CO2 alert has reached the first endpoint and
+        /// its delivery has ended.
+        ///
+        /// A delivery logs this line and then returns without waiting on
+        /// anything, and it runs on the test's thread, so it has ended by the
+        /// time the test can see the line. The dispatcher takes a finished
+        /// delivery before the next reading, so a reading sent after this is
+        /// judged with that delivery accounted for.
+        async fn wait_until_delivered(logs: &CapturedLogs, device: &str) {
+            let sent = format!("Sent co2_high webhook for {device} to endpoint #1 ");
+            wait_until("the delivery to finish", || logs.text().contains(&sent)).await;
+        }
+
         #[tokio::test]
         async fn webhook_slow_endpoint_does_not_delay_other_alerts() {
             let server =
@@ -1032,6 +1045,66 @@ mod tests {
                 server.url("")
             );
             assert!(text.contains(&line), "{text}");
+        }
+
+        #[tokio::test]
+        async fn webhook_cooldown_starts_when_an_alert_is_delivered() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![("/hook", Reply::Status(200))]).await;
+            let t = TestState::with_config(webhook_config(vec![endpoint(
+                server.url("/hook"),
+                "co2_high",
+            )]));
+            let dispatcher = start_dispatcher(&t, WebhookSettings::default()).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            server.wait_for_requests(1).await;
+            wait_until_delivered(&logs, X).await;
+
+            // Still over the threshold, a moment into the 300 s cooldown.
+            t.state.readings_tx.send(reading_for(X, 1600, 80)).unwrap();
+            wait_until_readings_taken(&t).await;
+
+            // Shutdown lets a delivery that was started finish, so a second
+            // request would have reached the server by the time the dispatcher
+            // returns.
+            shut_down(&t, dispatcher).await;
+            let text = logs.text();
+            assert!(
+                text.contains(&format!("Skipping co2_high alert for {X} (cooldown: ")),
+                "the cooldown did not hold the second alert back:\n{text}"
+            );
+            assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+        }
+
+        #[tokio::test]
+        async fn webhook_finished_delivery_frees_its_device_and_event() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![("/hook", Reply::Status(200))]).await;
+            // No cooldown (a config file needs at least 10 s), so the second
+            // alert is held back only if the first still counts as being
+            // delivered.
+            let mut config = webhook_config(vec![endpoint(server.url("/hook"), "co2_high")]);
+            config.webhooks.cooldown_secs = 0;
+            let t = TestState::with_config(config);
+            let dispatcher = start_dispatcher(&t, WebhookSettings::default()).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            server.wait_for_requests(1).await;
+            wait_until_delivered(&logs, X).await;
+
+            t.state.readings_tx.send(reading_for(X, 1600, 80)).unwrap();
+            let requests = server.wait_for_requests(2).await;
+            let values: Vec<f64> = requests
+                .iter()
+                .map(|request| {
+                    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+                    body["value"].as_f64().unwrap()
+                })
+                .collect();
+            assert_eq!(values, [1500.0, 1600.0], "{requests:?}");
+
+            shut_down(&t, dispatcher).await;
         }
     }
 }
