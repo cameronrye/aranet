@@ -35,6 +35,10 @@
 //! escaped. Config validation therefore refuses backslashes in device
 //! addresses, aliases and the measurement name, so every line reads the same
 //! on InfluxDB 1.x, 2.x and 3.
+//!
+//! Validation also refuses a measurement name that starts with `#`. The name
+//! starts the line, InfluxDB reads a line that starts with `#` as a comment
+//! and stores nothing, and no escape changes that.
 
 use std::sync::Arc;
 use std::time::Duration;
