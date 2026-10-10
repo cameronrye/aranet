@@ -368,6 +368,9 @@ pub(crate) fn register_silent_dispatcher() {
 pub(crate) enum Reply {
     /// This status code with an empty body, every time.
     Status(u16),
+    /// Never. The request is recorded and then left waiting until the client
+    /// gives up or the test ends.
+    Hang,
 }
 
 /// One request that a [`RecordingServer`] route received.
@@ -389,7 +392,36 @@ pub(crate) struct RecordingServer {
     addr: std::net::SocketAddr,
     requests: Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
     notify: Arc<tokio::sync::Notify>,
+    in_flight: Arc<InFlight>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Requests a [`RecordingServer`] is answering right now, and the most it
+/// was ever answering at once.
+#[derive(Default)]
+struct InFlight {
+    now: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+}
+
+impl InFlight {
+    /// Count a request until the returned guard is dropped: when the handler
+    /// returns, or when a hanging handler is dropped because its client went
+    /// away.
+    fn enter(this: &Arc<Self>) -> InFlightGuard {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = this.now.fetch_add(1, SeqCst) + 1;
+        this.max.fetch_max(now, SeqCst);
+        InFlightGuard(Arc::clone(this))
+    }
+}
+
+struct InFlightGuard(Arc<InFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl RecordingServer {
@@ -397,14 +429,25 @@ impl RecordingServer {
     pub(crate) async fn start(routes: Vec<(&'static str, Reply)>) -> Self {
         let requests: Arc<std::sync::Mutex<Vec<RecordedRequest>>> = Arc::default();
         let notify = Arc::new(tokio::sync::Notify::new());
+        let in_flight: Arc<InFlight> = Arc::default();
 
         let mut router: axum::Router = axum::Router::new();
         for (path, reply) in routes {
-            let Reply::Status(code) = reply;
-            let status = axum::http::StatusCode::from_u16(code).expect("a valid status code");
+            let status =
+                |code| axum::http::StatusCode::from_u16(code).expect("a valid status code");
+            // The answer to each request in turn, the last one repeating for
+            // every later request. `None` leaves the request waiting.
+            let script: Arc<Vec<Option<axum::http::StatusCode>>> = Arc::new(match reply {
+                Reply::Status(code) => vec![Some(status(code))],
+                Reply::Hang => vec![None],
+            });
+            let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let requests = Arc::clone(&requests);
             let notify = Arc::clone(&notify);
+            let in_flight = Arc::clone(&in_flight);
             let handler = move |uri: axum::http::Uri, body: String| async move {
+                let _in_flight = InFlight::enter(&in_flight);
+                let turn = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 requests
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -413,7 +456,10 @@ impl RecordingServer {
                         body,
                     });
                 notify.notify_waiters();
-                status
+                match script[turn.min(script.len() - 1)] {
+                    Some(status) => status,
+                    None => std::future::pending().await,
+                }
             };
             router = router.route(path, axum::routing::post(handler));
         }
@@ -431,6 +477,7 @@ impl RecordingServer {
             addr,
             requests,
             notify,
+            in_flight,
             task,
         }
     }
@@ -446,6 +493,11 @@ impl RecordingServer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// The most requests this server was ever answering at the same time.
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.in_flight.max.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Wait until at least `n` requests have arrived, and return all of them.
@@ -492,6 +544,22 @@ pub(crate) async fn closed_port_url(path: &str) -> String {
         .port();
     drop(listener);
     format!("http://127.0.0.1:{port}{path}")
+}
+
+/// Check `condition` every 10 ms until it holds. Panics after 5 s, naming
+/// `what`.
+///
+/// For tests on real time, where the thing to wait for has no event of its
+/// own, such as a sink subscribing to the readings channel.
+pub(crate) async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out after 5 s waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 mod tests {
