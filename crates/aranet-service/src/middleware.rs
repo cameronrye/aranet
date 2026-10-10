@@ -141,11 +141,24 @@ fn ws_query_tokens(uri: &axum::http::Uri) -> Vec<String> {
     tokens
 }
 
+/// The token of an `Authorization: Bearer <token>` header (RFC 6750), which is
+/// how Prometheus and most HTTP clients send a key. The scheme is matched ASCII
+/// case-insensitively, whitespace around the token is ignored, and an empty
+/// token counts as none.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then(|| token.to_owned())
+}
+
 /// API key authentication middleware.
 ///
-/// Checks for the `X-API-Key` header and validates against the configured key.
-/// For WebSocket connections (which cannot set custom headers from browsers),
-/// also accepts a `token` query parameter.
+/// Validates the `X-API-Key` header against the configured key. Without that
+/// header, the request passes when the token of an `Authorization: Bearer <key>`
+/// header matches or, on `/api/ws`, when a `token` query parameter does:
+/// browsers can't set custom headers on a WebSocket upgrade, and a proxy in
+/// front of the service may add its own `Authorization` header.
 ///
 /// Returns 401 Unauthorized if the key is missing or invalid.
 pub async fn api_key_auth(
@@ -166,20 +179,23 @@ pub async fn api_key_auth(
     }
 
     // SECURITY NOTE: Query parameters may be logged by reverse proxies,
-    // appear in browser history, and leak via Referer headers. Prefer the
-    // X-API-Key header for non-browser clients.
+    // appear in browser history, and leak via Referer headers. Prefer a
+    // header (X-API-Key or Authorization: Bearer) for non-browser clients.
     let header_key = headers
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let provided_keys = match header_key {
         Some(key) => vec![key],
+        // Without X-API-Key, a bearer token and the /api/ws query token are
+        // both candidates: a proxy in front of the service may add its own
+        // Authorization header to the dashboard's WebSocket upgrade.
         None => {
             let tokens = ws_query_tokens(request.uri());
             if !tokens.is_empty() {
                 debug!("WebSocket auth via query parameter (prefer X-API-Key header)");
             }
-            tokens
+            bearer_token(&headers).into_iter().chain(tokens).collect()
         }
     };
 
@@ -199,7 +215,7 @@ pub async fn api_key_auth(
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": "Invalid or missing API key",
-                "hint": "Provide a valid API key in the X-API-Key header, or use the 'token' query parameter only for /api/ws"
+                "hint": "Provide the API key in the X-API-Key header or as Authorization: Bearer <key>, or use the 'token' query parameter only for /api/ws"
             })),
         )
             .into_response()
@@ -1117,5 +1133,158 @@ mod tests {
             assert_eq!(warnings.len(), 1, "{entry:?}: {warnings:?}");
             assert!(warnings[0].starts_with("security.allowed_hosts contains \"*\""));
         }
+    }
+
+    /// The status of `GET uri` with `headers`, through the auth middleware
+    /// with `test_security_config()`'s key. `/api/devices` and `/api/ws` are
+    /// routed.
+    async fn auth_status(uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+        let app = Router::new()
+            .route("/api/devices", get(|| async { StatusCode::OK }))
+            .route("/api/ws", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_security_config(),
+                api_key_auth,
+            ));
+        let mut request = Request::builder().uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The key in `test_security_config()`.
+    const CONFIGURED_KEY: &str = "1234567890abcdef1234567890abcdef";
+
+    // The messages of the tests below name the case and leave out the header
+    // value, which holds the key.
+
+    #[tokio::test]
+    async fn test_api_key_accepts_bearer_token() {
+        for (case, value) in [
+            ("one space", format!("Bearer {CONFIGURED_KEY}")),
+            (
+                "spaces around the token",
+                format!("Bearer   {CONFIGURED_KEY}  "),
+            ),
+        ] {
+            assert_eq!(
+                auth_status("/api/devices", &[("Authorization", &value)]).await,
+                StatusCode::OK,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bearer_scheme_is_case_insensitive() {
+        for scheme in ["bearer", "BEARER", "bEaReR"] {
+            let value = format!("{scheme} {CONFIGURED_KEY}");
+            assert_eq!(
+                auth_status("/api/devices", &[("Authorization", &value)]).await,
+                StatusCode::OK,
+                "{scheme:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bearer_with_wrong_key_is_rejected() {
+        for (case, value) in [
+            ("another key", "Bearer wrong-key".to_string()),
+            (
+                "the key with a character added",
+                format!("Bearer {CONFIGURED_KEY}0"),
+            ),
+            (
+                "the key without its first character",
+                format!("Bearer {}", &CONFIGURED_KEY[1..]),
+            ),
+            (
+                "no space after the scheme",
+                format!("Bearer{CONFIGURED_KEY}"),
+            ),
+            ("no token", "Bearer".to_string()),
+            ("an empty token", "Bearer   ".to_string()),
+        ] {
+            assert_eq!(
+                auth_status("/api/devices", &[("Authorization", &value)]).await,
+                StatusCode::UNAUTHORIZED,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_basic_auth_is_not_accepted() {
+        for (case, value) in [
+            ("the Basic scheme", format!("Basic {CONFIGURED_KEY}")),
+            ("the key without a scheme", CONFIGURED_KEY.to_string()),
+        ] {
+            assert_eq!(
+                auth_status("/api/devices", &[("Authorization", &value)]).await,
+                StatusCode::UNAUTHORIZED,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_x_api_key_is_checked_before_bearer() {
+        let bearer = format!("Bearer {CONFIGURED_KEY}");
+        assert_eq!(
+            auth_status(
+                "/api/devices",
+                &[("X-API-Key", "wrong-key"), ("Authorization", &bearer)]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            auth_status(
+                "/api/devices",
+                &[
+                    ("X-API-Key", CONFIGURED_KEY),
+                    ("Authorization", "Bearer wrong-key")
+                ]
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_websocket_accepts_query_token_or_bearer() {
+        let query = format!("/api/ws?token={CONFIGURED_KEY}");
+        let bearer = format!("Bearer {CONFIGURED_KEY}");
+        // An authenticating proxy may add its own bearer token to the
+        // dashboard's WebSocket upgrade: the query token still counts.
+        assert_eq!(
+            auth_status(&query, &[("Authorization", "Bearer proxy-token")]).await,
+            StatusCode::OK,
+            "a foreign bearer token hid the query token"
+        );
+        assert_eq!(
+            auth_status("/api/ws?token=wrong-key", &[("Authorization", &bearer)]).await,
+            StatusCode::OK,
+            "a wrong query token hid the bearer token"
+        );
+        // The query token still counts only on /api/ws, and X-API-Key alone
+        // decides when it is present.
+        assert_eq!(
+            auth_status(
+                &format!("/api/devices?token={CONFIGURED_KEY}"),
+                &[("Authorization", "Bearer proxy-token")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            auth_status(&query, &[("X-API-Key", "wrong-key")]).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

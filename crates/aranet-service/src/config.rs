@@ -429,7 +429,8 @@ impl RetentionConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     /// Enable API key authentication.
-    /// When enabled, clients must provide the API key in the `X-API-Key` header.
+    /// When enabled, clients must provide the API key in the `X-API-Key` header
+    /// or as `Authorization: Bearer <key>`.
     pub api_key_enabled: bool,
     /// The API key required for authentication (if enabled).
     /// Should be a secure random string of at least 32 characters.
