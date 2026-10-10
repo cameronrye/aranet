@@ -540,6 +540,20 @@ fn to_value(value: &toml::Value) -> Value {
     }
 }
 
+/// What a test leaves in [`TEMP_FILE_CREATED`]: it is given the temporary file's
+/// path.
+#[cfg(all(test, unix))]
+type TempFileHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Test seam: when set, [`write_private`] calls it on this thread with the
+    /// path of its temporary file, right after creating the file and before it
+    /// sets the owner or writes any contents.
+    static TEMP_FILE_CREATED: std::cell::RefCell<Option<TempFileHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Replace `path` with `contents` atomically, readable only by its owner.
 ///
 /// The contents go to a temporary file in the same directory, which is flushed to
@@ -593,6 +607,12 @@ pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
+    #[cfg(all(test, unix))]
+    TEMP_FILE_CREATED.with_borrow_mut(|created| {
+        if let Some(created) = created {
+            created(temp.path());
+        }
+    });
     // Keep the owner of the file being replaced. Only root can give a file to
     // another user; for anyone else this changes nothing or fails, which is fine.
     #[cfg(unix)]
@@ -1245,6 +1265,47 @@ value = 4
                 old_inode,
                 "the file should have been replaced"
             );
+        }
+
+        #[test]
+        fn write_private_temp_file_is_0600_from_creation() {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+
+            let dir = tempfile::tempdir().unwrap();
+            // A file created without a mode of its own shows what this process's
+            // umask allows. If that is already owner-only, a temporary file created
+            // with the default mode and made private later looks the same here.
+            let probe = dir.path().join("probe");
+            fs::File::create(&probe).unwrap();
+            if mode(&probe) & 0o077 == 0 {
+                eprintln!(
+                    "note: this umask already keeps group and others out of new files, so this \
+                     run can't tell a temporary file created 0600 from one made private later"
+                );
+            }
+            fs::remove_file(&probe).unwrap();
+            let path = dir.path().join("settings.toml");
+            fs::write(&path, "x = 1\n").unwrap();
+            set_mode(&path, 0o644);
+
+            // The temporary file's mode (in octal) and length when it is created.
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let record = Rc::clone(&seen);
+            TEMP_FILE_CREATED.set(Some(Box::new(move |temp: &Path| {
+                let length = fs::metadata(temp).unwrap().len();
+                record
+                    .borrow_mut()
+                    .push((format!("{:03o}", mode(temp)), length));
+            })));
+            let result = write_private(&path, b"api_key = \"secret\"\n");
+            TEMP_FILE_CREATED.set(None);
+            result.unwrap();
+
+            // Owner-only while still empty: the contents were never in a file that
+            // other users could open, not even for the time until a later chmod.
+            assert_eq!(*seen.borrow(), [("600".to_string(), 0)]);
+            assert_eq!(fs::read_to_string(&path).unwrap(), "api_key = \"secret\"\n");
         }
 
         #[test]
