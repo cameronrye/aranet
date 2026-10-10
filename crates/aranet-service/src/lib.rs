@@ -436,7 +436,9 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     {
         use crate::influxdb::InfluxDbWriter;
         let influxdb_writer = InfluxDbWriter::new(Arc::clone(&state));
-        influxdb_writer.start().await;
+        if let Some(handle) = influxdb_writer.start().await {
+            background.push(handle);
+        }
     }
 
     let _mdns_handle = {
@@ -821,6 +823,12 @@ mod tests {
                 }],
                 ..WebhookConfig::default()
             },
+            influxdb: InfluxDbConfig {
+                enabled: true,
+                url: crate::test_support::closed_port_url("").await,
+                org: "aranet".to_string(),
+                ..InfluxDbConfig::default()
+            },
             ..Config::default()
         };
         let t = crate::test_support::TestState::with_config(config);
@@ -832,8 +840,14 @@ mod tests {
         {
             background.push(handle);
         }
+        if let Some(handle) = influxdb::InfluxDbWriter::new(Arc::clone(&t.state))
+            .start()
+            .await
+        {
+            background.push(handle);
+        }
         let sinks = background.len();
-        assert_eq!(sinks, 1, "every enabled sink returns its handle");
+        assert_eq!(sinks, 2, "every enabled sink returns its handle");
         crate::test_support::wait_until("every sink to subscribe to readings", || {
             t.state.readings_tx.receiver_count() == sinks
         })

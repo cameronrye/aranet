@@ -368,6 +368,9 @@ pub(crate) fn register_silent_dispatcher() {
 pub(crate) enum Reply {
     /// This status code with an empty body, every time.
     Status(u16),
+    /// These status codes in turn, one per request, and then the last one
+    /// again for every later request.
+    Sequence(Vec<u16>),
     /// Never. The request is recorded and then left waiting until the client
     /// gives up or the test ends.
     Hang,
@@ -439,6 +442,10 @@ impl RecordingServer {
             // every later request. `None` leaves the request waiting.
             let script: Arc<Vec<Option<axum::http::StatusCode>>> = Arc::new(match reply {
                 Reply::Status(code) => vec![Some(status(code))],
+                Reply::Sequence(codes) => {
+                    assert!(!codes.is_empty(), "a Reply::Sequence needs a status");
+                    codes.into_iter().map(|code| Some(status(code))).collect()
+                }
                 Reply::Hang => vec![None],
             });
             let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
