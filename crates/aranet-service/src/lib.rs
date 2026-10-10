@@ -1133,6 +1133,54 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), contents);
     }
 
+    /// `--database '~/x.db'` (quoted, so the shell leaves the `~` alone) is
+    /// expanded like a `storage.path` from the file: the overrides are applied
+    /// before the expansion.
+    #[test]
+    fn load_config_expands_home_in_database_override() {
+        let home = dirs::home_dir().expect("a home directory");
+        let dir = tempfile::tempdir().unwrap();
+
+        let loaded = load_config(&RunOptions {
+            config: Some(dir.path().join("server.toml")),
+            database: Some(PathBuf::from("~/aranet-load-config-test/override.db")),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            loaded.config.storage.path,
+            home.join("aranet-load-config-test").join("override.db")
+        );
+    }
+
+    /// A config file that is there but can't be parsed stops startup. Running
+    /// on the defaults instead would move the service to the default bind
+    /// address and database without a word.
+    #[test]
+    fn load_config_fails_on_unparseable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        std::fs::write(&config_path, "[server\nbind = \"127.0.0.1:8080\"\n").unwrap();
+
+        let result = load_config(&RunOptions {
+            config: Some(config_path.clone()),
+            database: Some(dir.path().join("x.db")),
+            ..Default::default()
+        });
+
+        let Err(err) = result else {
+            panic!("an unparseable config file fell back to the defaults");
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<ConfigError>(),
+                Some(ConfigError::Parse { path, .. }) if *path == config_path
+            ),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn unexpanded_database_is_reported_until_it_is_moved() {
         let dir = tempfile::tempdir().unwrap();

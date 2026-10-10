@@ -1476,6 +1476,59 @@ fn test_server_daemon_reports_invalid_bind() {
     assert!(!db_path.exists(), "the database was created");
 }
 
+/// Before it detaches, `aranet server --daemon` must check the configuration
+/// the detached server will get: the file `--config` names, with `--database`
+/// applied to it. A mistake in that file is reported, and a value that the
+/// command line replaces is not.
+#[test]
+fn test_server_daemon_checks_config_file_with_overrides() {
+    let env = TestEnv::new();
+    // The file's broadcast_buffer is invalid, and its empty storage.path is
+    // replaced by --database. --bind is a host name, so that a server which
+    // is started anyway exits by itself.
+    let server_config = env.config_dir.join("server.toml");
+    fs::write(
+        &server_config,
+        "[server]\nbroadcast_buffer = 0\n\n[storage]\npath = \"\"\n",
+    )
+    .expect("write server.toml");
+    let db_path = env.db_path();
+    let output = env.run(&[
+        "server",
+        "--daemon",
+        "--no-collector",
+        "--bind",
+        "localhost:8080",
+        "--config",
+        server_config.to_str().expect("UTF-8 temp path"),
+        "--database",
+        db_path.to_str().expect("UTF-8 temp path"),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "--daemon accepted an invalid configuration\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Invalid server configuration"),
+        "should say that the server configuration is invalid: {stderr}"
+    );
+    assert!(
+        stderr.contains("server.broadcast_buffer"),
+        "should report the mistake in the file --config names: {stderr}"
+    );
+    assert!(
+        !stderr.contains("storage.path"),
+        "--database replaces storage.path, so the file's value is no error: {stderr}"
+    );
+    assert!(
+        !stdout.contains("started"),
+        "nothing was started, but the output says so: {stdout}"
+    );
+}
+
 #[test]
 #[ignore = "requires BLE hardware"]
 fn test_invalid_device() {

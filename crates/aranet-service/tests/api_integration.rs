@@ -1123,3 +1123,74 @@ async fn test_removing_first_of_two_devices_keeps_shipped_comments() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert_eq!(std::fs::read_to_string(&config_path).unwrap(), shipped);
 }
+
+// ==========================================================================
+// Startup
+// ==========================================================================
+
+/// An earlier version didn't expand `~` in `storage.path`, so it kept its
+/// database under a directory named `~` in its working directory. The service
+/// now uses another database, and every start must say so for as long as the
+/// old file is there.
+///
+/// The warning depends on the working directory, so this runs the binary in a
+/// directory of its own. Unix only: `dirs` takes the home directory from
+/// `HOME` there, which keeps `~` inside the `TempDir`.
+#[cfg(unix)]
+#[test]
+fn test_startup_warns_about_database_in_tilde_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("cwd");
+    let legacy = cwd.join("~").join("old").join("data.db");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, b"").unwrap();
+    // The host name stops the service once the configuration is loaded: after
+    // the warning, and before it listens or opens a database. It is given
+    // twice, so that neither a lost file nor a lost override starts a server.
+    let config = dir.path().join("server.toml");
+    std::fs::write(
+        &config,
+        "[server]\nbind = \"localhost:8080\"\n\n[storage]\npath = \"~/old/data.db\"\n",
+    )
+    .unwrap();
+
+    let start = || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_aranet-service"))
+            .arg("--config")
+            .arg(&config)
+            .args(["--bind", "localhost:8080", "--no-collector", "run"])
+            .current_dir(&cwd)
+            .env("HOME", &home)
+            .env("NO_COLOR", "1")
+            .env_remove("RUST_LOG")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to start aranet-service");
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.contains("invalid bind address 'localhost:8080'"),
+            "{output}"
+        );
+        output
+    };
+
+    let output = start();
+    let warning = format!(
+        "Found a database at ./~/old/data.db, created by an earlier version that did not \
+         expand '~'; the service now uses {}.",
+        home.join("old").join("data.db").display()
+    );
+    assert!(output.contains(&warning), "{output}");
+
+    // Moving or removing the old file is what ends the warning.
+    std::fs::remove_file(&legacy).unwrap();
+    let output = start();
+    assert!(!output.contains("Found a database"), "{output}");
+    assert!(!home.join("old").exists(), "a database was opened");
+}
