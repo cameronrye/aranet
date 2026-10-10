@@ -1108,5 +1108,50 @@ mod tests {
 
             shut_down(&t, dispatcher).await;
         }
+
+        #[tokio::test]
+        async fn webhook_failed_delivery_starts_no_cooldown() {
+            let (logs, _guard) = CapturedLogs::start();
+            let server = RecordingServer::start(vec![("/hook", Reply::Status(500))]).await;
+            let t = TestState::with_config(webhook_config(vec![endpoint(
+                server.url("/hook"),
+                "co2_high",
+            )]));
+            // One attempt per alert, so the delivery has failed as soon as the
+            // endpoint has answered 500, and a second request can only be a
+            // second alert.
+            let settings = WebhookSettings {
+                retry: RetryPolicy {
+                    attempts: 1,
+                    base_delay: Duration::ZERO,
+                },
+                ..WebhookSettings::default()
+            };
+            let dispatcher = start_dispatcher(&t, settings).await;
+
+            t.state.readings_tx.send(reading_for(X, 1500, 80)).unwrap();
+            server.wait_for_requests(1).await;
+            // The dispatcher says so once it has dealt with the failed
+            // delivery; nothing else about that can be awaited.
+            let failed = format!("All webhook deliveries failed for co2_high alert on {X}");
+            wait_until("the dispatcher to report the failed delivery", || {
+                logs.text().contains(&failed)
+            })
+            .await;
+
+            // Still over the threshold. The first alert reached no endpoint,
+            // so the 300 s cooldown must not hold this one back.
+            t.state.readings_tx.send(reading_for(X, 1600, 80)).unwrap();
+            let requests = server.wait_for_requests(2).await;
+            let second: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+            assert_eq!(second["value"], 1600.0, "{requests:?}");
+
+            shut_down(&t, dispatcher).await;
+            let text = logs.text();
+            assert!(
+                !text.contains(&format!("Skipping co2_high alert for {X} (cooldown: ")),
+                "a delivery that failed started the cooldown:\n{text}"
+            );
+        }
     }
 }
