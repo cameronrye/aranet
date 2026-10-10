@@ -32,14 +32,23 @@
 //!
 //! The client automatically reconnects if the connection is lost. Connection
 //! errors are logged but don't stop the publisher task.
+//!
+//! Readings wait in the client's queue of 100 messages until they are sent.
+//! While the broker is unreachable or too slow, a reading that doesn't fit is
+//! dropped instead of waiting, with a warning at most once a minute, so the
+//! publisher keeps up. When the broker is back, the messages queued at the
+//! start of the outage (at most 100) are sent first, then fresh readings.
+//! Home Assistant discovery waits for room for up to 10 s.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::DropLog;
 use crate::config::MqttConfig;
 use crate::state::{AppState, ReadingEvent};
 
@@ -61,15 +70,16 @@ impl MqttPublisher {
     /// 2. Subscribes to the internal readings broadcast channel
     /// 3. Publishes each reading to the broker
     ///
-    /// Returns immediately; publishing happens in the background.
-    pub async fn start(&self) {
+    /// Returns the task's handle, or `None` when MQTT is disabled. The task
+    /// stops when the service shuts down.
+    pub async fn start(&self) -> Option<JoinHandle<()>> {
         let config = self.state.config.read().await;
         let mqtt_config = config.mqtt.clone();
         drop(config);
 
         if !mqtt_config.enabled {
             info!("MQTT publisher is disabled");
-            return;
+            return None;
         }
 
         info!("Starting MQTT publisher to {}", mqtt_config.broker);
@@ -77,9 +87,11 @@ impl MqttPublisher {
         let state = Arc::clone(&self.state);
         let shutdown_rx = self.state.subscribe_shutdown();
 
-        tokio::spawn(async move {
-            run_mqtt_publisher(state, mqtt_config, shutdown_rx).await;
-        });
+        Some(tokio::spawn(run_mqtt_publisher(
+            state,
+            mqtt_config,
+            shutdown_rx,
+        )))
     }
 }
 
@@ -178,24 +190,44 @@ async fn run_mqtt_publisher(
         }
     });
 
-    // Publish Home Assistant discovery messages if enabled
+    // Publish Home Assistant discovery messages if enabled. They wait in the
+    // client's queue until the event loop has connected.
     if config.homeassistant {
-        // Small delay to ensure MQTT connection is established
-        tokio::time::sleep(Duration::from_secs(2)).await;
         let devices = configured_devices(&state).await;
-        if let Err(e) = publish_ha_discovery(&client, &config, &devices, qos).await {
-            warn!("Failed to publish HA discovery: {}", e);
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                info!("MQTT publisher received stop signal");
+                stop_publisher(&client, &eventloop_handle);
+                return;
+            }
+            _ = publish_ha_discovery_bounded(&client, &config, &devices, qos) => {}
         }
     }
+
+    // Readings dropped because the client's queue was full.
+    let mut drops = DropLog::default();
 
     // Main publishing loop
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                info!("MQTT publisher received stop signal");
+                break;
+            }
             result = readings_rx.recv() => {
                 match result {
                     Ok(event) => {
-                        if let Err(e) = publish_reading(&client, &config, &state, &event, qos).await {
-                            warn!("Failed to publish reading: {}", e);
+                        let device_name = configured_device_name(&state, &event.device_id)
+                            .await
+                            .unwrap_or_else(|| event.device_id.clone());
+                        let outcome = publish_reading(&client, &config, &device_name, &event, qos);
+                        if outcome == PublishOutcome::Dropped && drops.record() {
+                            warn!(
+                                "MQTT broker unreachable or slow; dropped {} readings",
+                                drops.dropped
+                            );
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -210,58 +242,66 @@ async fn run_mqtt_publisher(
             result = reload_rx.changed() => {
                 if result.is_ok() && config.homeassistant {
                     let devices = configured_devices(&state).await;
-                    if let Err(e) = publish_ha_discovery(&client, &config, &devices, qos).await {
-                        warn!("Failed to refresh HA discovery after config reload: {}", e);
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => {
+                            info!("MQTT publisher received stop signal");
+                            break;
+                        }
+                        _ = publish_ha_discovery_bounded(&client, &config, &devices, qos) => {}
                     }
-                }
-            }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!("MQTT publisher received stop signal");
-                    break;
                 }
             }
         }
     }
 
-    // Disconnect gracefully and abort the event loop task
-    if let Err(e) = client.disconnect().await {
+    stop_publisher(&client, &eventloop_handle);
+}
+
+/// Disconnect from the broker and stop the event loop task.
+fn stop_publisher(client: &AsyncClient, eventloop: &JoinHandle<()>) {
+    // Don't wait: while the broker is unreachable the queue is full, and
+    // `disconnect().await` would wait for room forever.
+    if let Err(e) = client.try_disconnect() {
         debug!("Error disconnecting MQTT client: {}", e);
     }
-    eventloop_handle.abort();
+    eventloop.abort();
 
     info!("MQTT publisher stopped");
 }
 
-/// Publish a reading to MQTT topics.
-async fn publish_reading(
+/// Whether a reading went to the MQTT client's queue.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    /// Every topic of the reading was queued.
+    Published,
+    /// The queue was full (the broker is unreachable or slow) or the event
+    /// loop had stopped, so the reading's remaining topics were skipped.
+    Dropped,
+}
+
+/// Queue a reading's MQTT messages without waiting for room in the client's
+/// queue.
+///
+/// `device_name` is the device's alias or address; it becomes the topic's
+/// device segment. At the first message that doesn't fit, the reading's
+/// remaining topics are skipped and [`PublishOutcome::Dropped`] is returned,
+/// so a stalled broker never stalls the publisher, and the backlog it gets
+/// when it is back is at most one queue, not the whole outage.
+fn publish_reading(
     client: &AsyncClient,
     config: &MqttConfig,
-    state: &AppState,
+    device_name: &str,
     event: &ReadingEvent,
     qos: QoS,
-) -> Result<(), rumqttc::ClientError> {
-    let device_name = sanitize_topic_segment(
-        configured_device_name(state, &event.device_id)
-            .await
-            .as_deref()
-            .unwrap_or(&event.device_id),
-    );
-    let prefix = &config.topic_prefix;
-    let retain = config.retain;
-
-    // Publish full JSON reading
-    let json_topic = format!("{}/{}/json", prefix, device_name);
-    let json_payload = serde_json::to_string(&event.reading).unwrap_or_default();
-    client
-        .publish(&json_topic, qos, retain, json_payload.as_bytes())
-        .await?;
+) -> PublishOutcome {
+    let device_name = sanitize_topic_segment(device_name);
+    let reading = &event.reading;
 
     // Publish individual metrics, filtered by device capabilities.
     // When device type can be determined from the name, use capability checks.
     // When it cannot (e.g. MAC address), fall back to data-driven detection
     // to avoid suppressing valid readings.
-    let reading = &event.reading;
     let device_type = aranet_types::DeviceType::from_name(&event.device_id);
     let has_co2 = device_type.map_or(reading.co2 > 0, |dt| dt.has_co2());
     let has_temp = device_type.map_or(reading.temperature != 0.0 || reading.humidity > 0, |dt| {
@@ -269,118 +309,57 @@ async fn publish_reading(
     });
     let has_pressure = device_type.map_or(reading.pressure > 0.0, |dt| dt.has_pressure());
 
-    if has_co2 {
-        let co2_topic = format!("{}/{}/co2", prefix, device_name);
-        client
-            .publish(&co2_topic, qos, retain, reading.co2.to_string().as_bytes())
-            .await?;
-    }
-
-    if has_temp {
-        let temp_topic = format!("{}/{}/temperature", prefix, device_name);
-        client
-            .publish(
-                &temp_topic,
-                qos,
-                retain,
-                format!("{:.2}", reading.temperature).as_bytes(),
-            )
-            .await?;
-
-        let humidity_topic = format!("{}/{}/humidity", prefix, device_name);
-        client
-            .publish(
-                &humidity_topic,
-                qos,
-                retain,
-                reading.humidity.to_string().as_bytes(),
-            )
-            .await?;
-    }
-
-    if has_pressure {
-        let pressure_topic = format!("{}/{}/pressure", prefix, device_name);
-        client
-            .publish(
-                &pressure_topic,
-                qos,
-                retain,
-                format!("{:.2}", reading.pressure).as_bytes(),
-            )
-            .await?;
-    }
-
-    // Battery (all devices have this)
-    let battery_topic = format!("{}/{}/battery", prefix, device_name);
-    client
-        .publish(
-            &battery_topic,
-            qos,
-            retain,
-            reading.battery.to_string().as_bytes(),
-        )
-        .await?;
-
-    // Status
-    let status_topic = format!("{}/{}/status", prefix, device_name);
-    let status_str = match reading.status {
+    let status = match reading.status {
         aranet_types::Status::Green => "green",
         aranet_types::Status::Yellow => "yellow",
         aranet_types::Status::Red => "red",
         aranet_types::Status::Error => "error",
         _ => "unknown",
     };
-    client
-        .publish(&status_topic, qos, retain, status_str.as_bytes())
-        .await?;
 
-    // Radon (if available)
-    if let Some(radon) = reading.radon {
-        let radon_topic = format!("{}/{}/radon", prefix, device_name);
-        client
-            .publish(&radon_topic, qos, retain, radon.to_string().as_bytes())
-            .await?;
+    // (metric, payload) in publishing order: the full JSON reading first.
+    let mut messages = vec![("json", serde_json::to_string(reading).unwrap_or_default())];
+    if has_co2 {
+        messages.push(("co2", reading.co2.to_string()));
     }
-
-    // Radon averages (if available)
+    if has_temp {
+        messages.push(("temperature", format!("{:.2}", reading.temperature)));
+        messages.push(("humidity", reading.humidity.to_string()));
+    }
+    if has_pressure {
+        messages.push(("pressure", format!("{:.2}", reading.pressure)));
+    }
+    // Battery (all devices have this)
+    messages.push(("battery", reading.battery.to_string()));
+    messages.push(("status", status.to_string()));
+    if let Some(radon) = reading.radon {
+        messages.push(("radon", radon.to_string()));
+    }
     if let Some(avg) = reading.radon_avg_24h {
-        let topic = format!("{}/{}/radon_avg_24h", prefix, device_name);
-        client
-            .publish(&topic, qos, retain, avg.to_string().as_bytes())
-            .await?;
+        messages.push(("radon_avg_24h", avg.to_string()));
     }
     if let Some(avg) = reading.radon_avg_7d {
-        let topic = format!("{}/{}/radon_avg_7d", prefix, device_name);
-        client
-            .publish(&topic, qos, retain, avg.to_string().as_bytes())
-            .await?;
+        messages.push(("radon_avg_7d", avg.to_string()));
     }
     if let Some(avg) = reading.radon_avg_30d {
-        let topic = format!("{}/{}/radon_avg_30d", prefix, device_name);
-        client
-            .publish(&topic, qos, retain, avg.to_string().as_bytes())
-            .await?;
+        messages.push(("radon_avg_30d", avg.to_string()));
     }
-
-    // Radiation rate (if available)
     if let Some(rate) = reading.radiation_rate {
-        let rate_topic = format!("{}/{}/radiation_rate", prefix, device_name);
-        client
-            .publish(&rate_topic, qos, retain, format!("{:.4}", rate).as_bytes())
-            .await?;
+        messages.push(("radiation_rate", format!("{:.4}", rate)));
+    }
+    if let Some(total) = reading.radiation_total {
+        messages.push(("radiation_total", format!("{:.6}", total)));
     }
 
-    // Radiation total (if available)
-    if let Some(total) = reading.radiation_total {
-        let total_topic = format!("{}/{}/radiation_total", prefix, device_name);
-        client
-            .publish(
-                &total_topic,
-                qos,
-                retain,
-                format!("{:.6}", total).as_bytes(),
-            )
-            .await?;
+    for (metric, payload) in messages {
+        let topic = format!("{}/{}/{}", config.topic_prefix, device_name, metric);
+        if let Err(e) = client.try_publish(topic, qos, config.retain, payload) {
+            debug!(
+                "MQTT queue refused {} for {}: {}; skipping the rest of the reading",
+                metric, event.device_id, e
+            );
+            return PublishOutcome::Dropped;
+        }
     }
 
     debug!(
@@ -388,7 +367,7 @@ async fn publish_reading(
         event.device_id, reading.co2
     );
 
-    Ok(())
+    PublishOutcome::Published
 }
 
 async fn configured_devices(state: &AppState) -> Vec<crate::config::DeviceConfig> {
@@ -408,6 +387,44 @@ async fn configured_device_name(state: &AppState, device_id: &str) -> Option<Str
                 .clone()
                 .unwrap_or_else(|| device.address.clone())
         })
+}
+
+/// Longest time Home Assistant discovery waits for room in the MQTT client's
+/// queue.
+pub(crate) const HA_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`publish_ha_discovery`], given at most [`HA_DISCOVERY_TIMEOUT`]. Returns
+/// whether every discovery message was queued; otherwise warns.
+///
+/// Discovery messages wait for room in the queue, unlike readings, but a
+/// broker that stays unreachable must not stall the publisher. Discovery is
+/// published again after the next device change.
+async fn publish_ha_discovery_bounded(
+    client: &AsyncClient,
+    config: &MqttConfig,
+    devices: &[crate::config::DeviceConfig],
+    qos: QoS,
+) -> bool {
+    match tokio::time::timeout(
+        HA_DISCOVERY_TIMEOUT,
+        publish_ha_discovery(client, config, devices, qos),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!("Failed to publish HA discovery: {}", e);
+            false
+        }
+        Err(_) => {
+            warn!(
+                "HA discovery did not fit in the MQTT queue within {}s (broker unreachable?); \
+                 it is published again after the next device change",
+                HA_DISCOVERY_TIMEOUT.as_secs()
+            );
+            false
+        }
+    }
 }
 
 /// Publish Home Assistant MQTT auto-discovery messages for all configured devices.
@@ -649,5 +666,160 @@ mod tests {
             "Aranet\u{2622}_30ED1"
         );
         assert_eq!(sanitize_topic_segment("Küche"), "Küche");
+    }
+
+    /// A reading from an Aranet4, which publishes 7 topics.
+    fn aranet4_event() -> ReadingEvent {
+        ReadingEvent {
+            device_id: "Aranet4 12345".to_string(),
+            reading: aranet_store::StoredReading {
+                id: 1,
+                device_id: "Aranet4 12345".to_string(),
+                co2: 800,
+                temperature: 22.5,
+                humidity: 45,
+                pressure: 1013.0,
+                battery: 85,
+                status: aranet_types::Status::Green,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+                radon_avg_24h: None,
+                radon_avg_7d: None,
+                radon_avg_30d: None,
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        }
+    }
+
+    /// A client whose queue holds `capacity` requests. Its event loop is
+    /// returned but never polled, so nothing connects and the queue never
+    /// drains, as while the broker is unreachable.
+    fn client_with_queue(capacity: usize) -> (AsyncClient, rumqttc::EventLoop) {
+        AsyncClient::new(MqttOptions::new("aranet-test", "127.0.0.1", 1883), capacity)
+    }
+
+    /// `count` Aranet4s, each with 5 discovery messages.
+    fn aranet4_devices(count: usize) -> Vec<crate::config::DeviceConfig> {
+        (0..count)
+            .map(|i| crate::config::DeviceConfig {
+                address: format!("Aranet4 {i:05}"),
+                alias: None,
+                poll_interval: 60,
+            })
+            .collect()
+    }
+
+    /// Five Aranet4s: 25 discovery messages.
+    fn five_devices() -> Vec<crate::config::DeviceConfig> {
+        aranet4_devices(5)
+    }
+
+    #[test]
+    fn mqtt_publish_reading_does_not_block_when_queue_full() {
+        let (client, _eventloop) = client_with_queue(1);
+
+        let outcome = publish_reading(
+            &client,
+            &MqttConfig::default(),
+            "Office",
+            &aranet4_event(),
+            QoS::AtMostOnce,
+        );
+
+        assert_eq!(outcome, PublishOutcome::Dropped);
+    }
+
+    #[test]
+    fn mqtt_publish_reading_queues_every_topic_when_there_is_room() {
+        // Exactly the reading's 7 topics fit.
+        let (client, _eventloop) = client_with_queue(7);
+
+        let outcome = publish_reading(
+            &client,
+            &MqttConfig::default(),
+            "Office",
+            &aranet4_event(),
+            QoS::AtMostOnce,
+        );
+
+        assert_eq!(outcome, PublishOutcome::Published);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mqtt_ha_discovery_is_bounded() {
+        let (client, _eventloop) = client_with_queue(1);
+        let config = MqttConfig {
+            homeassistant: true,
+            ..MqttConfig::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let published =
+            publish_ha_discovery_bounded(&client, &config, &five_devices(), QoS::AtMostOnce).await;
+
+        let waited = started.elapsed();
+        assert!(!published);
+        assert!(
+            waited <= HA_DISCOVERY_TIMEOUT + Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mqtt_ha_discovery_is_queued_at_once_when_there_is_room() {
+        let (client, _eventloop) = client_with_queue(100);
+        let config = MqttConfig {
+            homeassistant: true,
+            ..MqttConfig::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let published =
+            publish_ha_discovery_bounded(&client, &config, &five_devices(), QoS::AtMostOnce).await;
+
+        assert!(published);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn mqtt_publisher_stops_promptly_while_broker_unreachable() {
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+        // Nothing listens there, so the event loop never connects and the
+        // client's queue of 100 never drains.
+        let broker = crate::test_support::closed_port_url("")
+            .await
+            .replacen("http://", "mqtt://", 1);
+        let t = crate::test_support::TestState::with_config(crate::config::Config {
+            mqtt: MqttConfig {
+                enabled: true,
+                broker,
+                homeassistant: true,
+                ..MqttConfig::default()
+            },
+            // 125 discovery messages, more than the queue holds.
+            devices: aranet4_devices(25),
+            ..crate::config::Config::default()
+        });
+
+        let publisher = MqttPublisher::new(Arc::clone(&t.state))
+            .start()
+            .await
+            .expect("MQTT is enabled");
+        // The first 20 devices' messages fill the queue, and discovery waits
+        // for room for the 21st's.
+        crate::test_support::wait_until("HA discovery to fill the MQTT queue", || {
+            logs.text()
+                .contains("Published HA discovery for device: Aranet4 00019")
+        })
+        .await;
+
+        // Shutdown ends discovery, and the publisher disconnects without
+        // waiting for room in the full queue.
+        t.state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), publisher)
+            .await
+            .expect("the publisher stops within 5 s of shutdown")
+            .expect("the publisher does not panic");
     }
 }
