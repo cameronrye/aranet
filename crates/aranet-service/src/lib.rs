@@ -39,6 +39,7 @@
 //!
 //! ```toml
 //! [server]
+//! # An IP address and port; host names such as "localhost" are rejected.
 //! bind = "127.0.0.1:8080"
 //!
 //! [storage]
@@ -227,6 +228,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::Router;
 use tokio::task::JoinHandle;
 use tower_http::trace::TraceLayer;
@@ -274,6 +276,18 @@ pub struct RunOptions {
     pub database: Option<PathBuf>,
     /// Disable the background collector.
     pub no_collector: bool,
+}
+
+/// A validated service configuration and the file it came from, as returned by
+/// [`load_config`].
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    /// The configuration, with the command-line overrides applied.
+    pub config: Config,
+    /// The config file: [`RunOptions::config`], or
+    /// [`config::default_config_path`]. It need not exist. The service saves
+    /// device changes made through the API here.
+    pub path: PathBuf,
 }
 
 /// Default log directives for the service binaries: request/response tracing at
@@ -348,27 +362,76 @@ pub fn app(
         .with_state(state)
 }
 
-/// Run the HTTP service until shutdown.
-pub async fn run(options: RunOptions) -> anyhow::Result<()> {
-    let config_path = options
+/// Load the service configuration: read the config file, apply the
+/// command-line overrides and validate the result.
+///
+/// The file is [`RunOptions::config`], or [`config::default_config_path`] when
+/// that is `None`. A file that doesn't exist gives the defaults.
+/// [`RunOptions::bind`] and [`RunOptions::database`] replace `server.bind` and
+/// `storage.path` in the returned config only; they are never written to the
+/// file.
+///
+/// Errors wrap [`ConfigError`]; use `anyhow::Error::downcast_ref` to inspect
+/// them.
+pub fn load_config(options: &RunOptions) -> anyhow::Result<LoadedConfig> {
+    prepare_config(options, true)
+}
+
+/// Check the service configuration exactly as [`load_config`] does, without
+/// writing anything.
+///
+/// `aranet server --daemon` calls this before it detaches, so configuration
+/// errors reach the terminal instead of a process whose output is discarded.
+pub fn check_config(options: &RunOptions) -> anyhow::Result<()> {
+    prepare_config(options, false)?;
+    Ok(())
+}
+
+/// The body of [`load_config`] (`save_generated_key` true) and
+/// [`check_config`] (false).
+fn prepare_config(options: &RunOptions, _save_generated_key: bool) -> anyhow::Result<LoadedConfig> {
+    let path = options
         .config
         .clone()
         .unwrap_or_else(config::default_config_path);
 
-    let mut config = if config_path.exists() {
-        Config::load(&config_path)?
+    let mut config = if path.exists() {
+        Config::load(&path)?
     } else {
         Config::default()
     };
 
-    if let Some(bind) = options.bind {
-        config.server.bind = bind;
+    if let Some(bind) = &options.bind {
+        config.server.bind = bind.clone();
     }
-    if let Some(db_path) = options.database {
-        config.storage.path = db_path;
+    if let Some(database) = &options.database {
+        config.storage.path = database.clone();
     }
 
     config.validate()?;
+
+    tracing::info!("Using config {}", path.display());
+    Ok(LoadedConfig { config, path })
+}
+
+/// Run the HTTP service until shutdown.
+///
+/// Loads the configuration with [`load_config`] and listens on `server.bind`
+/// before anything else, so an invalid configuration or a port that is
+/// already in use fails before the database is opened, the collector uses
+/// Bluetooth or any integration starts.
+pub async fn run(options: RunOptions) -> anyhow::Result<()> {
+    let LoadedConfig { config, path } = load_config(&options)?;
+
+    let addr = config
+        .server
+        .socket_addr()
+        .expect("load_config validated server.bind");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to listen on {addr}"))?;
+    let bound = listener.local_addr()?;
+    tracing::info!("Listening on {bound}");
 
     tracing::info!("Opening database at {:?}", config.storage.path);
     // Opening creates the file and migrates the schema, and can wait for
@@ -376,7 +439,7 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     // blocking thread.
     let db_path = config.storage.path.clone();
     let store = db::run_blocking(move || aranet_store::Store::open(db_path)).await?;
-    let state = AppState::with_config_path(store, config.clone(), config_path);
+    let state = AppState::with_config_path(store, config.clone(), path);
 
     let security_config = Arc::new(config.security.clone());
     let rate_limit_state = Arc::new(middleware::RateLimitState::new());
@@ -456,10 +519,6 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     )
     .layer(middleware::cors_layer(&config.security));
 
-    let addr: SocketAddr = config.server.bind.parse()?;
-    tracing::info!("Starting server on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -899,5 +958,140 @@ mod tests {
         assert!(drops.record_at(at(60)), "a minute later it warns again");
         assert!(!drops.record_at(at(61)));
         assert_eq!(drops.dropped, 5);
+    }
+
+    #[test]
+    fn load_config_uses_defaults_when_config_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("server.toml");
+
+        let loaded = load_config(&RunOptions {
+            config: Some(missing.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(loaded.path, missing);
+        assert_eq!(loaded.config.server.bind, ServerConfig::default().bind);
+        assert!(loaded.config.devices.is_empty());
+        assert!(!missing.exists(), "loading created the config file");
+    }
+
+    #[test]
+    fn load_config_applies_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        let contents = "[server]\nbind = \"127.0.0.1:8080\"\n";
+        std::fs::write(&config_path, contents).unwrap();
+        let database = dir.path().join("x.db");
+
+        let loaded = load_config(&RunOptions {
+            config: Some(config_path.clone()),
+            bind: Some("127.0.0.1:9".to_string()),
+            database: Some(database.clone()),
+            no_collector: true,
+        })
+        .unwrap();
+
+        assert_eq!(loaded.config.server.bind, "127.0.0.1:9");
+        assert_eq!(loaded.config.storage.path, database);
+        assert_eq!(loaded.path, config_path);
+        // The overrides live only in the returned value.
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), contents);
+        assert!(!database.exists(), "loading opened the database");
+    }
+
+    #[test]
+    fn check_config_reports_what_load_config_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = |bind: &str| RunOptions {
+            config: Some(dir.path().join("server.toml")),
+            bind: Some(bind.to_string()),
+            database: Some(dir.path().join("x.db")),
+            no_collector: false,
+        };
+
+        check_config(&options("127.0.0.1:9")).unwrap();
+        let err = check_config(&options("localhost:8080")).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("invalid bind address 'localhost:8080'"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "check_config created a file"
+        );
+    }
+
+    /// Write `dir/server.toml` with `bind` and a database at `dir/sub/aranet.db`.
+    /// Returns the config path. A single-quoted TOML string needs no escaping,
+    /// so Windows paths work too.
+    fn write_server_toml(dir: &std::path::Path, bind: &str) -> PathBuf {
+        let path = dir.join("server.toml");
+        let database = dir.join("sub").join("aranet.db");
+        let contents = format!(
+            "[server]\nbind = \"{bind}\"\n\n[storage]\npath = '{}'\n",
+            database.display()
+        );
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Run the service and return its error. The limit turns a regression that
+    /// starts serving into a failure instead of a hung test.
+    async fn run_until_error(config: PathBuf) -> anyhow::Error {
+        let options = RunOptions {
+            config: Some(config),
+            no_collector: true,
+            ..Default::default()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), run(options))
+            .await
+            .expect("run() started serving instead of failing")
+            .expect_err("run() returned Ok")
+    }
+
+    #[tokio::test]
+    async fn test_run_rejects_host_name_bind_before_opening_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_server_toml(dir.path(), "localhost:8080");
+
+        let err = run_until_error(config).await;
+
+        assert!(
+            !dir.path().join("sub").exists(),
+            "the database was opened before the bind address was checked: {err:#}"
+        );
+        match err.downcast_ref::<ConfigError>() {
+            Some(ConfigError::Validation(errors)) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].field, "server.bind");
+                assert!(errors[0].message.contains("'localhost:8080'"), "{errors:?}");
+            }
+            _ => panic!("expected a validation error, got: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_fails_before_side_effects_when_port_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        // Neither this listener nor the service sets SO_REUSEPORT, so the
+        // service's bind fails on Linux, macOS and Windows alike.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = taken.local_addr().unwrap().to_string();
+        let config = write_server_toml(dir.path(), &bind);
+
+        let err = run_until_error(config).await;
+
+        assert!(
+            !dir.path().join("sub").exists(),
+            "the database was opened before the port was bound: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").starts_with(&format!("failed to listen on {bind}: ")),
+            "{err:#}"
+        );
     }
 }

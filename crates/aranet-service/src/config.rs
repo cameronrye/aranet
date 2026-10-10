@@ -1,5 +1,6 @@
 //! Server configuration.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use aranet_store::TomlFile;
@@ -128,7 +129,7 @@ impl Config {
     /// Validate the configuration and return any errors.
     ///
     /// This checks:
-    /// - Server bind address is valid (host:port format)
+    /// - Server bind address is an IP address and port (host names are rejected)
     /// - Storage path is not empty
     /// - Retention limits, when set, are 1 to 36500 days
     /// - Device addresses are not empty
@@ -212,7 +213,8 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    /// Bind address (e.g., "127.0.0.1:8080").
+    /// IP address and port to listen on, such as `127.0.0.1:8080` or
+    /// `[::1]:8080`. Host names such as `localhost` are rejected.
     pub bind: String,
     /// Broadcast channel buffer size for real-time reading updates.
     ///
@@ -242,39 +244,36 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The bind address as a socket address, or `None` when it isn't an
+    /// `IP:port` pair. Host names such as `localhost` give `None`: the listener
+    /// binds exactly this address and never resolves names.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        self.bind.parse().ok()
+    }
+
     /// Validate server configuration.
+    ///
+    /// `bind` must be an IP address and a port from 1 to 65535, such as
+    /// `127.0.0.1:8080` or `[::1]:8080`. A bad `bind` gives exactly one error.
     pub fn validate(&self) -> Vec<ValidationError> {
         let mut errors = Vec::new();
 
-        if self.bind.is_empty() {
-            validate!(errors, "server.bind", "bind address cannot be empty");
-        } else {
-            // Check for valid host:port format
-            let parts: Vec<&str> = self.bind.rsplitn(2, ':').collect();
-            if parts.len() != 2 {
+        match self.bind.parse::<SocketAddr>() {
+            Ok(addr) if addr.port() == 0 => {
+                validate!(errors, "server.bind", "port cannot be 0");
+            }
+            Ok(_) => {}
+            Err(_) if self.bind.is_empty() => {
+                validate!(errors, "server.bind", "bind address cannot be empty");
+            }
+            Err(_) => {
                 validate!(
                     errors,
                     "server.bind",
-                    "invalid bind address '{}': expected format 'host:port'",
+                    "invalid bind address '{}': expected IP:port such as 127.0.0.1:8080 or \
+                     [::1]:8080 (host names such as 'localhost' are not resolved)",
                     self.bind
                 );
-            } else {
-                // Validate port
-                let port_str = parts[0];
-                match port_str.parse::<u16>() {
-                    Ok(0) => {
-                        validate!(errors, "server.bind", "port cannot be 0");
-                    }
-                    Err(_) => {
-                        validate!(
-                            errors,
-                            "server.bind",
-                            "invalid port '{}': must be a number 1-65535",
-                            port_str
-                        );
-                    }
-                    Ok(_) => {} // Valid port
-                }
             }
         }
 
@@ -1499,62 +1498,47 @@ path = "/data/aranet.db"
 
     #[test]
     fn test_server_bind_validation() {
-        // Valid bind addresses
-        let valid = ServerConfig {
-            bind: "127.0.0.1:8080".to_string(),
+        let with_bind = |bind: &str| ServerConfig {
+            bind: bind.to_string(),
             ..Default::default()
         };
-        assert!(valid.validate().is_empty());
 
-        let valid_ipv6 = ServerConfig {
-            bind: "[::1]:8080".to_string(),
-            ..Default::default()
-        };
-        assert!(valid_ipv6.validate().is_empty());
+        // An IP address and a port: valid.
+        for bind in ["127.0.0.1:8080", "[::1]:8080", "0.0.0.0:8080"] {
+            let errors = with_bind(bind).validate();
+            assert!(errors.is_empty(), "{bind}: {errors:?}");
+        }
 
-        let valid_hostname = ServerConfig {
-            bind: "localhost:8080".to_string(),
-            ..Default::default()
-        };
-        assert!(valid_hostname.validate().is_empty());
+        // The listener binds exactly this address and never resolves names, so
+        // a host name, IPv6 without brackets, an octet above 255, a missing port
+        // and a non-numeric port each get one error that names the expected form.
+        for bind in [
+            "localhost:8080",
+            "::1:8080",
+            "999.1.1.1:80",
+            "127.0.0.1",
+            "127.0.0.1:abc",
+        ] {
+            let errors = with_bind(bind).validate();
+            assert_eq!(errors.len(), 1, "{bind}: {errors:?}");
+            assert_eq!(errors[0].field, "server.bind");
+            assert!(
+                errors[0]
+                    .message
+                    .starts_with(&format!("invalid bind address '{bind}': expected IP:port")),
+                "{bind}: {}",
+                errors[0].message
+            );
+        }
 
-        // Invalid: empty
-        let empty = ServerConfig {
-            bind: "".to_string(),
-            ..Default::default()
-        };
-        let errors = empty.validate();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].message.contains("cannot be empty"));
+        let errors = with_bind("127.0.0.1:0").validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "port cannot be 0");
 
-        // Invalid: no port
-        let no_port = ServerConfig {
-            bind: "127.0.0.1".to_string(),
-            ..Default::default()
-        };
-        let errors = no_port.validate();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].message.contains("host:port"));
+        let errors = with_bind("").validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "bind address cannot be empty");
 
-        // Invalid: port 0
-        let port_zero = ServerConfig {
-            bind: "127.0.0.1:0".to_string(),
-            ..Default::default()
-        };
-        let errors = port_zero.validate();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].message.contains("cannot be 0"));
-
-        // Invalid: non-numeric port
-        let bad_port = ServerConfig {
-            bind: "127.0.0.1:abc".to_string(),
-            ..Default::default()
-        };
-        let errors = bad_port.validate();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].message.contains("must be a number"));
-
-        // Invalid: zero broadcast buffer
         let zero_buffer = ServerConfig {
             broadcast_buffer: 0,
             ..Default::default()
@@ -1562,6 +1546,26 @@ path = "/data/aranet.db"
         let errors = zero_buffer.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].field.contains("broadcast_buffer"));
+    }
+
+    #[test]
+    fn test_socket_addr() {
+        use std::net::{Ipv6Addr, SocketAddr};
+
+        let with_bind = |bind: &str| ServerConfig {
+            bind: bind.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ServerConfig::default().socket_addr(),
+            Some(SocketAddr::from(([127, 0, 0, 1], 8080)))
+        );
+        assert_eq!(
+            with_bind("[::1]:9090").socket_addr(),
+            Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 9090)))
+        );
+        assert_eq!(with_bind("localhost:8080").socket_addr(), None);
+        assert_eq!(with_bind("").socket_addr(), None);
     }
 
     #[test]
