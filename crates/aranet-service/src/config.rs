@@ -1304,6 +1304,54 @@ path = "/data/aranet.db"
         assert!(display.contains("not found"));
     }
 
+    #[test]
+    fn test_config_file_error_keeps_why_a_save_was_refused() {
+        use std::error::Error;
+
+        // The file names the field by its alias, so a save adds the field's own
+        // name next to it. The updater then refuses its own text, which has the
+        // field twice.
+        #[derive(Default, Serialize, Deserialize)]
+        #[serde(default)]
+        struct Aliased {
+            #[serde(alias = "colour")]
+            color: String,
+        }
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("server.toml");
+        std::fs::write(&path, "colour = \"red\"\n").unwrap();
+        let desired = Aliased {
+            color: "blue".to_string(),
+        };
+        let refused = TomlFile::<Aliased>::open(&path)
+            .unwrap()
+            .save(&desired)
+            .unwrap_err();
+
+        let error = config_file_error(&path, refused);
+
+        // The message ends with the direct cause. The reason is the cause below
+        // that, which the API logs and keeps out of its response.
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to write config file {}: rendered TOML does not read back as the \
+                 intended values; the file was not changed",
+                path.display()
+            )
+        );
+        let reason = error
+            .source()
+            .and_then(Error::source)
+            .map(ToString::to_string);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("duplicate field `color`")),
+            "{reason:?}"
+        );
+    }
+
     // ==========================================================================
     // Validation tests
     // ==========================================================================
