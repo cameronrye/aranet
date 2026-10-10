@@ -413,7 +413,9 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     {
         use crate::mqtt::MqttPublisher;
         let mqtt_publisher = MqttPublisher::new(Arc::clone(&state));
-        mqtt_publisher.start().await;
+        if let Some(handle) = mqtt_publisher.start().await {
+            background.push(handle);
+        }
     }
 
     #[cfg(feature = "prometheus")]
