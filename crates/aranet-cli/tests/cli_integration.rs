@@ -388,6 +388,132 @@ fn test_config_show_fails_on_invalid_config() {
     );
 }
 
+/// The permission bits of `path` in octal, such as "600".
+#[cfg(unix)]
+fn mode_of(path: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+    format!("{mode:o}")
+}
+
+#[test]
+fn test_config_set_keeps_unknown_keys() {
+    let env = TestEnv::new();
+    env.write_config("# keep\nfuture_option = 1\nformat = \"text\"\n");
+
+    let output = env.run(&["config", "set", "format", "json"]);
+    assert!(
+        output.status.success(),
+        "config set should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Set Format = json\n"
+    );
+
+    assert_eq!(
+        fs::read_to_string(env.config_path()).expect("read config"),
+        "# keep\nfuture_option = 1\nformat = \"json\"\n"
+    );
+}
+
+#[test]
+fn test_config_init_writes_owner_only_commented_template() {
+    let env = TestEnv::new();
+
+    let output = env.run(&["config", "init"]);
+    assert!(
+        output.status.success(),
+        "config init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text = fs::read_to_string(env.config_path()).expect("read config");
+    // Only the empty [section] headers are active, so the file loads as the defaults.
+    let active: toml::Table = toml::from_str(&text).expect("config init should write TOML");
+    let mut sections: Vec<&str> = active.keys().map(String::as_str).collect();
+    sections.sort_unstable();
+    assert_eq!(
+        sections,
+        ["aliases", "behavior", "gui"],
+        "only the [section] headers should be active:\n{text}"
+    );
+    assert!(
+        active
+            .values()
+            .all(|section| section.as_table().is_some_and(toml::Table::is_empty)),
+        "every setting should be commented out:\n{text}"
+    );
+    // Uncommenting every setting below the header gives exactly the defaults.
+    let uncommented: String = text
+        .lines()
+        .skip_while(|line| !line.is_empty())
+        .map(|line| format!("{}\n", line.strip_prefix("# ").unwrap_or(line)))
+        .collect();
+    let uncommented: toml::Table =
+        toml::from_str(&uncommented).expect("the uncommented template should be TOML");
+    let defaults =
+        toml::Table::try_from(aranet_cli::config::Config::default()).expect("serialize defaults");
+    assert_eq!(uncommented, defaults, "{text}");
+
+    #[cfg(unix)]
+    assert_eq!(mode_of(&env.config_path()), "600");
+
+    // Uncommenting one line is enough: the setting lands in its section and takes effect.
+    let edited = text.replacen("\n# theme = \"dark\"\n", "\ntheme = \"light\"\n", 1);
+    assert_ne!(
+        edited, text,
+        "the template should list `# theme = \"dark\"`"
+    );
+    env.write_config(&edited);
+    let output = env.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "config show should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown: toml::Table = toml::from_str(&stdout).expect("config show should print TOML");
+    let theme = shown
+        .get("gui")
+        .and_then(|gui| gui.get("theme"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(theme, Some("light"), "{edited}");
+}
+
+#[test]
+fn test_config_show_redacts_service_api_key() {
+    let env = TestEnv::new();
+    let config = "[gui]\nservice_api_key = \"s3cret-key\"\n";
+    env.write_config(config);
+
+    let output = env.run(&["config", "show"]);
+    assert!(
+        output.status.success(),
+        "config show should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("s3cret-key"),
+        "the key was printed:\n{stdout}"
+    );
+    let shown: toml::Table = toml::from_str(&stdout).expect("config show should print TOML");
+    let key = shown
+        .get("gui")
+        .and_then(|gui| gui.get("service_api_key"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(key, Some("<redacted>"), "{stdout}");
+
+    // Showing the config never changes the file.
+    assert_eq!(
+        fs::read_to_string(env.config_path()).expect("read config"),
+        config
+    );
+}
+
 // =============================================================================
 // Cache Commands (no device required)
 // =============================================================================
@@ -439,6 +565,65 @@ fn test_alias_list() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("No aliases configured."), "{stdout}");
+}
+
+#[test]
+fn test_alias_set_preserves_config_comments_and_mode() {
+    let env = TestEnv::new();
+    env.write_config("# mine\nfahrenheit = true\n");
+    // Start from the mode files got before this change, whatever the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(env.config_path(), fs::Permissions::from_mode(0o644))
+            .expect("chmod config");
+    }
+
+    let output = env.run(&["alias", "set", "office", "AA:BB:CC:DD:EE:FF"]);
+    assert!(
+        output.status.success(),
+        "alias set should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Added alias 'office' → AA:BB:CC:DD:EE:FF\n"
+    );
+
+    let text = fs::read_to_string(env.config_path()).expect("read config");
+    assert!(text.starts_with("# mine\nfahrenheit = true\n"), "{text}");
+    let written: toml::Table = toml::from_str(&text).expect("config should stay valid TOML");
+    let mut keys: Vec<&str> = written.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["aliases", "fahrenheit"], "{text}");
+    let aliases = written["aliases"].as_table().expect("[aliases] table");
+    assert_eq!(aliases.len(), 1, "{text}");
+    assert_eq!(
+        aliases.get("office").and_then(toml::Value::as_str),
+        Some("AA:BB:CC:DD:EE:FF")
+    );
+
+    #[cfg(unix)]
+    assert_eq!(mode_of(&env.config_path()), "600");
+}
+
+#[test]
+fn test_alias_set_refuses_unparseable_config() {
+    let env = TestEnv::new();
+    env.write_config("device = [");
+
+    let output = env.run(&["alias", "set", "office", "AA:BB:CC:DD:EE:FF"]);
+    assert!(
+        !output.status.success(),
+        "alias set should fail on a config file that doesn't parse"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Failed to parse"), "{stderr}");
+
+    assert_eq!(
+        fs::read_to_string(env.config_path()).expect("read config"),
+        "device = ["
+    );
 }
 
 // =============================================================================

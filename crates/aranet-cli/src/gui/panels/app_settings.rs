@@ -569,7 +569,8 @@ impl AranetApp {
                         let slider = egui::Slider::new(&mut co2_warning, 600.0..=1200.0)
                             .show_value(false)
                             .step_by(50.0);
-                        if ui.add(slider).changed() {
+                        let response = ui.add(slider);
+                        if response.changed() {
                             self.gui_config.co2_warning_threshold = co2_warning as u16;
                             // Ensure warning < danger (maintain at least 50 ppm gap)
                             if self.gui_config.co2_warning_threshold
@@ -578,8 +579,8 @@ impl AranetApp {
                                 self.gui_config.co2_danger_threshold =
                                     (self.gui_config.co2_warning_threshold + 50).min(2000);
                             }
-                            config_changed = true;
                         }
+                        config_changed |= slider_settled(&response);
                         // Min label (leftmost)
                         ui.label(
                             RichText::new("600")
@@ -624,7 +625,8 @@ impl AranetApp {
                         let slider = egui::Slider::new(&mut co2_danger, 1000.0..=2000.0)
                             .show_value(false)
                             .step_by(50.0);
-                        if ui.add(slider).changed() {
+                        let response = ui.add(slider);
+                        if response.changed() {
                             self.gui_config.co2_danger_threshold = co2_danger as u16;
                             // Ensure danger > warning (maintain at least 50 ppm gap)
                             if self.gui_config.co2_danger_threshold
@@ -636,8 +638,8 @@ impl AranetApp {
                                     .saturating_sub(50)
                                     .max(600);
                             }
-                            config_changed = true;
                         }
+                        config_changed |= slider_settled(&response);
                         // Min label (leftmost)
                         ui.label(
                             RichText::new("1000")
@@ -685,7 +687,8 @@ impl AranetApp {
                         let slider = egui::Slider::new(&mut radon_warning, 50.0..=200.0)
                             .show_value(false)
                             .step_by(10.0);
-                        if ui.add(slider).changed() {
+                        let response = ui.add(slider);
+                        if response.changed() {
                             self.gui_config.radon_warning_threshold = radon_warning as u32;
                             // Ensure warning < danger (maintain at least 10 Bq/m³ gap)
                             if self.gui_config.radon_warning_threshold
@@ -694,8 +697,8 @@ impl AranetApp {
                                 self.gui_config.radon_danger_threshold =
                                     (self.gui_config.radon_warning_threshold + 10).min(300);
                             }
-                            config_changed = true;
                         }
+                        config_changed |= slider_settled(&response);
                         // Min label (leftmost)
                         ui.label(
                             RichText::new("50")
@@ -743,7 +746,8 @@ impl AranetApp {
                         let slider = egui::Slider::new(&mut radon_danger, 100.0..=300.0)
                             .show_value(false)
                             .step_by(10.0);
-                        if ui.add(slider).changed() {
+                        let response = ui.add(slider);
+                        if response.changed() {
                             self.gui_config.radon_danger_threshold = radon_danger as u32;
                             // Ensure danger > warning (maintain at least 10 Bq/m³ gap)
                             if self.gui_config.radon_danger_threshold
@@ -755,8 +759,8 @@ impl AranetApp {
                                     .saturating_sub(10)
                                     .max(50);
                             }
-                            config_changed = true;
                         }
+                        config_changed |= slider_settled(&response);
                         // Min label (leftmost)
                         ui.label(
                             RichText::new("100")
@@ -914,11 +918,16 @@ impl AranetApp {
                             .fill(bg)
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
-                            if ui.add(btn).clicked() && !is_selected {
-                                // Save behavior config separately
-                                let mut full_config = Config::load_or_default_logged();
-                                full_config.behavior.auto_connect = val;
-                                let _ = full_config.save();
+                            // Save behavior config separately: only this key is written, and a
+                            // config file that doesn't parse is left untouched.
+                            if ui.add(btn).clicked()
+                                && !is_selected
+                                && let Err(e) = Config::update(|c| {
+                                    c.behavior.auto_connect = val;
+                                    Ok(())
+                                })
+                            {
+                                tracing::warn!("Failed to save the Auto-Connect setting: {e:#}");
                             }
                         }
                     });
@@ -958,10 +967,14 @@ impl AranetApp {
                             .fill(bg)
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
-                            if ui.add(btn).clicked() && !is_selected {
-                                let mut full_config = Config::load_or_default_logged();
-                                full_config.behavior.auto_sync = val;
-                                let _ = full_config.save();
+                            if ui.add(btn).clicked()
+                                && !is_selected
+                                && let Err(e) = Config::update(|c| {
+                                    c.behavior.auto_sync = val;
+                                    Ok(())
+                                })
+                            {
+                                tracing::warn!("Failed to save the Auto-Sync setting: {e:#}");
                             }
                         }
                     });
@@ -1001,10 +1014,16 @@ impl AranetApp {
                             .fill(bg)
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
-                            if ui.add(btn).clicked() && !is_selected {
-                                let mut full_config = Config::load_or_default_logged();
-                                full_config.behavior.remember_devices = val;
-                                let _ = full_config.save();
+                            if ui.add(btn).clicked()
+                                && !is_selected
+                                && let Err(e) = Config::update(|c| {
+                                    c.behavior.remember_devices = val;
+                                    Ok(())
+                                })
+                            {
+                                tracing::warn!(
+                                    "Failed to save the Remember Devices setting: {e:#}"
+                                );
                             }
                         }
                     });
@@ -1044,10 +1063,16 @@ impl AranetApp {
                             .fill(bg)
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
-                            if ui.add(btn).clicked() && !is_selected {
-                                let mut full_config = Config::load_or_default_logged();
-                                full_config.behavior.load_cache = val;
-                                let _ = full_config.save();
+                            if ui.add(btn).clicked()
+                                && !is_selected
+                                && let Err(e) = Config::update(|c| {
+                                    c.behavior.load_cache = val;
+                                    Ok(())
+                                })
+                            {
+                                tracing::warn!(
+                                    "Failed to save the Load Cached Data setting: {e:#}"
+                                );
                             }
                         }
                     });
@@ -1059,4 +1084,13 @@ impl AranetApp {
                 }
             });
     }
+}
+
+/// Whether to save a threshold slider's value this frame: when a drag on it ends, or when its
+/// value changed without a drag (arrow keys, accessibility actions).
+///
+/// The panel uses the new value from the first frame of a drag. Saving syncs the config file
+/// to disk, which takes milliseconds on the UI thread, so a drag is saved once, on release.
+fn slider_settled(response: &egui::Response) -> bool {
+    response.drag_stopped() || (response.changed() && !response.dragged())
 }

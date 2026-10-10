@@ -34,6 +34,9 @@ use aranet_cli::tui;
 use anyhow::Result;
 
 #[cfg(feature = "cli")]
+use anyhow::Context;
+
+#[cfg(feature = "cli")]
 use clap::{CommandFactory, Parser};
 #[cfg(feature = "cli")]
 use cli::{AliasSubcommand, Cli, Commands, ConfigAction, ConfigKey, OutputFormat, ReportFormat};
@@ -377,7 +380,11 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
             println!("{}", Config::path().display());
         }
         ConfigAction::Show => {
-            let config = Config::load_or_default()?;
+            let mut config = Config::load_or_default()?;
+            // The output ends up in terminals, bug reports and screen shares.
+            if config.gui.service_api_key.is_some() {
+                config.gui.service_api_key = Some("<redacted>".to_string());
+            }
             println!("{}", toml::to_string_pretty(&config)?);
         }
         ConfigAction::Init => {
@@ -385,7 +392,8 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
             if path.exists() {
                 eprintln!("Config file already exists: {}", path.display());
             } else {
-                Config::default().save()?;
+                aranet_store::write_private(&path, config_template()?.as_bytes())
+                    .with_context(|| format!("Failed to write config: {}", path.display()))?;
                 println!("Created config file: {}", path.display());
             }
         }
@@ -403,71 +411,101 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
             println!("{}", value);
         }
         ConfigAction::Set { key, value } => {
-            let mut config = Config::load_or_default()?;
-            match key {
-                ConfigKey::Device => config.device = Some(value.clone()),
-                ConfigKey::Format => {
-                    // Validate format value
-                    match value.to_lowercase().as_str() {
-                        "text" | "json" | "csv" => config.format = Some(value.to_lowercase()),
-                        _ => anyhow::bail!(
-                            "Invalid format: {}. Valid values: text, json, csv",
-                            value
-                        ),
+            // Applied to a fresh read of the file: only this key is written, and an invalid
+            // value fails before anything is.
+            Config::update(|config| {
+                match key {
+                    ConfigKey::Device => config.device = Some(value.clone()),
+                    ConfigKey::Format => {
+                        // Validate format value
+                        match value.to_lowercase().as_str() {
+                            "text" | "json" | "csv" => config.format = Some(value.to_lowercase()),
+                            _ => anyhow::bail!(
+                                "Invalid format: {}. Valid values: text, json, csv",
+                                value
+                            ),
+                        }
+                    }
+                    ConfigKey::Timeout => {
+                        let seconds: u64 = value.parse().map_err(|_| {
+                            anyhow::anyhow!(
+                                "Invalid timeout value: {}. Must be a positive integer (seconds).",
+                                value
+                            )
+                        })?;
+                        config.timeout = Some(seconds);
+                    }
+                    ConfigKey::NoColor => {
+                        config.no_color = parse_bool(value).map_err(|_| {
+                            anyhow::anyhow!(
+                                "Invalid no_color value: {}. Use 'true' or 'false'.",
+                                value
+                            )
+                        })?;
+                    }
+                    ConfigKey::Fahrenheit => {
+                        config.fahrenheit = parse_bool(value).map_err(|_| {
+                            anyhow::anyhow!(
+                                "Invalid fahrenheit value: {}. Use 'true' or 'false'.",
+                                value
+                            )
+                        })?;
+                    }
+                    ConfigKey::Inhg => {
+                        config.inhg = parse_bool(value).map_err(|_| {
+                            anyhow::anyhow!("Invalid inhg value: {}. Use 'true' or 'false'.", value)
+                        })?;
+                    }
+                    ConfigKey::Bq => {
+                        config.bq = parse_bool(value).map_err(|_| {
+                            anyhow::anyhow!("Invalid bq value: {}. Use 'true' or 'false'.", value)
+                        })?;
                     }
                 }
-                ConfigKey::Timeout => {
-                    let seconds: u64 = value.parse().map_err(|_| {
-                        anyhow::anyhow!(
-                            "Invalid timeout value: {}. Must be a positive integer (seconds).",
-                            value
-                        )
-                    })?;
-                    config.timeout = Some(seconds);
-                }
-                ConfigKey::NoColor => {
-                    config.no_color = parse_bool(value).map_err(|_| {
-                        anyhow::anyhow!("Invalid no_color value: {}. Use 'true' or 'false'.", value)
-                    })?;
-                }
-                ConfigKey::Fahrenheit => {
-                    config.fahrenheit = parse_bool(value).map_err(|_| {
-                        anyhow::anyhow!(
-                            "Invalid fahrenheit value: {}. Use 'true' or 'false'.",
-                            value
-                        )
-                    })?;
-                }
-                ConfigKey::Inhg => {
-                    config.inhg = parse_bool(value).map_err(|_| {
-                        anyhow::anyhow!("Invalid inhg value: {}. Use 'true' or 'false'.", value)
-                    })?;
-                }
-                ConfigKey::Bq => {
-                    config.bq = parse_bool(value).map_err(|_| {
-                        anyhow::anyhow!("Invalid bq value: {}. Use 'true' or 'false'.", value)
-                    })?;
-                }
-            }
-            config.save()?;
+                Ok(())
+            })?;
             println!("Set {:?} = {}", key, value);
         }
         ConfigAction::Unset { key } => {
-            let mut config = Config::load_or_default()?;
-            match key {
-                ConfigKey::Device => config.device = None,
-                ConfigKey::Format => config.format = None,
-                ConfigKey::Timeout => config.timeout = None,
-                ConfigKey::NoColor => config.no_color = false,
-                ConfigKey::Fahrenheit => config.fahrenheit = false,
-                ConfigKey::Inhg => config.inhg = false,
-                ConfigKey::Bq => config.bq = false,
-            }
-            config.save()?;
+            // `None` removes the key from the file; a flag is written as `false`.
+            Config::update(|config| {
+                match key {
+                    ConfigKey::Device => config.device = None,
+                    ConfigKey::Format => config.format = None,
+                    ConfigKey::Timeout => config.timeout = None,
+                    ConfigKey::NoColor => config.no_color = false,
+                    ConfigKey::Fahrenheit => config.fahrenheit = false,
+                    ConfigKey::Inhg => config.inhg = false,
+                    ConfigKey::Bq => config.bq = false,
+                }
+                Ok(())
+            })?;
             println!("Unset {:?}", key);
         }
     }
     Ok(())
+}
+
+/// The file `aranet config init` writes: every setting at its default, commented out.
+///
+/// Commented out, the defaults document the settings without pinning them, so a default
+/// that changes in a later version still takes effect. The `[section]` headers stay active,
+/// so uncommenting a setting's line is enough to change it.
+#[cfg(feature = "cli")]
+fn config_template() -> Result<String> {
+    let defaults = toml::to_string_pretty(&Config::default())?;
+    let mut template = String::from(
+        "# aranet CLI configuration. Uncomment a setting to change it.\n\
+         # The values shown are the defaults.\n\n",
+    );
+    for line in defaults.lines() {
+        if !line.is_empty() && !line.starts_with('[') {
+            template.push_str("# ");
+        }
+        template.push_str(line);
+        template.push('\n');
+    }
+    Ok(template)
 }
 
 /// Parse a boolean value from a string, supporting common representations.
