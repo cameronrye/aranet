@@ -1082,6 +1082,25 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn mqtt_ha_discovery_waits_for_room_until_its_time_is_up() {
+        let (client, _eventloop) = client_with_queue(1);
+        let config = MqttConfig {
+            homeassistant: true,
+            ..MqttConfig::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let published =
+            publish_ha_discovery_bounded(&client, &config, &five_devices(), QoS::AtMostOnce).await;
+
+        // Unlike a reading, discovery isn't given up at the first message
+        // that doesn't fit: the broker gets the whole 10 s to make room.
+        let waited = started.elapsed();
+        assert!(!published);
+        assert!(waited >= HA_DISCOVERY_TIMEOUT, "gave up after {waited:?}");
+    }
+
     #[tokio::test]
     async fn mqtt_publisher_stops_promptly_while_broker_unreachable() {
         let (logs, _guard) = crate::test_support::CapturedLogs::start();
@@ -1121,5 +1140,135 @@ mod tests {
             .await
             .expect("the publisher stops within 5 s of shutdown")
             .expect("the publisher does not panic");
+    }
+
+    /// MQTT publishing to a broker that refuses connections, so the event
+    /// loop never connects and the client's queue of 100 never drains.
+    async fn config_without_broker(
+        homeassistant: bool,
+        devices: Vec<crate::config::DeviceConfig>,
+    ) -> crate::config::Config {
+        let broker = crate::test_support::closed_port_url("")
+            .await
+            .replacen("http://", "mqtt://", 1);
+        crate::config::Config {
+            mqtt: MqttConfig {
+                enabled: true,
+                broker,
+                homeassistant,
+                ..MqttConfig::default()
+            },
+            devices,
+            ..crate::config::Config::default()
+        }
+    }
+
+    /// Start the publisher and wait until it listens for readings.
+    async fn start_publisher(t: &crate::test_support::TestState) -> JoinHandle<()> {
+        let handle = MqttPublisher::new(Arc::clone(&t.state))
+            .start()
+            .await
+            .expect("MQTT is enabled");
+        crate::test_support::wait_until("the publisher to subscribe to readings", || {
+            t.state.readings_tx.receiver_count() >= 1
+        })
+        .await;
+        handle
+    }
+
+    /// Signal shutdown and wait for the publisher to return.
+    async fn shut_down(t: &crate::test_support::TestState, publisher: JoinHandle<()>) {
+        t.state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), publisher)
+            .await
+            .expect("the publisher stops within 5 s of shutdown")
+            .expect("the publisher does not panic");
+    }
+
+    #[tokio::test]
+    async fn mqtt_publisher_drops_readings_that_do_not_fit_and_warns_once() {
+        /// Send `count` Aranet4 readings, 7 messages each, and wait until
+        /// the publisher has taken them all.
+        async fn send_readings(t: &crate::test_support::TestState, count: usize) {
+            for _ in 0..count {
+                t.state.readings_tx.send(aranet4_event()).unwrap();
+            }
+            crate::test_support::wait_until("the publisher to take every reading", || {
+                t.state.readings_tx.is_empty()
+            })
+            .await;
+        }
+
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+        let config = config_without_broker(false, Vec::new()).await;
+        let t = crate::test_support::TestState::with_config(config);
+        let publisher = start_publisher(&t).await;
+
+        // 14 readings fit in the queue of 100, so nothing is dropped yet.
+        send_readings(&t, 14).await;
+        let text = logs.text();
+        assert!(!text.contains("MQTT broker unreachable or slow"), "{text}");
+
+        // The 15th fits only up to its CO2, and the next two not at all.
+        send_readings(&t, 3).await;
+
+        // The publisher kept up with the readings, and stops as promptly.
+        shut_down(&t, publisher).await;
+        let text = logs.text();
+        let count = |line: &str| text.matches(line).count();
+        assert_eq!(
+            count("Published reading for Aranet4 12345 to MQTT"),
+            14,
+            "{text}"
+        );
+        // Each of the other three stopped at its first message that didn't
+        // fit, without trying the rest of its topics.
+        assert_eq!(count("MQTT queue refused"), 3, "{text}");
+        assert_eq!(
+            count("MQTT queue refused temperature for Aranet4 12345"),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            count("MQTT queue refused json for Aranet4 12345"),
+            2,
+            "{text}"
+        );
+        // Three readings were dropped, and the warning is rate-limited.
+        assert_eq!(count("MQTT broker unreachable or slow"), 1, "{text}");
+        assert!(
+            text.contains("MQTT broker unreachable or slow; dropped 1 readings"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mqtt_publisher_stops_promptly_during_discovery_after_a_device_change() {
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+        // 19 Aranet4s have 95 discovery messages, which fit in the queue of
+        // 100 once.
+        let config = config_without_broker(true, aranet4_devices(19)).await;
+        let t = crate::test_support::TestState::with_config(config);
+        let publisher = start_publisher(&t).await;
+        crate::test_support::wait_until("HA discovery to be queued at the start", || {
+            logs.text()
+                .contains("Published HA discovery for device: Aranet4 00018")
+        })
+        .await;
+
+        // A device change publishes discovery again. The first device's
+        // messages fill the queue, and discovery waits for room for the
+        // second's.
+        t.state.collector.signal_reload();
+        crate::test_support::wait_until("the second HA discovery to fill the MQTT queue", || {
+            logs.text()
+                .matches("Published HA discovery for device: Aranet4 00000")
+                .count()
+                == 2
+        })
+        .await;
+
+        // Shutdown ends that wait, which would last 10 s.
+        shut_down(&t, publisher).await;
     }
 }
