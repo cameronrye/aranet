@@ -692,11 +692,92 @@ mod tests {
         }
     }
 
+    /// A reading from an AranetRn+ with every radon value, which publishes
+    /// 10 topics.
+    fn radon_event() -> ReadingEvent {
+        let device_id = "AranetRn+ 12345".to_string();
+        ReadingEvent {
+            device_id: device_id.clone(),
+            reading: aranet_store::StoredReading {
+                device_id,
+                co2: 0,
+                temperature: 21.3,
+                humidity: 52,
+                pressure: 1009.5,
+                battery: 97,
+                status: aranet_types::Status::Yellow,
+                radon: Some(87),
+                radon_avg_24h: Some(91),
+                radon_avg_7d: Some(104),
+                radon_avg_30d: Some(118),
+                ..aranet4_event().reading
+            },
+        }
+    }
+
+    /// A reading from an Aranet Radiation, which publishes 5 topics.
+    fn radiation_event() -> ReadingEvent {
+        let device_id = "Aranet\u{2622} 30ED1".to_string();
+        ReadingEvent {
+            device_id: device_id.clone(),
+            reading: aranet_store::StoredReading {
+                device_id,
+                co2: 0,
+                temperature: 0.0,
+                humidity: 0,
+                pressure: 0.0,
+                battery: 64,
+                radiation_rate: Some(0.12),
+                radiation_total: Some(0.0425),
+                ..aranet4_event().reading
+            },
+        }
+    }
+
     /// A client whose queue holds `capacity` requests. Its event loop is
     /// returned but never polled, so nothing connects and the queue never
     /// drains, as while the broker is unreachable.
     fn client_with_queue(capacity: usize) -> (AsyncClient, rumqttc::EventLoop) {
         AsyncClient::new(MqttOptions::new("aranet-test", "127.0.0.1", 1883), capacity)
+    }
+
+    /// The messages waiting in the client's queue, oldest first, as (topic
+    /// below `topic_base`, payload). Panics unless every one was published
+    /// below `topic_base`, with `qos` and `retain`.
+    fn queued_messages(
+        eventloop: &mut rumqttc::EventLoop,
+        topic_base: &str,
+        qos: QoS,
+        retain: bool,
+    ) -> Vec<(String, String)> {
+        // Nothing polls the event loop, so everything published is still in
+        // the client's queue. `clean` moves it to `pending`.
+        eventloop.clean();
+        eventloop
+            .pending
+            .drain(..)
+            .map(|request| {
+                let publish = match request {
+                    rumqttc::Request::Publish(publish) => publish,
+                    other => panic!("queued something other than a publish: {other:?}"),
+                };
+                assert_eq!((publish.qos, publish.retain), (qos, retain), "{publish:?}");
+                let metric = publish
+                    .topic
+                    .strip_prefix(topic_base)
+                    .unwrap_or_else(|| panic!("{} is not below {topic_base}", publish.topic));
+                let payload = String::from_utf8(publish.payload.to_vec()).expect("a text payload");
+                (metric.to_string(), payload)
+            })
+            .collect()
+    }
+
+    /// (metric, payload) pairs in the form `queued_messages` returns.
+    fn messages(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(metric, payload)| (metric.to_string(), payload.to_string()))
+            .collect()
     }
 
     /// `count` Aranet4s, each with 5 discovery messages.
@@ -744,6 +825,107 @@ mod tests {
         );
 
         assert_eq!(outcome, PublishOutcome::Published);
+    }
+
+    #[test]
+    fn mqtt_publish_reading_queues_these_messages_for_a_co2_sensor() {
+        let (client, mut eventloop) = client_with_queue(100);
+        let event = aranet4_event();
+
+        let outcome = publish_reading(
+            &client,
+            &MqttConfig::default(),
+            "Office",
+            &event,
+            QoS::AtMostOnce,
+        );
+
+        assert_eq!(outcome, PublishOutcome::Published);
+        let queued = queued_messages(&mut eventloop, "aranet/Office/", QoS::AtMostOnce, false);
+        // The first message is the whole reading as JSON.
+        let json = serde_json::to_string(&event.reading).unwrap();
+        assert_eq!(
+            queued,
+            messages(&[
+                ("json", &json),
+                ("co2", "800"),
+                ("temperature", "22.50"),
+                ("humidity", "45"),
+                ("pressure", "1013.00"),
+                ("battery", "85"),
+                ("status", "green"),
+            ])
+        );
+        let reading: serde_json::Value = serde_json::from_str(&queued[0].1).unwrap();
+        assert_eq!(reading["co2"], 800, "{reading}");
+    }
+
+    #[test]
+    fn mqtt_publish_reading_queues_these_messages_for_a_radon_sensor() {
+        let (client, mut eventloop) = client_with_queue(100);
+        let event = radon_event();
+        // A prefix, retain flag and QoS other than the defaults, and a device
+        // without an alias: its address, with the `+` and the space replaced,
+        // is the topic's device segment.
+        let config = MqttConfig {
+            topic_prefix: "home/sensors".to_string(),
+            retain: true,
+            ..MqttConfig::default()
+        };
+
+        let outcome = publish_reading(&client, &config, &event.device_id, &event, QoS::AtLeastOnce);
+
+        assert_eq!(outcome, PublishOutcome::Published);
+        let queued = queued_messages(
+            &mut eventloop,
+            "home/sensors/AranetRn__12345/",
+            QoS::AtLeastOnce,
+            true,
+        );
+        let json = serde_json::to_string(&event.reading).unwrap();
+        assert_eq!(
+            queued,
+            messages(&[
+                ("json", &json),
+                ("temperature", "21.30"),
+                ("humidity", "52"),
+                ("pressure", "1009.50"),
+                ("battery", "97"),
+                ("status", "yellow"),
+                ("radon", "87"),
+                ("radon_avg_24h", "91"),
+                ("radon_avg_7d", "104"),
+                ("radon_avg_30d", "118"),
+            ])
+        );
+    }
+
+    #[test]
+    fn mqtt_publish_reading_queues_these_messages_for_a_radiation_sensor() {
+        let (client, mut eventloop) = client_with_queue(100);
+        let event = radiation_event();
+
+        let outcome = publish_reading(
+            &client,
+            &MqttConfig::default(),
+            "Lab",
+            &event,
+            QoS::AtMostOnce,
+        );
+
+        assert_eq!(outcome, PublishOutcome::Published);
+        let queued = queued_messages(&mut eventloop, "aranet/Lab/", QoS::AtMostOnce, false);
+        let json = serde_json::to_string(&event.reading).unwrap();
+        assert_eq!(
+            queued,
+            messages(&[
+                ("json", &json),
+                ("battery", "64"),
+                ("status", "green"),
+                ("radiation_rate", "0.1200"),
+                ("radiation_total", "0.042500"),
+            ])
+        );
     }
 
     #[tokio::test(start_paused = true)]
