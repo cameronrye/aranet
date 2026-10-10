@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use aranet_store::TomlFile;
 use serde::{Deserialize, Serialize};
 
+use crate::state::CliState;
+
 /// Configuration file structure
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -43,12 +45,15 @@ pub struct Config {
     #[serde(default)]
     pub aliases: HashMap<String, String>,
 
-    /// Last successfully connected device (auto-updated)
-    #[serde(default)]
+    /// Last connected device, from a `config.toml` written by aranet 0.2 or earlier.
+    ///
+    /// Read but never written: connections are recorded in the CLI state file
+    /// ([`CliState`]), which [`Config::apply_state`] puts here.
+    #[serde(default, skip_serializing)]
     pub last_device: Option<String>,
 
-    /// Name of the last connected device (for display)
-    #[serde(default)]
+    /// Name of the last connected device (for display); legacy, like `last_device`.
+    #[serde(default, skip_serializing)]
     pub last_device_name: Option<String>,
 
     /// Behavior settings for unified data architecture
@@ -388,6 +393,17 @@ impl Config {
             Ok(())
         })
     }
+
+    /// Use the last connected device recorded in the CLI state file.
+    ///
+    /// Once a connection has been recorded there, it replaces the legacy `last_device` and
+    /// `last_device_name` read from `config.toml`, name included.
+    pub fn apply_state(&mut self, state: &CliState) {
+        if let Some(device) = &state.last_device {
+            self.last_device = Some(device.clone());
+            self.last_device_name = state.last_device_name.clone();
+        }
+    }
 }
 
 /// Resolve multiple devices, applying alias resolution to each.
@@ -439,14 +455,10 @@ pub fn print_device_source_feedback(device: &str, source: Option<&str>, quiet: b
     }
 }
 
-/// Update the last connected device in config.
-/// This is called after a successful connection.
+/// Remember the last connected device in the CLI state file.
+/// This is called after a successful connection; `config.toml` is not touched.
 pub fn update_last_device(identifier: &str, name: Option<&str>) -> Result<()> {
-    Config::update(|c| {
-        c.last_device = Some(identifier.to_string());
-        c.last_device_name = name.map(str::to_string);
-        Ok(())
-    })
+    CliState::record_connection_at(&CliState::path(), identifier, name)
 }
 
 /// Get info about whether we're using a fallback device.
@@ -727,6 +739,53 @@ office = "Aranet4 12345"
     }
 
     #[test]
+    fn save_never_writes_last_device() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config {
+            fahrenheit: true,
+            last_device: Some("AA:BB:CC:DD:EE:FF".to_string()),
+            last_device_name: Some("Aranet4 TEST".to_string()),
+            ..Default::default()
+        };
+
+        config.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fahrenheit = true\n");
+
+        // A legacy value already in the file is left exactly as it is.
+        fs::write(&path, "last_device = \"legacy\"\n").unwrap();
+        Config::update_at(&path, |c| {
+            c.last_device = Some("AA:BB:CC:DD:EE:FF".to_string());
+            c.bq = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "last_device = \"legacy\"\nbq = true\n"
+        );
+    }
+
+    #[test]
+    fn apply_state_prefers_state_over_legacy_config() {
+        let mut config: Config =
+            toml::from_str("last_device = \"legacy\"\nlast_device_name = \"Legacy\"\n").unwrap();
+
+        // Nothing recorded yet: the legacy keys from config.toml are used.
+        config.apply_state(&CliState::default());
+        assert_eq!(config.last_device.as_deref(), Some("legacy"));
+        assert_eq!(config.last_device_name.as_deref(), Some("Legacy"));
+
+        // A recorded connection wins, name included, even when it has none.
+        config.apply_state(&CliState {
+            last_device: Some("AA:BB:CC:DD:EE:FF".to_string()),
+            last_device_name: None,
+        });
+        assert_eq!(config.last_device.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(config.last_device_name, None);
+    }
+
+    #[test]
     fn test_behavior_config_serialization() {
         let behavior = BehaviorConfig {
             auto_connect: false,
@@ -882,6 +941,32 @@ office = "Aranet4 12345"
         // Default should take precedence over last
         assert_eq!(device, Some("default-device".to_string()));
         assert_eq!(source, Some("default"));
+    }
+
+    #[test]
+    fn get_device_source_uses_state_last_device() {
+        let state = CliState {
+            last_device: Some("AA:BB:CC:DD:EE:FF".to_string()),
+            last_device_name: Some("Aranet4 TEST".to_string()),
+        };
+
+        let mut config = Config::default();
+        config.apply_state(&state);
+        assert_eq!(
+            get_device_source(None, &config),
+            (Some("AA:BB:CC:DD:EE:FF".to_string()), Some("last"))
+        );
+
+        // A default device in config.toml still comes first.
+        let mut config = Config {
+            device: Some("default-device".to_string()),
+            ..Default::default()
+        };
+        config.apply_state(&state);
+        assert_eq!(
+            get_device_source(None, &config),
+            (Some("default-device".to_string()), Some("default"))
+        );
     }
 
     #[test]

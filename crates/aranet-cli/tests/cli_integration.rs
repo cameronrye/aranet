@@ -705,6 +705,35 @@ fn test_report_all_outputs_all_cached_devices() {
 }
 
 #[test]
+fn test_report_uses_last_device_from_state_file() {
+    let env = TestEnv::new();
+    fs::write(
+        env.data_dir.join("cli-state.toml"),
+        "last_device = \"AA:BB:CC:DD:EE:FF\"\nlast_device_name = \"Aranet4 TEST\"\n",
+    )
+    .expect("write state file");
+    // Two cached devices: the database fallback picks the most recently seen one, which can be
+    // either, so the "Using last connected device" line is what shows the state file was read.
+    seed_history_database(&env.db_path(), "Aranet4 67890", Some("Bedroom"));
+    seed_history_database(&env.db_path(), "AA:BB:CC:DD:EE:FF", Some("Office"));
+
+    let output = env.run(&["report", "--format", "json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "report should succeed: {stderr}");
+    assert!(
+        stderr.contains("Using last connected device: Aranet4 TEST (AA:BB:CC:DD:EE:FF)"),
+        "{stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("report JSON should be valid");
+    let reports = parsed.as_array().expect("report output should be an array");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["device_id"], "AA:BB:CC:DD:EE:FF");
+}
+
+#[test]
 fn test_sync_all_json_empty_is_machine_readable() {
     let env = TestEnv::new();
 

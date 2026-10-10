@@ -41,22 +41,42 @@ pub use queries::{HistoryQuery, MAX_QUERY_LIMIT, ReadingQuery};
 pub use store::{HistoryAggregates, HistoryStats, ImportResult, PRUNE_BATCH_ROWS, Store};
 pub use toml_file::{TomlFile, TomlFileError, write_private};
 
-/// Default database path following platform conventions.
+/// Default directory for aranet's data files: the database and the CLI state file.
 ///
 /// Checks `ARANET_DATA_DIR` first, then falls back to the platform data directory:
-/// - Linux: `~/.local/share/aranet/data.db`
-/// - macOS: `~/Library/Application Support/aranet/data.db`
-/// - Windows: `C:\Users\<user>\AppData\Local\aranet\data.db`
-pub fn default_db_path() -> std::path::PathBuf {
+/// - Linux: `~/.local/share/aranet`
+/// - macOS: `~/Library/Application Support/aranet`
+/// - Windows: `C:\Users\<user>\AppData\Local\aranet`
+///
+/// Without a platform data directory, it logs a warning and uses the current directory.
+pub fn default_data_dir() -> std::path::PathBuf {
     std::env::var_os("ARANET_DATA_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::data_local_dir().map(|d| d.join("aranet")))
         .unwrap_or_else(|| {
             tracing::warn!(
                 "Could not determine platform data directory; \
-                 falling back to current directory for database"
+                 falling back to current directory for data files"
             );
             std::path::PathBuf::from(".")
         })
-        .join("data.db")
+}
+
+/// Default database path: `data.db` in [`default_data_dir`].
+///
+/// - Linux: `~/.local/share/aranet/data.db`
+/// - macOS: `~/Library/Application Support/aranet/data.db`
+/// - Windows: `C:\Users\<user>\AppData\Local\aranet\data.db`
+pub fn default_db_path() -> std::path::PathBuf {
+    default_data_dir().join("data.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_db_path_is_in_default_data_dir() {
+        assert_eq!(default_db_path(), default_data_dir().join("data.db"));
+    }
 }
