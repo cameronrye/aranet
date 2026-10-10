@@ -734,6 +734,21 @@ mod tests {
         }
     }
 
+    /// The Aranet4's reading, from a device known only by its Bluetooth
+    /// address, as devices often are on Linux. An address doesn't say what
+    /// kind of sensor it belongs to.
+    fn address_event() -> ReadingEvent {
+        let device_id = "AA:BB:CC:DD:EE:FF".to_string();
+        assert_eq!(aranet_types::DeviceType::from_name(&device_id), None);
+        ReadingEvent {
+            device_id: device_id.clone(),
+            reading: aranet_store::StoredReading {
+                device_id,
+                ..aranet4_event().reading
+            },
+        }
+    }
+
     /// A client whose queue holds `capacity` requests. Its event loop is
     /// returned but never polled, so nothing connects and the queue never
     /// drains, as while the broker is unreachable.
@@ -926,6 +941,109 @@ mod tests {
                 ("radiation_total", "0.042500"),
             ])
         );
+    }
+
+    #[test]
+    fn mqtt_publish_reading_queues_these_messages_for_a_device_known_by_its_address() {
+        let (client, mut eventloop) = client_with_queue(100);
+        let event = address_event();
+
+        let outcome = publish_reading(
+            &client,
+            &MqttConfig::default(),
+            "Office",
+            &event,
+            QoS::AtMostOnce,
+        );
+
+        assert_eq!(outcome, PublishOutcome::Published);
+        let queued = queued_messages(&mut eventloop, "aranet/Office/", QoS::AtMostOnce, false);
+        // With no name to tell the sensor's type, the values decide, and
+        // every one of them is there.
+        let json = serde_json::to_string(&event.reading).unwrap();
+        assert_eq!(
+            queued,
+            messages(&[
+                ("json", &json),
+                ("co2", "800"),
+                ("temperature", "22.50"),
+                ("humidity", "45"),
+                ("pressure", "1013.00"),
+                ("battery", "85"),
+                ("status", "green"),
+            ])
+        );
+    }
+
+    #[test]
+    fn mqtt_publish_reading_goes_by_the_values_of_a_device_known_by_its_address() {
+        /// The metrics queued for [`address_event`]'s reading after `change`,
+        /// in order.
+        fn metrics_after(change: impl FnOnce(&mut aranet_store::StoredReading)) -> Vec<String> {
+            let (client, mut eventloop) = client_with_queue(100);
+            let mut event = address_event();
+            change(&mut event.reading);
+
+            let outcome = publish_reading(
+                &client,
+                &MqttConfig::default(),
+                "Office",
+                &event,
+                QoS::AtMostOnce,
+            );
+
+            assert_eq!(outcome, PublishOutcome::Published);
+            queued_messages(&mut eventloop, "aranet/Office/", QoS::AtMostOnce, false)
+                .into_iter()
+                .map(|(metric, _)| metric)
+                .collect()
+        }
+
+        // A value of zero counts as not measured: its topic is left out, and
+        // the others stay.
+        assert_eq!(
+            metrics_after(|reading| reading.co2 = 0),
+            [
+                "json",
+                "temperature",
+                "humidity",
+                "pressure",
+                "battery",
+                "status"
+            ]
+        );
+        assert_eq!(
+            metrics_after(|reading| reading.pressure = 0.0),
+            [
+                "json",
+                "co2",
+                "temperature",
+                "humidity",
+                "battery",
+                "status"
+            ]
+        );
+        assert_eq!(
+            metrics_after(|reading| {
+                reading.temperature = 0.0;
+                reading.humidity = 0;
+            }),
+            ["json", "co2", "pressure", "battery", "status"]
+        );
+
+        // Temperature and humidity go together, and either one is enough for
+        // both: a room can be at 0 °C.
+        let all = [
+            "json",
+            "co2",
+            "temperature",
+            "humidity",
+            "pressure",
+            "battery",
+            "status",
+        ];
+        assert_eq!(metrics_after(|reading| reading.temperature = 0.0), all);
+        assert_eq!(metrics_after(|reading| reading.humidity = 0), all);
     }
 
     #[tokio::test(start_paused = true)]
