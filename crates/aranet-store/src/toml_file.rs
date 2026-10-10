@@ -265,6 +265,13 @@ fn keep_comments_of_removed_tables(doc: &mut DocumentMut, old_prefixes: &[(Strin
 /// removing that entry again restores the file byte for byte. A new subtable of
 /// the file's last table is written above that table's trailing comments in the
 /// same way.
+///
+/// The comments that open a file have no such rule. When the file has no
+/// root-level key (the one `aranet config init` writes, for example), they are
+/// the prefix of the first table header, or the trailing trivia if there is no
+/// header either, so a new root-level key is written at the start of the file,
+/// above them. No text is lost, and removing the key again restores the file
+/// byte for byte.
 fn keep_trailing_comments_with_last_table(doc: &mut DocumentMut, old_keys: &[String]) {
     let trailing = doc.trailing().as_str().unwrap_or("").to_owned();
     if trailing.trim().is_empty() {
@@ -394,7 +401,9 @@ fn move_key_comments_to_first_table(target: &mut dyn TableLike, key: &str) {
 
 /// Add `key`, which `target` doesn't have. A table gets only the entries that
 /// differ from `before` (usually the serde defaults), so a nested struct left at
-/// its defaults never appears in the file.
+/// its defaults never appears in the file. A root-level key lands after the
+/// root's other keys, which in a file that has none is above the comments that
+/// open it (see [`keep_trailing_comments_with_last_table`]).
 fn insert_new(target: &mut dyn TableLike, key: &str, before: &toml::Table, new: &toml::Value) {
     let toml::Value::Table(new_table) = new else {
         target.insert(key, to_item(new));
