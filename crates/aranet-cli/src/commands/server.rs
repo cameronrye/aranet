@@ -32,8 +32,22 @@ pub async fn cmd_server(args: ServerArgs) -> Result<()> {
 }
 
 /// Run the server as a background daemon.
+///
+/// The configuration is checked first, because the detached process's output
+/// is discarded: an unreadable or invalid `server.toml`, or an invalid
+/// `--bind`, is reported here with a non-zero exit. Errors that appear only
+/// once the server starts, such as a port that is already in use, are still
+/// seen only by the detached process.
 fn run_daemon(args: &ServerArgs) -> Result<()> {
     use std::process::Command;
+
+    aranet_service::check_config(&aranet_service::RunOptions {
+        config: args.config.clone(),
+        bind: args.bind.clone(),
+        database: args.database.clone(),
+        no_collector: args.no_collector,
+    })
+    .context("Invalid server configuration")?;
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
