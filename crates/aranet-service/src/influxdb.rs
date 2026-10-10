@@ -30,11 +30,13 @@
 //! become an escaped space. An alias can therefore never add tags or start a
 //! second point. The `device` tag is left out when it would be empty.
 //!
-//! InfluxDB 1.x and 2.x don't read `\\` back as one backslash in a tag value
-//! or a measurement, and they treat a separator after any backslash as
-//! escaped. Config validation therefore refuses backslashes in device
-//! addresses, aliases and the measurement name, so every line reads the same
-//! on InfluxDB 1.x, 2.x and 3.
+//! Escaping can't make a backslash storable, though. Measured on InfluxDB
+//! 1.8.10, 2.7.12 and 3 Core 3.12.0: 1.8.10 and 2.7.12 store a doubled
+//! backslash as two and read a separator after any backslash as escaped,
+//! 3 Core stores a doubled backslash as one, and none of them stores a tag
+//! value or a measurement that ends in a backslash correctly. No encoding
+//! works on all three, so config validation refuses backslashes in device
+//! addresses, aliases and the measurement name.
 //!
 //! Validation also refuses a measurement name that starts with `#`. The name
 //! starts the line, InfluxDB reads a line that starts with `#` as a comment
@@ -267,17 +269,21 @@ fn urlencoding(s: &str) -> String {
 
 /// Escape a tag value for InfluxDB line protocol.
 ///
-/// Backslashes are doubled first, as the line protocol reference specifies, so
-/// on InfluxDB 3 a value can't escape the separator after it. Commas, equals
-/// signs and spaces then get a backslash, so a value can't end its tag early.
+/// Backslashes are doubled, as the line protocol reference specifies. Commas,
+/// equals signs and spaces get a backslash, so a value can't end its tag early.
 /// Line protocol can't hold a newline or any other control character in a tag
 /// value, so each becomes an escaped space and a value can never start a second
 /// point.
 ///
-/// InfluxDB 1.x and 2.x don't unescape `\\`: they would store a backslash
-/// doubled, and they reject a line whose tag value ends in one. That is why
+/// Doubling doesn't make a backslash storable. Measured on InfluxDB 1.8.10,
+/// 2.7.12 and 3 Core 3.12.0: 1.8.10 and 2.7.12 store a doubled backslash as
+/// two and read a separator after any backslash as escaped, 3 Core stores it as
+/// one in the middle of a value, and all three answer 400 when a tag value ends
+/// in it. No encoding stores every backslash the same on all three. That is why
 /// `DeviceConfig::validate` rejects backslashes, as well as control characters,
 /// in addresses and aliases; the escaping here is the second line of defence.
+/// For a value that ends in a backslash, it turns a point that 3 Core would
+/// store with two tags merged into a write that all three refuse.
 fn escape_tag_value(s: &str) -> String {
     escape_line_protocol(s, &['\\', ',', '=', ' '])
 }
@@ -448,9 +454,13 @@ mod tests {
         let config = InfluxDbConfig::default();
         let event = test_event("Aranet4 12345", 800);
 
-        // The line protocol reference (and InfluxDB 3) reads `\\` as one
-        // literal backslash, so the comma after it still separates the tags.
-        // InfluxDB 1.x and 2.x reject this line instead, which is why
+        // A trailing backslash must never swallow the comma after it into the
+        // value. Sent undoubled, InfluxDB 3 Core 3.12.0 stores the alias and
+        // the address as one tag value, `Office,address=Aranet4 12345`. Doubled,
+        // as here, the line is refused with HTTP 400 by InfluxDB 1.8.10, 2.7.12
+        // and 3 Core, which reads `\\` as one backslash only in the middle of a
+        // value. The doubling turns a silently wrong point into a refused
+        // write. It doesn't make the value storable, which is why
         // `DeviceConfig::validate` keeps backslashes out of aliases.
         let line = to_line_protocol(&config, &event, Some("Office\\"));
 
