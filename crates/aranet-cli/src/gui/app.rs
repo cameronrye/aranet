@@ -12,7 +12,7 @@ use aranet_core::messages::{Command, SensorEvent};
 use aranet_core::service_client::DeviceCollectionStats;
 use eframe::egui::{self, RichText, UserData, ViewportCommand};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, GuiConfig};
 
@@ -1994,12 +1994,16 @@ impl eframe::App for AranetApp {
 }
 
 impl AranetApp {
-    /// Save GUI configuration to the config file.
+    /// Save the GUI settings to the config file, leaving every other setting as the file has it.
+    ///
+    /// A config file that doesn't parse is left untouched, and the failure is logged.
     pub(crate) fn save_gui_config(&self) {
-        let mut config = Config::load_or_default_logged();
-        config.gui = self.gui_config.clone();
-        if let Err(e) = config.save() {
-            debug!("Failed to save GUI config: {}", e);
+        let gui = self.gui_config.clone();
+        if let Err(e) = Config::update(move |c| {
+            c.gui = gui;
+            Ok(())
+        }) {
+            warn!("Failed to save GUI settings: {e:#}");
         }
     }
 

@@ -84,8 +84,8 @@ fn save_aliases_interactive(
 ) -> Result<()> {
     use std::io::BufRead;
 
-    let mut config = config.clone();
-    let mut saved_count = 0;
+    // (alias, device identifier) pairs entered at the prompts
+    let mut new_aliases: Vec<(String, String)> = Vec::new();
 
     // Show existing aliases first
     if !config.aliases.is_empty() {
@@ -129,18 +129,20 @@ fn save_aliases_interactive(
         let alias = input.trim();
 
         if !alias.is_empty() {
-            config
-                .aliases
-                .insert(alias.to_string(), device.identifier.clone());
-            saved_count += 1;
+            new_aliases.push((alias.to_string(), device.identifier.clone()));
         }
     }
 
-    if saved_count > 0 {
-        config.save()?;
-        println!("\nSaved {} alias(es).", saved_count);
-    } else {
+    if new_aliases.is_empty() {
         println!("\nNo aliases saved.");
+    } else {
+        let saved_count = new_aliases.len();
+        // Add them to a fresh read of the file, which may have changed while the prompts waited.
+        Config::update(|c| {
+            c.aliases.extend(new_aliases);
+            Ok(())
+        })?;
+        println!("\nSaved {} alias(es).", saved_count);
     }
 
     Ok(())

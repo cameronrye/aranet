@@ -18,10 +18,9 @@ pub enum AliasAction {
 }
 
 pub fn cmd_alias(action: AliasAction, quiet: bool) -> Result<()> {
-    let mut config = Config::load_or_default()?;
-
     match action {
         AliasAction::List => {
+            let config = Config::load_or_default()?;
             if config.aliases.is_empty() {
                 if !quiet {
                     println!("No aliases configured.");
@@ -53,9 +52,8 @@ pub fn cmd_alias(action: AliasAction, quiet: bool) -> Result<()> {
                 );
             }
 
-            let was_update = config.aliases.contains_key(&name);
-            config.aliases.insert(name.clone(), address.clone());
-            config.save()?;
+            let was_update =
+                Config::update(|c| Ok(c.aliases.insert(name.clone(), address.clone()).is_some()))?;
 
             if !quiet {
                 if was_update {
@@ -66,13 +64,15 @@ pub fn cmd_alias(action: AliasAction, quiet: bool) -> Result<()> {
             }
         }
         AliasAction::Remove { name } => {
-            if config.aliases.remove(&name).is_some() {
-                config.save()?;
-                if !quiet {
-                    println!("Removed alias '{}'", name);
+            // Failing inside the update writes nothing when the alias doesn't exist.
+            Config::update(|c| {
+                if c.aliases.remove(&name).is_none() {
+                    bail!("Alias '{}' not found", name);
                 }
-            } else {
-                bail!("Alias '{}' not found", name);
+                Ok(())
+            })?;
+            if !quiet {
+                println!("Removed alias '{}'", name);
             }
         }
     }

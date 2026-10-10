@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use aranet_store::TomlFile;
 use serde::{Deserialize, Serialize};
 
 /// Configuration file structure
@@ -342,18 +343,50 @@ impl Config {
         }
     }
 
-    /// Save config to file
+    /// Change the config file at [`Config::path`]. See [`Config::update_at`].
+    pub fn update<R>(change: impl FnOnce(&mut Config) -> Result<R>) -> Result<R> {
+        Self::update_at(&Self::path(), change)
+    }
+
+    /// Re-read the config file at `path`, apply `change` to it and write back only what
+    /// `change` changed. Returns `change`'s value.
+    ///
+    /// Comments, key order and keys this version doesn't know are kept, and settings at their
+    /// defaults are not added. A missing file (and its directory) is created when there is
+    /// something to write. The file is replaced atomically and is readable only by its owner
+    /// (0600 on Unix).
+    ///
+    /// Nothing is written when `change` leaves every saved setting as the file has it, when it
+    /// returns an error, or when the file can't be read or doesn't parse (the error is returned).
+    pub fn update_at<R>(path: &Path, change: impl FnOnce(&mut Config) -> Result<R>) -> Result<R> {
+        let file = TomlFile::<Config>::open(path)
+            .with_context(|| format!("Failed to update config file: {}", path.display()))?;
+        let mut desired = file.value().clone();
+        let result = change(&mut desired)?;
+        file.save(&desired)
+            .with_context(|| format!("Failed to update config file: {}", path.display()))?;
+        Ok(result)
+    }
+
+    /// Save this whole config to [`Config::path`].
+    ///
+    /// Goes through [`Config::update_at`], so comments survive and a file that doesn't parse
+    /// is never replaced. But every setting that differs from the file is written, including
+    /// ones someone else changed in the file after `self` was loaded.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use Config::update, which keeps comments and never overwrites a config file that doesn't parse"
+    )]
     pub fn save(&self) -> Result<()> {
-        let path = Self::path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory: {}", parent.display())
-            })?;
-        }
-        let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(&path, content)
-            .with_context(|| format!("Failed to write config: {}", path.display()))?;
-        Ok(())
+        self.save_to(&Self::path())
+    }
+
+    /// [`Config::save`] to an explicit path.
+    fn save_to(&self, path: &Path) -> Result<()> {
+        Self::update_at(path, |c| {
+            *c = self.clone();
+            Ok(())
+        })
     }
 }
 
@@ -409,10 +442,11 @@ pub fn print_device_source_feedback(device: &str, source: Option<&str>, quiet: b
 /// Update the last connected device in config.
 /// This is called after a successful connection.
 pub fn update_last_device(identifier: &str, name: Option<&str>) -> Result<()> {
-    let mut config = Config::load_or_default()?;
-    config.last_device = Some(identifier.to_string());
-    config.last_device_name = name.map(|n| n.to_string());
-    config.save()
+    Config::update(|c| {
+        c.last_device = Some(identifier.to_string());
+        c.last_device_name = name.map(str::to_string);
+        Ok(())
+    })
 }
 
 /// Get info about whether we're using a fallback device.
@@ -462,6 +496,7 @@ pub fn resolve_timeout(cmd_timeout: Option<u64>, config: &Config, default: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aranet_store::TomlFileError;
     use tempfile::tempdir;
 
     #[test]
@@ -552,6 +587,143 @@ office = "Aranet4 12345"
             config.aliases.get("office").map(String::as_str),
             Some("Aranet4 12345")
         );
+    }
+
+    // ========================================================================
+    // Config::update tests
+    // ========================================================================
+
+    /// Whether `err` was caused by a config file that doesn't parse.
+    fn is_parse_error(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<TomlFileError>(),
+                Some(TomlFileError::Parse { .. })
+            )
+        })
+    }
+
+    #[test]
+    fn update_creates_a_missing_config_with_only_the_changed_keys() {
+        let dir = tempdir().unwrap();
+        // Neither the file nor its directory exists yet, as on a fresh install.
+        let path = dir.path().join("aranet").join("config.toml");
+
+        Config::update_at(&path, |c| {
+            c.fahrenheit = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fahrenheit = true\n");
+    }
+
+    #[test]
+    fn update_preserves_comments_unknown_keys_and_skips_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "# mine\nfuture_option = 1\nfahrenheit = true\n").unwrap();
+
+        Config::update_at(&path, |c| {
+            c.bq = true;
+            Ok(())
+        })
+        .unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# mine\nfuture_option = 1\nfahrenheit = true\nbq = true\n"
+        );
+        assert!(
+            !text.contains("[gui]") && !text.contains("[behavior]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn update_removes_keys_set_to_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "device = \"Aranet4 12345\"\n# keep\nfahrenheit = true\n",
+        )
+        .unwrap();
+
+        Config::update_at(&path, |c| {
+            c.device = None;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# keep\nfahrenheit = true\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_makes_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "fahrenheit = true\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        Config::update_at(&path, |c| {
+            c.gui.service_api_key = Some("secret".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(format!("{mode:o}"), "600");
+    }
+
+    #[test]
+    fn update_refuses_unparseable_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "device = [").unwrap();
+
+        // What the GUI did: fall back to defaults when the file doesn't parse, then save them.
+        let err = Config::default().save_to(&path).unwrap_err();
+        assert!(is_parse_error(&err), "{err:#}");
+
+        let err = Config::update_at(&path, |c| {
+            c.fahrenheit = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(is_parse_error(&err), "{err:#}");
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "device = [");
+    }
+
+    #[test]
+    fn update_closure_error_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "# mine\nfahrenheit = true\n").unwrap();
+        let missing = dir.path().join("missing.toml");
+
+        for target in [&path, &missing] {
+            let err = Config::update_at(target, |c| -> Result<()> {
+                c.bq = true;
+                anyhow::bail!("Invalid value")
+            })
+            .unwrap_err();
+            assert_eq!(err.to_string(), "Invalid value");
+        }
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# mine\nfahrenheit = true\n"
+        );
+        assert!(!missing.exists());
     }
 
     #[test]
