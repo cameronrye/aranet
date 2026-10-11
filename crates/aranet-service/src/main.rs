@@ -144,7 +144,7 @@ fn run_service_action(action: ServiceAction, run_options: RunOptions) -> anyhow:
             let result = service::install(level, &run_options);
             if result.is_ok() && !user {
                 // Only systemd accepts a system-level install.
-                install_notes = Some(service::system_install_notes());
+                install_notes = Some(service::system_install_notes(&run_options));
             }
             ("install", "Successfully installed aranet-service", result)
         }
