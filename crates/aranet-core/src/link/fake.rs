@@ -302,8 +302,12 @@ impl GattLink for FakeGatt {
     async fn properties(&self) -> btleplug::Result<Option<PeripheralProperties>> {
         let outcome = self.lock().properties.pop_front();
         run(outcome).await?;
+        // Both name fields hold the advertised name, as btleplug 0.13.5 reports
+        // a named sensor on BlueZ while no alias is set, on CoreBluetooth once
+        // a name has been advertised, and on WinRT before a connect.
         Ok(Some(PeripheralProperties {
             local_name: Some("Aranet4 12345".to_string()),
+            advertisement_name: Some("Aranet4 12345".to_string()),
             ..Default::default()
         }))
     }

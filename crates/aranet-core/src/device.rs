@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 use crate::scan::ScanOptions;
 use crate::traits::AranetDevice;
-use crate::util::{create_identifier, format_peripheral_id};
+use crate::util::{create_identifier, format_peripheral_id, peripheral_name};
 use crate::uuid::{
     BATTERY_LEVEL, BATTERY_SERVICE, CURRENT_READINGS_DETAIL, CURRENT_READINGS_DETAIL_ALT,
     DEVICE_INFO_SERVICE, DEVICE_NAME, FIRMWARE_REVISION, GAP_SERVICE, HARDWARE_REVISION,
@@ -602,7 +602,10 @@ impl Device {
             characteristics_cache.len()
         );
 
-        let name = properties.as_ref().and_then(|p| p.local_name.clone());
+        let name = properties
+            .as_ref()
+            .and_then(peripheral_name)
+            .map(str::to_owned);
 
         // Get address - on macOS this may be 00:00:00:00:00:00, so we use peripheral ID as fallback
         let address = properties

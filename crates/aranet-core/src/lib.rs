@@ -246,7 +246,7 @@ pub use reconnect::{ReconnectOptions, ReconnectingDevice};
 pub use retry::{RetryConfig, with_retry};
 pub use streaming::{ReadingStream, StreamOptions, StreamOptionsBuilder};
 pub use thresholds::{Co2Level, ThresholdConfig, Thresholds};
-pub use util::{create_identifier, format_peripheral_id};
+pub use util::{create_identifier, format_peripheral_id, peripheral_name};
 pub use validation::{ReadingValidator, ValidationResult, ValidationWarning};
 
 // Re-export from aranet-types

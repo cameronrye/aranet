@@ -746,6 +746,7 @@ mod tests {
     use crate::device::ConnectionConfig;
     use crate::error::{ConnectionFailureReason, Error};
     use crate::test_support::within;
+    use crate::util::peripheral_name;
 
     /// Run a connect on `fake` that must fail, with the default config and the
     /// test's runtime for cleanup, and return its error.
@@ -791,8 +792,12 @@ mod tests {
             open.pending.disarm();
 
             assert_eq!(open.services, aranet_services());
+            // The name, read as every other place in the crate reads it. The
+            // test double reports it in both name fields: with `local_name`
+            // alone this would fail on Linux and Windows, where
+            // `peripheral_name` takes only the advertised name.
             assert_eq!(
-                open.properties.and_then(|p| p.local_name).as_deref(),
+                open.properties.as_ref().and_then(peripheral_name),
                 Some("Aranet4 12345")
             );
             tokio::time::sleep(Duration::from_secs(1)).await;

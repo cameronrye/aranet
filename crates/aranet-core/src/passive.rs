@@ -46,6 +46,7 @@ use tracing::{debug, info, warn};
 use crate::advertisement::{AdvertisementData, parse_advertisement_with_name};
 use crate::error::Result;
 use crate::scan::get_adapter;
+use crate::util::peripheral_name;
 use crate::uuid::MANUFACTURER_ID;
 
 /// Bitwise-exact comparison of two `Option<f32>` values (handles NaN correctly).
@@ -296,7 +297,7 @@ impl PassiveMonitor {
                     }
 
                     // Try to parse the advertisement
-                    match parse_advertisement_with_name(data, props.local_name.as_deref()) {
+                    match parse_advertisement_with_name(data, peripheral_name(&props)) {
                         Ok(adv_data) => {
                             // Check for deduplication
                             let should_emit = if self.options.deduplicate {
@@ -308,7 +309,7 @@ impl PassiveMonitor {
                             if should_emit {
                                 let reading = PassiveReading {
                                     device_id: device_id.clone(),
-                                    device_name: props.local_name.clone(),
+                                    device_name: peripheral_name(&props).map(str::to_owned),
                                     rssi: props.rssi,
                                     data: adv_data.clone(),
                                     received_at: std::time::Instant::now(),
