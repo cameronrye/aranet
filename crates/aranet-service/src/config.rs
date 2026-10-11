@@ -376,8 +376,11 @@ pub const MAX_RETENTION_DAYS: u32 = 36_500;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetentionConfig {
-    /// Delete readings the service polled once they are older than this many
-    /// days. Unset keeps them forever.
+    /// Delete readings once they are older than this many days. This covers
+    /// every reading in the database, including those the `aranet` CLI, TUI
+    /// and GUI stored there; they share it unless the service has its own
+    /// database, as under the systemd system service and Docker. Unset keeps
+    /// them forever.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readings_days: Option<u32>,
     /// Delete cached device history (shared with `aranet sync`) once it is

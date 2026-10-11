@@ -58,7 +58,7 @@
 //!
 //! ```toml
 //! [storage.retention]
-//! readings_days = 365 # readings the service polled
+//! readings_days = 365 # every reading in the database, also the CLI's, TUI's and GUI's
 //! history_days = 730  # history cached by `aranet sync`, shared with the CLI
 //! ```
 //!
