@@ -27,7 +27,9 @@ use governor::{Quota, RateLimiter};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, warn};
 
+use crate::DropLog;
 use crate::config::{MAX_RATE_LIMIT_WINDOW_SECS, SecurityConfig};
+use crate::redact::sanitize_log_text;
 
 /// The client a request is rate-limited as: its IPv4 address, or the /64
 /// network of its IPv6 address.
@@ -87,6 +89,8 @@ pub struct RateLimitState<C: Clock = DefaultClock> {
     /// When the last over-the-cap sweep ran. `try_lock` keeps concurrent
     /// requests from sweeping at the same time.
     last_sweep: Mutex<Option<C::Instant>>,
+    /// Requests refused so far, and when [`rate_limit`] last warned about one.
+    refusals: Mutex<DropLog>,
 }
 
 impl RateLimitState {
@@ -128,6 +132,7 @@ impl<C: Clock> RateLimitState<C> {
             period,
             max_entries: config.rate_limit_max_entries,
             last_sweep: Mutex::new(None),
+            refusals: Mutex::new(DropLog::default()),
         }
     }
 
@@ -160,6 +165,18 @@ impl<C: Clock> RateLimitState<C> {
     /// Whether no client is tracked.
     pub fn is_empty(&self) -> bool {
         self.limiter.is_empty()
+    }
+
+    /// Count a refused request. Returns the number refused so far when the
+    /// caller should warn about this one: at most once a minute, because a
+    /// client that ignores the 429 would otherwise write a warning per
+    /// request, and the limiter can't limit that.
+    fn record_refusal(&self) -> Option<u64> {
+        let mut refusals = self
+            .refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        refusals.record().then_some(refusals.dropped)
     }
 
     /// Forget idle clients while more than `max_entries` are tracked, at most
@@ -320,7 +337,11 @@ pub async fn api_key_auth(
     if valid {
         next.run(request).await
     } else {
-        warn!("API key authentication failed for {}", request.uri().path());
+        // The sender, who needs no key for this, chooses the path.
+        warn!(
+            "API key authentication failed for {}",
+            sanitize_log_text(request.uri().path())
+        );
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -526,11 +547,13 @@ pub async fn origin_guard(
         && !policy.allows_host(host)
     {
         let name = host_name(host).unwrap_or_else(|| host.clone());
+        // `{:?}` escapes what could split the line. The sanitiser bounds the
+        // length too, of the name and of the path.
         warn!(
             "Refused {} {}: host {:?} is not allowed while API-key authentication is off",
             request.method(),
-            request.uri().path(),
-            name
+            sanitize_log_text(request.uri().path()),
+            sanitize_log_text(&name)
         );
         return (
             StatusCode::MISDIRECTED_REQUEST,
@@ -548,8 +571,8 @@ pub async fn origin_guard(
             warn!(
                 "Refused {} {} from origin {:?}: not the service's own origin or listed in security.cors_origins",
                 request.method(),
-                request.uri().path(),
-                origin
+                sanitize_log_text(request.uri().path()),
+                sanitize_log_text(&origin)
             );
             return (
                 StatusCode::FORBIDDEN,
@@ -573,6 +596,10 @@ pub async fn origin_guard(
 /// `config.rate_limit_enabled` switches it on; the limits are the ones `state`
 /// was created with.
 ///
+/// A refused request is logged as a warning at most once a minute, with the
+/// number of requests refused since `state` was created, and at debug
+/// otherwise: a client that ignores the 429 can't flood the log.
+///
 /// A request without a peer address (no [`ConnectInfo`], which
 /// `into_make_service_with_connect_info` supplies) gets 500 Internal Server
 /// Error, whether rate limiting is on or off.
@@ -593,7 +620,20 @@ pub async fn rate_limit(
         Ok(()) => next.run(request).await,
         Err(wait) => {
             let retry_after = retry_after_secs(wait);
-            warn!("Rate limit exceeded for {} on {}", ip, request.uri().path());
+            match state.record_refusal() {
+                Some(refused) => warn!(
+                    "Rate limit exceeded for {} on {}; {} requests refused since the service \
+                     started (this warning is logged at most once a minute)",
+                    ip,
+                    sanitize_log_text(request.uri().path()),
+                    refused
+                ),
+                None => debug!(
+                    "Rate limit exceeded for {} on {}",
+                    ip,
+                    sanitize_log_text(request.uri().path())
+                ),
+            }
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 [
@@ -953,6 +993,188 @@ mod tests {
             body,
             serde_json::json!({"error": "Too many requests", "retry_after": retry_after})
         );
+    }
+
+    #[tokio::test]
+    async fn refused_requests_warn_once_a_minute_and_count_the_rest() {
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+        // A burst of 1, then one request an hour.
+        let app = rate_limited_app(SecurityConfig {
+            rate_limit_enabled: true,
+            rate_limit_requests: 1,
+            rate_limit_window_secs: 3600,
+            ..Default::default()
+        });
+        assert_eq!(get_from(&app, "192.0.2.1").await.status(), StatusCode::OK);
+        // Every refused request is answered alike, whatever is logged.
+        for _ in 0..3 {
+            assert_eq!(
+                get_from(&app, "192.0.2.1").await.status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+
+        // The limiter can't limit its own log: a client that keeps sending
+        // would write a warning per request. One warning with the count so
+        // far, and the others at debug.
+        let text = logs.text();
+        let refused: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("Rate limit exceeded"))
+            .collect();
+        let levels: Vec<&str> = refused
+            .iter()
+            .map(|line| line.split_whitespace().nth(1).unwrap_or_default())
+            .collect();
+        assert_eq!(levels, ["WARN", "DEBUG", "DEBUG"], "{text}");
+        assert!(
+            refused[0].ends_with(
+                "Rate limit exceeded for 192.0.2.1 on /; 1 requests refused since the service \
+                 started (this warning is logged at most once a minute)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A path of 401 characters that starts with a bidi override, and what
+    /// the log shows of it: the override as a space, and 256 characters.
+    fn hostile_path() -> (String, String) {
+        (
+            format!("/\u{202e}{}", "a".repeat(399)),
+            format!("/ {}…", "a".repeat(254)),
+        )
+    }
+
+    #[tokio::test]
+    async fn refusal_warnings_show_a_sanitised_bounded_path() {
+        let (path, shown) = hostile_path();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 1], 40_000));
+        let ok = || get(|| async { StatusCode::OK });
+
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+
+        // 401: the sender needs no key to get this line written.
+        let status = Router::new()
+            .fallback_service(ok())
+            .layer(axum::middleware::from_fn_with_state(
+                test_security_config(),
+                api_key_auth,
+            ))
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // 421 and 403 from the origin guard.
+        let policy = Arc::new(OriginPolicy::new(&SecurityConfig::default(), None));
+        for (name, value) in [("Host", "evil.example"), ("Origin", "https://evil.example")] {
+            let status = Router::new()
+                .fallback_service(ok())
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&policy),
+                    origin_guard,
+                ))
+                .oneshot(
+                    Request::builder()
+                        .uri(&path)
+                        .header(name, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::MISDIRECTED_REQUEST | StatusCode::FORBIDDEN
+                ),
+                "{name}: {status}"
+            );
+        }
+
+        // 429, for the second request of a burst of 1.
+        let config = SecurityConfig {
+            rate_limit_enabled: true,
+            rate_limit_requests: 1,
+            rate_limit_window_secs: 3600,
+            ..Default::default()
+        };
+        let limiter = Arc::new(RateLimitState::new(&config));
+        let limited =
+            Router::new()
+                .fallback_service(ok())
+                .layer(axum::middleware::from_fn_with_state(
+                    (Arc::new(config), limiter),
+                    rate_limit,
+                ));
+        for expected in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+            let request = Request::builder()
+                .uri(&path)
+                .extension(ConnectInfo(peer))
+                .body(Body::empty())
+                .unwrap();
+            let status = limited.clone().oneshot(request).await.unwrap().status();
+            assert_eq!(status, expected);
+        }
+
+        let text = logs.text();
+        assert!(!text.contains('\u{202e}'), "{text:?}");
+        assert!(
+            !text.contains(&"a".repeat(255)),
+            "a line holds more of the path than 256 characters:\n{text}"
+        );
+        for line in [
+            format!("API key authentication failed for {shown}\n"),
+            format!("Refused GET {shown}: host \"evil.example\" is not allowed"),
+            format!("Refused GET {shown} from origin \"https://evil.example\": "),
+            format!("Rate limit exceeded for 192.0.2.1 on {shown}; "),
+        ] {
+            assert!(text.contains(&line), "missing {line:?} in:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_guard_warnings_cap_the_host_and_the_origin() {
+        let policy = Arc::new(OriginPolicy::new(&SecurityConfig::default(), None));
+        let long_host = format!("{}.example", "h".repeat(300));
+        let long_origin = format!("https://{}.example", "o".repeat(300));
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+
+        for (name, value) in [("Host", &long_host), ("Origin", &long_origin)] {
+            let status = Router::new()
+                .route("/api/devices", get(|| async { StatusCode::OK }))
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&policy),
+                    origin_guard,
+                ))
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/devices")
+                        .header(name, value.as_str())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::MISDIRECTED_REQUEST | StatusCode::FORBIDDEN
+                ),
+                "{name}: {status}"
+            );
+        }
+
+        let text = logs.text();
+        for line in [
+            format!("host \"{}…\" is not allowed", "h".repeat(256)),
+            format!("from origin \"https://{}…\": ", "o".repeat(248)),
+        ] {
+            assert!(text.contains(&line), "missing {line:?} in:\n{text}");
+        }
     }
 
     #[tokio::test]
