@@ -827,12 +827,13 @@ pub(crate) fn sink_client(timeout: Duration) -> reqwest::Result<reqwest::Client>
         .build()
 }
 
-/// Counts what a sink had to drop, and says when to warn about it: at most
-/// once a minute, so an outage that drops data on every reading can't flood
+/// Counts what a sink had to drop, or the rate limiter refused, and says when
+/// to warn about it: at most once a minute, so an outage that drops data on
+/// every reading, or a client that keeps sending past its limit, can't flood
 /// the log.
 #[derive(Debug, Default)]
 pub(crate) struct DropLog {
-    /// Items dropped since the sink started.
+    /// Items dropped, or requests refused, since this log was created.
     pub(crate) dropped: u64,
     last_warn: Option<std::time::Instant>,
 }
