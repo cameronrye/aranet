@@ -82,27 +82,28 @@ Pre-built service configuration files for running `aranet-service` as a backgrou
 
 ## Linux (systemd)
 
+`systemd/aranet.service` is the unit that `sudo aranet-service service install` writes. It runs the service as a dynamic, unprivileged `aranet` user with no extra capabilities, reads `/var/lib/aranet/server.toml` and keeps the database in `/var/lib/aranet` (`/var/lib/private/aranet`, which systemd links there). systemd creates the user and the directory when the service starts.
+
 ```bash
-# Copy service file
-sudo cp distribution/systemd/aranet.service /etc/systemd/system/
+# Build, then install the binary where only root can change it
+cargo build --release --locked -p aranet-service --features full
+sudo install -o root -g root -m 0755 target/release/aranet-service /usr/local/bin/aranet-service
 
-# Create user and directories
-sudo useradd -r -s /bin/false aranet
-sudo mkdir -p /var/lib/aranet
-sudo chown aranet:aranet /var/lib/aranet
-
-# Copy binary
-sudo cp target/release/aranet-service /usr/local/bin/
-
-# Enable and start
+# Install the unit (or run: sudo /usr/local/bin/aranet-service service install)
+sudo install -m 0644 distribution/systemd/aranet.service /etc/systemd/system/aranet.service
 sudo systemctl daemon-reload
-sudo systemctl enable aranet
-sudo systemctl start aranet
+sudo systemctl enable --now aranet
+
+# Add your sensors (the first start created /var/lib/aranet), then restart
+sudoedit /var/lib/aranet/server.toml
+sudo systemctl restart aranet
 
 # Check status
-sudo systemctl status aranet
+systemctl status aranet
 journalctl -u aranet -f
 ```
+
+The [deployment guide](https://cameronrye.github.io/aranet/docs/service/deployment/#linux-systemd) covers Bluetooth group access (`SupplementaryGroups=bluetooth`), running the released `aranet` binary (`aranet server`) under this unit, and moving the data of a system service installed by 0.2.x.
 
 ## macOS (launchd)
 
@@ -131,55 +132,42 @@ launchctl list | grep aranet
 
 ### System-level service
 
-```bash
-# Copy plist
-sudo cp distribution/launchd/dev.rye.aranet.plist /Library/LaunchDaemons/
-
-# Create directories
-sudo mkdir -p /usr/local/var/aranet
-sudo mkdir -p /usr/local/var/log
-
-# Copy binary
-sudo cp target/release/aranet-service /usr/local/bin/
-
-# Load service
-sudo launchctl load /Library/LaunchDaemons/dev.rye.aranet.plist
-
-# Check status
-sudo launchctl list | grep aranet
-```
+Not supported: a LaunchDaemon runs the service as root. `sudo aranet-service service install` refuses to install one on macOS; use the user-level service above, or `aranet-service service install --user`.
 
 ## Using the CLI (Recommended)
 
 The easiest way to manage the service is using the built-in CLI commands:
 
 ```bash
-# Install as a service (auto-detects platform)
-aranet-service service install
+# macOS (LaunchAgent) and Linux (systemd user service): a service that runs as you
+aranet-service service install --user
+aranet-service service start --user
+aranet-service service status --user
+aranet-service service stop --user
+aranet-service service uninstall --user
 
-# Start the service
-aranet-service service start
-
-# Check status
-aranet-service service status
-
-# Stop the service
-aranet-service service stop
-
-# Uninstall the service
-aranet-service service uninstall
+# Linux with systemd: the system service aranet.service (binary in /usr/local/bin, see above)
+sudo /usr/local/bin/aranet-service service install
+sudo systemctl start aranet
 ```
+
+System-level installs are refused on macOS, Windows, OpenRC and rc.d, where the service would run as root. On Windows, where `service install` doesn't work yet, start `aranet server` (or `aranet-service run`) at logon with Task Scheduler; the [deployment guide](https://cameronrye.github.io/aranet/docs/service/deployment/#windows) has the command.
 
 ## Configuration
 
-The service reads configuration from `~/.config/aranet/server.toml`:
+The service reads `~/.config/aranet/server.toml` (macOS: `~/Library/Application Support/aranet/server.toml`; the systemd system service: `/var/lib/aranet/server.toml`):
 
 ```toml
 [server]
 bind = "127.0.0.1:8080"
 
 [storage]
-path = "~/.local/share/aranet/data.db"
+path = "~/.local/share/aranet/data.db"  # `~/` is your home directory; leave it out under the system service
+
+# Optional: delete old data at startup and hourly (off by default)
+# [storage.retention]
+# readings_days = 90
+# history_days = 365
 
 [[devices]]
 address = "Aranet4 17C3C"

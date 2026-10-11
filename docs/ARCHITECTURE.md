@@ -704,8 +704,8 @@ This phase adds two new crates for data persistence, caching, and external integ
 |----------|--------|-----------|
 | Database location | `~/.local/share/aranet/data.db` | XDG Base Directory spec compliance |
 | History sync strategy | Incremental | Only download new records since last sync |
-| API authentication | None | Local-first design; bind to localhost by default |
-| Data retention | No pruning | Users manage their own data; no automatic deletion |
+| API authentication | Optional API key; required for network binds | Local-first design: binds to localhost by default, and a non-loopback bind needs an API key unless `security.allow_unauthenticated_network` is set |
+| Data retention | Opt-in retention | Nothing is deleted unless `[storage.retention]` is set in `server.toml`; the service then prunes old rows in batches at startup and hourly |
 
 ### aranet-store (Data Persistence)
 
@@ -740,10 +740,9 @@ GET  /api/health                     # Service health check
 GET  /api/devices                    # List all known devices
 GET  /api/devices/:id                # Get device info
 GET  /api/devices/:id/current        # Latest reading for device
-GET  /api/devices/:id/readings       # Query readings (?since, ?until, ?limit)
-GET  /api/devices/:id/history        # Query cached history
-POST /api/devices/:id/sync           # Trigger manual history sync
-GET  /api/readings                   # All readings across devices (paginated)
+GET  /api/devices/:id/readings       # Query readings (?since, ?until, ?limit, ?offset; 1000 per page by default)
+GET  /api/devices/:id/history        # Query cached history (same paging)
+GET  /api/readings                   # All readings across devices (paginated: 1000 by default, at most 10000)
 WS   /api/ws                         # Real-time readings stream (WebSocket)
 ```
 
@@ -825,7 +824,12 @@ bind = "127.0.0.1:8080"           # Listen address (localhost only by default)
 
 # Database location
 [storage]
-path = "~/.local/share/aranet/data.db"
+path = "~/.local/share/aranet/data.db"   # `~/` expands to the home directory
+
+# Optional retention (off by default): delete older rows at startup and hourly
+# [storage.retention]
+# readings_days = 90
+# history_days = 365
 
 # Devices to monitor (background collector)
 [[devices]]

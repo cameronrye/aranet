@@ -90,6 +90,15 @@ Feature requests are welcome! Please:
    combination with cargo-hack (the `features` job in `.github/workflows/ci.yml`). `--locked` fails if
    `Cargo.lock` is out of date: after changing a `Cargo.toml`, run `cargo update --workspace` and commit
    `Cargo.lock` with it.
+
+   The `Deployment files` workflow (`.github/workflows/deployment-files.yml`) runs on every push to
+   `main` and on pull requests that change `crates/`, `docker/`, `docker-compose.yml`, `.dockerignore`,
+   the root `Cargo.toml` or `Cargo.lock`, `distribution/systemd/` or `scripts/ci/`. Its `Docker image`
+   job builds `docker/Dockerfile` and smoke-tests it with `scripts/ci/check-docker-image.sh`, which also
+   runs locally with Docker. Its `systemd system service` job installs, runs and uninstalls the system
+   service on a real systemd with `scripts/ci/check-systemd-install.sh`, and its
+   `launchd system install is refused` job checks that `sudo aranet-service service install` refuses on
+   macOS.
 6. **Commit** with a clear message:
    ```bash
    git commit -m "Add feature: brief description"

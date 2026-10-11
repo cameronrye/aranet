@@ -67,7 +67,7 @@ Connect to your Aranet devices via Bluetooth LE to read measurements, download h
   - System service management (install/start/stop as launchd/systemd service)
   - Webhook notifications for CO₂/radon/battery threshold alerts (Slack/Discord/PagerDuty)
   - InfluxDB v2 real-time export via line protocol
-  - mDNS service discovery (`_aranet._tcp.local.`)
+  - mDNS service discovery (`_aranet._tcp.local.`) when serving the network with API-key authentication
   - Pre-built Grafana dashboard template
   - Built-in web dashboard with live sparklines, history charts, and service status
   - Staleness detection on current readings (`age_seconds`, `stale`)
@@ -110,11 +110,11 @@ cargo install aranet-cli
 
 This installs the `aranet` executable.
 
-Or run with Docker:
+Or run the service with Docker, from a clone of this repository (Bluetooth in Docker needs a Linux host with BlueZ):
 
 ```bash
 docker compose up -d
-# Dashboard: http://localhost:8080/dashboard
+# Dashboard: http://127.0.0.1:8080/dashboard (published on this machine only)
 ```
 
 Or build from source:
