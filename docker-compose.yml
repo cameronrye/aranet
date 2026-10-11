@@ -1,30 +1,45 @@
-# Aranet Service — standalone Docker Compose (BLE-enabled host)
+# Aranet Service: standalone Docker Compose
 #
-# This is the minimal single-service setup for hosts with Bluetooth.
+#   docker compose up -d
+#
+# Builds docker/Dockerfile and runs it with docker/server.toml, published on
+# http://127.0.0.1:8080 only. Edit docker/server.toml to add sensors, then run
+# `docker compose restart aranet-service`.
+#
+# On a Linux host with BlueZ, the service reaches Bluetooth over the host's
+# system bus through the read-only /run/dbus mount: no privileged mode, host
+# network or devices. Elsewhere (Docker Desktop on macOS or Windows) there is no
+# Bluetooth; add `command: ["--no-collector"]` to run the API only.
+#
 # For the full monitoring stack (Prometheus + Grafana), use:
 #   docker compose -f docker/docker-compose.yml up -d
 
 services:
   aranet-service:
-    build: .
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     container_name: aranet-service
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
-      # Persist database
+      # Database
       - aranet-data:/data
-      # Mount config
-      - ./server.toml:/app/server.toml:ro
-      # D-Bus access for BLE
-      - /var/run/dbus:/var/run/dbus
-    # Required for BLE access
-    privileged: true
-    network_mode: host
+      # Configuration (read-only: edit docker/server.toml on the host)
+      - ./docker/server.toml:/app/server.toml:ro
+      # BlueZ over the host's system bus. The directory, not the socket file,
+      # so the container still reaches a restarted dbus-daemon.
+      - /run/dbus:/run/dbus:ro
+    # If the log shows org.freedesktop.DBus.Error.AccessDenied, the host's AppArmor
+    # or SELinux filters D-Bus. Relax it for this container instead of using
+    # privileged mode:
+    # security_opt: ["apparmor=unconfined"]  # Ubuntu, if BlueZ calls fail with AccessDenied
+    # security_opt: ["label=disable"]  # SELinux (Fedora, RHEL)
     environment:
       - RUST_LOG=aranet_service=info
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
