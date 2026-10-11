@@ -78,6 +78,9 @@ notify-rust = { version = "4", optional = true }
 subtle = "2"
 # Decode WebSocket `?token=` values without turning `+` into a space
 percent-encoding = "2"
+# Per-client rate limiting (GCRA). No default features: they add the quanta
+# clock and random jitter, which the service doesn't use.
+governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
 # Generate an API key when authentication is enabled without one
 getrandom = "0.3"
 

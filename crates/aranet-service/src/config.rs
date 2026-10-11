@@ -447,18 +447,26 @@ pub struct SecurityConfig {
     /// warning at startup when this setting is what lets it listen.
     #[serde(default)]
     pub allow_unauthenticated_network: bool,
-    /// Enable rate limiting.
+    /// Enable rate limiting, per client: an IPv4 address or an IPv6 /64.
     pub rate_limit_enabled: bool,
-    /// Maximum requests per window.
+    /// Requests a client may send at once. After that, one more request is
+    /// allowed every `rate_limit_window_secs / rate_limit_requests`, so a
+    /// client that keeps sending gets this many requests per window. Must be
+    /// greater than 0.
     #[serde(default = "default_rate_limit_requests")]
     pub rate_limit_requests: u32,
-    /// Rate limit window in seconds.
+    /// Seconds for a client's whole burst to refill, from 1 to 86400 (one
+    /// day).
     #[serde(default = "default_rate_limit_window")]
     pub rate_limit_window_secs: u64,
-    /// Maximum number of tracked IPs for rate limiting.
+    /// Number of tracked clients above which requests also forget idle
+    /// clients, at most once per refill period. Must be at least 1.
     ///
-    /// When the number of tracked IPs exceeds this limit, the oldest entries
-    /// are evicted to prevent unbounded memory growth from many unique IPs.
+    /// A client is forgotten once its budget has been full again for one
+    /// refill period: at most one window plus one period after its last
+    /// request. The service also sweeps idle clients once per window. A
+    /// throttled client is never forgotten, so more clients than this are
+    /// tracked while more than this are active.
     #[serde(default = "default_rate_limit_max_entries")]
     pub rate_limit_max_entries: usize,
     /// Browser origins, other than the service's own, that may call the API.
@@ -500,6 +508,11 @@ fn default_rate_limit_window() -> u64 {
 fn default_rate_limit_max_entries() -> usize {
     10_000
 }
+
+/// Longest accepted `security.rate_limit_window_secs`: one day. The rate
+/// limiter counts time in `u64` nanoseconds, which a window of centuries
+/// overflows.
+pub(crate) const MAX_RATE_LIMIT_WINDOW_SECS: u64 = 86_400;
 
 fn default_cors_origins() -> Vec<String> {
     Vec::new()
@@ -560,6 +573,22 @@ impl SecurityConfig {
                     errors,
                     "security.rate_limit_window_secs",
                     "rate limit window must be at least 1 second"
+                );
+            }
+            if self.rate_limit_window_secs > MAX_RATE_LIMIT_WINDOW_SECS {
+                validate!(
+                    errors,
+                    "security.rate_limit_window_secs",
+                    "rate limit window {} exceeds maximum of {} seconds",
+                    self.rate_limit_window_secs,
+                    MAX_RATE_LIMIT_WINDOW_SECS
+                );
+            }
+            if self.rate_limit_max_entries < 1 {
+                validate!(
+                    errors,
+                    "security.rate_limit_max_entries",
+                    "rate limit max entries must be at least 1"
                 );
             }
         }
@@ -2774,5 +2803,49 @@ path = "/data/aranet.db"
         assert!(config.prometheus.enabled);
         assert!(config.mqtt.enabled);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rate_limit_window_over_a_day_and_zero_max_entries_rejected() {
+        let over_a_day = SecurityConfig {
+            rate_limit_window_secs: 86_401,
+            ..Default::default()
+        };
+        let errors = over_a_day.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "security.rate_limit_window_secs");
+        assert_eq!(
+            errors[0].message,
+            "rate limit window 86401 exceeds maximum of 86400 seconds"
+        );
+
+        let no_entries = SecurityConfig {
+            rate_limit_max_entries: 0,
+            ..Default::default()
+        };
+        let errors = no_entries.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "security.rate_limit_max_entries");
+        assert_eq!(
+            errors[0].message,
+            "rate limit max entries must be at least 1"
+        );
+
+        // The limits themselves are accepted.
+        let at_the_limits = SecurityConfig {
+            rate_limit_window_secs: 86_400,
+            rate_limit_max_entries: 1,
+            ..Default::default()
+        };
+        assert!(at_the_limits.validate().is_empty());
+
+        // Nothing is checked while rate limiting is off.
+        let disabled = SecurityConfig {
+            rate_limit_enabled: false,
+            rate_limit_window_secs: u64::MAX,
+            rate_limit_max_entries: 0,
+            ..Default::default()
+        };
+        assert!(disabled.validate().is_empty());
     }
 }

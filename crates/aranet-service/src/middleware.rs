@@ -6,10 +6,12 @@
 //!   cross-site requests)
 //! - Rate limiting
 
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     Json,
@@ -18,92 +20,171 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use tokio::sync::RwLock;
+use governor::clock::{Clock, DefaultClock, Reference};
+use governor::middleware::NoOpMiddleware;
+use governor::state::keyed::DashMapStateStore;
+use governor::{Quota, RateLimiter};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, warn};
 
-use crate::config::SecurityConfig;
+use crate::config::{MAX_RATE_LIMIT_WINDOW_SECS, SecurityConfig};
 
-/// State for rate limiting.
-#[derive(Debug, Default)]
-pub struct RateLimitState {
-    /// Request counts per IP address.
-    requests: RwLock<HashMap<IpAddr, RateLimitEntry>>,
+/// The client a request is rate-limited as: its IPv4 address, or the /64
+/// network of its IPv6 address.
+///
+/// One IPv6 host normally has a whole /64 to itself (SLAAC and privacy
+/// addresses), so keying on the full address would let it send every request
+/// from a new address. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, which a
+/// dual-stack listener reports for IPv4 clients) counts as its IPv4 address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateLimitKey {
+    /// An IPv4 client.
+    V4(Ipv4Addr),
+    /// The upper 64 bits (the network prefix) of an IPv6 client's address.
+    V6Net64(u64),
 }
 
-#[derive(Debug, Clone)]
-struct RateLimitEntry {
-    count: u32,
-    window_start: Instant,
+impl From<IpAddr> for RateLimitKey {
+    fn from(ip: IpAddr) -> Self {
+        match ip.to_canonical() {
+            IpAddr::V4(ip) => Self::V4(ip),
+            IpAddr::V6(ip) => Self::V6Net64((ip.to_bits() >> 64) as u64),
+        }
+    }
+}
+
+/// Per-client rate limiting state (GCRA, from `governor`).
+///
+/// Each client ([`RateLimitKey`]) may send `security.rate_limit_requests`
+/// requests at once, and then one more every
+/// `rate_limit_window_secs / rate_limit_requests`. A check locks only the map
+/// shard that holds the client, so requests never queue on one global lock.
+///
+/// A client is forgotten only once its whole budget has been back for at
+/// least one refill period, so a throttled client never is.
+/// [`cleanup`](Self::cleanup) forgets such clients, and the service runs it
+/// once per window. While more than `security.rate_limit_max_entries` clients
+/// are tracked, allowed requests also sweep, at most once per refill period,
+/// so the map holds more entries than that only while that many clients are
+/// active.
+///
+/// Behind a reverse proxy, or Docker's port proxy, every client has the
+/// proxy's address and so shares one budget.
+pub struct RateLimitState<C: Clock = DefaultClock> {
+    limiter:
+        RateLimiter<RateLimitKey, DashMapStateStore<RateLimitKey>, C, NoOpMiddleware<C::Instant>>,
+    /// The burst size, reported in `X-RateLimit-Limit`.
+    limit: u32,
+    /// How long one request takes to refill: the window divided by `limit`.
+    period: Duration,
+    max_entries: usize,
+    /// When the last over-the-cap sweep ran. `try_lock` keeps concurrent
+    /// requests from sweeping at the same time.
+    last_sweep: Mutex<Option<C::Instant>>,
 }
 
 impl RateLimitState {
-    /// Create a new rate limit state.
-    pub fn new() -> Self {
-        Self {
-            requests: RwLock::new(HashMap::new()),
-        }
+    /// Create the rate limiting state for `config`, on the system's monotonic
+    /// clock.
+    pub fn new(config: &SecurityConfig) -> Self {
+        Self::with_clock(config, DefaultClock::default())
     }
+}
 
-    /// Check if a request from the given IP should be rate limited.
-    pub async fn check_rate_limit(
-        &self,
-        ip: IpAddr,
-        max_requests: u32,
-        window_secs: u64,
-    ) -> Result<(), (u32, u64)> {
-        let window = Duration::from_secs(window_secs);
-        let now = Instant::now();
-
-        let mut requests = self.requests.write().await;
-
-        let entry = requests.entry(ip).or_insert_with(|| RateLimitEntry {
-            count: 0,
-            window_start: now,
-        });
-
-        // Reset window if expired
-        if now.duration_since(entry.window_start) >= window {
-            entry.count = 0;
-            entry.window_start = now;
-        }
-
-        entry.count += 1;
-
-        if entry.count > max_requests {
-            let remaining_secs = window
-                .checked_sub(now.duration_since(entry.window_start))
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            Err((max_requests, remaining_secs))
-        } else {
-            Ok(())
-        }
+impl Default for RateLimitState {
+    /// The state for [`SecurityConfig::default`]'s limits.
+    fn default() -> Self {
+        Self::new(&SecurityConfig::default())
     }
+}
 
-    /// Clean up expired entries to prevent memory leaks.
+impl<C: Clock> RateLimitState<C> {
+    /// Create the rate limiting state for `config` on `clock` (tests use
+    /// [`governor::clock::FakeRelativeClock`]).
     ///
-    /// Also enforces `max_entries` cap to prevent unbounded growth from many unique IPs.
-    pub async fn cleanup(&self, window_secs: u64, max_entries: usize) {
-        let window = Duration::from_secs(window_secs);
-        let now = Instant::now();
-
-        let mut requests = self.requests.write().await;
-        // Remove expired entries
-        requests.retain(|_, entry| now.duration_since(entry.window_start) < window * 2);
-
-        // Evict oldest entries if we exceed the cap
-        if requests.len() > max_entries {
-            let mut entries: Vec<(IpAddr, Instant)> = requests
-                .iter()
-                .map(|(ip, entry)| (*ip, entry.window_start))
-                .collect();
-            entries.sort_by_key(|(_, start)| *start);
-            let to_remove = requests.len() - max_entries;
-            for (ip, _) in entries.into_iter().take(to_remove) {
-                requests.remove(&ip);
-            }
+    /// Values that validation rejects are clamped instead, because the state
+    /// is built even while rate limiting is off: a `rate_limit_requests` of 0
+    /// counts as 1, and the window as 1 second to 1 day.
+    pub fn with_clock(config: &SecurityConfig, clock: C) -> Self {
+        let requests = NonZeroU32::new(config.rate_limit_requests).unwrap_or(NonZeroU32::MIN);
+        let window = Duration::from_secs(
+            config
+                .rate_limit_window_secs
+                .clamp(1, MAX_RATE_LIMIT_WINDOW_SECS),
+        );
+        let period = (window / requests.get()).max(Duration::from_nanos(1));
+        let quota = Quota::with_period(period)
+            .expect("the refill period is at least 1 ns")
+            .allow_burst(requests);
+        Self {
+            limiter: RateLimiter::dashmap_with_clock(quota, clock),
+            limit: requests.get(),
+            period,
+            max_entries: config.rate_limit_max_entries,
+            last_sweep: Mutex::new(None),
         }
+    }
+
+    /// Count a request from `ip` against its client's budget.
+    ///
+    /// `Err` carries how long until the client's next request is allowed.
+    pub fn check(&self, ip: IpAddr) -> Result<(), Duration> {
+        match self.limiter.check_key(&RateLimitKey::from(ip)) {
+            Ok(()) => {
+                self.sweep_if_over_cap();
+                Ok(())
+            }
+            Err(not_until) => Err(not_until.wait_time_from(self.limiter.clock().now())),
+        }
+    }
+
+    /// Forget every client whose whole budget has been back for at least one
+    /// refill period (at most a window plus a period after its last request),
+    /// and release the memory. A throttled client is never forgotten.
+    pub fn cleanup(&self) {
+        self.limiter.retain_recent();
+        self.limiter.shrink_to_fit();
+    }
+
+    /// The number of clients tracked.
+    pub fn len(&self) -> usize {
+        self.limiter.len()
+    }
+
+    /// Whether no client is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.limiter.is_empty()
+    }
+
+    /// Forget idle clients while more than `max_entries` are tracked, at most
+    /// once per refill period.
+    ///
+    /// Only an allowed request can add a client (a client's first request is
+    /// always allowed), so only allowed requests call this.
+    fn sweep_if_over_cap(&self) {
+        if self.limiter.len() <= self.max_entries {
+            return;
+        }
+        let Ok(mut last_sweep) = self.last_sweep.try_lock() else {
+            return;
+        };
+        let now = self.limiter.clock().now();
+        if last_sweep.is_some_and(|at| Duration::from(now.duration_since(at)) < self.period) {
+            return;
+        }
+        self.limiter.retain_recent();
+        *last_sweep = Some(now);
+    }
+}
+
+impl<C: Clock> fmt::Debug for RateLimitState<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RateLimitState")
+            .field("limit", &self.limit)
+            .field("period", &self.period)
+            .field("max_entries", &self.max_entries)
+            .field("keys", &self.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -471,8 +552,11 @@ pub async fn origin_guard(
 
 /// Rate limiting middleware.
 ///
-/// Limits requests per IP address within a time window.
-/// Returns 429 Too Many Requests if the limit is exceeded.
+/// Counts each request against its client's budget in `state` (see
+/// [`RateLimitState`]) and answers 429 Too Many Requests once the budget is
+/// spent, with `Retry-After` in whole seconds, rounded up.
+/// `config.rate_limit_enabled` switches it on; the limits are the ones `state`
+/// was created with.
 pub async fn rate_limit(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     State((config, state)): State<(Arc<SecurityConfig>, Arc<RateLimitState>)>,
@@ -486,22 +570,16 @@ pub async fn rate_limit(
 
     let ip = addr.ip();
 
-    match state
-        .check_rate_limit(
-            ip,
-            config.rate_limit_requests,
-            config.rate_limit_window_secs,
-        )
-        .await
-    {
+    match state.check(ip) {
         Ok(()) => next.run(request).await,
-        Err((limit, retry_after)) => {
+        Err(wait) => {
+            let retry_after = retry_after_secs(wait);
             warn!("Rate limit exceeded for {} on {}", ip, request.uri().path());
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 [
                     ("Retry-After", retry_after.to_string()),
-                    ("X-RateLimit-Limit", limit.to_string()),
+                    ("X-RateLimit-Limit", state.limit.to_string()),
                     ("X-RateLimit-Remaining", "0".to_string()),
                 ],
                 Json(serde_json::json!({
@@ -512,6 +590,14 @@ pub async fn rate_limit(
                 .into_response()
         }
     }
+}
+
+/// `wait` in the whole seconds `Retry-After` needs: rounded up, and at least
+/// 1, so a client that waits as told is never refused again.
+pub(crate) fn retry_after_secs(wait: Duration) -> u64 {
+    wait.as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0))
+        .max(1)
 }
 
 /// Constant-time byte comparison to prevent timing attacks.
@@ -565,6 +651,7 @@ mod tests {
         http::{Request, StatusCode},
         routing::get,
     };
+    use governor::clock::FakeRelativeClock;
     use tower::ServiceExt;
 
     fn test_security_config() -> Arc<SecurityConfig> {
@@ -583,73 +670,285 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"longer"));
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_state_allows_requests() {
-        let state = RateLimitState::new();
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+    // ---- Rate limiting (SV-14) ----
+    //
+    // The limiter tests run on governor's FakeRelativeClock, which only moves
+    // when a test advances it: tokio's paused clock doesn't drive governor.
+    // With a burst of `b` over `window`, one request refills every
+    // `t = window / b`. governor keeps each client's theoretical arrival time
+    // (TAT): a first request sets it to `now + t`, each allowed request adds
+    // `t`, and a request is refused while `now < TAT - (b - 1) * t`.
+    // `cleanup` forgets a client once `TAT <= now - t`.
 
-        // First request should succeed
-        assert!(state.check_rate_limit(ip, 10, 60).await.is_ok());
-
-        // Second request should succeed
-        assert!(state.check_rate_limit(ip, 10, 60).await.is_ok());
+    fn ip(addr: &str) -> IpAddr {
+        addr.parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_state_blocks_excess() {
-        let state = RateLimitState::new();
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-
-        // Make 3 requests (limit is 2)
-        assert!(state.check_rate_limit(ip, 2, 60).await.is_ok());
-        assert!(state.check_rate_limit(ip, 2, 60).await.is_ok());
-        assert!(state.check_rate_limit(ip, 2, 60).await.is_err());
+    /// A limiter for these limits on a fake clock that starts at 0, and a
+    /// handle to that clock (clones share its time).
+    fn limiter(
+        requests: u32,
+        window_secs: u64,
+        max_entries: usize,
+    ) -> (RateLimitState<FakeRelativeClock>, FakeRelativeClock) {
+        let config = SecurityConfig {
+            rate_limit_enabled: true,
+            rate_limit_requests: requests,
+            rate_limit_window_secs: window_secs,
+            rate_limit_max_entries: max_entries,
+            ..Default::default()
+        };
+        let clock = FakeRelativeClock::default();
+        (RateLimitState::with_clock(&config, clock.clone()), clock)
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_state_per_ip() {
-        let state = RateLimitState::new();
-        let ip1: IpAddr = "127.0.0.1".parse().unwrap();
-        let ip2: IpAddr = "127.0.0.2".parse().unwrap();
+    #[test]
+    fn burst_then_throttle_and_retry_after() {
+        // A burst of 2, then one request every 30 s.
+        let (state, clock) = limiter(2, 60, 100);
+        let client = ip("192.0.2.7");
+        assert_eq!(state.check(client), Ok(()));
+        assert_eq!(state.check(client), Ok(()));
+        assert_eq!(state.check(client), Err(Duration::from_secs(30)));
 
-        // Exhaust IP1's limit
-        assert!(state.check_rate_limit(ip1, 1, 60).await.is_ok());
-        assert!(state.check_rate_limit(ip1, 1, 60).await.is_err());
-
-        // IP2 should still be allowed
-        assert!(state.check_rate_limit(ip2, 1, 60).await.is_ok());
+        clock.advance(Duration::from_secs(30));
+        assert_eq!(state.check(client), Ok(()));
+        // One request came back, not a new window's worth.
+        assert_eq!(state.check(client), Err(Duration::from_secs(30)));
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_state_cleanup() {
-        let state = RateLimitState::new();
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-
-        // Add an entry
-        state.check_rate_limit(ip, 10, 60).await.ok();
-
-        // Should have one entry
-        assert_eq!(state.requests.read().await.len(), 1);
-
-        // Cleanup (entries within 2x window are kept)
-        state.cleanup(60, 10_000).await;
-        assert_eq!(state.requests.read().await.len(), 1);
+    #[test]
+    fn ipv6_clients_in_one_64_share_a_bucket() {
+        let (state, _clock) = limiter(1, 60, 100);
+        assert_eq!(state.check(ip("2001:db8::1")), Ok(()));
+        assert!(
+            state.check(ip("2001:db8::2")).is_err(),
+            "a second address in the same /64 got a fresh budget"
+        );
+        // The next /64 is another client.
+        assert_eq!(state.check(ip("2001:db8:0:1::1")), Ok(()));
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_state_cleanup_evicts_over_cap() {
-        let state = RateLimitState::new();
+    #[test]
+    fn ipv4_mapped_clients_stay_separate() {
+        // Masking ::ffff:a.b.c.d to /64 would put every IPv4 client of a
+        // dual-stack listener into ::/64.
+        let (state, _clock) = limiter(1, 60, 100);
+        assert_eq!(state.check(ip("::ffff:10.0.0.1")), Ok(()));
+        assert_eq!(state.check(ip("::ffff:10.0.0.2")), Ok(()));
+    }
 
-        // Add 5 entries from different IPs
-        for i in 1..=5u8 {
-            let ip: IpAddr = format!("10.0.0.{}", i).parse().unwrap();
-            state.check_rate_limit(ip, 100, 60).await.ok();
+    #[test]
+    fn ipv4_mapped_address_shares_a_bucket_with_its_ipv4_address() {
+        let (state, _clock) = limiter(1, 60, 100);
+        assert_eq!(state.check(ip("::ffff:10.0.0.1")), Ok(()));
+        assert!(
+            state.check(ip("10.0.0.1")).is_err(),
+            "::ffff:10.0.0.1 and 10.0.0.1 are one client"
+        );
+    }
+
+    #[test]
+    fn rate_limit_key_is_the_ipv4_address_or_the_ipv6_64() {
+        assert_eq!(
+            RateLimitKey::from(ip("2001:db8:0:1::5")),
+            RateLimitKey::V6Net64(0x2001_0db8_0000_0001)
+        );
+        assert_eq!(
+            RateLimitKey::from(ip("2001:db8:0:1:ffff:ffff:ffff:ffff")),
+            RateLimitKey::from(ip("2001:db8:0:1::"))
+        );
+        assert_eq!(
+            RateLimitKey::from(ip("::ffff:192.0.2.1")),
+            RateLimitKey::V4(Ipv4Addr::new(192, 0, 2, 1))
+        );
+        assert_eq!(RateLimitKey::from(ip("::1")), RateLimitKey::V6Net64(0));
+    }
+
+    #[test]
+    fn throttled_client_survives_overflow_sweep() {
+        // One request per 60 s, and at most 2 clients before requests sweep.
+        let (state, clock) = limiter(1, 60, 2);
+        let throttled = ip("10.0.0.1");
+        assert_eq!(state.check(throttled), Ok(()));
+        assert_eq!(state.check(throttled), Err(Duration::from_secs(60)));
+        // The third client triggers an early sweep; the rest come within
+        // the same refill period, so they don't.
+        for i in 2..=6u8 {
+            assert_eq!(state.check(IpAddr::from([10, 0, 0, i])), Ok(()));
         }
-        assert_eq!(state.requests.read().await.len(), 5);
+        // Every client is still active, so the map stays over max_entries.
+        assert_eq!(state.len(), 6);
 
-        // Cleanup with max_entries=3 should evict the 2 oldest
-        state.cleanup(60, 3).await;
-        assert_eq!(state.requests.read().await.len(), 3);
+        state.cleanup();
+        assert_eq!(
+            state.check(throttled),
+            Err(Duration::from_secs(60)),
+            "the sweep forgot a throttled client"
+        );
+
+        clock.advance(Duration::from_secs(59));
+        state.cleanup();
+        assert_eq!(state.check(throttled), Err(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn sweep_drops_only_replenished_clients() {
+        // A burst of 2, one request back every 30 s.
+        let (state, clock) = limiter(2, 60, 100);
+        let light = ip("10.0.0.1"); // one request: TAT 30 s
+        let heavy = ip("10.0.0.2"); // the whole burst, then refused: TAT 60 s
+        assert_eq!(state.check(light), Ok(()));
+        assert_eq!(state.check(heavy), Ok(()));
+        assert_eq!(state.check(heavy), Ok(()));
+        assert!(state.check(heavy).is_err());
+
+        state.cleanup();
+        assert_eq!(state.len(), 2, "clients seen just now are kept");
+
+        // One window later, the light client has been back to a full budget
+        // for a whole period; the heavy one only just got there.
+        clock.advance(Duration::from_secs(60));
+        state.cleanup();
+        assert_eq!(state.len(), 1);
+
+        clock.advance(Duration::from_secs(30));
+        state.cleanup();
+        assert_eq!(state.len(), 0);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn early_sweep_runs_over_max_entries_at_most_once_per_period() {
+        // A burst of 10, one request back every 6 s; sweep above 2 clients.
+        let (state, clock) = limiter(10, 60, 2);
+        assert_eq!(state.check(ip("10.0.0.1")), Ok(())); // TAT 6 s
+        clock.advance(Duration::from_secs(49));
+        assert_eq!(state.check(ip("10.0.0.2")), Ok(())); // TAT 55 s
+        clock.advance(Duration::from_secs(11));
+
+        // t = 60 s: a third client takes the map over the cap, and the sweep
+        // forgets 10.0.0.1 (TAT 6 s <= 60 s - 6 s).
+        assert_eq!(state.check(ip("10.0.0.3")), Ok(()));
+        assert_eq!(state.len(), 2);
+
+        // t = 61 s: over the cap again, and 10.0.0.2 could go (55 s <= 55 s),
+        // but a sweep ran less than a period ago.
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(state.check(ip("10.0.0.4")), Ok(()));
+        assert_eq!(state.len(), 3);
+
+        // t = 66 s: a period after the last sweep, the next one runs.
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(state.check(ip("10.0.0.5")), Ok(()));
+        assert_eq!(state.len(), 3);
+    }
+
+    #[test]
+    fn out_of_range_config_is_clamped_instead_of_panicking() {
+        // The service builds the limiter even while rate limiting is off, and
+        // then nothing validates these values.
+        let (state, _clock) = limiter(0, 0, 0);
+        assert_eq!(state.limit, 1);
+        assert_eq!(state.check(ip("10.0.0.1")), Ok(()));
+        assert_eq!(state.check(ip("10.0.0.1")), Err(Duration::from_secs(1)));
+
+        // A window of centuries would overflow governor's nanosecond clock.
+        let (state, _clock) = limiter(1, u64::MAX, 10);
+        assert_eq!(state.check(ip("10.0.0.1")), Ok(()));
+        assert_eq!(
+            state.check(ip("10.0.0.1")),
+            Err(Duration::from_secs(86_400))
+        );
+
+        for window_secs in [1, u64::MAX] {
+            let (state, _clock) = limiter(u32::MAX, window_secs, 10);
+            assert_eq!(state.check(ip("10.0.0.1")), Ok(()));
+        }
+    }
+
+    #[test]
+    fn retry_after_is_rounded_up_and_at_least_one() {
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_secs(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1200)), 2);
+        assert_eq!(retry_after_secs(Duration::from_secs(30)), 30);
+    }
+
+    /// One route behind `rate_limit`, with its own limiter state.
+    fn rate_limited_app(config: SecurityConfig) -> Router {
+        let state = Arc::new(RateLimitState::new(&config));
+        Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                (Arc::new(config), state),
+                rate_limit,
+            ))
+    }
+
+    /// `GET /` from the client address `ip`.
+    async fn get_from(app: &Router, ip: &str) -> Response {
+        let peer = std::net::SocketAddr::new(ip.parse().unwrap(), 40_000);
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(ConnectInfo(peer))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rate_limited_response_has_retry_after_headers_and_body() {
+        // A burst of 2, then one request every 30 s.
+        let app = rate_limited_app(SecurityConfig {
+            rate_limit_enabled: true,
+            rate_limit_requests: 2,
+            rate_limit_window_secs: 60,
+            ..Default::default()
+        });
+        assert_eq!(get_from(&app, "192.0.2.1").await.status(), StatusCode::OK);
+        assert_eq!(get_from(&app, "192.0.2.1").await.status(), StatusCode::OK);
+
+        let limited = get_from(&app, "192.0.2.1").await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header = |name: &str| limited.headers()[name].to_str().unwrap().to_owned();
+        let retry_after: u64 = header("retry-after").parse().unwrap();
+        // 30 s minus the microseconds since the first request, rounded up;
+        // the range only tolerates a stalled test machine.
+        assert!(
+            (1..=30).contains(&retry_after),
+            "Retry-After {retry_after} s, but one request refills in 30 s"
+        );
+        assert_eq!(header("x-ratelimit-limit"), "2");
+        assert_eq!(header("x-ratelimit-remaining"), "0");
+        let body = axum::body::to_bytes(limited.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "Too many requests", "retry_after": retry_after})
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_rate_limit_passes_every_request() {
+        // Limits that validation would reject are ignored while it is off.
+        let app = rate_limited_app(SecurityConfig {
+            rate_limit_enabled: false,
+            rate_limit_requests: 0,
+            rate_limit_window_secs: 0,
+            rate_limit_max_entries: 0,
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            assert_eq!(get_from(&app, "192.0.2.1").await.status(), StatusCode::OK);
+        }
     }
 
     #[test]

@@ -75,10 +75,11 @@
 //! # it starts and saves it here.
 //! api_key = "your-secure-random-key-at-least-32-chars"
 //!
-//! # Rate limit requests per IP address
+//! # Rate limit each IPv4 address or IPv6 /64: a burst of 100 requests, then
+//! # one more every 60 / 100 seconds
 //! rate_limit_enabled = true
-//! rate_limit_requests = 100   # max requests per window
-//! rate_limit_window_secs = 60 # window duration
+//! rate_limit_requests = 100   # burst size, and requests per window
+//! rate_limit_window_secs = 60 # time to refill the whole burst (at most 86400)
 //! ```
 //!
 //! The service refuses to listen on an address other than loopback (such as
@@ -553,6 +554,32 @@ fn unauthenticated_network_warning(bound: SocketAddr, security: &SecurityConfig)
     })
 }
 
+/// Sweep idle clients out of `rate_limit_state` once per rate-limit window
+/// (clamped to 1 second to 1 day) until `shutdown` changes or its sender is
+/// dropped.
+fn spawn_rate_limit_sweeper<C>(
+    rate_limit_state: Arc<middleware::RateLimitState<C>>,
+    window_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()>
+where
+    C: governor::clock::Clock + Send + Sync + 'static,
+{
+    let every =
+        std::time::Duration::from_secs(window_secs.clamp(1, config::MAX_RATE_LIMIT_WINDOW_SECS));
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(every);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = interval.tick() => rate_limit_state.cleanup(),
+            }
+        }
+    })
+}
+
 /// Run the HTTP service until shutdown.
 ///
 /// Loads the configuration with [`load_config`] and listens on `server.bind`
@@ -587,24 +614,10 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
     let state = AppState::with_config_path(store, config.clone(), path);
 
     let security_config = Arc::new(config.security.clone());
-    let rate_limit_state = Arc::new(middleware::RateLimitState::new());
-
-    {
-        let rate_limit_state = Arc::clone(&rate_limit_state);
-        let window_secs = config.security.rate_limit_window_secs;
-        let max_entries = config.security.rate_limit_max_entries;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                rate_limit_state.cleanup(window_secs, max_entries).await;
-            }
-        });
-    }
+    let rate_limit_state = Arc::new(middleware::RateLimitState::new(&config.security));
 
     // Background tasks that stop on `AppState::signal_shutdown`; shutdown
     // waits for them.
-    #[cfg_attr(not(feature = "prometheus"), allow(unused_mut))]
     let mut background: Vec<JoinHandle<()>> = Vec::new();
 
     if let Some(handle) = retention::spawn(Arc::clone(&state), config.storage.retention.clone()) {
@@ -656,6 +669,14 @@ pub async fn run(options: RunOptions) -> anyhow::Result<()> {
         let advertiser = MdnsAdvertiser::new(Arc::clone(&state));
         advertiser.start(bound).await
     };
+
+    if config.security.rate_limit_enabled {
+        background.push(spawn_rate_limit_sweeper(
+            Arc::clone(&rate_limit_state),
+            config.security.rate_limit_window_secs,
+            state.subscribe_shutdown(),
+        ));
+    }
 
     let app = app(
         Arc::clone(&state),
@@ -1786,5 +1807,35 @@ mod tests {
             unauthenticated_network_warning(bound, &authenticated_and_opted_out).is_none(),
             "warned although authentication is on"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_sweeper_sweeps_every_window_and_stops_at_shutdown() {
+        // tokio's paused clock drives the sweeper's interval; governor's fake
+        // clock drives the limiter. The default limits refill a request every
+        // 0.6 s, so a client is idle one window after its only request.
+        let clock = governor::clock::FakeRelativeClock::default();
+        let limiter = Arc::new(middleware::RateLimitState::with_clock(
+            &SecurityConfig::default(),
+            clock.clone(),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let sweeper = spawn_rate_limit_sweeper(Arc::clone(&limiter), 60, shutdown_rx);
+        // Let the sweeper take its immediate first tick (t = 0 s).
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        limiter.check("10.0.0.1".parse().unwrap()).unwrap();
+        clock.advance(std::time::Duration::from_secs(60));
+        assert_eq!(limiter.len(), 1, "swept before the next tick");
+
+        // The next tick (t = 60 s) forgets the idle client.
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(limiter.is_empty());
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), sweeper)
+            .await
+            .expect("the sweeper kept running after shutdown")
+            .unwrap();
     }
 }

@@ -1655,11 +1655,12 @@ mod tests {
     }
 
     fn create_full_app(security: SecurityConfig) -> (axum::Router, TestState) {
+        let rate_limit_state = Arc::new(RateLimitState::new(&security));
         let t = create_test_state();
         let app = crate::app(
             Arc::clone(&t.state),
             Arc::new(security.clone()),
-            Arc::new(RateLimitState::new()),
+            rate_limit_state,
         );
         (app, t)
     }
