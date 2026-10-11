@@ -38,6 +38,9 @@ scrape_configs:
     #   credentials: <your API key>
 
   # Alternative: If running aranet-service outside Docker
+  # While API key authentication is off, the service answers only Host names it
+  # knows (421 Misdirected Request otherwise), so that service's server.toml
+  # needs allowed_hosts = ["host.docker.internal"] in its [security] table.
   # - job_name: 'aranet-local'
   #   static_configs:
   #     - targets: ['host.docker.internal:8080']
