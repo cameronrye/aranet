@@ -48,7 +48,7 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum ServiceAction {
-    /// Install aranet-service as a system service.
+    /// Install aranet-service as a service (system-wide installs need Linux with systemd).
     Install {
         /// Install as user-level service (no root/admin required).
         #[arg(long)]
@@ -84,6 +84,22 @@ enum ServiceAction {
     },
 }
 
+impl ServiceAction {
+    /// The level the action applies to: `--user` or system-wide.
+    fn level(&self) -> service::Level {
+        let (Self::Install { user }
+        | Self::Uninstall { user }
+        | Self::Start { user }
+        | Self::Stop { user }
+        | Self::Status { user }) = self;
+        if *user {
+            service::Level::User
+        } else {
+            service::Level::System
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -104,16 +120,33 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn handle_service_action(action: ServiceAction, run_options: RunOptions) -> anyhow::Result<()> {
+    let level = action.level();
+    let result = run_service_action(action, run_options);
+
+    // Services from 0.2.1 or earlier that this action didn't replace or remove,
+    // one line each. On stderr: the GUI reads `service status` from stdout.
+    if let Some(warnings) = service::legacy_service_warning(level) {
+        for warning in warnings.lines() {
+            eprintln!("Warning: {warning}");
+        }
+    }
+
+    result
+}
+
+fn run_service_action(action: ServiceAction, run_options: RunOptions) -> anyhow::Result<()> {
     use service::{Level, ServiceStatus};
 
+    let mut install_notes = None;
     let (action_name, success_message, result) = match action {
         ServiceAction::Install { user } => {
             let level = if user { Level::User } else { Level::System };
-            (
-                "install",
-                "Successfully installed aranet-service",
-                service::install(level, &run_options),
-            )
+            let result = service::install(level, &run_options);
+            if result.is_ok() && !user {
+                // Only systemd accepts a system-level install.
+                install_notes = Some(service::system_install_notes());
+            }
+            ("install", "Successfully installed aranet-service", result)
         }
         ServiceAction::Uninstall { user } => {
             let level = if user { Level::User } else { Level::System };
@@ -161,6 +194,9 @@ fn handle_service_action(action: ServiceAction, run_options: RunOptions) -> anyh
     match result {
         Ok(()) => {
             println!("{}", success_message);
+            if let Some(notes) = install_notes {
+                print!("{notes}");
+            }
             Ok(())
         }
         Err(e) => {

@@ -1,37 +1,34 @@
 [Unit]
-Description=Aranet Sensor Collector Service
+Description=Aranet sensor collector and HTTP API
 Documentation=https://github.com/cameronrye/aranet
 After=network-online.target bluetooth.target
-Wants=bluetooth.target
+Wants=network-online.target bluetooth.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=aranet
-Group=aranet
-ExecStart=/usr/local/bin/aranet-service
+ExecStart=/usr/local/bin/aranet-service run --config /var/lib/aranet/server.toml
 Restart=on-failure
 RestartSec=5
-StartLimitInterval=60
-StartLimitBurst=3
-
-# Environment file (optional)
+Environment=ARANET_DATA_DIR=/var/lib/aranet
 EnvironmentFile=-/etc/default/aranet
-
-# Security hardening
-NoNewPrivileges=true
+User=aranet
+Group=aranet
+DynamicUser=yes
+StateDirectory=aranet
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-
-# Allow read/write to data directory
-ReadWritePaths=/var/lib/aranet
-
-# Allow Bluetooth access
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
-
