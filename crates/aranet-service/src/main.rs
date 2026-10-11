@@ -209,3 +209,34 @@ fn run_service_action(action: ServiceAction, run_options: RunOptions) -> anyhow:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_action_level_follows_the_user_flag() {
+        for user in [false, true] {
+            let actions = [
+                ServiceAction::Install { user },
+                ServiceAction::Uninstall { user },
+                ServiceAction::Start { user },
+                ServiceAction::Stop { user },
+                ServiceAction::Status { user },
+            ];
+            for action in actions {
+                let level = action.level();
+                assert_eq!(
+                    matches!(level, service::Level::User),
+                    user,
+                    "{action:?}: {level:?}"
+                );
+                assert_eq!(
+                    matches!(level, service::Level::System),
+                    !user,
+                    "{action:?}: {level:?}"
+                );
+            }
+        }
+    }
+}
