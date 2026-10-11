@@ -258,7 +258,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// present, still rules out the other two, and a repeated `Authorization`
 /// header or `token` parameter carries none.
 ///
-/// Returns 401 Unauthorized if the key is missing or invalid.
+/// Returns 401 Unauthorized if the key is missing or invalid, and always
+/// while the configured key is missing or empty.
 pub async fn api_key_auth(
     headers: HeaderMap,
     State(config): State<Arc<SecurityConfig>>,
@@ -302,11 +303,19 @@ pub async fn api_key_auth(
 
     // Validate with constant-time comparisons to prevent timing attacks. Every
     // candidate is compared, so the timing doesn't reveal which form matched.
-    let valid = config.api_key.as_deref().is_some_and(|expected| {
-        provided_keys.iter().fold(false, |valid, provided| {
-            valid | constant_time_eq(expected.as_bytes(), provided.as_bytes())
-        })
-    });
+    // An empty configured key matches nothing: it would equal an empty
+    // `X-API-Key` or `?token=`. The service never runs with one (loading
+    // the configuration replaces it), but this function is public and takes
+    // any `SecurityConfig`.
+    let valid = config
+        .api_key
+        .as_deref()
+        .filter(|expected| !expected.is_empty())
+        .is_some_and(|expected| {
+            provided_keys.iter().fold(false, |valid, provided| {
+                valid | constant_time_eq(expected.as_bytes(), provided.as_bytes())
+            })
+        });
 
     if valid {
         next.run(request).await
@@ -2059,6 +2068,45 @@ mod tests {
     }
 
     /// The whole hint of a 401, which names every way to send the key.
+    /// `run()` never serves with an empty key: loading the configuration
+    /// replaces it with a generated one, and validation wants 32 characters.
+    /// But `app()` and `api_key_auth` are public and take a config that was
+    /// never validated, and two empty strings compare equal.
+    #[tokio::test]
+    async fn test_empty_configured_key_authenticates_nothing() {
+        for (configured, api_key) in [("an empty", Some(String::new())), ("no", None)] {
+            let config = Arc::new(SecurityConfig {
+                api_key_enabled: true,
+                api_key,
+                ..Default::default()
+            });
+            let requests: [(&str, &[(&str, &str)]); 5] = [
+                // `curl -H "X-API-Key;"` sends the header with an empty value.
+                ("/api/devices", &[("X-API-Key", "")]),
+                ("/api/ws?token=", &[]),
+                ("/api/ws?token", &[]),
+                ("/api/devices", &[("Authorization", "Bearer ")]),
+                ("/api/devices", &[]),
+            ];
+            for (uri, headers) in requests {
+                let mut request = Request::builder().uri(uri);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                let status = auth_router(Arc::clone(&config))
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status();
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "GET {uri} with {headers:?}, with {configured} key configured"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_unauthorized_hint_names_every_way_to_send_the_key() {
         let request = Request::builder()
