@@ -32,10 +32,12 @@ use crate::config::{MAX_RATE_LIMIT_WINDOW_SECS, SecurityConfig};
 /// The client a request is rate-limited as: its IPv4 address, or the /64
 /// network of its IPv6 address.
 ///
-/// One IPv6 host normally has a whole /64 to itself (SLAAC and privacy
+/// A host can use any address in its network's /64 (SLAAC and privacy
 /// addresses), so keying on the full address would let it send every request
-/// from a new address. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, which a
-/// dual-stack listener reports for IPv4 clients) counts as its IPv4 address.
+/// from a new address. Every IPv6 client on that network therefore shares one
+/// budget, as do all link-local clients (`fe80::/64`). An IPv4-mapped IPv6
+/// address (`::ffff:a.b.c.d`, which a dual-stack listener reports for IPv4
+/// clients) counts as its IPv4 address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RateLimitKey {
     /// An IPv4 client.
@@ -57,8 +59,9 @@ impl From<IpAddr> for RateLimitKey {
 ///
 /// Each client ([`RateLimitKey`]) may send `security.rate_limit_requests`
 /// requests at once, and then one more every
-/// `rate_limit_window_secs / rate_limit_requests`. A check locks only the map
-/// shard that holds the client, so requests never queue on one global lock.
+/// `rate_limit_window_secs / rate_limit_requests`. A check never waits for a
+/// global lock: it locks the map shard that holds the client, and an allowed
+/// request also reads each shard's length.
 ///
 /// A client is forgotten only once its whole budget has been back for at
 /// least one refill period, so a throttled client never is.
@@ -69,7 +72,10 @@ impl From<IpAddr> for RateLimitKey {
 /// active.
 ///
 /// Behind a reverse proxy, or Docker's port proxy, every client has the
-/// proxy's address and so shares one budget.
+/// proxy's address and so shares one budget. So do the IPv6 clients of one
+/// /64, which is normally every IPv6 client on the service's own network, and
+/// all link-local clients (`fe80::/64`). Over IPv4, each of them has a budget
+/// of its own.
 pub struct RateLimitState<C: Clock = DefaultClock> {
     limiter:
         RateLimiter<RateLimitKey, DashMapStateStore<RateLimitKey>, C, NoOpMiddleware<C::Instant>>,
