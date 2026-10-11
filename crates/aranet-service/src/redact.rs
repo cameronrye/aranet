@@ -3,7 +3,8 @@
 //! the requests to them.
 //!
 //! Webhook URLs often carry their secret in the path (Slack, Discord) or are
-//! the secret (an ntfy topic), and any sink URL can carry `user:password@`.
+//! the secret (an ntfy topic), and any sink URL can carry `user:password@`,
+//! the MQTT broker URL included.
 //! Log a sink URL only through [`redact_url`], and a response body only
 //! through [`sanitize_body`]. Read the body of a sink's error response only
 //! with [`read_error_body`], which also limits how much of it is read.
@@ -159,6 +160,12 @@ mod tests {
             ("https://ntfy.sh/topic?auth=abc", "https://ntfy.sh/…"),
             ("not a url", "<invalid URL>"),
             ("http://user:pw@influx:8086", "http://influx:8086"),
+            // The MQTT broker URL. `mqtt` has no default port to leave out.
+            ("mqtt://user:pw@broker:1883", "mqtt://broker:1883"),
+            (
+                "mqtts://user:pw@broker.example.com",
+                "mqtts://broker.example.com",
+            ),
             ("https://example.com/?token=abc", "https://example.com/…"),
             ("https://example.com/#token=abc", "https://example.com/…"),
             ("https://example.com:443/hook", "https://example.com/…"),
