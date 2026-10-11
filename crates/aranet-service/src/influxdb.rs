@@ -54,6 +54,12 @@
 //! never followed, because it could send the readings to another host, so set
 //! `url` to InfluxDB's final address. Lines still queued when the service
 //! stops are not written.
+//!
+//! A request that can't be built at all is not retried either, because it
+//! would fail the same way every time: its lines are dropped, with an error
+//! in the log. That happens when `url` is no URL with a host, such as
+//! `influx.local:8086` without `http://`, or when `token` holds a character
+//! that no header can, such as a line break.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,11 +67,11 @@ use std::time::Duration;
 use reqwest::Client;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::DropLog;
 use crate::config::InfluxDbConfig;
-use crate::redact::{read_error_body, redact_url};
+use crate::redact::{error_chain, read_error_body, redact_url};
 use crate::state::{AppState, ReadingEvent};
 
 /// InfluxDB writer that exports readings to InfluxDB.
@@ -154,8 +160,9 @@ impl Default for InfluxSettings {
 /// minute. The writer sends up to `settings.batch_lines` lines per request.
 /// A batch that failed with a request error, a 5xx, 408 or 429 is sent again
 /// after `settings.base_backoff`, doubling up to `settings.max_backoff`;
-/// any other failure (another 4xx, or a 3xx, which is never followed) would
-/// only repeat, so that batch is dropped. On shutdown the writer stops at
+/// any other failure (another 4xx, a 3xx, which is never followed, or a
+/// request that can't be built from this configuration) would only repeat,
+/// so that batch is dropped. On shutdown the writer stops at
 /// once and warns how many queued lines were not written; this function
 /// returns after it.
 async fn run_influxdb_writer(
@@ -305,10 +312,20 @@ async fn write_queued_lines(
                 backoff = backoff.saturating_mul(2).min(settings.max_backoff);
             }
             Err(e) => {
-                warn!(
-                    "InfluxDB rejected {} lines, dropping them: {e}",
-                    batch.len()
-                );
+                if matches!(&e, InfluxDbError::Request(request) if request.is_builder()) {
+                    // Nothing was sent, and nothing will be until the
+                    // configuration changes.
+                    error!(
+                        "InfluxDB request could not be built; check influxdb.url and \
+                         influxdb.token: {e}; dropping {} lines",
+                        batch.len()
+                    );
+                } else {
+                    warn!(
+                        "InfluxDB rejected {} lines, dropping them: {e}",
+                        batch.len()
+                    );
+                }
                 batch.clear();
                 backoff = settings.base_backoff;
                 failures = 0;
@@ -437,9 +454,12 @@ async fn write_lines(
 /// (InfluxDB unreachable or too slow) or InfluxDB answered 5xx, 408 or 429.
 /// Any other 4xx means InfluxDB rejected the lines themselves, and a 3xx is a
 /// redirect, which is never followed and would be answered the same again.
+/// A request that could not even be built (an `influxdb.url` that is no URL
+/// with a host, such as `influx.local:8086`, or a token that is no header
+/// value) fails the same way every time.
 fn is_transient(e: &InfluxDbError) -> bool {
     match e {
-        InfluxDbError::Request(_) => true,
+        InfluxDbError::Request(e) => !e.is_builder(),
         InfluxDbError::Response { status, .. } => {
             *status >= 500 || *status == 408 || *status == 429
         }
@@ -510,13 +530,15 @@ fn escape_line_protocol(s: &str, special: &[char]) -> String {
 /// Errors that can occur when writing to InfluxDB.
 ///
 /// Their text is safe to log: a request error converted with `From` carries no
-/// URL, and a stored response body keeps only its first 256 characters,
+/// URL, and its text is followed by its causes (a refused connection, a
+/// failed name lookup, a certificate that was not accepted), cut like a
+/// response body. A stored response body keeps only its first 256 characters,
 /// followed by `…` when it was longer (so 257 at most), with line breaks,
 /// control characters and bidi controls replaced by spaces. For a 3xx answer
 /// the body is a fixed text that says the redirect was not followed.
 #[derive(Debug, thiserror::Error)]
 pub enum InfluxDbError {
-    #[error("Request failed: {0}")]
+    #[error("Request failed: {}", error_chain(.0))]
     Request(#[source] reqwest::Error),
     #[error("InfluxDB returned error {status}: {body}")]
     Response { status: u16, body: String },
@@ -772,6 +794,57 @@ mod tests {
                 "the InfluxDB URL leaked into the error: {text}"
             );
         }
+
+        // reqwest's own text is the same for a refused connection, a DNS
+        // failure, an expired certificate and a timeout. The cause follows it.
+        let text = error.to_string();
+        let cause = text
+            .split_once("error sending request")
+            .map(|(_, cause)| cause);
+        assert!(
+            cause.is_some_and(|cause| cause.contains("os error")),
+            "the error does not say why the request failed: {text}"
+        );
+        // InfluxDB may be back at the next attempt.
+        assert!(is_transient(&error), "{error}");
+    }
+
+    #[tokio::test]
+    async fn influxdb_request_that_cannot_be_built_is_not_retried() {
+        let client = crate::sink_client(Duration::from_secs(10)).unwrap();
+        let lines = ["aranet co2=800i 1711612800".to_string()];
+        for config in [
+            // No scheme: `influx.local` is read as one, and no request can
+            // be made for it.
+            InfluxDbConfig {
+                enabled: true,
+                url: "influx.local:8086".to_string(),
+                ..Default::default()
+            },
+            // A token copied with its line break is no header value.
+            InfluxDbConfig {
+                enabled: true,
+                url: closed_port_url("").await,
+                token: Some("TOKEN-SECRET\n".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let error = write_lines(&client, &config, &lines)
+                .await
+                .expect_err("the request can't be built");
+
+            // Sending the same request again can't work either.
+            assert!(
+                !is_transient(&error),
+                "a request that can't be built is retried: {error}"
+            );
+            for text in [error.to_string(), format!("{error:?}")] {
+                assert!(
+                    !text.contains("SECRET") && !text.contains("/api/v2/write"),
+                    "the token or the URL leaked into the error: {text}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1018,6 +1091,48 @@ mod tests {
 
             shut_down(&t, writer).await;
             assert_eq!(server.requests().len(), 2, "{:?}", server.requests());
+        }
+
+        #[tokio::test]
+        async fn influxdb_writer_drops_lines_it_cannot_build_a_request_for() {
+            let (logs, _guard) = CapturedLogs::start();
+            // No scheme, which validation accepts.
+            let t = TestState::with_config(Config {
+                influxdb: InfluxDbConfig {
+                    enabled: true,
+                    url: "influx.local:8086".to_string(),
+                    org: "aranet".to_string(),
+                    ..InfluxDbConfig::default()
+                },
+                ..Config::default()
+            });
+            let settings = InfluxSettings {
+                base_backoff: Duration::from_secs(60),
+                ..InfluxSettings::default()
+            };
+            let writer = start_writer(&t, settings).await;
+
+            t.state.readings_tx.send(test_event(DEVICE, 801)).unwrap();
+            wait_until("the writer to give up on the request", || {
+                logs.text().contains("InfluxDB request could not be built")
+            })
+            .await;
+            shut_down(&t, writer).await;
+
+            let text = logs.text();
+            let line = text
+                .lines()
+                .find(|line| line.contains("InfluxDB request could not be built"))
+                .unwrap_or_default();
+            assert!(line.contains(" ERROR "), "{text}");
+            assert!(
+                line.contains("; check influxdb.url and influxdb.token: Request failed: ")
+                    && line.ends_with("; dropping 1 lines"),
+                "{text}"
+            );
+            // Dropped, not kept in the queue for a retry that can't work.
+            assert!(!text.contains("retrying in"), "{text}");
+            assert!(!text.contains("queued lines not written"), "{text}");
         }
 
         #[tokio::test]

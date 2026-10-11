@@ -1,17 +1,23 @@
-//! Redaction for text that reaches the logs from the integrations: sink URLs
-//! and the response bodies of the endpoints behind them.
+//! Redaction for text that reaches the logs from outside the service: sink
+//! URLs, the response bodies of the endpoints behind them, and the errors of
+//! the requests to them.
 //!
 //! Webhook URLs often carry their secret in the path (Slack, Discord) or are
 //! the secret (an ntfy topic), and any sink URL can carry `user:password@`.
 //! Log a sink URL only through [`redact_url`], and a response body only
 //! through [`sanitize_body`]. Read the body of a sink's error response only
 //! with [`read_error_body`], which also limits how much of it is read.
+//!
+//! Any other text that someone outside the service chose goes through
+//! [`sanitize_log_text`] before it is logged or stored, and an error's chain
+//! of causes through [`error_chain`].
 
-/// The most characters of a response body kept in an error or log line.
-pub(crate) const MAX_LOGGED_BODY_CHARS: usize = 256;
+/// The most characters of a text from outside the service that are kept in
+/// an error or log line.
+pub(crate) const MAX_LOGGED_TEXT_CHARS: usize = 256;
 
 /// The most bytes of an error response's body that [`read_error_body`] reads.
-/// More than [`MAX_LOGGED_BODY_CHARS`] characters of any encoding.
+/// More than [`MAX_LOGGED_TEXT_CHARS`] characters of any encoding.
 const MAX_ERROR_BODY_BYTES: usize = 4096;
 
 /// What a sink reports in place of the body of a 3xx answer.
@@ -46,21 +52,48 @@ pub(crate) fn redact_url(url: &str) -> String {
     format!("{}://{host}{port}{elided}", parsed.scheme())
 }
 
-/// `body`, fit for one log line: the characters that could split the line or
+/// `text`, fit for one log line: the characters that could split the line or
 /// change how it reads (see [`is_log_breaking_char`]) become spaces, and
-/// everything after the first [`MAX_LOGGED_BODY_CHARS`] characters is
+/// everything after the first [`MAX_LOGGED_TEXT_CHARS`] characters is
 /// replaced by `…`.
-pub(crate) fn sanitize_body(body: &str) -> String {
-    let mut chars = body.chars();
+pub(crate) fn sanitize_log_text(text: &str) -> String {
+    let mut chars = text.chars();
     let mut sanitized: String = chars
         .by_ref()
-        .take(MAX_LOGGED_BODY_CHARS)
+        .take(MAX_LOGGED_TEXT_CHARS)
         .map(|c| if is_log_breaking_char(c) { ' ' } else { c })
         .collect();
     if chars.next().is_some() {
         sanitized.push('…');
     }
     sanitized
+}
+
+/// A response `body`, fit for one log line: see [`sanitize_log_text`].
+pub(crate) fn sanitize_body(body: &str) -> String {
+    sanitize_log_text(body)
+}
+
+/// The text of `error` and of each error in its `source()` chain, joined with
+/// `: ` and fit for one log line (see [`sanitize_log_text`]).
+///
+/// reqwest's own text is "error sending request" for a refused connection, a
+/// DNS failure, an expired certificate and a timeout alike. What went wrong
+/// is only in the chain. A source whose text the result already ends with is
+/// left out, because some errors print their cause themselves (hyper-util's
+/// connect error does).
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.ends_with(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    sanitize_log_text(&text)
 }
 
 /// The body of a sink's error `response`, fit for one log line (see
@@ -152,16 +185,74 @@ mod tests {
         // the rest of the line read differently.
         assert_eq!(sanitize_body("a\u{2028}b\u{202e}c\u{2066}d"), "a b c d");
 
-        let exact = "x".repeat(MAX_LOGGED_BODY_CHARS);
+        let exact = "x".repeat(MAX_LOGGED_TEXT_CHARS);
         assert_eq!(sanitize_body(&exact), exact);
 
         // Counted in characters, not bytes: a cut at byte 256 would split a
         // two-byte `é`.
-        let long = "é".repeat(MAX_LOGGED_BODY_CHARS + 1);
+        let long = "é".repeat(MAX_LOGGED_TEXT_CHARS + 1);
         assert_eq!(
             sanitize_body(&long),
-            format!("{}…", "é".repeat(MAX_LOGGED_BODY_CHARS))
+            format!("{}…", "é".repeat(MAX_LOGGED_TEXT_CHARS))
         );
+    }
+
+    /// An error with this text and, optionally, a source.
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|source| source as _)
+        }
+    }
+
+    fn layers(texts: &[&'static str]) -> Layer {
+        let (first, rest) = texts.split_first().expect("at least one layer");
+        Layer(first, (!rest.is_empty()).then(|| Box::new(layers(rest))))
+    }
+
+    #[test]
+    fn error_chain_joins_the_causes_and_skips_one_already_printed() {
+        assert_eq!(error_chain(&layers(&["only"])), "only");
+        assert_eq!(
+            error_chain(&layers(&[
+                "error sending request",
+                "client error (Connect)"
+            ])),
+            "error sending request: client error (Connect)"
+        );
+        // The third error prints its cause, the fourth, itself.
+        assert_eq!(
+            error_chain(&layers(&[
+                "error sending request",
+                "client error (Connect)",
+                "tcp connect error: Connection refused (os error 61)",
+                "Connection refused (os error 61)",
+            ])),
+            "error sending request: client error (Connect): tcp connect error: Connection \
+             refused (os error 61)"
+        );
+        // A cause without text adds nothing, and the one after it still counts.
+        assert_eq!(error_chain(&layers(&["a", "", "b"])), "a: b");
+        // The result is one log line of bounded length, like every other
+        // text from outside.
+        assert_eq!(
+            error_chain(&layers(&["bad\nrequest", "\u{202e}cause"])),
+            "bad request:  cause"
+        );
+        let long = error_chain(&layers(&[
+            "error sending request",
+            Box::leak("x".repeat(300).into_boxed_str()),
+        ]));
+        assert_eq!(long.chars().count(), MAX_LOGGED_TEXT_CHARS + 1);
+        assert!(long.ends_with('…'), "{long}");
     }
 
     #[test]
