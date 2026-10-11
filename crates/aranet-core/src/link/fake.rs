@@ -97,6 +97,7 @@ impl State {
             // Sending fails only to a stream that has been dropped.
             let _ = stream.unbounded_send(ValueNotification {
                 uuid,
+                service_uuid: SAF_TEHNIKA_SERVICE_NEW,
                 value: value.to_vec(),
             });
         }
