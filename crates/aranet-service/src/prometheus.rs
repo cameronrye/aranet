@@ -64,8 +64,10 @@ impl PrometheusPusher {
     /// [`AppState::signal_shutdown`] is called.
     ///
     /// Returns the task's handle, or `None` when Prometheus or its push gateway
-    /// isn't configured and nothing was started. After signalling shutdown,
-    /// await the handle to let a push that is in flight finish.
+    /// isn't configured, or the HTTP client can't be created, and nothing was
+    /// started. A push that is in flight when shutdown is signalled is
+    /// cancelled, so the task ends at once: a gateway that doesn't answer
+    /// would otherwise hold it for the request's 30 s timeout.
     pub async fn start(&self) -> Option<tokio::task::JoinHandle<()>> {
         let config = self.state.config.read().await;
         let prometheus_config = config.prometheus.clone();
@@ -90,30 +92,40 @@ impl PrometheusPusher {
             prometheus_config.push_interval
         );
 
+        // Built here, not in the task: building a client reads the system's
+        // certificate store, which can take a while, and the task's first
+        // push should not start by waiting for that.
+        let client = match crate::sink_client(PUSH_TIMEOUT) {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!("Failed to create HTTP client for Prometheus pusher: {e}");
+                return None;
+            }
+        };
+
         let state = Arc::clone(&self.state);
         let shutdown_rx = self.state.subscribe_shutdown();
 
         Some(tokio::spawn(async move {
-            run_prometheus_pusher(state, prometheus_config, push_gateway, shutdown_rx).await;
+            run_prometheus_pusher(state, client, prometheus_config, push_gateway, shutdown_rx)
+                .await;
         }))
     }
 }
 
-/// Run the Prometheus push loop.
+/// Timeout of one push to the gateway, connecting included.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run the Prometheus push loop: push through `client` every
+/// `config.push_interval` seconds until shutdown is signalled. A push in
+/// flight at that moment is cancelled.
 async fn run_prometheus_pusher(
     state: Arc<AppState>,
+    client: Client,
     config: PrometheusConfig,
     push_gateway: String,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let client = match crate::sink_client(Duration::from_secs(30)) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to create HTTP client for Prometheus pusher: {e}");
-            return;
-        }
-    };
-
     let push_interval = Duration::from_secs(config.push_interval);
     let mut interval = tokio::time::interval(push_interval);
     // A push can take up to the client's 30 s timeout, longer than the shortest
@@ -126,20 +138,33 @@ async fn run_prometheus_pusher(
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                let metrics = generate_metrics(&state).await;
-                if let Err(e) = push_metrics(&client, &push_gateway, job_name, &metrics).await {
-                    warn!("Failed to push metrics to Prometheus: {}", e);
-                } else {
-                    debug!("Pushed metrics to Prometheus push gateway");
-                }
-            }
+            biased;
             _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!("Prometheus pusher received stop signal");
-                    break;
-                }
+                info!("Prometheus pusher received stop signal");
+                break;
             }
+            _ = interval.tick() => {}
+        }
+
+        // The push races shutdown too. A gateway that takes the request and
+        // doesn't answer holds a push for the client's whole timeout, and
+        // shutdown waits only `SHUTDOWN_GRACE` for this task before it
+        // aborts it with a warning.
+        let pushed = tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                info!("Prometheus pusher received stop signal; cancelling the push in flight");
+                break;
+            }
+            pushed = async {
+                let metrics = generate_metrics(&state).await;
+                push_metrics(&client, &push_gateway, job_name, &metrics).await
+            } => pushed,
+        };
+        if let Err(e) = pushed {
+            warn!("Failed to push metrics to Prometheus: {}", e);
+        } else {
+            debug!("Pushed metrics to Prometheus push gateway");
         }
     }
 
@@ -763,6 +788,31 @@ mod tests {
     /// The pusher's client, with this request timeout.
     fn client(timeout: Duration) -> Client {
         crate::sink_client(timeout).unwrap()
+    }
+
+    #[tokio::test]
+    async fn prometheus_pusher_stops_promptly_while_a_push_gets_no_answer() {
+        // The gateway takes the push and never answers, so the push would
+        // wait for the client's 30 s timeout: longer than the 10 s that
+        // shutdown gives its background tasks, and than Docker's stop timeout.
+        let gateway = RecordingServer::start(vec![(PUSH, Reply::Hang)]).await;
+        let mut config = crate::config::Config::default();
+        config.prometheus.enabled = true;
+        config.prometheus.push_gateway = Some(gateway.url(""));
+        let t = TestState::with_config(config);
+
+        // The pusher pushes once as soon as it starts.
+        let pusher = PrometheusPusher::new(Arc::clone(&t.state))
+            .start()
+            .await
+            .expect("a push gateway is configured");
+        gateway.wait_for_requests(1).await;
+
+        t.state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), pusher)
+            .await
+            .expect("the pusher waited for the push in flight instead of stopping at shutdown")
+            .expect("the pusher task doesn't panic");
     }
 
     #[tokio::test]

@@ -811,12 +811,15 @@ mod tests {
             server.url("/fail?x=1"),
             server.url("/unknown"),
         ];
+        // Built before the sender starts: building a client reads the system's
+        // certificate store, which can take long enough on a busy machine to
+        // use up `wait_for_requests`' 5 s.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
         // Send from another task, so `wait_for_requests` really waits.
         let sender = tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap();
             let mut statuses = Vec::new();
             for url in urls {
                 let response = client
