@@ -387,6 +387,70 @@ async fn file_backed_readings_endpoint_sees_writes() {
     drop(dir);
 }
 
+/// Every handler that reads the database, on a database file. There, as in
+/// production, reads run on connections that refuse writes. The other tests
+/// use an in-memory store, whose reads run on the writer connection, so a
+/// handler whose read closure wrote something would pass all of them and
+/// answer 500 only in production.
+#[tokio::test]
+async fn file_backed_read_endpoints_answer_from_read_only_connections() {
+    const DEVICE: &str = "Aranet4 FILE2";
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("data.db");
+    let mut config = Config::default();
+    config.storage.path = db_path.clone();
+    // `/metrics` answers 503 while this is off.
+    config.prometheus.enabled = true;
+    let store = aranet_store::Store::open(&db_path).unwrap();
+    let state = AppState::with_config_path(store, config, dir.path().join("server.toml"));
+    let router = aranet_service::api::router().with_state(Arc::clone(&state));
+
+    insert_test_reading(&state, DEVICE, Some("Office"), 812).await;
+    state
+        .with_store_write(|store| {
+            let records = vec![HistoryRecord {
+                timestamp: OffsetDateTime::now_utc() - time::Duration::hours(1),
+                co2: 900,
+                temperature: 21.5,
+                pressure: 1012.0,
+                humidity: 44,
+                radon: None,
+                radiation_rate: None,
+                radiation_total: None,
+            }];
+            store.insert_history(DEVICE, &records)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    for path in [
+        "/api/devices",
+        "/api/devices/current",
+        "/api/devices/Aranet4%20FILE2",
+        "/api/devices/Aranet4%20FILE2/current",
+        "/api/devices/Aranet4%20FILE2/readings",
+        "/api/devices/Aranet4%20FILE2/history",
+        "/api/readings",
+        "/api/health/detailed",
+        "/metrics",
+    ] {
+        let (status, body) = get(&router, path).await;
+        assert_eq!(status, StatusCode::OK, "GET {path}: {body}");
+    }
+    // The detailed health check answers 200 also when its query failed, and
+    // reports the failure in the body.
+    let (_, body) = get(&router, "/api/health/detailed").await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["database"]["ok"], true, "{body}");
+    assert_eq!(json["database"]["device_count"], 1, "{body}");
+
+    // Close every connection before the directory is deleted (Windows).
+    drop(router);
+    drop(state);
+    drop(dir);
+}
+
 // ==========================================================================
 // Collector control endpoints
 // ==========================================================================
