@@ -404,6 +404,23 @@ impl Config {
             self.last_device_name = state.last_device_name.clone();
         }
     }
+
+    /// Take the GUI's settings from `gui`, except the two the GUI has no control for.
+    ///
+    /// `gui.service_url` and `gui.service_api_key` stay as `self` has them. The GUI reads
+    /// `[gui]` once at start-up and saves it on every setting change and at quit, and the
+    /// config file is the only place to set these two. Taken from the GUI's copy, a key that
+    /// was added to the file while the GUI ran would be removed by the GUI's next save.
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn set_gui_settings(&mut self, gui: GuiConfig) {
+        let service_url = std::mem::take(&mut self.gui.service_url);
+        let service_api_key = self.gui.service_api_key.take();
+        self.gui = GuiConfig {
+            service_url,
+            service_api_key,
+            ..gui
+        };
+    }
 }
 
 /// Resolve multiple devices, applying alias resolution to each.
@@ -763,6 +780,73 @@ office = "Aranet4 12345"
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "last_device = \"legacy\"\nbq = true\n"
+        );
+    }
+
+    /// A GUI save keeps `service_url` and `service_api_key` as the file has them: the GUI has
+    /// no control for either, so its copy of them is as old as its start-up.
+    #[test]
+    fn gui_save_keeps_the_service_keys_as_the_file_has_them() {
+        // A fixture, not a credential. Failure messages show the file with it replaced.
+        const KEY: &str = "KEY-ADDED-WHILE-THE-GUI-RAN";
+        let shown = |path: &Path| fs::read_to_string(path).unwrap().replace(KEY, "<key>");
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[gui]\n# the service on the server in the hall\n\
+                 service_url = \"http://192.168.1.5:8080\"\nservice_api_key = \"{KEY}\"\n"
+            ),
+        )
+        .unwrap();
+
+        // What the GUI holds: the `[gui]` it read at start-up, before the user added the two
+        // lines, with a theme and a window size changed since.
+        let gui = GuiConfig {
+            theme: "light".to_string(),
+            window_width: Some(1024.0),
+            window_height: Some(768.0),
+            ..GuiConfig::default()
+        };
+        assert_eq!(gui.service_url, "http://localhost:8080");
+        assert_eq!(gui.service_api_key, None);
+        let held = gui.clone();
+        Config::update_at(&path, |c| {
+            c.set_gui_settings(held);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            shown(&path),
+            "[gui]\n# the service on the server in the hall\n\
+             service_url = \"http://192.168.1.5:8080\"\nservice_api_key = \"<key>\"\n\
+             theme = \"light\"\nwindow_width = 1024.0\nwindow_height = 768.0\n"
+        );
+        let saved = Config::load_from_path(&path).unwrap();
+        assert_eq!(saved.gui.service_url, "http://192.168.1.5:8080");
+        assert_eq!(saved.gui.service_api_key.as_deref(), Some(KEY));
+
+        // The other direction: the GUI started with the two keys in the file and the user
+        // has removed them since. The save doesn't put them back.
+        let bare = dir.path().join("bare.toml");
+        fs::write(&bare, "fahrenheit = true\n").unwrap();
+        let held = GuiConfig {
+            service_url: "http://192.168.1.9:8080".to_string(),
+            service_api_key: Some(KEY.to_string()),
+            ..gui
+        };
+        Config::update_at(&bare, |c| {
+            c.set_gui_settings(held);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            shown(&bare),
+            "fahrenheit = true\n\n[gui]\ntheme = \"light\"\nwindow_width = 1024.0\nwindow_height = 768.0\n"
         );
     }
 
