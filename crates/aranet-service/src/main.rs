@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn handle_service_action(action: ServiceAction, run_options: RunOptions) -> anyhow::Result<()> {
     let level = action.level();
-    let result = run_service_action(action, run_options);
+    let result = run_service_action(action, level, run_options);
 
     // Services from 0.2.1 or earlier that this action didn't replace or remove,
     // one line each. On stderr: the GUI reads `service status` from stdout.
@@ -134,85 +134,117 @@ fn handle_service_action(action: ServiceAction, run_options: RunOptions) -> anyh
     result
 }
 
-fn run_service_action(action: ServiceAction, run_options: RunOptions) -> anyhow::Result<()> {
+/// Run `action` at `level` and print its result. A failure is returned, not
+/// printed: `main` prints the error it returns.
+fn run_service_action(
+    action: ServiceAction,
+    level: service::Level,
+    run_options: RunOptions,
+) -> anyhow::Result<()> {
     use service::{Level, ServiceStatus};
 
     let mut install_notes = None;
-    let (action_name, success_message, result) = match action {
-        ServiceAction::Install { user } => {
-            let level = if user { Level::User } else { Level::System };
+    let (what, success_message, result) = match action {
+        ServiceAction::Install { .. } => {
             let result = service::install(level, &run_options);
-            if result.is_ok() && !user {
+            if result.is_ok() && matches!(level, Level::System) {
                 // Only systemd accepts a system-level install.
                 install_notes = Some(service::system_install_notes(&run_options));
             }
-            ("install", "Successfully installed aranet-service", result)
-        }
-        ServiceAction::Uninstall { user } => {
-            let level = if user { Level::User } else { Level::System };
             (
-                "uninstall",
-                "Successfully uninstalled aranet-service",
-                service::uninstall(level),
+                "install service",
+                "Successfully installed aranet-service",
+                result,
             )
         }
-        ServiceAction::Start { user } => {
-            let level = if user { Level::User } else { Level::System };
-            (
-                "start",
-                "Successfully started aranet-service",
-                service::start(level),
-            )
-        }
-        ServiceAction::Stop { user } => {
-            let level = if user { Level::User } else { Level::System };
-            (
-                "stop",
-                "Successfully stopped aranet-service",
-                service::stop(level),
-            )
-        }
-        ServiceAction::Status { user } => {
-            let level = if user { Level::User } else { Level::System };
-            match service::status(level) {
-                Ok(ServiceStatus::Running) => {
-                    println!("aranet-service is running");
-                    return Ok(());
+        ServiceAction::Uninstall { .. } => (
+            "uninstall service",
+            "Successfully uninstalled aranet-service",
+            service::uninstall(level),
+        ),
+        ServiceAction::Start { .. } => (
+            "start service",
+            "Successfully started aranet-service",
+            service::start(level),
+        ),
+        ServiceAction::Stop { .. } => (
+            "stop service",
+            "Successfully stopped aranet-service",
+            service::stop(level),
+        ),
+        ServiceAction::Status { .. } => {
+            let status =
+                service::status(level).map_err(|e| service_action_error("get status", e))?;
+            println!(
+                "{}",
+                match status {
+                    ServiceStatus::Running => "aranet-service is running",
+                    ServiceStatus::Stopped => "aranet-service is stopped",
+                    ServiceStatus::NotInstalled => "aranet-service is not installed",
                 }
-                Ok(ServiceStatus::Stopped) => {
-                    println!("aranet-service is stopped");
-                    return Ok(());
-                }
-                Ok(ServiceStatus::NotInstalled) => {
-                    println!("aranet-service is not installed");
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!("Failed to get status: {}", e);
-                    return Err(e.into());
-                }
-            }
+            );
+            return Ok(());
         }
     };
 
-    match result {
-        Ok(()) => {
-            println!("{}", success_message);
-            if let Some(notes) = install_notes {
-                print!("{notes}");
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Failed to {} service: {}", action_name, e);
-            Err(e.into())
-        }
+    result.map_err(|e| service_action_error(what, e))?;
+    println!("{success_message}");
+    if let Some(notes) = install_notes {
+        print!("{notes}");
     }
+    Ok(())
+}
+
+/// The error `main` returns when a service action failed: `Failed to <what>`,
+/// with `error`'s message as its cause.
+///
+/// The cause is the message, not the error itself. Every `ServiceError` that has
+/// a source prints that source in its own message, so `main`, which prints the
+/// whole chain, would show the source a second time.
+fn service_action_error(what: &str, error: service::ServiceError) -> anyhow::Error {
+    anyhow::Error::msg(error.to_string()).context(format!("Failed to {what}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `main` prints for a failed action is the `Debug` text of the error it
+    /// returns. Each part of the error is in it once.
+    #[test]
+    fn failed_service_action_prints_its_error_once() {
+        use service::ServiceError;
+        use std::io;
+
+        let errors = [
+            ServiceError::InvalidConfig("x marks".into()),
+            // These two print their source in their own message and also have it
+            // as their source.
+            ServiceError::Manager(io::Error::other("x marks")),
+            ServiceError::CurrentDirectory(io::Error::other("x marks")),
+        ];
+        for error in errors {
+            let name = format!("{error:?}");
+            let printed = format!("{:?}", service_action_error("install service", error));
+            assert!(
+                printed.starts_with("Failed to install service\n"),
+                "{name}: {printed}"
+            );
+            assert_eq!(printed.matches("x marks").count(), 1, "{name}: {printed}");
+        }
+
+        // `starts_with`: with `RUST_BACKTRACE` set, a backtrace follows.
+        let printed = format!(
+            "{:?}",
+            service_action_error("get status", ServiceError::NoServiceManager)
+        );
+        assert!(
+            printed.starts_with(
+                "Failed to get status\n\nCaused by:\n    No service manager available on this platform"
+            ),
+            "{printed}"
+        );
+    }
 
     #[test]
     fn service_action_level_follows_the_user_flag() {
