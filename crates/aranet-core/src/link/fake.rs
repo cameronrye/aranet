@@ -31,6 +31,12 @@ pub(super) enum Outcome {
     /// to the same device is still pending (`org.bluez.Error.InProgress`),
     /// with `btleplug::Error::Other("In Progress")`.
     InProgress,
+    /// Fail as bluez-async's `connect` does when BlueZ sends no reply to
+    /// `Device1.Connect` within the D-Bus call's own limit: after
+    /// `BLUEZ_DBUS_TIMEOUT`, with
+    /// `btleplug::Error::Other("Timeout waiting for reply")`. A caller whose
+    /// own limit is shorter never sees it.
+    DbusTimeout,
     /// Wait this long on the tokio clock, then succeed like `Ok`. A
     /// `disconnect` that ends this way notifies `disconnected()` at the end
     /// of the wait.
@@ -51,6 +57,11 @@ pub(super) enum Outcome {
 /// and the test would see the library's timeout first: an order that cannot
 /// happen. Under a shorter limit the fake keeps the real order.
 pub(super) const BLUEZ_ASYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long bluez-async waits for BlueZ's reply to a D-Bus method call, such
+/// as the `Device1.Connect` that its `connect` starts with, before the call
+/// fails (`DBUS_METHOD_CALL_TIMEOUT`, bluez-async 0.9.0 `src/lib.rs:57`).
+pub(super) const BLUEZ_DBUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A call made on a `FakeGatt`, in the order it was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +275,13 @@ async fn run(outcome: Option<Outcome>) -> btleplug::Result<()> {
         // bluez-async's `BluetoothError::DbusError`, whose text is the D-Bus
         // error's message, wrapped in `Error::Other` by btleplug.
         Outcome::InProgress => Err(btleplug::Error::Other("In Progress".into())),
+        Outcome::DbusTimeout => {
+            tokio::time::sleep(BLUEZ_DBUS_TIMEOUT).await;
+            // The same kind of error: the D-Bus call ran out of time, and
+            // this is the message it fails with (dbus 0.9.12
+            // `src/nonblock.rs:512`).
+            Err(btleplug::Error::Other("Timeout waiting for reply".into()))
+        }
         Outcome::After(delay) => {
             tokio::time::sleep(delay).await;
             Ok(())
