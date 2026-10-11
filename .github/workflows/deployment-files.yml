@@ -1,0 +1,42 @@
+name: Deployment files
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Everything that goes into the image or the deployment files. crates/** because
+    # the image build compiles or loads every workspace member.
+    paths:
+      - "crates/**"
+      - "docker/**"
+      - "docker-compose.yml"
+      - ".dockerignore"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "distribution/systemd/**"
+      - "scripts/ci/**"
+      - ".github/workflows/deployment-files.yml"
+  workflow_dispatch:
+
+# Every job only reads the repository. Jobs that need more must ask for it explicitly.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels that PR's older run. Pushes to main each get
+# their own group (by commit), so every commit on main is checked in full.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  docker:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Build and smoke-test the image
+        run: scripts/ci/check-docker-image.sh
