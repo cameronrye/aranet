@@ -3,6 +3,7 @@
 //! This module contains utility types like [`Toast`] notifications and
 //! unit conversion functions for temperature, pressure, and radon measurements.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use aranet_core::settings::{DeviceSettings, RadonUnit, TemperatureUnit};
@@ -52,6 +53,30 @@ impl Toast {
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed() > TOAST_DURATION
     }
+}
+
+/// Record the outcome of a save to the config file, and return the toast to show for it.
+///
+/// `error` is the failed save's error text, or `None` when the save worked. `last_error` is
+/// the same for the save before this one, and is replaced.
+///
+/// A failure is shown when the save before it worked or failed with another text. The GUI
+/// saves on every setting change, so a file that stays broken would otherwise show the same
+/// toast on every click. The toast names `file` and not the cause: the cause is in the log,
+/// and for a file that doesn't parse it quotes a line of the file.
+pub(crate) fn save_failure_toast(
+    last_error: &mut Option<String>,
+    error: Option<String>,
+    file: &Path,
+) -> Option<String> {
+    let show = error.is_some() && *last_error != error;
+    *last_error = error;
+    show.then(|| {
+        format!(
+            "Settings not saved: could not update {}. The log says why.",
+            file.display()
+        )
+    })
 }
 
 /// Convert Celsius to Fahrenheit.
@@ -138,6 +163,48 @@ pub fn format_uptime(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // save_failure_toast tests
+    // ========================================================================
+
+    #[test]
+    fn save_failure_is_shown_once_per_cause() {
+        let file = Path::new("/home/user/.config/aranet/config.toml");
+        let parse_error = || {
+            Some(
+                "Failed to update config file: /home/user/.config/aranet/config.toml: \
+                 TOML parse error at line 1, column 11"
+                    .to_string(),
+            )
+        };
+        let mut last = None;
+
+        // The first failure is shown. The toast names the file and leaves the cause, which can
+        // quote a line of the file, to the log.
+        let toast = save_failure_toast(&mut last, parse_error(), file).expect("the first failure");
+        assert_eq!(
+            toast,
+            "Settings not saved: could not update /home/user/.config/aranet/config.toml. \
+             The log says why."
+        );
+
+        // The same failure again is not: a setting can be saved on every click.
+        assert_eq!(save_failure_toast(&mut last, parse_error(), file), None);
+        assert_eq!(save_failure_toast(&mut last, parse_error(), file), None);
+
+        // Another cause is.
+        let other = Some("Permission denied (os error 13)".to_string());
+        assert!(save_failure_toast(&mut last, other.clone(), file).is_some());
+        assert_eq!(save_failure_toast(&mut last, other, file), None);
+
+        // A save that works shows nothing and forgets the failure, so the same failure after
+        // it is shown again.
+        assert_eq!(save_failure_toast(&mut last, None, file), None);
+        assert_eq!(last, None);
+        assert!(save_failure_toast(&mut last, parse_error(), file).is_some());
+        assert_eq!(last, parse_error());
+    }
 
     // ========================================================================
     // celsius_to_fahrenheit tests

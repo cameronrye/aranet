@@ -12,13 +12,13 @@ use aranet_core::messages::{Command, SensorEvent};
 use aranet_core::service_client::DeviceCollectionStats;
 use eframe::egui::{self, RichText, UserData, ViewportCommand};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::{Config, GuiConfig};
 
 use super::components;
 use super::export;
-use super::helpers::{SCAN_DURATION, TOAST_DURATION, Toast, ToastType};
+use super::helpers::{SCAN_DURATION, TOAST_DURATION, Toast, ToastType, save_failure_toast};
 use super::theme::{Theme, ThemeMode};
 use super::tray::{
     TrayCommand, TrayManager, TrayState, check_co2_threshold, hide_dock_icon, show_dock_icon,
@@ -122,6 +122,9 @@ pub struct AranetApp {
     // -------------------------------------------------------------------------
     /// GUI-specific configuration (persisted to config file).
     pub(crate) gui_config: GuiConfig,
+    /// Error text of the last save to the config file, if that save failed. A failure is shown
+    /// in the window once per cause (see [`AranetApp::report_config_save`]).
+    pub(crate) last_save_error: Option<String>,
     // -------------------------------------------------------------------------
     // UI State
     // -------------------------------------------------------------------------
@@ -298,6 +301,7 @@ impl AranetApp {
             // Do Not Disturb mode (persisted in config, read before moving gui_config)
             do_not_disturb: gui_config.do_not_disturb,
             gui_config,
+            last_save_error: None,
             // Alias edit state
             alias_edit: None,
             // Alert history
@@ -1971,15 +1975,17 @@ impl eframe::App for AranetApp {
             && size.x > 100.0
             && size.y > 100.0
         {
-            self.gui_config.window_width = Some(size.x);
-            self.gui_config.window_height = Some(size.y);
+            // Whole points: on a fractionally scaled display the size is a value like
+            // 666.6667, which would be written with the digits of an `f32` widened to `f64`.
+            self.gui_config.window_width = Some(size.x.round());
+            self.gui_config.window_height = Some(size.y.round());
             config_changed = true;
         }
         if let Some(pos) = self.last_window_pos {
             // Only save reasonable positions (not off-screen)
             if pos.x >= -1000.0 && pos.y >= -1000.0 && pos.x < 10000.0 && pos.y < 10000.0 {
-                self.gui_config.window_x = Some(pos.x);
-                self.gui_config.window_y = Some(pos.y);
+                self.gui_config.window_x = Some(pos.x.round());
+                self.gui_config.window_y = Some(pos.y.round());
                 config_changed = true;
             }
         }
@@ -1988,6 +1994,8 @@ impl eframe::App for AranetApp {
                 "Saving window geometry: size={:?}, pos={:?}",
                 self.last_window_size, self.last_window_pos
             );
+            // No frame follows this one, so the error line that a failed save logs is all
+            // the report there is.
             self.save_gui_config();
         }
     }
@@ -1999,14 +2007,31 @@ impl AranetApp {
     /// `gui.service_url` and `gui.service_api_key` are also kept as the file has them: the GUI
     /// has no control for either, so its own copy of them is as old as its start-up.
     ///
-    /// A config file that doesn't parse is left untouched, and the failure is logged.
-    pub(crate) fn save_gui_config(&self) {
+    /// A config file that doesn't parse is left untouched. A failure is logged and shown in
+    /// the window (see [`AranetApp::report_config_save`]).
+    pub(crate) fn save_gui_config(&mut self) {
         let gui = self.gui_config.clone();
-        if let Err(e) = Config::update(move |c| {
+        let saved = Config::update(move |c| {
             c.set_gui_settings(gui);
             Ok(())
-        }) {
-            warn!("Failed to save GUI settings: {e:#}");
+        });
+        self.report_config_save("Failed to save GUI settings", saved);
+    }
+
+    /// Report the outcome of a save to the config file.
+    ///
+    /// A failure is logged as `<what>: <the error and its causes>`, at error level: the GUI's
+    /// log shows only errors unless `RUST_LOG` asks for more, and without the line a setting
+    /// that applies on screen is lost without a word. The window shows a toast when a save
+    /// first fails or fails for another reason than the save before it; the toast names the
+    /// config file and leaves the reason to the log.
+    pub(crate) fn report_config_save(&mut self, what: &str, saved: anyhow::Result<()>) {
+        let error = saved.err().map(|e| format!("{e:#}"));
+        if let Some(error) = &error {
+            error!("{what}: {error}");
+        }
+        if let Some(toast) = save_failure_toast(&mut self.last_save_error, error, &Config::path()) {
+            self.add_toast(toast, ToastType::Error);
         }
     }
 
