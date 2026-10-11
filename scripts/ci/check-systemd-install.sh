@@ -49,6 +49,8 @@ user_home=$(getent passwd "$invoking_user" | cut -d: -f6)
 home_copy="$user_home/aranet-service"
 root_copy=/root/aranet-service
 state_config=/var/lib/aranet/server.toml
+# `yes` only while $state_config is the file this run wrote.
+wrote_state_config=no
 work=$(mktemp -d)
 
 on_exit() {
@@ -58,6 +60,9 @@ on_exit() {
     journalctl --no-pager -n 100 -u aranet.service || true
   fi
   rm -rf "$work" "$home_copy" "$root_copy"
+  if [ "$wrote_state_config" = yes ]; then
+    rm -f "$state_config"
+  fi
   exit "$status"
 }
 trap on_exit EXIT
@@ -66,7 +71,15 @@ echo "== Install the binary where only root can change it"
 install -o root -g root -m 0755 "$built" "$program"
 
 echo "== Nothing is installed yet"
-"$program" service status 2> "$work/status.err" | tee "$work/status.out"
+# The binary runs here for the first time. If it can't start or fails, its
+# stderr says why, so show it before stopping.
+status_code=0
+"$program" service status > "$work/status.out" 2> "$work/status.err" || status_code=$?
+cat "$work/status.out"
+if [ "$status_code" -ne 0 ]; then
+  cat "$work/status.err"
+  fail "service status exited with $status_code"
+fi
 grep -qx 'aranet-service is not installed' "$work/status.out" ||
   fail "service status doesn't report the missing service"
 if [ -s "$work/status.err" ]; then
@@ -117,13 +130,14 @@ systemd-analyze security --offline=true --threshold=50 --no-pager "$unit" | tail
 
 echo "== The service runs as the dynamic user aranet"
 systemctl start aranet.service
+# 30 tries, a second apart, each limited to 5 s: up to about three minutes.
 for _ in $(seq 1 30); do
   if curl -fsS --max-time 5 "$health" > /dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-curl -fsS --max-time 5 "$health" > /dev/null || fail "$health did not answer within 30 s"
+curl -fsS --max-time 5 "$health" > /dev/null || fail "$health did not answer after 30 tries"
 pid=$(systemctl show -p MainPID --value aranet.service)
 [ "$pid" -gt 0 ] || fail "aranet.service has no main process"
 user=$(ps -o user= -p "$pid" | tr -d ' ')
@@ -173,11 +187,14 @@ echo "== The same bind in $state_config is refused"
 # config directory: that is the default without --config, and the service
 # never sees it.
 [ ! -e "$state_config" ] || fail "$state_config exists: run this only on a throwaway machine"
+# From here until the `rm`, the EXIT trap removes the file if a check fails.
+wrote_state_config=yes
 printf '%s\n' '[server]' 'bind = "0.0.0.0:8080"' > "$state_config"
 if "$program" service install 2> "$work/refusal.err"; then
   fail "service install accepted the unauthenticated network bind in $state_config"
 fi
 rm "$state_config"
+wrote_state_config=no
 cat "$work/refusal.err"
 grep -qF 'Invalid configuration' "$work/refusal.err" ||
   fail "the refusal doesn't say that the configuration is invalid"
