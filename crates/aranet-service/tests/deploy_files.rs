@@ -876,9 +876,9 @@ fn image_check_script_keeps_exit_1_in_fail_and_loopback_only_ports() {
         .map(|line| strip_comment(line).trim())
         .collect();
 
-    // Without errexit a failed command, such as `docker build` or the
-    // `docker compose … config -q` of a broken compose file, would not stop the
-    // script, and it would go on to print that every check passed.
+    // Without errexit a failed command that no `|| fail` follows would not stop
+    // the script. After the `docker compose … config -q` of a broken compose
+    // file, it would go on to print that every check passed.
     assert!(
         lines.contains(&"set -euo pipefail"),
         "the script must run under `set -euo pipefail`"
