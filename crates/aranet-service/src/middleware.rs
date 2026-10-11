@@ -432,6 +432,11 @@ impl OriginPolicy {
     /// Whether a request carrying `Origin: origin` may reach the service.
     /// `host` is the request's `Host` value: an origin whose host and port
     /// equal it is the service's own. `null` is never allowed.
+    ///
+    /// The dashboard is served with `Referrer-Policy: no-referrer`, which
+    /// makes browsers send `Origin: null` on a POST from the page that isn't
+    /// a CORS request, such as a form. Such a request would be refused here;
+    /// the page makes only GET requests and a WebSocket connection today.
     pub fn allows_origin(&self, origin: &str, host: Option<&str>) -> bool {
         let origin = normalize_origin(origin);
         if origin == "null" {
