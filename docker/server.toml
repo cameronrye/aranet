@@ -12,6 +12,11 @@
 # reason, if you set security.api_key_enabled = true, also set
 # security.api_key yourself: the service can't save a generated key here and
 # would stop at startup.
+#
+# The image build copies this file into the image (mode 0644). An image built
+# after you put an API key, an MQTT password or a webhook URL in here contains
+# them: don't push or share such an image, or leave this file as it is and
+# mount a config that you keep outside the checkout over /app/server.toml.
 
 [server]
 # Bind to all interfaces for Docker networking

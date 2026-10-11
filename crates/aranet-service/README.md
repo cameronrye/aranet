@@ -72,6 +72,8 @@ bind = "127.0.0.1:8080"
 path = "~/.local/share/aranet/data.db"  # `~/` is your home directory
 
 # Optional: delete old data at startup and hourly (off by default).
+# readings_days deletes every reading in the database that is older, including
+# those the aranet CLI, TUI and GUI stored there.
 # history_days also prunes the history that `aranet sync` cached.
 # [storage.retention]
 # readings_days = 90
@@ -149,6 +151,8 @@ precision = "s"
 The dashboard shell routes `/` and `/dashboard` are public so browsers can load the UI. API, WebSocket, and metrics requests still honor the configured security settings.
 
 If API key authentication is enabled, send the key as `X-API-Key` or `Authorization: Bearer <key>`; WebSocket clients can also use the `token` query parameter for `/api/ws`. A repeated `X-API-Key` or `Authorization` header, or an `X-API-Key` that isn't plain text, is never read as a key, so a request that sends its key that way is refused. While authentication is off, the service answers only local host names, IP addresses, this machine's name and `security.allowed_hosts` (421 otherwise), and rejects browser requests from origins other than its own and `security.cors_origins` (403).
+
+"This machine's name" is the first label of its host name (`server1` for `server1.example.com`), with or without `.local`. List a fully qualified name in `security.allowed_hosts`.
 
 ### Query Parameters
 

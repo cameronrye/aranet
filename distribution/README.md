@@ -103,6 +103,10 @@ systemctl status aranet
 journalctl -u aranet -f
 ```
 
+The unit reads environment settings from `/etc/default/aranet` if that file exists (`EnvironmentFile=-/etc/default/aranet`). It is the place for `RUST_LOG` and other variables, one `NAME=value` per line, for example `RUST_LOG=aranet_core=info`; restart the service after changing it. (A `RUST_LOG` entry for exactly `aranet_service`, `tower_http` or `aranet_store` has no effect: the service sets the levels of those three itself.)
+
+`sudo aranet-service service install --database <path>` is refused unless the path is in `/var/lib/aranet`, the only directory the service can write.
+
 The [deployment guide](https://cameronrye.github.io/aranet/docs/service/deployment/#linux-systemd) covers Bluetooth group access (`SupplementaryGroups=bluetooth`), running the released `aranet` binary (`aranet server`) under this unit, and moving the data of a system service installed by 0.2.x.
 
 ## macOS (launchd)
@@ -134,6 +138,8 @@ launchctl list | grep aranet
 
 Not supported: a LaunchDaemon runs the service as root. `sudo aranet-service service install` refuses to install one on macOS; use the user-level service above, or `aranet-service service install --user`.
 
+A LaunchDaemon that 0.2.x installed keeps running the service as root after an upgrade. Remove it with `sudo aranet-service service uninstall`, then run `aranet-service service install --user`. Every `aranet-service service` command prints a warning while it is still there.
+
 ## Using the CLI (Recommended)
 
 The easiest way to manage the service is using the built-in CLI commands:
@@ -151,7 +157,13 @@ sudo /usr/local/bin/aranet-service service install
 sudo systemctl start aranet
 ```
 
-System-level installs are refused on macOS, Windows, OpenRC and rc.d, where the service would run as root. On Windows, where `service install` doesn't work yet, start `aranet server` (or `aranet-service run`) at logon with Task Scheduler; the [deployment guide](https://cameronrye.github.io/aranet/docs/service/deployment/#windows) has the command.
+System-level installs are refused on macOS, Windows, OpenRC and rc.d, where the service would run as root. On Windows, where `service install` doesn't work yet, start `aranet server` (or `aranet-service run`) at logon with Task Scheduler. From a Command Prompt opened with **Run as administrator**, for the `aranet` CLI from the installer:
+
+```text
+schtasks /create /tn "Aranet Service" /tr "\"%USERPROFILE%\.cargo\bin\aranet.exe\" server" /sc onlogon /ru "%USERNAME%" /it
+```
+
+With `aranet-service` from `cargo install`, use `"\"%USERPROFILE%\.cargo\bin\aranet-service.exe\" run"` as the `/tr` value. `/ru` and `/it` make the task run as you, in your session. Remove it with `schtasks /delete /tn "Aranet Service"`.
 
 ## Configuration
 
