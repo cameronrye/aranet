@@ -498,12 +498,59 @@ fn executable_remedy(program: &Path) -> String {
     }
 }
 
-/// Why the system unit's sandbox would hide `path` from the service.
+/// Why the system unit's sandbox would hide `path` from the service, or why
+/// that can't be ruled out. `None` if the service can reach it.
+///
+/// `path` is compared with each `HIDDEN_FROM_SERVICE` directory twice, by
+/// whole components:
+///
+/// - As written. The service can't pass through a hidden directory, wherever
+///   a symlink inside it leads.
+/// - With symlinks resolved, because the sandbox hides the directories
+///   themselves, whatever name leads to them. Of `path`, the nearest ancestor
+///   that exists is resolved and the components below it are kept as written:
+///   a config file need not exist yet. A symlink whose target doesn't exist
+///   counts as not existing, so it is not followed. A hidden directory that
+///   exists is resolved (on some systems `/home` is a symlink to `/var/home`);
+///   one that doesn't is compared as written.
+///
+/// A `path` with a `..` component is refused without comparing it: where
+/// `..` leads depends on symlinks in directories that may not exist yet.
 fn hidden_from_service(path: &Path) -> Option<&'static str> {
-    HIDDEN_FROM_SERVICE
+    hidden_under(path, &HIDDEN_FROM_SERVICE)
+}
+
+/// `hidden_from_service` for the directories in `roots`, each with its reason.
+fn hidden_under<P: AsRef<Path>>(path: &Path, roots: &[(P, &'static str)]) -> Option<&'static str> {
+    if path.components().any(|c| c == Component::ParentDir) {
+        return Some(
+            "a path with `..` can't be checked against the directories the unit hides; give it \
+             without `..`",
+        );
+    }
+    let resolved = resolve_existing_part(path);
+    roots
         .iter()
-        .find(|(dir, _)| path.starts_with(dir))
+        .find(|(root, _)| {
+            let root = root.as_ref();
+            path.starts_with(root)
+                || resolved.starts_with(fs::canonicalize(root).unwrap_or_else(|_| root.into()))
+        })
         .map(|&(_, reason)| reason)
+}
+
+/// `path` with its symlinks resolved as far as it exists: its nearest ancestor
+/// that exists, canonicalized, then the components below that one as written.
+fn resolve_existing_part(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let (Ok(mut resolved), Ok(below)) =
+            (fs::canonicalize(ancestor), path.strip_prefix(ancestor))
+        {
+            resolved.extend(below);
+            return resolved;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// The config file of the systemd system service: `--config`, made absolute,
@@ -520,7 +567,11 @@ fn systemd_config_path(options: &aranet_service::RunOptions) -> Result<PathBuf, 
 ///
 /// The unit hides home directories, gives the service its own `/tmp` and lets
 /// it write only `/var/lib/aranet`, so a config or database it couldn't use
-/// is refused here instead of failing when the service starts.
+/// is refused here instead of failing when the service starts. The config is
+/// refused if `hidden_from_service` finds it in a hidden directory, as written
+/// or with symlinks resolved as far as the path exists, or if it has a `..`
+/// component. The database is compared as written with `/var/lib/aranet` and
+/// must not have a `..` component either.
 fn systemd_system_args(
     options: &aranet_service::RunOptions,
 ) -> Result<Vec<OsString>, ServiceError> {
@@ -2021,6 +2072,96 @@ mod tests {
                     }
                     other => panic!("{database}: {other:?}"),
                 }
+            }
+        }
+
+        #[test]
+        fn sandbox_paths_are_matched_with_symlinks_resolved_and_dot_dot_is_refused() {
+            use std::os::unix::fs::symlink;
+
+            const DOT_DOT: &str = "a path with `..` can't be checked against the directories the \
+                                   unit hides; give it without `..`";
+
+            // The roots live in a TempDir: `home` is a directory, `root` is a
+            // symlink to `real-root` (Fedora Atomic links /home and /root into
+            // /var like that), and `run/user` doesn't exist.
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path();
+            fs::create_dir_all(base.join("home/u")).unwrap();
+            fs::write(base.join("home/u/server.toml"), "").unwrap();
+            fs::create_dir(base.join("etc")).unwrap();
+            fs::create_dir(base.join("real-root")).unwrap();
+            fs::create_dir(base.join("real-root2")).unwrap();
+            symlink(base.join("real-root"), base.join("root")).unwrap();
+            // Into the hidden directory: a directory and a file. And out of it.
+            symlink(base.join("home/u"), base.join("etc/link")).unwrap();
+            symlink(
+                base.join("home/u/server.toml"),
+                base.join("etc/linked.toml"),
+            )
+            .unwrap();
+            symlink(base.join("etc"), base.join("home/out")).unwrap();
+            let roots = [
+                (base.join("home"), "home is hidden"),
+                (base.join("root"), "root is hidden"),
+                (base.join("run/user"), "run/user is hidden"),
+            ];
+
+            let cases = [
+                ("home/u/server.toml", Some("home is hidden")),
+                // `..`, wherever it leads: into a hidden directory or not.
+                ("etc/../home/u/server.toml", Some(DOT_DOT)),
+                ("etc/../etc/server.toml", Some(DOT_DOT)),
+                // Through a symlinked directory, also with directories that
+                // don't exist yet, and through a symlinked file.
+                ("etc/link/server.toml", Some("home is hidden")),
+                ("etc/link/new/dir/server.toml", Some("home is hidden")),
+                ("etc/linked.toml", Some("home is hidden")),
+                // A hidden directory that is a symlink: by its name and by
+                // the real path of what it points to.
+                ("root/server.toml", Some("root is hidden")),
+                ("real-root/server.toml", Some("root is hidden")),
+                (
+                    "real-root/.config/aranet/server.toml",
+                    Some("root is hidden"),
+                ),
+                // As written it is in the hidden directory, which the service
+                // can't pass through, wherever the symlink leads.
+                ("home/out/server.toml", Some("home is hidden")),
+                // A hidden directory that doesn't exist is compared as written.
+                ("run/user/1000/server.toml", Some("run/user is hidden")),
+                // Outside the hidden directories, also by a name that only
+                // starts like a resolved one's.
+                ("etc/server.toml", None),
+                ("etc/new/dir/server.toml", None),
+                ("real-root2/server.toml", None),
+                ("run/users/server.toml", None),
+            ];
+            let wrong: Vec<String> = cases
+                .iter()
+                .filter_map(|(path, expected)| {
+                    let found = hidden_under(&base.join(path), &roots);
+                    (found != *expected)
+                        .then(|| format!("{path}: found {found:?}, expected {expected:?}"))
+                })
+                .collect();
+            assert!(wrong.is_empty(), "{wrong:#?}");
+
+            // `service install --config` refuses `..` with the path as given.
+            for config in ["/etc/../home/u/server.toml", "/etc/aranet/../server.toml"] {
+                let error = systemd_system_args(&aranet_service::RunOptions {
+                    config: Some(PathBuf::from(config)),
+                    ..aranet_service::RunOptions::default()
+                })
+                .expect_err(config);
+                assert!(
+                    matches!(error, ServiceError::InaccessiblePath { .. }),
+                    "{config}: {error:?}"
+                );
+                assert_eq!(
+                    error.to_string(),
+                    format!("{config} can't be used by the system service: {DOT_DOT}")
+                );
             }
         }
     }
