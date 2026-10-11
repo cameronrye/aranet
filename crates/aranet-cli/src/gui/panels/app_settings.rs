@@ -920,14 +920,15 @@ impl AranetApp {
 
                             // Save behavior config separately: only this key is written, and a
                             // config file that doesn't parse is left untouched.
-                            if ui.add(btn).clicked()
-                                && !is_selected
-                                && let Err(e) = Config::update(|c| {
+                            if ui.add(btn).clicked() && !is_selected {
+                                let saved = Config::update(|c| {
                                     c.behavior.auto_connect = val;
                                     Ok(())
-                                })
-                            {
-                                tracing::warn!("Failed to save the Auto-Connect setting: {e:#}");
+                                });
+                                self.report_config_save(
+                                    "Failed to save the Auto-Connect setting",
+                                    saved,
+                                );
                             }
                         }
                     });
@@ -967,14 +968,15 @@ impl AranetApp {
                             .fill(bg)
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
-                            if ui.add(btn).clicked()
-                                && !is_selected
-                                && let Err(e) = Config::update(|c| {
+                            if ui.add(btn).clicked() && !is_selected {
+                                let saved = Config::update(|c| {
                                     c.behavior.auto_sync = val;
                                     Ok(())
-                                })
-                            {
-                                tracing::warn!("Failed to save the Auto-Sync setting: {e:#}");
+                                });
+                                self.report_config_save(
+                                    "Failed to save the Auto-Sync setting",
+                                    saved,
+                                );
                             }
                         }
                     });
@@ -1014,15 +1016,14 @@ impl AranetApp {
                             .fill(bg)
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
-                            if ui.add(btn).clicked()
-                                && !is_selected
-                                && let Err(e) = Config::update(|c| {
+                            if ui.add(btn).clicked() && !is_selected {
+                                let saved = Config::update(|c| {
                                     c.behavior.remember_devices = val;
                                     Ok(())
-                                })
-                            {
-                                tracing::warn!(
-                                    "Failed to save the Remember Devices setting: {e:#}"
+                                });
+                                self.report_config_save(
+                                    "Failed to save the Remember Devices setting",
+                                    saved,
                                 );
                             }
                         }
@@ -1063,15 +1064,14 @@ impl AranetApp {
                             .fill(bg)
                             .corner_radius(egui::CornerRadius::same(self.theme.rounding.sm as u8));
 
-                            if ui.add(btn).clicked()
-                                && !is_selected
-                                && let Err(e) = Config::update(|c| {
+                            if ui.add(btn).clicked() && !is_selected {
+                                let saved = Config::update(|c| {
                                     c.behavior.load_cache = val;
                                     Ok(())
-                                })
-                            {
-                                tracing::warn!(
-                                    "Failed to save the Load Cached Data setting: {e:#}"
+                                });
+                                self.report_config_save(
+                                    "Failed to save the Load Cached Data setting",
+                                    saved,
                                 );
                             }
                         }
