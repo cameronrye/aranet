@@ -5,7 +5,8 @@
 //! the repository. They read the files line by line, without a Dockerfile or
 //! YAML parser, so the compose files must stay in block style. The image itself
 //! is built and started by `scripts/ci/check-docker-image.sh`, in the `docker`
-//! job of `.github/workflows/deployment-files.yml`.
+//! job of `.github/workflows/deployment-files.yml`. The last test here reads
+//! that workflow: it must keep running the script.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -410,5 +411,276 @@ fn compose_build_dockerfiles_exist() {
                 dockerfile.display()
             );
         }
+    }
+}
+
+// The tests below pin lines that the image check doesn't reach, or reaches
+// only with Docker: each fails for a one-line change that the tests above let
+// through.
+
+#[test]
+fn dockerfile_user_entrypoint_and_cmd_are_the_image_contract() {
+    let instructions = dockerfile();
+    let users: Vec<&String> = instructions
+        .iter()
+        .filter(|instruction| instruction.starts_with("USER "))
+        .collect();
+    assert_eq!(users, ["USER aranet"], "the service must not run as root");
+    let useradd = instructions
+        .iter()
+        .find(|instruction| instruction.contains("useradd "))
+        .expect("docker/Dockerfile creates no user");
+    for part in [
+        "groupadd --system --gid 999 aranet ",
+        "useradd --system --uid 999 --gid 999 ",
+        " --home-dir /data ",
+    ] {
+        assert!(
+            useradd.contains(part),
+            "`{part}` is missing: uid and gid 999 keep existing aranet-data volumes \
+             writable, and the home directory is the data volume: {useradd}"
+        );
+    }
+    assert!(
+        useradd.ends_with(" && chown aranet:aranet /data"),
+        "/data must belong to the service user, or it can't create its database \
+         in a new volume: {useradd}"
+    );
+
+    assert_eq!(
+        exec_form(&instructions, "ENTRYPOINT"),
+        ["/app/aranet-service", "--config", "/app/server.toml"],
+        "ENTRYPOINT is the service binary and its config, nothing else"
+    );
+    assert_eq!(
+        exec_form(&instructions, "CMD"),
+        ["run"],
+        "the default command is `run`: with `--no-collector` as the default the \
+         image would start, answer every check and never poll a sensor"
+    );
+}
+
+#[test]
+fn dockerfile_pins_its_base_images_and_uses_the_built_in_frontend() {
+    let stages: Vec<String> = dockerfile()
+        .into_iter()
+        .filter(|instruction| instruction.starts_with("FROM "))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            "FROM rust:1.90-slim-bookworm AS builder",
+            "FROM debian:bookworm-slim"
+        ],
+        "the builder names its Rust version and both stages the same Debian \
+         release, so the binary finds the libraries it was linked against"
+    );
+    assert!(
+        !read("docker/Dockerfile")
+            .lines()
+            .any(|line| line.trim_start().starts_with("# syntax=")),
+        "a `# syntax=` line would pull an unpinned Dockerfile frontend image; \
+         BuildKit's built-in frontend already supports the cache mounts and \
+         `COPY --chmod`"
+    );
+}
+
+#[test]
+fn dockerfile_run_steps_stop_at_the_first_failing_command() {
+    let unchecked: Vec<String> = dockerfile()
+        .into_iter()
+        .filter(|instruction| instruction.starts_with("RUN ") && instruction.contains([';', '|']))
+        .collect();
+    assert!(
+        unchecked.is_empty(),
+        "RUN steps chain their commands with `&&` only. After `;`, `||` or a pipe a \
+         failed command no longer fails the image build: after a failed `cargo \
+         build`, `cp` would copy an older binary out of the cache mount: \
+         {unchecked:#?}"
+    );
+}
+
+#[test]
+fn dockerignore_excludes_env_files_and_coverage_output() {
+    let text = read(".dockerignore");
+    let patterns: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    for pattern in [
+        "**/.env*",
+        "**/*.profraw",
+        "**/*.profdata",
+        "coverage/",
+        "lcov.info",
+    ] {
+        assert!(
+            patterns.contains(&pattern),
+            ".dockerignore must list {pattern}, or `COPY . .` sends a developer's \
+             environment files or coverage output to the builder (a bare `.env*` \
+             matches only the context root): {patterns:?}"
+        );
+    }
+}
+
+#[test]
+fn expose_healthchecks_and_published_port_are_loopback_8080() {
+    // The port that docker/server.toml binds, which
+    // `docker_default_config_is_valid_and_serves_metrics` pins.
+    let url = "http://127.0.0.1:8080/api/health";
+
+    let instructions = dockerfile();
+    assert!(
+        instructions
+            .iter()
+            .any(|instruction| instruction == "EXPOSE 8080"),
+        "docker/Dockerfile must EXPOSE 8080"
+    );
+    let healthcheck = instructions
+        .iter()
+        .find(|instruction| instruction.starts_with("HEALTHCHECK "))
+        .expect("docker/Dockerfile has no HEALTHCHECK");
+    assert!(
+        healthcheck.ends_with(&format!(" CMD curl -fsS {url} || exit 1")),
+        "the image's HEALTHCHECK must ask {url}. Nothing else checks it: the image \
+         check never reads a container's health, and the compose files replace it: \
+         {healthcheck}"
+    );
+    let runtime = instructions
+        .rsplit(|instruction| instruction.starts_with("FROM "))
+        .next()
+        .unwrap_or_default();
+    assert!(
+        runtime.iter().any(|instruction| {
+            instruction.starts_with("RUN apt-get ")
+                && instruction.split(' ').any(|word| word == "curl")
+        }),
+        "the final stage must install curl, which every healthcheck runs inside \
+         the container: {runtime:#?}"
+    );
+
+    for file in COMPOSE_FILES {
+        let text = read(file);
+        let probes: Vec<&str> = text
+            .lines()
+            .map(|line| strip_comment(line).trim())
+            .filter(|line| line.starts_with("test:"))
+            .collect();
+        let probe = format!("test: [\"CMD\", \"curl\", \"-fsS\", \"{url}\"]");
+        assert!(
+            probes.contains(&probe.as_str()),
+            "{file}: the healthcheck of aranet-service must be `{probe}`: {probes:?}"
+        );
+        let ports = list_items(&text, "ports");
+        assert!(
+            ports.iter().any(|port| port == "\"127.0.0.1:8080:8080\""),
+            "{file} must publish the API as \"127.0.0.1:8080:8080\": {ports:?}"
+        );
+    }
+}
+
+#[test]
+fn compose_files_mount_the_data_volume_and_the_config_and_dbus_read_only() {
+    let expected: [(&str, &[&str]); 2] = [
+        (
+            "docker-compose.yml",
+            &[
+                "aranet-data:/data",
+                "./docker/server.toml:/app/server.toml:ro",
+                "/run/dbus:/run/dbus:ro",
+            ],
+        ),
+        (
+            "docker/docker-compose.yml",
+            &["aranet-data:/data", "./server.toml:/app/server.toml:ro"],
+        ),
+    ];
+    for (file, mounts) in expected {
+        let text = read(file);
+        let volumes = list_items(&text, "volumes");
+        for mount in mounts {
+            assert!(
+                volumes.iter().any(|volume| volume == mount),
+                "{file} must mount {mount}: the database lives in /data, and the \
+                 service reads /app/server.toml and must not write it: {volumes:#?}"
+            );
+        }
+        // Every D-Bus mount, including the commented one in docker/, which is
+        // there to be uncommented.
+        let dbus: Vec<&str> = text
+            .lines()
+            .map(|line| line.trim().trim_start_matches('#').trim())
+            .filter(|line| line.starts_with("- ") && line.contains("dbus"))
+            .collect();
+        assert_eq!(
+            dbus,
+            ["- /run/dbus:/run/dbus:ro"],
+            "{file}: the host's system bus is mounted read-only"
+        );
+    }
+}
+
+#[test]
+fn compose_files_set_privileged_to_nothing_but_false() {
+    let mut problems = Vec::new();
+    for file in COMPOSE_FILES {
+        for (n, line) in read(file).lines().enumerate() {
+            // Comments count too, as in
+            // `compose_files_are_unprivileged_and_loopback_only`.
+            let code = line.trim().trim_start_matches('#').trim_start();
+            let Some(value) = code.strip_prefix("privileged:") else {
+                continue;
+            };
+            let value = strip_comment(value).trim().trim_matches(['"', '\'']);
+            if !value.eq_ignore_ascii_case("false") {
+                problems.push(format!("{file}:{}: `{}`", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "compose reads `True`, `TRUE`, `yes` and `on` as true as well, so the only \
+         value `privileged:` may have in these files is false:\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn deployment_workflow_runs_the_image_check_for_main_and_deploy_file_changes() {
+    let text = read(".github/workflows/deployment-files.yml");
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|line| strip_comment(line).trim())
+        .collect();
+    assert!(
+        lines.contains(&"run: scripts/ci/check-docker-image.sh"),
+        "a job must run scripts/ci/check-docker-image.sh, the only check that \
+         builds and starts the image"
+    );
+    let push = lines
+        .iter()
+        .position(|line| *line == "push:")
+        .expect("the workflow has no push trigger");
+    assert_eq!(
+        lines.get(push + 1),
+        Some(&"branches: [main]"),
+        "every push to main must run the workflow"
+    );
+    let paths = list_items(&text, "paths");
+    for path in [
+        "crates/**",
+        "docker/**",
+        "docker-compose.yml",
+        ".dockerignore",
+        "Cargo.toml",
+        "Cargo.lock",
+        "scripts/ci/**",
+        ".github/workflows/deployment-files.yml",
+    ] {
+        assert!(
+            paths.contains(&format!("\"{path}\"")),
+            "a pull request that changes {path} must run the workflow: {paths:?}"
+        );
     }
 }
