@@ -53,7 +53,7 @@
 //!   battery plugin reads the Battery Level, which needs encryption) and finds
 //!   no agent on a headless host, so after a timeout or a lost link the next
 //!   connect pairs again.
-//! - btleplug 0.11.8 has no pairing call.
+//! - btleplug 0.13.5 has no pairing call.
 
 use std::collections::HashMap;
 use std::fmt;

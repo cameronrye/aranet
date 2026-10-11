@@ -20,12 +20,21 @@ pub(super) enum Outcome {
     /// Fail at once with a Bluetooth error, as a refused connection or a
     /// failed discovery does.
     Fail,
-    /// Never answer, as btleplug does on macOS once CoreBluetooth has dropped
-    /// the peripheral.
+    /// Never answer. It stands for two things. One is a BlueZ `connect` that
+    /// is still waiting when aranet's own limit ends: bluez-async waits up to
+    /// 30 s for BlueZ's reply to `Device1.Connect` and then 30 s for the
+    /// services (bluez-async 0.9.0 `src/lib.rs:57`, `:61`), so under the 15 s
+    /// default limit this is how a slow first connect is scripted. The other
+    /// is a call that the stack never answers, such as a CoreBluetooth
+    /// connect to a sensor that has gone.
     Hang,
     /// Fail as bluez-async's `connect` does while BlueZ is still discovering
     /// the services of a connected device: after `BLUEZ_ASYNC_WAIT`, with
-    /// `btleplug::Error::Other("Service discovery timed out")`.
+    /// `btleplug::Error::Other("Service discovery timed out")`. The wait
+    /// starts at the call, as if BlueZ answered `Device1.Connect` at once,
+    /// which it does when a wait asks again on a live link. The caller sees
+    /// this outcome only if its own limit is longer than `BLUEZ_ASYNC_WAIT`;
+    /// that constant's doc says how to script a first connect.
     DiscoveryTimedOut,
     /// Fail at once as BlueZ refuses a `Device1.Connect` while an earlier one
     /// to the same device is still pending (`org.bluez.Error.InProgress`),
@@ -39,7 +48,10 @@ pub(super) enum Outcome {
     DbusTimeout,
     /// Wait this long on the tokio clock, then succeed like `Ok`. A
     /// `disconnect` that ends this way notifies `disconnected()` at the end
-    /// of the wait.
+    /// of the wait. As a BlueZ `connect` it stands for BlueZ resolving the
+    /// services that long after the call: bluez-async's `connect` can succeed
+    /// up to `BLUEZ_ASYNC_WAIT` after BlueZ's answer, which for a re-ask on a
+    /// live link comes at once.
     After(std::time::Duration),
 }
 
@@ -268,8 +280,8 @@ async fn run(outcome: Option<Outcome>) -> btleplug::Result<()> {
         Outcome::DiscoveryTimedOut => {
             tokio::time::sleep(BLUEZ_ASYNC_WAIT).await;
             // bluez-async's `BluetoothError::ServiceDiscoveryTimedOut`
-            // (`src/lib.rs:90-92`), which btleplug wraps in `Error::Other`
-            // (`src/bluez/adapter.rs:125-129`).
+            // (bluez-async 0.9.0 `src/lib.rs:90-92`), which btleplug wraps in
+            // `Error::Other` (btleplug 0.13.5 `src/bluez/adapter.rs:182-186`).
             Err(btleplug::Error::Other("Service discovery timed out".into()))
         }
         // bluez-async's `BluetoothError::DbusError`, whose text is the D-Bus

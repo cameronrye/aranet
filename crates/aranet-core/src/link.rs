@@ -60,9 +60,11 @@ pub(crate) trait GattLink: Clone + Send + Sync + 'static {
     /// Whether the connection goes through BlueZ. There `connect` doesn't
     /// return when the link comes up: BlueZ answers `Device1.Connect` only
     /// once the ATT channel is up, a few seconds later, and bluez-async then
-    /// waits up to 5 s more for BlueZ to resolve the services. So a `connect`
-    /// can run out of time with the link already up and BlueZ still setting
-    /// up the ATT channel or discovering.
+    /// waits up to 30 s more for BlueZ to resolve the services (bluez-async
+    /// 0.9.0 `src/lib.rs:61`). So a `connect` can run out of time with the
+    /// link already up and BlueZ still setting up the ATT channel or
+    /// discovering. Under a limit of 30 s or less, such as the 15 s default,
+    /// that is how every connect ends whose discovery outlasts the limit.
     fn is_bluez(&self) -> bool;
 
     /// Enable notifications on `characteristic` (the CCCD write).
@@ -441,14 +443,18 @@ pub(crate) async fn connect<L: GattLink>(
 /// On BlueZ, a connect (the first one or the retry's) can end while BlueZ is
 /// still discovering the services on the live link. BlueZ answers
 /// `Device1.Connect` only once the ATT channel is up, a few seconds after the
-/// link, and bluez-async stops waiting for the services 5 s after that answer.
-/// A link that comes up late can also use up `connection_timeout` first, while
-/// BlueZ is still setting up the ATT channel or discovering; `connect_link`
-/// then asks whether the link is up. Either way the discovery after it first
-/// waits for BlueZ to finish (`wait_for_bluez_discovery`), and that
-/// connection-state query, the wait and the discovery share one
-/// `bluez_discovery_limit` (20 s at defaults), whose end fails the connect
-/// with a "discover services" (or "rediscover services") timeout.
+/// link, and bluez-async then waits 30 s for the services (bluez-async 0.9.0
+/// `src/lib.rs:61`). It waited 5 s before btleplug 0.13.5
+/// (<https://github.com/deviceplug/btleplug/issues/496>). So under a
+/// `connection_timeout` of 30 s or less, the 15 s default included, a connect
+/// whose discovery is unfinished at that limit runs out of time first, and
+/// `connect_link` then asks whether the link is up. bluez-async gives up
+/// first ("Service discovery timed out") only under a longer limit. Either
+/// way the discovery after it first waits for BlueZ to finish
+/// (`wait_for_bluez_discovery`), and that connection-state query, the wait
+/// and the discovery share one `bluez_discovery_limit` (20 s at defaults),
+/// whose end fails the connect with a "discover services" (or "rediscover
+/// services") timeout.
 ///
 /// `connect` disconnects the link when any step fails.
 async fn connect_and_discover<L: GattLink>(
@@ -524,22 +530,38 @@ async fn connect_and_discover<L: GattLink>(
 }
 
 /// What bluez-async's `connect` fails with when BlueZ hasn't resolved the
-/// services 5 s after `Device1.Connect` returned, although the link is up and
-/// BlueZ is still discovering (`BluetoothError::ServiceDiscoveryTimedOut`,
-/// bluez-async 0.8.2 `src/lib.rs:61`, `:90-92`, `:696-724`). btleplug passes
-/// it on as `btleplug::Error::Other` (`src/bluez/adapter.rs:125-129`). No
-/// other btleplug backend produces it. aranet-core can't name bluez-async's
-/// type (it isn't a dependency), so this matches the message.
+/// services 30 s after `Device1.Connect` returned, although the link is up
+/// and BlueZ is still discovering (`BluetoothError::ServiceDiscoveryTimedOut`,
+/// bluez-async 0.9.0 `src/lib.rs:61`, `:90-92`, `:699-727`). btleplug passes
+/// it on as `btleplug::Error::Other` (btleplug 0.13.5
+/// `src/bluez/adapter.rs:182-186`). No other btleplug backend produces it.
+/// aranet-core can't name bluez-async's type (it isn't a dependency), so this
+/// matches the message. A connect gets it only under a `connection_timeout`
+/// longer than those 30 s; a shorter limit ends the call first.
 const BLUEZ_DISCOVERY_TIMED_OUT: &str = "Service discovery timed out";
 
 /// The least time a connect waits for BlueZ to finish discovering the services
-/// once bluez-async has given up, or the connect has run out of time with the
-/// link up (BR-25). An Aranet4 that BlueZ hasn't cached needs about 30-48 ATT
+/// once the connect has run out of time with the link up, or bluez-async has
+/// given up (BR-25). An Aranet4 that BlueZ hasn't cached needs about 30-48 ATT
 /// requests at 0.3-0.45 s each: 9-22 s from the moment BlueZ answers
 /// `Device1.Connect`, which on an LE link it does once the ATT channel is up,
-/// a few seconds after the link. bluez-async has already waited 5 s of that
-/// when it gives up. When the connect runs out of time with the link up, less
-/// than 5 s of it has passed, or none if BlueZ hasn't answered yet.
+/// a few seconds after the link.
+///
+/// Counted from that answer, BlueZ's discovery gets
+/// `min(a + 30 s, connection_timeout) + wait - a` in all, where `a` is the
+/// time BlueZ took to answer and the 30 s are bluez-async's own wait for the
+/// services (bluez-async 0.9.0 `src/lib.rs:61`). At the default limits that
+/// is `15 s + 20 s - a`: 33 s when BlueZ answers after 2 s, and little more
+/// than this wait alone when it answers just before the connect's limit. If
+/// BlueZ hasn't answered by then, the wait also has to cover the rest of the
+/// ATT set-up. When bluez-async gives up first, which needs a
+/// `connection_timeout` above 30 s, the discovery has already had 30 s.
+///
+/// bluez-async waited only 5 s until btleplug 0.13.5 moved to bluez-async
+/// 0.9.0 (<https://github.com/deviceplug/btleplug/issues/496>), and this wait
+/// was added to make up for that. It is still needed: a connect whose limit
+/// is 30 s or less ends before bluez-async's wait does, and without this wait
+/// it would fail and disconnect in the middle of BlueZ's discovery.
 pub(crate) const BLUEZ_DISCOVERY_MIN_WAIT: Duration = Duration::from_secs(20);
 
 /// How long a connect waits for BlueZ to finish discovering the services once
@@ -577,10 +599,13 @@ fn is_bluez_in_progress(error: &btleplug::Error) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BluezWaitReason {
     /// bluez-async's `connect` gave up waiting for the services, so BlueZ has
-    /// answered `Device1.Connect`.
+    /// answered `Device1.Connect`. bluez-async waits 30 s (bluez-async 0.9.0
+    /// `src/lib.rs:61`), so this needs a `connection_timeout` above 30 s.
     DiscoveryTimedOut,
-    /// The connect ran out of time with the link up. BlueZ may not have
-    /// answered that `Device1.Connect` yet.
+    /// The connect ran out of time with the link up. Under a
+    /// `connection_timeout` of 30 s or less this is the reason for every
+    /// wait. BlueZ has usually answered that `Device1.Connect` by then, but
+    /// it may not have answered yet.
     ConnectTimedOut,
 }
 
@@ -638,10 +663,12 @@ async fn connect_link<L: GattLink>(
         }
         // BlueZ answers `Device1.Connect` only once the ATT channel is up, a
         // few seconds after the link, and bluez-async's `connect` then waits
-        // up to 5 s more for the services. So a link that comes up late in
-        // `connection_timeout` runs out of time here while BlueZ is still
-        // setting up the ATT channel or discovering on it. Disconnecting
-        // would cancel that, and every retry would start it again.
+        // up to 30 s more for the services (bluez-async 0.9.0
+        // `src/lib.rs:61`). So under a `connection_timeout` of 30 s or less,
+        // every connect whose discovery is unfinished at the limit runs out
+        // of time here, with BlueZ still setting up the ATT channel or
+        // discovering on the link. Disconnecting would cancel that, and
+        // every retry would start it again.
         Err(timeout @ Error::Timeout { .. }) if link.is_bluez() => {
             // The query counts against the wait's limit, so the connect still
             // takes at most `connection_timeout`, and the query and the wait
@@ -699,17 +726,29 @@ async fn discover<L: GattLink>(
 ///
 /// Once BlueZ has answered the connect that started the wait, it answers
 /// `Device1.Connect` at once while the device is connected (`src/device.c`,
-/// `dev_connect`), and bluez-async then waits up to 5 s more for
-/// `ServicesResolved`, or returns at once if it is already set. If the link
-/// has dropped, `Device1.Connect` opens a new one, as the caller's own retry
-/// would.
+/// `dev_connect`), and bluez-async then waits up to 30 s more for
+/// `ServicesResolved` (bluez-async 0.9.0 `src/lib.rs:61`), or returns at once
+/// if it is already set. Those 30 s are longer than the default 20 s wait, so
+/// at the default limits the wait makes one such call: BlueZ finishes during
+/// it, or the caller's deadline ends it. Another call after a "Service
+/// discovery timed out" needs a `discovery_timeout` above 30 s.
+///
+/// If the link has dropped, a `Device1.Connect` made after the drop opens a
+/// new one, as the caller's own retry would. A call that is already waiting
+/// for the services does not notice a drop (bluez-async 0.9.0
+/// `src/lib.rs:711-726`), so at the default limits a link that drops during
+/// the wait is not reopened.
 ///
 /// After a connect timeout (`BluezWaitReason::ConnectTimedOut`), BlueZ may not
 /// have answered the timed-out `Device1.Connect` yet, and until it does it
 /// refuses the next one with `In Progress`. Then the wait asks again after
-/// `BLUEZ_IN_PROGRESS_PAUSE`. After bluez-async's discovery timeout BlueZ has
-/// answered, so an `In Progress` there comes from another connect to the
-/// device or a pairing of it, and ends the wait.
+/// `BLUEZ_IN_PROGRESS_PAUSE`. Under a `connection_timeout` of 30 s or less
+/// every wait starts this way, so there an `In Progress` that comes from
+/// another connect to the device or a pairing of it is asked again as well,
+/// until the caller's deadline. After bluez-async's discovery timeout, which
+/// needs a longer `connection_timeout`, BlueZ has answered, so an
+/// `In Progress` there comes from another connect to the device or a pairing
+/// of it, and ends the wait.
 ///
 /// Any other result ends the wait. The caller limits it.
 async fn wait_for_bluez_discovery<L: GattLink>(
@@ -1648,14 +1687,23 @@ mod tests {
     }
 }
 
-/// BR-25: bluez-async's `connect` gives BlueZ 5 s to resolve the services
+/// BR-25: bluez-async's `connect` gives BlueZ 30 s to resolve the services
 /// after BlueZ answers `Device1.Connect`, which on an LE link it does once the
-/// ATT channel is up, a few seconds after the link. A sensor with a large GATT
-/// table and a slow link, such as an Aranet4 that BlueZ hasn't cached yet,
-/// needs longer, and BlueZ keeps discovering on the live link after
-/// bluez-async has given up. When the link itself is slow to come up, the
-/// connect's own time limit can run out first, again with the link up and
-/// BlueZ still setting up the ATT channel or discovering on it.
+/// ATT channel is up, a few seconds after the link (bluez-async 0.9.0
+/// `src/lib.rs:61`). It gave 5 s before btleplug 0.13.5
+/// (<https://github.com/deviceplug/btleplug/issues/496>). A connect's own
+/// time limit is 15 s by default, so when a sensor with a large GATT table
+/// and a slow link, such as an Aranet4 that BlueZ hasn't cached yet, needs
+/// longer than that, the connect's limit runs out first, with the link up
+/// and BlueZ still setting up the ATT channel or discovering on it. The
+/// connect then waits for BlueZ by asking it to connect again. bluez-async
+/// gives up before the connect's limit only when that limit is longer than
+/// its 30 s; the tests of that path set such a limit (`LONG_CONNECT_LIMIT`,
+/// or `ConnectionConfig::challenging_environment()`). Either way BlueZ keeps
+/// discovering on the live link.
+///
+/// The fake's `fake::BLUEZ_ASYNC_WAIT` models bluez-async's wait, and its
+/// doc says how a first connect must be scripted.
 #[cfg(test)]
 mod bluez_discovery_tests {
     use std::collections::BTreeSet;
@@ -1671,7 +1719,8 @@ mod bluez_discovery_tests {
     use crate::error::{Error, Result};
     use crate::test_support::within;
 
-    /// The least time a connect waits for BlueZ once bluez-async has given up
+    /// The least time a connect waits for BlueZ once the connect has run out
+    /// of time with the link up, or bluez-async has given up
     /// (`BLUEZ_DISCOVERY_MIN_WAIT`).
     const MIN_WAIT: Duration = Duration::from_secs(20);
 
@@ -2646,8 +2695,9 @@ mod pairing_tests {
     /// `Duration::MAX` is how a caller says "no limit". A connect must not
     /// panic on it: not when the pairing budget adds two of them, and not on
     /// BlueZ when the wait for BlueZ's service discovery starts with a
-    /// deadline `discovery_timeout` away, after bluez-async gave up waiting
-    /// for the services or after a connect timeout.
+    /// deadline `discovery_timeout` away. The wait starts after bluez-async
+    /// gave up waiting for the services, which a connect without a limit
+    /// lets it do after its 30 s, or after a finite connect limit ran out.
     #[tokio::test(start_paused = true)]
     async fn connect_with_unlimited_timeouts_does_not_panic() {
         within(Duration::from_secs(600), async {
@@ -2665,8 +2715,9 @@ mod pairing_tests {
                 [Call::Pair(Duration::MAX), Call::Connect, Call::Discover]
             );
 
-            // On BlueZ, bluez-async gives up waiting for the services, so the
-            // connect waits for BlueZ to finish.
+            // On BlueZ, a connect without a limit lasts until bluez-async
+            // gives up waiting for the services, 30 s in (the fake's
+            // `BLUEZ_ASYNC_WAIT`), so the connect waits for BlueZ to finish.
             let bluez = FakeGatt::new();
             bluez.set_bluez(true);
             bluez.script_pair([Outcome::Ok]);
