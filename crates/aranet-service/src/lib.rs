@@ -1838,4 +1838,56 @@ mod tests {
             .expect("the sweeper kept running after shutdown")
             .unwrap();
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_sweeper_period_is_the_window_clamped_to_a_second_and_a_day() {
+        for (window_secs, period_secs) in [(0, 1), (60, 60), (u64::MAX, 86_400)] {
+            let clock = governor::clock::FakeRelativeClock::default();
+            let limiter = Arc::new(middleware::RateLimitState::with_clock(
+                &SecurityConfig::default(),
+                clock.clone(),
+            ));
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let sweeper = spawn_rate_limit_sweeper(Arc::clone(&limiter), window_secs, shutdown_rx);
+            // Let the sweeper take its immediate first tick, then make a
+            // client idle on governor's clock.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            limiter.check("10.0.0.1".parse().unwrap()).unwrap();
+            clock.advance(Duration::from_secs(60));
+
+            // 1 ms before the period is over, nothing has been swept ...
+            tokio::time::sleep(Duration::from_secs(period_secs) - Duration::from_millis(2)).await;
+            assert_eq!(
+                limiter.len(),
+                1,
+                "window {window_secs}: swept before {period_secs} s had passed"
+            );
+            // ... and 1 ms after it, the idle client is gone.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            assert!(
+                limiter.is_empty(),
+                "window {window_secs}: not swept after {period_secs} s"
+            );
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), sweeper)
+                .await
+                .expect("the sweeper kept running after shutdown")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_sweeper_stops_when_the_shutdown_sender_is_dropped() {
+        let limiter = Arc::new(middleware::RateLimitState::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let sweeper = spawn_rate_limit_sweeper(limiter, 60, shutdown_rx);
+
+        drop(shutdown_tx);
+
+        tokio::time::timeout(Duration::from_secs(1), sweeper)
+            .await
+            .expect("the sweeper kept running without a shutdown sender")
+            .unwrap();
+    }
 }
