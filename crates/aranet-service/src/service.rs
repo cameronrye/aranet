@@ -1444,9 +1444,21 @@ mod tests {
 
         let upgrade = render_system_install_notes(true);
         assert!(upgrade.starts_with(&fresh), "{upgrade}");
+        // The seven steps end the notes, word for word and in this order.
+        // Documentation that repeats them has to match.
+        let steps = [
+            "  1. sudo systemctl start aranet && sudo systemctl stop aranet  (creates /var/lib/aranet)",
+            "  2. sudo cp /root/.config/aranet/server.toml /var/lib/aranet/",
+            "  3. sudo sh -c 'rm -f /var/lib/aranet/data.db*'",
+            "  4. sudo sh -c 'cp /root/.local/share/aranet/data.db* /var/lib/aranet/'",
+            "  5. sudo chown -R --reference=/var/lib/aranet /var/lib/aranet/",
+            "  6. If /var/lib/aranet/server.toml sets storage.path under /root, delete that line",
+            "  7. sudo systemctl start aranet",
+        ];
+        let lines: Vec<&str> = upgrade.lines().collect();
         assert!(
-            upgrade.contains("sudo cp /root/.config/aranet/server.toml /var/lib/aranet/"),
-            "{upgrade}"
+            lines.ends_with(&steps),
+            "the upgrade notes must end with these steps:\n{steps:#?}\nbut they are:\n{upgrade}"
         );
     }
 
@@ -1688,12 +1700,24 @@ mod tests {
             );
         }
 
-        // "the service can only write /var/lib/aranet" (a refused database),
-        // and the rustdoc's "`UMask=0077` keeps both owner-only".
         for expected in [
+            // "the service can only write /var/lib/aranet" (a refused database),
+            // and the rustdoc's "`UMask=0077` keeps both owner-only".
             "ProtectSystem=strict",
             "StateDirectory=aranet",
             "UMask=0077",
+            // Nothing else would miss one of these if the renderer and the
+            // shipped unit lost it together: without any one of them,
+            // `systemd-analyze security` (systemd 252) still reports an
+            // exposure under the 5.0 that the CI job allows.
+            "EnvironmentFile=-/etc/default/aranet",
+            "Group=aranet",
+            "StateDirectoryMode=0750",
+            "NoNewPrivileges=yes",
+            "PrivateDevices=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectControlGroups=yes",
         ] {
             assert!(
                 lines.contains(&expected),
