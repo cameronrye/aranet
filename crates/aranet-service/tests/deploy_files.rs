@@ -896,8 +896,9 @@ fn image_check_script_keeps_exit_1_in_fail_and_loopback_only_ports() {
 /// run their checks on the right system with the read-only token, and the
 /// script stops at a failed check, keeps the exposure threshold, requires the
 /// dynamic user, treats an accepted home copy as an error and limits the time
-/// of every `curl` call. It reads the files and runs nothing, so it is not a
-/// test of the service, of systemd or of launchd: only the jobs themselves are.
+/// of every `curl` call that `curl_calls` finds. It reads the files and runs
+/// nothing, so it is not a test of the service, of systemd or of launchd: only
+/// the jobs themselves are.
 #[test]
 fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
     /// The lines of the job `name`, trimmed: those indented deeper than its
@@ -928,6 +929,83 @@ fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
             .take_while(|line| *line != end)
             .filter(|line| !line.is_empty())
             .collect()
+    }
+
+    /// Every `curl` call on `line`, from the command name to the end of that
+    /// command: an unquoted `|`, `;`, `&`, `)` or backtick, or the end of the
+    /// line. `>&` and `&>` are redirections and end nothing.
+    ///
+    /// `curl` is a call wherever it stands as a word of its own, so also
+    /// after `$(`, a backtick, `;`, `|`, `&&`, `!`, a quote or a directory
+    /// (`/usr/bin/curl`). It is not one inside a longer name such as
+    /// `libcurl`, `curl-config` or `$curl`. A call through a variable or
+    /// `eval`, and another client such as `wget`, are not found. This reads
+    /// one line at a time, so a call continued on the next line ends here.
+    /// Quotes are followed from the command name on: for a call that is
+    /// itself inside a quoted string, the command may end later than found.
+    fn curl_calls(line: &str) -> Vec<&str> {
+        let in_name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '$');
+        let mut calls = Vec::new();
+        for (at, name) in line.match_indices("curl") {
+            let rest = &line[at + name.len()..];
+            if line[..at].chars().next_back().is_some_and(in_name)
+                || rest.chars().next().is_some_and(in_name)
+            {
+                continue;
+            }
+            let mut quote = None;
+            let mut previous = ' ';
+            let mut end = rest.len();
+            let mut chars = rest.char_indices().peekable();
+            while let Some((i, c)) = chars.next() {
+                let next = chars.peek().map(|&(_, next)| next);
+                match quote {
+                    Some(open) if c == open => quote = None,
+                    Some(_) => {}
+                    None if matches!(c, '"' | '\'') => quote = Some(c),
+                    None if c == '&' && (matches!(previous, '>' | '<') || next == Some('>')) => {}
+                    None if matches!(c, '|' | ';' | '&' | ')' | '`') => {
+                        end = i;
+                        break;
+                    }
+                    None => {}
+                }
+                previous = c;
+            }
+            calls.push(line[at..at + name.len() + end].trim_end());
+        }
+        calls
+    }
+
+    // The forms `curl_calls` must find, and the names it must leave alone.
+    let forms: [(&str, &[&str]); 9] = [
+        ("curl -fsS http://a", &["curl -fsS http://a"]),
+        (
+            r#"body=$(curl -fsS "$url") || fail "no answer""#,
+            &[r#"curl -fsS "$url""#],
+        ),
+        (r#"echo "$(curl -fsS "$url")""#, &[r#"curl -fsS "$url""#]),
+        ("body=`curl -fsS http://a`", &["curl -fsS http://a"]),
+        (
+            "true; curl -a | curl -b && curl -c || ! curl -d",
+            &["curl -a", "curl -b", "curl -c", "curl -d"],
+        ),
+        (
+            r#"if /usr/bin/curl -fsS "$url" > /dev/null 2>&1; then"#,
+            &[r#"curl -fsS "$url" > /dev/null 2>&1"#],
+        ),
+        (
+            r#"curl -fsS "http://a/?b=1&c=(2);d" &> /dev/null --max-time 5 &"#,
+            &[r#"curl -fsS "http://a/?b=1&c=(2);d" &> /dev/null --max-time 5"#],
+        ),
+        ("(curl)", &["curl"]),
+        (
+            "ldd /usr/lib/libcurl.so; curl-config --version; echo $curl .curlrc",
+            &[],
+        ),
+    ];
+    for (line, calls) in forms {
+        assert_eq!(curl_calls(line), calls, "{line}");
     }
 
     if !repo("crates/aranet-service/Cargo.toml").is_file() {
@@ -1047,18 +1125,16 @@ fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
     );
 
     // A connection that is accepted and never answered would otherwise hold
-    // the job until its own timeout.
-    let curls: Vec<&&str> = script
-        .iter()
-        .filter(|line| line.split_whitespace().any(|word| word == "curl"))
-        .collect();
+    // the job until its own timeout. Each call needs its own limit: one on
+    // another command of the same line doesn't count.
+    let curls: Vec<&str> = script.iter().flat_map(|line| curl_calls(line)).collect();
     assert!(
         !curls.is_empty(),
         "the script has no `curl` call. If it reaches the service another way now, \
          this test must require that way's time limit"
     );
-    for line in curls {
-        let words: Vec<&str> = line.split_whitespace().collect();
+    for call in curls {
+        let words: Vec<&str> = call.split_whitespace().collect();
         let limit = words
             .iter()
             .position(|word| *word == "--max-time")
@@ -1066,9 +1142,9 @@ fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
             .and_then(|seconds| seconds.parse::<u32>().ok());
         assert!(
             limit.is_some_and(|seconds| seconds > 0),
-            "every `curl` call must have a time limit, as in `--max-time 5`. Without \
-             one, a connection that is accepted and never answered holds the job until \
-             its 30-minute timeout: {line}"
+            "every `curl` call must have a time limit of its own, on its line, as in \
+             `--max-time 5`. Without one, a connection that is accepted and never \
+             answered holds the job until its 30-minute timeout: `{call}`"
         );
     }
 }
