@@ -678,8 +678,8 @@ fn after_missed_scan(
 /// - btleplug's device ID as [`DiscoveredDevice::id`] displays it
 ///   (`hci0/dev_AA_BB_CC_DD_EE_FF` on Linux);
 /// - the MAC address, with or without colons;
-/// - the whole advertised name. On macOS a name shown as
-///   `"Kitchen [Aranet4 1A2B3]"` also matches `Kitchen` or `Aranet4 1A2B3`.
+/// - the device's whole name, as [`peripheral_name`] gives it and
+///   [`DiscoveredDevice::name`] holds it.
 ///
 /// An address or identifier match wins over a name match.
 ///
@@ -915,9 +915,12 @@ fn parse_query(identifier: &str) -> Result<&str> {
 /// 1. an identifier: the one `aranet scan` prints, btleplug's device ID (the
 ///    `hci0/dev_…` form on Linux), or the Bluetooth address with or without
 ///    colons, never `00:00:00:00:00:00`;
-/// 2. the whole advertised name, or either half of CoreBluetooth's combined
-///    `"<GAP name> [<advertised name>]"` (btleplug 0.11.8,
-///    `corebluetooth/internal.rs:577-585`).
+/// 2. the whole name, ignoring the spaces around it. Part of a name never
+///    matches, and that includes a name with a bracketed part: btleplug
+///    0.11.8 named some macOS peripherals
+///    `"<system name> [<advertised name>]"`, and 0.13.5 never builds that
+///    form (`src/corebluetooth/internal.rs:1003-1008`,
+///    `src/corebluetooth/peripheral.rs:221-235`).
 ///
 /// One match is `Found` and several are `Ambiguous`. With no match, `NotFound`
 /// lists the peripherals whose name contains both `query` and `aranet`, so a
@@ -975,15 +978,10 @@ fn decide(indices: Vec<usize>) -> Option<Lookup> {
     }
 }
 
-/// Whether the advertised `name` is `query` (lower case): the whole name, or
-/// either half of CoreBluetooth's `"<GAP name> [<advertised name>]"`.
+/// Whether `name` is `query` (lower case): the whole name, ignoring case and
+/// the spaces around it.
 fn name_matches(name: &str, query: &str) -> bool {
-    let name = name.trim().to_lowercase();
-    name == query
-        || name
-            .strip_suffix(']')
-            .and_then(|combined| combined.rsplit_once(" ["))
-            .is_some_and(|(gap, advertised)| gap.trim() == query || advertised.trim() == query)
+    name.trim().to_lowercase() == query
 }
 
 /// What a search of the known peripherals found.
@@ -1823,15 +1821,33 @@ mod tests {
         }
     }
 
+    /// Only the whole name matches, also when the name has a bracketed part.
+    /// btleplug 0.11.8 named some macOS peripherals
+    /// `"<system name> [<advertised name>]"`, and while aranet used it, each
+    /// half of such a name matched too. btleplug 0.13.5 never builds that form.
     #[test]
-    fn lookup_matches_either_half_of_a_corebluetooth_combined_name() {
+    fn lookup_matches_a_name_with_a_bracketed_part_only_as_a_whole() {
         let devices = [
             on_macos(UUID_2, "AranetRn+ 306B8"),
             on_macos(UUID_1, "Kitchen [Aranet4 1A2B3]"),
         ];
-        for query in ["Aranet4 1A2B3", "kitchen", "Kitchen [Aranet4 1A2B3]"] {
-            assert_eq!(lookup(query, &devices), Lookup::Found(1), "{query:?}");
+        assert_eq!(
+            lookup("kitchen [aranet4 1a2b3]", &devices),
+            Lookup::Found(1)
+        );
+        for half in ["Kitchen", "Aranet4 1A2B3"] {
+            assert_eq!(
+                lookup(half, &devices),
+                Lookup::NotFound { similar: vec![1] },
+                "{half:?}"
+            );
         }
+    }
+
+    #[test]
+    fn lookup_ignores_spaces_around_a_device_name() {
+        let devices = [on_macos(UUID_1, " Aranet2 2751B ")];
+        assert_eq!(lookup("aranet2 2751b", &devices), Lookup::Found(0));
     }
 
     #[test]

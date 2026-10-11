@@ -1455,9 +1455,8 @@ fn test_get_adapter_still_discovers_after_its_runtime_shuts_down() {
 // =============================================================================
 
 /// The adapter's peripheral for `device`: its scan identifier, its btleplug ID, or its
-/// name (either half of CoreBluetooth's "GAP [advertised]" form), any case. `None`
-/// when the adapter doesn't know it: CoreBluetooth forgets a peripheral once it
-/// has disconnected, until a scan finds it again.
+/// whole name, any case. `None` when the adapter doesn't know it: CoreBluetooth
+/// forgets a peripheral once it has disconnected, until a scan finds it again.
 async fn known_peripheral(device: &str) -> Option<btleplug::platform::Peripheral> {
     use btleplug::api::{Central as _, Peripheral as _};
 
@@ -1472,15 +1471,7 @@ async fn known_peripheral(device: &str) -> Option<btleplug::platform::Peripheral
             .and_then(aranet_core::peripheral_name)
             .map(str::to_owned);
         let id = aranet_core::create_identifier(&p.address().to_string(), &p.id());
-        let is_device = |n: &str| {
-            n.eq_ignore_ascii_case(device)
-                || n.strip_suffix(']')
-                    .and_then(|n| n.split_once(" ["))
-                    .is_some_and(|(gap, adv)| {
-                        gap.trim().eq_ignore_ascii_case(device)
-                            || adv.trim().eq_ignore_ascii_case(device)
-                    })
-        };
+        let is_device = |n: &str| n.eq_ignore_ascii_case(device);
         if id.eq_ignore_ascii_case(device)
             || p.id().to_string().eq_ignore_ascii_case(device)
             || name.as_deref().is_some_and(is_device)
