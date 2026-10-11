@@ -492,7 +492,9 @@ fn handle_config_command(action: &ConfigAction) -> Result<()> {
     Ok(())
 }
 
-/// The file `aranet config init` writes: every setting at its default, commented out.
+/// The file `aranet config init` writes: every setting that has a default, at that default
+/// and commented out. Settings without one are not listed: `device`, `format`, `timeout`
+/// and `gui.service_api_key`.
 ///
 /// Commented out, the defaults document the settings without pinning them, so a default
 /// that changes in a later version still takes effect. The `[section]` headers stay active,
