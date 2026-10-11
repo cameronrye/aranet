@@ -31,7 +31,9 @@ aranet-service = { version = "0.2.1", path = "crates/aranet-service" }
 # workspace entry already does, so it is set here.
 aranet-cli = { version = "0.2.1", path = "crates/aranet-cli", default-features = false }
 
-btleplug = "0.11"
+# At least 0.13.5: the first release with the fixes for btleplug's issues #494 (macOS memory
+# growth while scanning) and #496 (the 5 s BlueZ service-discovery wait). 0.13.0 is yanked.
+btleplug = "0.13.5"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 bytes = "1"
