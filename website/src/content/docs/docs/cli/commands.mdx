@@ -222,12 +222,12 @@ aranet config <SUBCOMMAND>
 
 | Subcommand | Description |
 |------------|-------------|
-| `show` | Print the full config |
+| `show` | Print the config (`gui.service_api_key` hidden) |
 | `get <KEY>` | Print a single config value |
 | `set <KEY> <VALUE>` | Update a config value |
 | `unset <KEY>` | Remove a config value |
 | `path` | Print the config file path |
-| `init` | Create a default config file |
+| `init` | Create a commented config file (an existing file is left alone) |
 
 Supported keys: `device`, `format`, `timeout`, `no-color`, `fahrenheit`, `inhg`, `bq`.
 
@@ -237,6 +237,22 @@ aranet config set device living-room
 aranet config set format json
 aranet config show
 ```
+
+`config.toml` lives in your platform's config directory: `aranet config path` prints where, and `ARANET_CONFIG_DIR` changes the directory. `config set`, `config unset`, `alias set`, `alias remove`, the alias prompt of `scan` and the GUI's settings change only the keys they touch: comments, key order and settings aranet doesn't know are kept. If the file doesn't parse, they fail with the parse error and leave it untouched. aranet writes the file atomically and owner-only (mode `0600`); a file that an earlier version created at `0644` becomes `0600` at its next change. `config init` writes a commented template and never replaces an existing file, and `config show` hides `gui.service_api_key`.
+
+The last device you connected to is kept in `cli-state.toml` in the data directory, not in `config.toml`, so connecting to a sensor doesn't rewrite your config:
+
+| OS | Location |
+|----|----------|
+| Linux | `~/.local/share/aranet/cli-state.toml` |
+| macOS | `~/Library/Application Support/aranet/cli-state.toml` |
+| Windows | `%LOCALAPPDATA%\aranet\cli-state.toml` |
+
+`ARANET_DATA_DIR` changes that directory. `config show` no longer lists `last_device`; a `last_device` that an earlier version wrote into `config.toml` is still used until your next connection.
+
+<Aside type="note">
+  On Windows, files inherit the permissions of their folder, and the default folders under your profile are private to your account. If you point `ARANET_CONFIG_DIR` or `ARANET_DATA_DIR` somewhere else, make that folder private in Command Prompt: `icacls <dir> /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"`
+</Aside>
 
 ## sync
 
@@ -334,6 +350,8 @@ aranet server [OPTIONS]
 aranet server --bind 127.0.0.1:8080
 aranet server --config ~/.config/aranet/server.toml --no-collector
 ```
+
+`--bind` takes an IP address and port, such as `127.0.0.1:8080` (`localhost:8080` is rejected). A network address such as `0.0.0.0:8080` needs API-key authentication in the config file, or `security.allow_unauthenticated_network = true`; see [API Security](/aranet/docs/service/security/). `--bind` and `--database` apply to this run only and are never written into the config file. With `--daemon`, the configuration is checked before the server detaches: an invalid config or a refused bind address is printed and the command exits non-zero instead of reporting that the server started. A port that is already in use isn't detected before detaching: the detached server exits and its output is discarded, so run `aranet server` without `--daemon` to see the error. The same goes for `security.api_key_enabled = true` without an `api_key` when the config file can't be written: `--daemon` reports that the server started, and the detached server then exits because it can't save the key it generated. When the key is saved, the `Generated an API key` line isn't shown under `--daemon`, so read the key from the config file.
 
 ## completions
 

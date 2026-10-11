@@ -33,7 +33,7 @@ aranet-service can publish sensor readings to MQTT and optionally register suppo
 
 ## aranet-service Configuration
 
-Edit `~/.config/aranet/server.toml`:
+Edit `server.toml` (see [Server Configuration](/aranet/docs/service/deployment/#server-configuration) for where it is):
 
 ```toml
 [mqtt]
@@ -61,6 +61,7 @@ Key points:
 - `topic_prefix` controls the reading topics, such as `aranet/office/co2`.
 - `ha_discovery_prefix` controls the Home Assistant discovery topics, usually `homeassistant`.
 - `homeassistant = true` enables discovery publishing.
+- While MQTT is enabled, `topic_prefix`, and `ha_discovery_prefix` when `homeassistant = true`, can't contain the MQTT wildcards `+` and `#` or control characters; the service refuses to start with such a prefix.
 
 ## Home Assistant Setup
 
@@ -169,7 +170,7 @@ mosquitto_sub -t 'homeassistant/#' -v
 
 ### Topic names are unexpected
 
-Device aliases are preferred for topic names. MQTT topic segments are sanitized by replacing spaces, `/`, `#`, and `+` with `_`.
+Device aliases are preferred for topic names. MQTT topic segments are sanitized by replacing spaces, `/`, `#`, `+` and control characters with `_`. An alias longer than 64 characters or with a control character or backslash is rejected: the API answers `400`, and a `server.toml` with one fails validation at startup.
 
 ### Discovery is enabled but no sensors appear
 
@@ -177,3 +178,7 @@ Device aliases are preferred for topic names. MQTT topic segments are sanitized 
 2. Make sure the service has at least one configured device.
 3. Wait for the service to publish readings after startup or config reload.
 4. Verify the discovery prefix matches Home Assistant expectations, usually `homeassistant`.
+
+### Readings are missing after a broker outage
+
+While the broker is unreachable, aranet-service keeps polling but drops live readings once the MQTT client's queue is full, with a warning in its log, instead of waiting. When the connection is back, the readings queued at the start of the outage (at most 100 messages, about 14 Aranet4 readings) are sent first, then live readings. The rest of the outage is a gap in Home Assistant's history, and retained topics end on the newest values.

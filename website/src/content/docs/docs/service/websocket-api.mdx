@@ -38,6 +38,10 @@ const ws = new WebSocket(`ws://localhost:8080/api/ws?token=${encodeURIComponent(
 
 URL-encode the key as shown. Keys sent unencoded are accepted too, with `+`, `/` and `=` read literally.
 
+### Browser Pages
+
+While API-key authentication is off, the service accepts a WebSocket connection from a browser page only if the page is the service's own, like the dashboard, or its origin is listed in `security.cors_origins`. Other pages get `403 Forbidden`, including pages opened from a file (`file://`), which send `Origin: null`. Serve your page from a listed origin, or turn on authentication and pass the key as `?token=`. Clients outside a browser, such as Python, Rust, Node.js `ws`, websocat and Node-RED, don't send `Origin` and aren't affected.
+
 ### Using Headers (where supported)
 
 Some WebSocket libraries support custom headers:
@@ -60,6 +64,8 @@ async with websockets.connect(
 ) as ws:
     ...
 ```
+
+`Authorization: Bearer <key>` works in place of `X-API-Key`. If a client sends both, only `X-API-Key` is checked.
 
 ## Message Format
 
@@ -105,6 +111,8 @@ Clients receive an initial snapshot of the latest reading for each device, follo
 ## Client Examples
 
 ### JavaScript / Browser
+
+Run this from a page the service accepts (see [Browser Pages](#browser-pages)).
 
 ```javascript
 const ws = new WebSocket('ws://localhost:8080/api/ws');
@@ -285,6 +293,8 @@ If clients are slow to process messages, they may miss readings when the buffer 
 
 ### Home Automation Dashboard
 
+This page connects from the browser, so the service must accept its origin (see [Browser Pages](#browser-pages)). Serve it from an origin listed in `security.cors_origins`: for example, save it as `index.html`, run `python3 -m http.server 8000` in its folder, set `cors_origins = ["http://localhost:8000"]`, restart the service and open `http://localhost:8000/`. Opened straight from disk (`file://`), it is rejected while authentication is off; with authentication on, add `?token=` and the URL-encoded key to the WebSocket URL instead.
+
 ```html
 <!DOCTYPE html>
 <html>
@@ -302,6 +312,7 @@ If clients are slow to process messages, they may miss readings when the buffer 
   <div id="temp" class="reading">--°C</div>
 
   <script>
+    // Serve this page from an origin listed in security.cors_origins.
     const ws = new WebSocket('ws://localhost:8080/api/ws');
 
     ws.onmessage = (event) => {
