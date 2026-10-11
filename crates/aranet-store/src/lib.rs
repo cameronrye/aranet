@@ -48,9 +48,13 @@ pub use toml_file::{TomlFile, TomlFileError, write_private};
 /// - macOS: `~/Library/Application Support/aranet`
 /// - Windows: `C:\Users\<user>\AppData\Local\aranet`
 ///
+/// An `ARANET_DATA_DIR` that is set to an empty string counts as unset: as a path it would
+/// be the current directory.
+///
 /// Without a platform data directory, it logs a warning and uses the current directory.
 pub fn default_data_dir() -> std::path::PathBuf {
     std::env::var_os("ARANET_DATA_DIR")
+        .filter(|dir| !dir.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::data_local_dir().map(|d| d.join("aranet")))
         .unwrap_or_else(|| {

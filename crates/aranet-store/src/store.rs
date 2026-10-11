@@ -247,7 +247,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`Error::Database`] with [`rusqlite::ErrorCode::CannotOpen`] if the
-    /// file doesn't exist.
+    /// file doesn't exist, and also if `path` names an in-memory or temporary
+    /// database (`":memory:"`, `""` or a `file:` URI with `mode=memory`). Such a
+    /// database can't be opened a second time (see [`Store::database_path`]), and
+    /// SQLite would open the name as a new, empty database.
     ///
     /// # Example
     ///
@@ -274,6 +277,18 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // SQLite opens an in-memory or temporary name without SQLITE_OPEN_CREATE
+        // too, and reports an empty file name for it, as in `Store::open`.
+        if conn.path().is_none_or(str::is_empty) {
+            return Err(Error::Database(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                Some(format!(
+                    "{:?} names an in-memory or temporary database, which can't be opened \
+                     a second time",
+                    path.display().to_string()
+                )),
+            )));
+        }
         conn.execute_batch("PRAGMA query_only = ON;")?;
 
         Ok(Self {
@@ -2103,6 +2118,23 @@ mod tests {
             .expect("the file doesn't exist");
         assert_sqlite_error(err, rusqlite::ErrorCode::CannotOpen);
         assert!(!missing_dir.exists(), "no directory is created");
+    }
+
+    #[test]
+    fn test_open_read_only_refuses_in_memory_names() {
+        // Without SQLITE_OPEN_CREATE these names still open, each as a new and empty
+        // database: not the one an earlier `Store::open` of the same name holds.
+        for name in [":memory:", "", "file:aranet-store-test?mode=memory"] {
+            let err = Store::open_read_only(name)
+                .err()
+                .unwrap_or_else(|| panic!("{name:?} was opened read-only"));
+            let text = err.to_string();
+            assert!(
+                text.contains("in-memory or temporary database"),
+                "{name:?}: {text}"
+            );
+            assert_sqlite_error(err, rusqlite::ErrorCode::CannotOpen);
+        }
     }
 
     #[test]

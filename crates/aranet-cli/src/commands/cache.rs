@@ -409,6 +409,11 @@ fn parse_duration(s: &str) -> Result<time::Duration> {
     }
 }
 
+/// Context for a failed prune. The store deletes in batches and commits each one, so an
+/// error in a later batch leaves the earlier ones deleted.
+const PRUNE_STOPPED: &str = "the prune stopped part-way; rows deleted before the error stay \
+                             deleted, and running the command again finishes it";
+
 fn prune_data(
     store: &Store,
     older_than: &str,
@@ -442,11 +447,11 @@ fn prune_data(
         }
     }
 
-    let history_deleted = store.prune_history(cutoff)?;
+    let history_deleted = store.prune_history(cutoff).context(PRUNE_STOPPED)?;
     println!("Deleted {} history records", history_deleted);
 
     if !history_only {
-        let readings_deleted = store.prune_readings(cutoff)?;
+        let readings_deleted = store.prune_readings(cutoff).context(PRUNE_STOPPED)?;
         println!("Deleted {} readings", readings_deleted);
     }
 
