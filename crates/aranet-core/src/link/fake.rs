@@ -38,9 +38,19 @@ pub(super) enum Outcome {
 }
 
 /// How long bluez-async's `connect` waits for BlueZ's `ServicesResolved`
-/// before it fails (`SERVICE_DISCOVERY_TIMEOUT`, bluez-async 0.8.2
-/// `src/lib.rs:61`).
-pub(super) const BLUEZ_ASYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// before it fails (`SERVICE_DISCOVERY_TIMEOUT`, bluez-async 0.9.0
+/// `src/lib.rs:61`). It was 5 s before btleplug 0.13.5.
+///
+/// Never script `Outcome::DiscoveryTimedOut` for a first connect whose
+/// `connection_timeout` is 30 s: script `Outcome::Hang`. bluez-async starts
+/// this wait only once BlueZ has answered `Device1.Connect`, so on a real
+/// host its timeout comes more than 30 s after the call, and a connect limit
+/// of 30 s or less always ends first. This fake starts the wait at the call.
+/// With a limit of exactly 30 s both would end at the same instant of the
+/// paused clock, `tokio::time::timeout` polls the call before its own timer,
+/// and the test would see the library's timeout first: an order that cannot
+/// happen. Under a shorter limit the fake keeps the real order.
+pub(super) const BLUEZ_ASYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A call made on a `FakeGatt`, in the order it was made.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1679,6 +1679,14 @@ mod bluez_discovery_tests {
     /// when BlueZ answered `In Progress` (`BLUEZ_IN_PROGRESS_PAUSE`).
     const IN_PROGRESS_PAUSE: Duration = Duration::from_secs(1);
 
+    /// A connect limit longer than bluez-async's 30 s wait for the services
+    /// (`BLUEZ_ASYNC_WAIT`). Only under such a limit can bluez-async's own
+    /// "Service discovery timed out" end a first connect: under the default
+    /// 15 s, and under `aranet watch`'s 30 s, the connect's limit ends it
+    /// first. The tests of the paths that start with the library's timeout
+    /// use this limit.
+    const LONG_CONNECT_LIMIT: Duration = Duration::from_secs(45);
+
     /// Connect `fake` with `config` and the test's runtime for cleanup, and
     /// disarm the link if the connect succeeds.
     pub(super) async fn connect_with(fake: &FakeGatt, config: &ConnectionConfig) -> Result<()> {
@@ -1711,8 +1719,13 @@ mod bluez_discovery_tests {
         }
     }
 
-    /// A connect that bluez-async gives up on while BlueZ is still discovering
-    /// asks again until BlueZ has resolved the services, then discovers them.
+    /// Under a connect limit longer than bluez-async's wait, a connect that
+    /// bluez-async gives up on while BlueZ is still discovering asks again
+    /// until BlueZ has resolved the services, then discovers them. The second
+    /// "Service discovery timed out" here comes from a re-ask inside the
+    /// wait, which needs a `discovery_timeout` above bluez-async's 30 s too:
+    /// at the default limits the wait's own limit ends the first re-ask
+    /// (`a_connect_timeout_with_the_link_up_gives_up_after_the_wait`).
     #[tokio::test(start_paused = true)]
     async fn waits_while_bluez_is_still_discovering() {
         within(Duration::from_secs(600), async {
@@ -1722,12 +1735,18 @@ mod bluez_discovery_tests {
                 Outcome::DiscoveryTimedOut,
                 Outcome::Ok,
             ]);
+            let config = ConnectionConfig::default()
+                .connection_timeout(LONG_CONNECT_LIMIT)
+                .discovery_timeout(Duration::from_secs(70));
             let start = Instant::now();
 
-            connect_with(&fake, &ConnectionConfig::default())
+            connect_with(&fake, &config)
                 .await
                 .expect("the connect should wait for BlueZ's service discovery");
 
+            // The library gives up at 30 s. The wait then lasts until 100 s
+            // (30 + 70): the first re-ask gives up at 60 s (30 + 30) and the
+            // second succeeds at once.
             assert_eq!(start.elapsed(), 2 * BLUEZ_ASYNC_WAIT);
             assert_eq!(
                 fake.calls(),
@@ -1739,56 +1758,78 @@ mod bluez_discovery_tests {
 
     /// A discovery that never finishes fails as a "discover services" timeout
     /// `MIN_WAIT` after bluez-async gave up, even with a shorter
-    /// `discovery_timeout`, and disconnects.
+    /// `discovery_timeout`, and disconnects. The wait makes one re-ask:
+    /// bluez-async waits 30 s on it, longer than the 20 s the wait has.
     #[tokio::test(start_paused = true)]
     async fn gives_up_after_the_minimum_wait_and_disconnects() {
         within(Duration::from_secs(600), async {
             let fake = FakeGatt::new();
             fake.script_connect(std::iter::repeat_with(|| Outcome::DiscoveryTimedOut).take(10));
-            let config = ConnectionConfig::default().discovery_timeout(Duration::from_secs(5));
+            let config = ConnectionConfig::default()
+                .connection_timeout(LONG_CONNECT_LIMIT)
+                .discovery_timeout(Duration::from_secs(5));
             let start = Instant::now();
 
             let result = connect_with(&fake, &config).await;
 
             assert_discovery_timeout(result, MIN_WAIT);
+            // The library gives up at 30 s. The wait ends at 50 s (30 + 20),
+            // before the re-ask's own 30 s are over (60 s).
             assert_eq!(start.elapsed(), BLUEZ_ASYNC_WAIT + MIN_WAIT);
-            let calls = fake.calls();
-            assert_eq!(calls.last(), Some(&Call::Disconnect), "calls: {calls:?}");
-            assert!(!calls.contains(&Call::Discover), "calls: {calls:?}");
-            let connects = calls.iter().filter(|call| **call == Call::Connect).count();
-            assert!(connects >= 5, "calls: {calls:?}");
+            assert_eq!(
+                fake.calls(),
+                [Call::Connect, Call::Connect, Call::Disconnect]
+            );
         })
         .await;
     }
 
-    /// A `discovery_timeout` longer than `MIN_WAIT` lengthens the wait.
+    /// A `discovery_timeout` longer than `MIN_WAIT` lengthens the wait. With
+    /// 40 s the wait ends between two of bluez-async's 30 s rounds, so the
+    /// end of the wait and the end of a round can't be mistaken for each
+    /// other.
     #[tokio::test(start_paused = true)]
     async fn a_longer_discovery_timeout_waits_longer() {
         within(Duration::from_secs(600), async {
             let fake = FakeGatt::new();
             fake.script_connect(std::iter::repeat_with(|| Outcome::DiscoveryTimedOut).take(10));
-            let config = ConnectionConfig::challenging_environment();
+            let config = ConnectionConfig::default()
+                .connection_timeout(Duration::from_secs(90))
+                .discovery_timeout(Duration::from_secs(40));
             let start = Instant::now();
 
             let result = connect_with(&fake, &config).await;
 
-            assert_discovery_timeout(result, Duration::from_secs(30));
-            assert_eq!(start.elapsed(), BLUEZ_ASYNC_WAIT + Duration::from_secs(30));
-            assert_eq!(fake.calls().last(), Some(&Call::Disconnect));
+            assert_discovery_timeout(result, Duration::from_secs(40));
+            // The library gives up at 30 s and the wait ends at 70 s
+            // (30 + 40). The first re-ask gives up at 60 s; the second would
+            // at 90 s.
+            assert_eq!(start.elapsed(), BLUEZ_ASYNC_WAIT + Duration::from_secs(40));
+            assert_eq!(
+                fake.calls(),
+                [
+                    Call::Connect,
+                    Call::Connect,
+                    Call::Connect,
+                    Call::Disconnect,
+                ]
+            );
         })
         .await;
     }
 
-    /// Any other error ends the wait at once and fails the connect: here the
-    /// link dropped and BlueZ's new connection attempt failed.
+    /// Any other error ends the wait at once and fails the connect: here
+    /// bluez-async gave up under a long connect limit, the link had dropped,
+    /// and BlueZ's new connection attempt failed.
     #[tokio::test(start_paused = true)]
     async fn another_error_ends_the_wait() {
         within(Duration::from_secs(600), async {
             let fake = FakeGatt::new();
             fake.script_connect([Outcome::DiscoveryTimedOut, Outcome::Fail]);
+            let config = ConnectionConfig::default().connection_timeout(LONG_CONNECT_LIMIT);
             let start = Instant::now();
 
-            let result = connect_with(&fake, &ConnectionConfig::default()).await;
+            let result = connect_with(&fake, &config).await;
 
             assert_eq!(
                 fake.calls(),
@@ -1801,24 +1842,65 @@ mod bluez_discovery_tests {
                 ),
                 "got {result:?}"
             );
+            // The library gives up at 30 s and the re-ask fails at once.
             assert_eq!(start.elapsed(), BLUEZ_ASYNC_WAIT);
         })
         .await;
     }
 
-    /// The reconnect of the zero-services retry waits for BlueZ too.
+    /// The same at the default limits, where the wait starts at the connect's
+    /// own time limit: any other error from the re-ask ends the wait at once
+    /// and fails the connect.
+    #[tokio::test(start_paused = true)]
+    async fn another_error_ends_the_wait_after_a_connect_timeout() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.set_bluez(true);
+            fake.script_connect([Outcome::Hang, Outcome::Fail]);
+            let config = ConnectionConfig::default();
+            let start = Instant::now();
+
+            let result = connect_with(&fake, &config).await;
+
+            assert_eq!(
+                fake.calls(),
+                [
+                    Call::Connect,
+                    Call::IsConnected,
+                    Call::Connect,
+                    Call::Disconnect,
+                ]
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Bluetooth(btleplug::Error::RuntimeError(_)))
+                ),
+                "got {result:?}"
+            );
+            // The connect's limit ends at 15 s and the re-ask fails at once.
+            assert_eq!(start.elapsed(), config.connection_timeout);
+        })
+        .await;
+    }
+
+    /// The reconnect of the zero-services retry waits for BlueZ too: here
+    /// after bluez-async gave up on it, under a long connect limit.
     #[tokio::test(start_paused = true)]
     async fn the_zero_services_retry_waits_too() {
         within(Duration::from_secs(600), async {
             let fake = FakeGatt::new();
             fake.service_rounds([BTreeSet::new()]);
             fake.script_connect([Outcome::Ok, Outcome::DiscoveryTimedOut, Outcome::Ok]);
+            let config = ConnectionConfig::default().connection_timeout(LONG_CONNECT_LIMIT);
             let start = Instant::now();
 
-            connect_with(&fake, &ConnectionConfig::default())
+            connect_with(&fake, &config)
                 .await
                 .expect("the retry should wait for BlueZ's service discovery");
 
+            // The retry's 2 s pause, then the library gives up 30 s into the
+            // reconnect and the re-ask succeeds at once: 32 s.
             assert_eq!(start.elapsed(), Duration::from_secs(2) + BLUEZ_ASYNC_WAIT);
             assert_eq!(
                 fake.calls(),
@@ -1835,22 +1917,18 @@ mod bluez_discovery_tests {
         .await;
     }
 
-    /// On BlueZ, a connect that runs out of time after the link came up, too
-    /// late for bluez-async's 5 s wait for the services to run out first,
-    /// waits for BlueZ's service discovery in the same way. The wait's limit
-    /// starts when the connect's ends and also covers the connection-state
-    /// query, which answers at once here, so the wait and the discovery get
-    /// all of it.
+    /// The same at the default limits: the retry's reconnect runs out of time
+    /// with the link up, the wait asks again, and BlueZ resolves the services
+    /// 4 s into the wait.
     #[tokio::test(start_paused = true)]
-    async fn a_connect_timeout_with_the_link_up_waits_on_bluez() {
+    async fn the_zero_services_retry_connects_after_a_connect_timeout() {
         within(Duration::from_secs(600), async {
             let fake = FakeGatt::new();
             fake.set_bluez(true);
+            fake.service_rounds([BTreeSet::new()]);
             fake.script_connect([
+                Outcome::Ok,
                 Outcome::Hang,
-                Outcome::DiscoveryTimedOut,
-                Outcome::DiscoveryTimedOut,
-                Outcome::DiscoveryTimedOut,
                 Outcome::After(Duration::from_secs(4)),
             ]);
             let config = ConnectionConfig::default();
@@ -1858,9 +1936,48 @@ mod bluez_discovery_tests {
 
             connect_with(&fake, &config)
                 .await
+                .expect("the retry should wait for BlueZ's service discovery");
+
+            // 2 s pause + 15 s connect limit + 4 s into the wait = 21 s.
+            assert_eq!(start.elapsed(), Duration::from_secs(21));
+            assert_eq!(
+                fake.calls(),
+                [
+                    Call::Connect,
+                    Call::Discover,
+                    Call::Disconnect,
+                    Call::Connect,
+                    Call::IsConnected,
+                    Call::Connect,
+                    Call::Discover,
+                ]
+            );
+        })
+        .await;
+    }
+
+    /// On BlueZ at the default limits, a connect whose discovery outlasts the
+    /// connect's 15 s runs out of time with the link up: bluez-async is still
+    /// inside its own 30 s wait for the services then. The connect waits for
+    /// BlueZ's service discovery by asking again. The wait's limit starts
+    /// when the connect's ends and also covers the connection-state query,
+    /// which answers at once here, so the wait and the discovery get all of
+    /// it: BlueZ may take 19 of its 20 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_timeout_with_the_link_up_waits_on_bluez() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.set_bluez(true);
+            fake.script_connect([Outcome::Hang, Outcome::After(Duration::from_secs(19))]);
+            let config = ConnectionConfig::default();
+            let start = Instant::now();
+
+            connect_with(&fake, &config)
+                .await
                 .expect("the connect should wait for BlueZ's service discovery");
 
-            // BlueZ resolves the services 19 s into the wait: 1 s inside it.
+            // BlueZ resolves the services 19 s into the wait: 1 s inside it
+            // (15 + 19 = 34 s).
             assert_eq!(
                 start.elapsed(),
                 config.connection_timeout + MIN_WAIT - Duration::from_secs(1)
@@ -1871,9 +1988,6 @@ mod bluez_discovery_tests {
                     Call::Connect,
                     Call::IsConnected,
                     Call::Connect,
-                    Call::Connect,
-                    Call::Connect,
-                    Call::Connect,
                     Call::Discover,
                 ]
             );
@@ -1882,7 +1996,11 @@ mod bluez_discovery_tests {
     }
 
     /// On BlueZ, when that wait never ends, the connect fails as a "discover
-    /// services" timeout after the wait's limit, and disconnects.
+    /// services" timeout after the wait's limit, and disconnects. The wait
+    /// makes one re-ask, which is still inside bluez-async's 30 s when the
+    /// wait's 20 s are over. This is also how a link ends that BlueZ still
+    /// reports as connected after it has died: the connection check passes,
+    /// and no re-ask ever finds the services.
     #[tokio::test(start_paused = true)]
     async fn a_connect_timeout_with_the_link_up_gives_up_after_the_wait() {
         within(Duration::from_secs(600), async {
@@ -1896,22 +2014,28 @@ mod bluez_discovery_tests {
             let result = connect_with(&fake, &config).await;
 
             assert_discovery_timeout(result, MIN_WAIT);
+            // The connect's limit ends at 15 s and the wait at 35 s
+            // (15 + 20). The re-ask's own 30 s would last until 45 s.
             assert_eq!(start.elapsed(), config.connection_timeout + MIN_WAIT);
-            let calls = fake.calls();
             assert_eq!(
-                calls[..3],
-                [Call::Connect, Call::IsConnected, Call::Connect],
-                "calls: {calls:?}"
+                fake.calls(),
+                [
+                    Call::Connect,
+                    Call::IsConnected,
+                    Call::Connect,
+                    Call::Disconnect,
+                ]
             );
-            assert_eq!(calls.last(), Some(&Call::Disconnect), "calls: {calls:?}");
-            assert!(!calls.contains(&Call::Discover), "calls: {calls:?}");
         })
         .await;
     }
 
     /// On BlueZ, a connect that runs out of time with the link down fails as
     /// before, with the "connect to device" timeout, and disconnects without
-    /// waiting.
+    /// waiting. The link may never have come up, or it came up and dropped
+    /// while bluez-async was still waiting for the services: bluez-async
+    /// does not watch the link during that wait. Neither case is asked again
+    /// inside the connect.
     #[tokio::test(start_paused = true)]
     async fn a_connect_timeout_with_the_link_down_fails_on_bluez() {
         within(Duration::from_secs(600), async {
@@ -2066,7 +2190,8 @@ mod bluez_discovery_tests {
     /// refuses the wait's first re-asks with `In Progress` until it has
     /// answered the timed-out `Device1.Connect`, which it does once the ATT
     /// channel is up. The wait asks again after a pause each time, then waits
-    /// for the discovery as before.
+    /// for the discovery as before: here BlueZ takes another 5 s once it has
+    /// accepted a re-ask.
     #[tokio::test(start_paused = true)]
     async fn a_connect_timeout_waits_while_bluez_is_still_connecting() {
         within(Duration::from_secs(600), async {
@@ -2077,8 +2202,7 @@ mod bluez_discovery_tests {
                 Outcome::InProgress,
                 Outcome::InProgress,
                 Outcome::InProgress,
-                Outcome::DiscoveryTimedOut,
-                Outcome::Ok,
+                Outcome::After(Duration::from_secs(5)),
             ]);
             let config = ConnectionConfig::default();
             let start = Instant::now();
@@ -2087,9 +2211,10 @@ mod bluez_discovery_tests {
                 .await
                 .expect("the connect should wait while BlueZ is still connecting");
 
+            // 15 s connect limit + three 1 s pauses + 5 s = 23 s.
             assert_eq!(
                 start.elapsed(),
-                config.connection_timeout + 3 * IN_PROGRESS_PAUSE + BLUEZ_ASYNC_WAIT
+                config.connection_timeout + 3 * IN_PROGRESS_PAUSE + Duration::from_secs(5)
             );
             assert!(start.elapsed() <= config.connection_timeout + MIN_WAIT);
             assert_eq!(
@@ -2097,7 +2222,6 @@ mod bluez_discovery_tests {
                 [
                     Call::Connect,
                     Call::IsConnected,
-                    Call::Connect,
                     Call::Connect,
                     Call::Connect,
                     Call::Connect,
@@ -2146,17 +2270,23 @@ mod bluez_discovery_tests {
     /// After bluez-async's own discovery timeout, BlueZ has answered
     /// `Device1.Connect`, so an `In Progress` comes from another connect to
     /// the device or a pairing of it, and ends the wait at once, as before.
+    /// This path needs a connect limit above bluez-async's 30 s wait. Under
+    /// the default limits every wait starts at the connect's own time limit,
+    /// and there `In Progress` is asked again
+    /// (`a_connect_timeout_gives_up_while_bluez_stays_in_progress`).
     #[tokio::test(start_paused = true)]
     async fn in_progress_ends_the_wait_after_bluez_async_gave_up() {
         within(Duration::from_secs(600), async {
             let fake = FakeGatt::new();
             fake.set_bluez(true);
             fake.script_connect([Outcome::DiscoveryTimedOut, Outcome::InProgress]);
+            let config = ConnectionConfig::default().connection_timeout(LONG_CONNECT_LIMIT);
             let start = Instant::now();
 
-            let result = connect_with(&fake, &ConnectionConfig::default()).await;
+            let result = connect_with(&fake, &config).await;
 
             assert_in_progress(result);
+            // The library gives up at 30 s and the re-ask is refused at once.
             assert_eq!(start.elapsed(), BLUEZ_ASYNC_WAIT);
             assert_eq!(
                 fake.calls(),
