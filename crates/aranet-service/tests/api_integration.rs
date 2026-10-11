@@ -840,6 +840,17 @@ async fn test_dashboard_sends_no_referrer() {
             Some("no-referrer"),
             "{path}"
         );
+        // The page may have been asked for as `/dashboard?token=<key>`. The
+        // script cleans the address bar, but a response the browser cached
+        // would stay stored under that URL.
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(|value| value.to_str().unwrap()),
+            Some("no-store"),
+            "{path}"
+        );
     }
 }
 

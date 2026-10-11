@@ -18,10 +18,15 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// Serve the dashboard. `Referrer-Policy: no-referrer` keeps the page's URL,
 /// which can carry `?token=<API key>` until the script removes it, out of the
-/// `Referer` header of the requests the page makes.
+/// `Referer` header of the requests the page makes. `Cache-Control: no-store`
+/// keeps the browser from storing the response under that URL in its HTTP
+/// cache, where it would outlive the script's clean-up of the address bar.
 async fn dashboard_page() -> impl IntoResponse {
     (
-        [(header::REFERRER_POLICY, "no-referrer")],
+        [
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         Html(DASHBOARD_HTML),
     )
 }
