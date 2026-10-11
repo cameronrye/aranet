@@ -138,7 +138,7 @@
 //!    Bluetooth permission list. You may need to use a signed binary or run
 //!    with appropriate entitlements.
 //!
-//! ### User-Level Service (Recommended)
+//! ### User-Level Service
 //!
 //! Install as a user LaunchAgent (no root required):
 //!
@@ -159,63 +159,81 @@
 //!
 //! The LaunchAgent plist is created at `~/Library/LaunchAgents/dev.rye.aranet.plist`.
 //!
+//! `sudo aranet-service service install` (without `--user`) is refused on macOS:
+//! a LaunchDaemon would run the service as root. If an earlier version installed
+//! `/Library/LaunchDaemons/dev.rye.aranet.plist`, every `service` command warns
+//! about it until `sudo aranet-service service uninstall` removes it.
+//!
 //! ## Linux
 //!
 //! ### BlueZ D-Bus Access
 //!
-//! The service needs access to the BlueZ D-Bus interface. For user-level services:
+//! The service talks to BlueZ over the system D-Bus. Where the BlueZ D-Bus
+//! policy admits only members of the `bluetooth` group, add your user to it
+//! for a user-level service:
 //!
-//! 1. **Ensure your user is in the bluetooth group:**
-//!    ```bash
-//!    sudo usermod -a -G bluetooth $USER
-//!    # Log out and back in for group changes to take effect
-//!    ```
-//!
-//! 2. **D-Bus session access**: User-level systemd services need the D-Bus session.
-//!    Create a drop-in config if needed:
-//!    ```bash
-//!    mkdir -p ~/.config/systemd/user/aranet.service.d
-//!    cat > ~/.config/systemd/user/aranet.service.d/dbus.conf << EOF
-//!    [Service]
-//!    Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
-//!    EOF
-//!    systemctl --user daemon-reload
-//!    ```
+//! ```bash
+//! sudo usermod -a -G bluetooth $USER
+//! # Log out and back in for group changes to take effect
+//! ```
 //!
 //! ### User-Level Service
 //!
-//! ```bash
-//! # Install the user service
-//! aranet-service service install --user
+//! The unit is `~/.config/systemd/user/aranet.service`, installed enabled:
 //!
-//! # Enable and start
-//! systemctl --user enable --now dev.rye.aranet
+//! ```bash
+//! # Install and start the user service
+//! aranet-service service install --user
+//! aranet-service service start --user
 //!
 //! # Check status
-//! systemctl --user status dev.rye.aranet
+//! systemctl --user status aranet
 //!
 //! # View logs
-//! journalctl --user -u dev.rye.aranet -f
+//! journalctl --user -u aranet -f
 //!
 //! # Stop and uninstall
-//! systemctl --user stop dev.rye.aranet
+//! aranet-service service stop --user
 //! aranet-service service uninstall --user
 //! ```
 //!
 //! ### System-Level Service
 //!
-//! For system services, you need to create a dedicated user:
+//! `sudo aranet-service service install` writes the hardened
+//! `/etc/systemd/system/aranet.service`, the same unit as
+//! `distribution/systemd/aranet.service`. It runs as the dynamic user `aranet`
+//! (no `useradd` needed) without capabilities, and keeps its config and database
+//! in `/var/lib/aranet` (`server.toml`, `data.db`). Only a binary that no
+//! non-root user can modify, and that the service's user can run (so not one
+//! under `/home` or `/root`), is accepted, so copy it to `/usr/local/bin` first:
 //!
 //! ```bash
-//! # Create aranet user (with bluetooth group membership)
-//! sudo useradd -r -s /sbin/nologin -G bluetooth aranet
+//! sudo install -o root -g root -m 0755 ~/.cargo/bin/aranet-service /usr/local/bin/
+//! sudo /usr/local/bin/aranet-service service install
+//! sudo systemctl start aranet
 //!
-//! # Install as system service
-//! sudo aranet-service service install
+//! # Add sensors, then restart
+//! sudoedit /var/lib/aranet/server.toml
+//! sudo systemctl restart aranet
 //!
-//! # Start the service
-//! sudo systemctl enable --now dev.rye.aranet
+//! # View logs
+//! journalctl -u aranet -f
 //! ```
+//!
+//! If the log shows BlueZ refusing the service (`AccessDenied`), give it the
+//! `bluetooth` group with a drop-in:
+//!
+//! ```bash
+//! sudo mkdir -p /etc/systemd/system/aranet.service.d
+//! printf '[Service]\nSupplementaryGroups=bluetooth\n' |
+//!   sudo tee /etc/systemd/system/aranet.service.d/bluetooth.conf
+//! sudo systemctl daemon-reload && sudo systemctl restart aranet
+//! ```
+//!
+//! `service install` also stops and removes the `rye-aranet.service` that
+//! versions up to 0.2.1 installed, which ran as root. Until then, every
+//! `service` command warns that it is still installed. OpenRC and rc.d
+//! system installs are refused, because they would run the service as root.
 //!
 //! ## Windows
 //!
@@ -224,30 +242,15 @@
 //! Windows requires the app to be granted Bluetooth access through Settings:
 //! - Settings > Privacy & Security > Bluetooth > Allow apps to access your Bluetooth
 //!
-//! ### Running as a Service
+//! ### Running at Logon
 //!
-//! On Windows, the service runs as a Windows Service. Install and manage via:
-//!
-//! ```powershell
-//! # Run as Administrator
-//! aranet-service service install
-//! aranet-service service start
-//!
-//! # Check status (in Services panel or via)
-//! aranet-service service status
-//!
-//! # Stop and uninstall
-//! aranet-service service stop
-//! aranet-service service uninstall
-//! ```
-//!
-//! **Note**: Windows Services run in session 0 without a desktop, which may affect
-//! Bluetooth access. Consider using Task Scheduler to run the service at logon
-//! if you encounter Bluetooth issues:
+//! `aranet-service service install` is refused on Windows: a Windows service
+//! would run as LocalSystem, and aranet-service can't run as one. Run it at
+//! logon as your own user with Task Scheduler instead:
 //!
 //! ```powershell
 //! # Create a scheduled task to run at logon
-//! schtasks /create /tn "AranetService" /tr "aranet-service run" /sc onlogon /rl highest
+//! schtasks /create /tn "AranetService" /tr "aranet-service run" /sc onlogon
 //! ```
 
 use std::net::SocketAddr;
