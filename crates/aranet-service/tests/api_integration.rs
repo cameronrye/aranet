@@ -1346,6 +1346,191 @@ fn test_startup_warns_about_database_in_tilde_directory() {
     assert!(!home.join("old").exists(), "a database was opened");
 }
 
+/// The limits in the config file must be the limits a running service
+/// enforces. `run()` builds the limiter once, from the configuration it
+/// loaded, and every other test builds a limiter of its own, so only the
+/// started binary shows it: with `rate_limit_requests = 1`, its second
+/// request is refused.
+///
+/// Unix only: the service is started without the test's environment, with a
+/// `HOME` and a `TMPDIR` inside the `TempDir`, and `dirs` takes every default
+/// path from `HOME` there. So even a service that ignored `--config` or
+/// `--database` would read and write nothing of the developer's.
+#[cfg(unix)]
+#[test]
+fn service_enforces_the_rate_limits_in_its_config_file() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    /// Starting the service takes under a second, and an answer milliseconds.
+    /// The limits turn a service that never listens or never answers into a
+    /// failure, instead of a test that hangs with a server running.
+    const START_LIMIT: Duration = Duration::from_secs(10);
+    const REQUEST_LIMIT: Duration = Duration::from_secs(10);
+
+    /// A started service. Dropping it kills the process and waits for it, so
+    /// that a failed assertion leaves no server running either.
+    struct Service(Child);
+
+    impl Drop for Service {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Send each line of a pipe to `lines`, on a thread of its own. It reads
+    /// to the pipe's end even when nobody receives any more, so that the
+    /// service never waits for room in the pipe.
+    fn forward_lines(pipe: impl Read + Send + 'static, lines: mpsc::Sender<String>) {
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).split(b'\n') {
+                let Ok(line) = line else { break };
+                let _ = lines.send(String::from_utf8_lossy(&line).into_owned());
+            }
+        });
+    }
+
+    /// `GET /api/health` on a connection of its own: the status and the
+    /// `Retry-After` header of the answer.
+    fn get_health(addr: SocketAddr) -> (StatusCode, Option<String>) {
+        let mut stream = TcpStream::connect_timeout(&addr, REQUEST_LIMIT).unwrap();
+        stream.set_read_timeout(Some(REQUEST_LIMIT)).unwrap();
+        stream.set_write_timeout(Some(REQUEST_LIMIT)).unwrap();
+        write!(
+            stream,
+            "GET /api/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+
+        let mut head = answer.split("\r\n\r\n").next().unwrap_or_default().lines();
+        let status = head
+            .next()
+            .and_then(|status_line| status_line.split(' ').nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("not an HTTP answer: {answer:?}"));
+        let retry_after = head.find_map(|header| {
+            let (name, value) = header.split_once(':')?;
+            name.eq_ignore_ascii_case("retry-after")
+                .then(|| value.trim().to_owned())
+        });
+        (status, retry_after)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let config = dir.path().join("server.toml");
+
+    // Start the service on `addr` and wait until it listens there. `None`
+    // when it couldn't, because something else had the port.
+    let start = |addr: SocketAddr| -> Option<Service> {
+        // The address is given twice, so that neither a lost file nor a lost
+        // override makes the service listen on its default port.
+        std::fs::write(
+            &config,
+            format!(
+                "[server]\nbind = \"{addr}\"\n\n\
+                 [security]\nrate_limit_requests = 1\nrate_limit_window_secs = 3600\n"
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_aranet-service"))
+            .arg("--config")
+            .arg(&config)
+            .arg("--database")
+            .arg(dir.path().join("data.db"))
+            .args(["--bind", &addr.to_string(), "--no-collector", "run"])
+            .current_dir(dir.path())
+            .env_clear()
+            .env("HOME", &home)
+            .env("TMPDIR", dir.path())
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start aranet-service");
+        let (sender, lines) = mpsc::channel();
+        forward_lines(
+            child.stdout.take().expect("stdout is piped"),
+            sender.clone(),
+        );
+        forward_lines(child.stderr.take().expect("stderr is piped"), sender);
+        let service = Service(child);
+
+        let listening = format!("Listening on {addr}");
+        let deadline = Instant::now() + START_LIMIT;
+        let mut output = String::new();
+        loop {
+            match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(line) => {
+                    output.push_str(&line);
+                    output.push('\n');
+                    if line.trim_end().ends_with(&listening) {
+                        return Some(service);
+                    }
+                }
+                // Both pipes are at their end: the service has stopped.
+                Err(RecvTimeoutError::Disconnected) => {
+                    assert!(
+                        output.contains("failed to listen on"),
+                        "aranet-service stopped before it listened; its output:\n{output}"
+                    );
+                    return None;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Stop it before failing, so that no server is left
+                    // running.
+                    drop(service);
+                    panic!(
+                        "aranet-service wasn't listening after {START_LIMIT:?} and was \
+                         stopped; its output so far:\n{output}"
+                    );
+                }
+            }
+        }
+    };
+
+    // `server.bind` can't name port 0, so the test asks the system for a free
+    // loopback port and gives it back for the service to listen on. Something
+    // else can take the port in between, and then another one is tried.
+    let (_service, addr) = (0..3)
+        .find_map(|_| {
+            let addr = TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            start(addr).map(|service| (service, addr))
+        })
+        .expect("three free ports in a row were taken before the service listened on them");
+
+    let (first, _) = get_health(addr);
+    assert_eq!(first, StatusCode::OK, "the first request");
+    let (second, retry_after) = get_health(addr);
+    assert_eq!(
+        second,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the second request, with rate_limit_requests = 1 in the config file"
+    );
+    // The wait is the configured window's, an hour, and not the default
+    // window's, a minute.
+    let retry_after: u64 = retry_after
+        .expect("the 429 answer has no Retry-After header")
+        .parse()
+        .unwrap();
+    assert!(
+        (61..=3600).contains(&retry_after),
+        "Retry-After {retry_after} s, with rate_limit_window_secs = 3600 in the config file"
+    );
+}
+
 // ==========================================================================
 // Host and Origin checks while API-key authentication is off
 // ==========================================================================
