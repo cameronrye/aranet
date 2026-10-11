@@ -429,7 +429,11 @@ pub fn app(
 /// `security.api_key`.
 ///
 /// Errors from reading, parsing or validating the configuration wrap
-/// [`ConfigError`]; use `anyhow::Error::downcast_ref` to inspect them.
+/// [`ConfigError`]; use `anyhow::Error::downcast_ref` to inspect them. A
+/// validation error has a context line that names the config file and says
+/// whether command-line options were applied to it, or that no file exists.
+/// Print the error with `{:#}` or `{:?}`: plain `{}` shows only that context
+/// line, without the settings that are wrong.
 pub fn load_config(options: &RunOptions) -> anyhow::Result<LoadedConfig> {
     prepare_config(options, true)
 }
@@ -458,11 +462,16 @@ fn prepare_config(options: &RunOptions, save_generated_key: bool) -> anyhow::Res
 
     // `Path::exists` reports "missing" when it can't tell, for example when
     // the directory can't be searched, which silently gave the defaults.
-    let mut config = match path.try_exists() {
-        Ok(true) => Config::load(&path)?,
+    let (mut config, file_read) = match path.try_exists() {
+        Ok(true) => {
+            // Before the file is parsed and validated, so the log names it
+            // for a configuration that is then refused.
+            tracing::info!("Using config {}", path.display());
+            (Config::load(&path)?, true)
+        }
         Ok(false) => {
             tracing::info!("No config file at {}; using defaults", path.display());
-            Config::default()
+            (Config::default(), false)
         }
         Err(source) => return Err(ConfigError::Read { path, source }.into()),
     };
@@ -505,7 +514,13 @@ fn prepare_config(options: &RunOptions, save_generated_key: bool) -> anyhow::Res
         None
     };
 
-    config.validate()?;
+    // A validation error lists settings, not where they came from, and the
+    // file may hold values its owner never wrote: 0.2.1 saved the whole
+    // running config, a `--bind` override included, on the first device edit.
+    let overridden = options.bind.is_some() || options.database.is_some();
+    config
+        .validate()
+        .with_context(|| invalid_config_context(&path, file_read, overridden))?;
 
     if let Some(key) = generated_key {
         // Only this key is written: comments, other settings and the
@@ -521,8 +536,25 @@ fn prepare_config(options: &RunOptions, save_generated_key: bool) -> anyhow::Res
         tracing::info!("Generated an API key and saved it to {}", path.display());
     }
 
-    tracing::info!("Using config {}", path.display());
     Ok(LoadedConfig { config, path })
+}
+
+/// What a validation error of [`prepare_config`] is about: the config file at
+/// `path`, that file with the `--bind` or `--database` override applied
+/// (`overridden`), or, when no file was read (`file_read` is false), the
+/// defaults with the overrides applied.
+fn invalid_config_context(path: &Path, file_read: bool, overridden: bool) -> String {
+    let path = path.display();
+    match (file_read, overridden) {
+        (true, false) => format!("invalid configuration in {path}"),
+        (true, true) => {
+            format!("invalid configuration in {path} with the command-line options applied")
+        }
+        (false, _) => format!(
+            "no config file at {path}: the defaults with the command-line options applied are \
+             invalid"
+        ),
+    }
 }
 
 /// The database that an earlier version, which didn't expand `~`, created for
@@ -1730,6 +1762,130 @@ mod tests {
             "{error:#}"
         );
         assert!(!dir.path().join("data.db").exists());
+    }
+
+    /// 0.2.1 saved the whole running config on the first device edit, so a
+    /// `server.toml` can hold a `bind` its owner never wrote. The refusal has
+    /// to say which file that is.
+    #[test]
+    fn load_config_names_the_file_of_an_invalid_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        std::fs::write(&config_path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+        let options = RunOptions {
+            config: Some(config_path.clone()),
+            ..Default::default()
+        };
+
+        for result in [
+            load_config(&options).map(drop),
+            // `aranet server --daemon` and `service install` check with this.
+            check_config(&options),
+        ] {
+            let error = result.expect_err("a network bind without authentication is refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.starts_with(&format!(
+                    "invalid configuration in {}: ",
+                    config_path.display()
+                )),
+                "{message}"
+            );
+            assert!(message.contains("server.bind"), "{message}");
+            assert!(!message.contains("command-line"), "{message}");
+            // Callers still get at the validation errors through the context.
+            assert!(
+                matches!(
+                    error.downcast_ref::<ConfigError>(),
+                    Some(ConfigError::Validation(_))
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_config_says_when_an_override_made_the_file_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        std::fs::write(&config_path, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+
+        let error = load_config(&RunOptions {
+            config: Some(config_path.clone()),
+            bind: Some("0.0.0.0:8080".into()),
+            ..Default::default()
+        })
+        .expect_err("--bind 0.0.0.0:8080 without authentication is refused");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(&format!(
+                "invalid configuration in {} with the command-line options applied: ",
+                config_path.display()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("server.bind"), "{message}");
+    }
+
+    #[test]
+    fn load_config_says_when_no_file_was_read_for_an_invalid_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("server.toml");
+
+        let error = load_config(&RunOptions {
+            config: Some(missing.clone()),
+            bind: Some("0.0.0.0:8080".into()),
+            database: Some(dir.path().join("data.db")),
+            ..Default::default()
+        })
+        .expect_err("--bind 0.0.0.0:8080 without authentication is refused");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(&format!(
+                "no config file at {}: the defaults with the command-line options applied are \
+                 invalid: ",
+                missing.display()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("server.bind"), "{message}");
+        // `aranet server --daemon`'s test wants no `storage.path` in an error
+        // that isn't about it.
+        assert!(!message.contains("storage.path"), "{message}");
+    }
+
+    #[test]
+    fn load_config_logs_the_config_file_only_when_it_reads_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        let options = RunOptions {
+            config: Some(path.clone()),
+            database: Some(dir.path().join("data.db")),
+            ..Default::default()
+        };
+        let using = format!("Using config {}", path.display());
+        let missing = format!("No config file at {}; using defaults", path.display());
+
+        let (logs, guard) = crate::test_support::CapturedLogs::start();
+        load_config(&options).unwrap();
+        drop(guard);
+        let text = logs.text();
+        assert!(text.contains(&missing), "{text}");
+        assert!(
+            !text.contains("Using config"),
+            "a file that does not exist is logged as the config in use:\n{text}"
+        );
+
+        // The file is named before it is validated, so the line is there for
+        // a configuration that is then refused.
+        std::fs::write(&path, "[server]\nbind = \"localhost:8080\"\n").unwrap();
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+        load_config(&options).expect_err("a host name is no bind address");
+        let text = logs.text();
+        assert!(text.contains(&using), "{text}");
+        assert!(!text.contains("No config file at"), "{text}");
     }
 
     /// The refusal's first remedy works on its own: with `api_key_enabled =
