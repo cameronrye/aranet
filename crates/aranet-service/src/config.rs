@@ -2424,7 +2424,9 @@ path = "/data/aranet.db"
     fn docker_server_toml_validates() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         if !repo.join("crates/aranet-service/Cargo.toml").is_file() {
-            return; // not a repository checkout: the published crate has no docker/
+            // The published crate has no docker/.
+            eprintln!("skipped: not a repository checkout, so there is no docker/server.toml");
+            return;
         }
         let config =
             Config::load(repo.join("docker/server.toml")).unwrap_or_else(|e| panic!("{e}"));

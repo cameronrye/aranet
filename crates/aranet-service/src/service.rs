@@ -1228,7 +1228,9 @@ mod tests {
         // A Windows checkout may have converted the file to CRLF.
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         if !repo.join("crates/aranet-service/Cargo.toml").is_file() {
-            return; // not a repository checkout: the published crate has no distribution/
+            // The published crate has no distribution/.
+            eprintln!("skipped: not a repository checkout, so there is no unit file to compare");
+            return;
         }
         let shipped = fs::read_to_string(repo.join("distribution/systemd/aranet.service"))
             .expect("read distribution/systemd/aranet.service")
