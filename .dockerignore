@@ -6,13 +6,14 @@
 .claude/
 .git/
 *.md
-!crates/aranet-service/README.md
 docs/
 website/
 dashboards/
 scripts/
 distribution/
 .github/
+# A writable config kept at the context root (docker/README.md) can hold an API key; docker/server.toml stays in.
+server.toml
 # Local files that .gitignore keeps out too: secrets and coverage output.
 **/.env*
 **/*.profraw

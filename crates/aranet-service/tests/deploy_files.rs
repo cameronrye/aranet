@@ -547,6 +547,16 @@ fn dockerignore_excludes_env_files_coverage_output_docs_and_the_website() {
              matches only the context root): {patterns:?}"
         );
     }
+    // docker/README.md has users keep a writable copy of the config at the
+    // context root, and the service writes the API key it generates into it.
+    // Patterns are anchored at the context root, so this one leaves
+    // docker/server.toml, which the image bakes in.
+    assert!(
+        patterns.contains(&"server.toml"),
+        ".dockerignore must list server.toml, or `COPY . .` sends a config kept at \
+         the repository root, which can hold an API key, to the builder, and every \
+         sensor edit rebuilds that layer: {patterns:?}"
+    );
     // docker/Dockerfile's comment on `COPY . .` says that .dockerignore keeps
     // the docs out.
     for pattern in ["docs/", "website/"] {
@@ -801,11 +811,26 @@ fn deployment_workflow_runs_the_image_check_for_main_and_deploy_file_changes() {
     );
 }
 
-/// Pins two things in the text of `scripts/ci/check-docker-image.sh`, the two
-/// whose loss would be worst: `fail` ends with `exit 1`, and container ports
-/// are published on 127.0.0.1 only. It reads the script and runs nothing, so
-/// it is not a test of what the script checks: only a run against a broken
-/// image is.
+/// The lines after `start` up to the next line that is `end`, without the empty ones.
+fn block<'a>(lines: &[&'a str], start: &str, end: &str) -> Vec<&'a str> {
+    let at = lines
+        .iter()
+        .position(|line| *line == start)
+        .unwrap_or_else(|| panic!("no `{start}` line"));
+    lines[at + 1..]
+        .iter()
+        .copied()
+        .take_while(|line| *line != end)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Pins, in the text of `scripts/ci/check-docker-image.sh`, the things whose
+/// loss would be worst. A failed check ends the script as a failure: it runs
+/// under `set -euo pipefail`, `fail` ends with `exit 1`, and its EXIT trap
+/// exits with the status the script was ending with. And container ports are
+/// published on 127.0.0.1 only. It reads the script and runs nothing, so it is
+/// not a test of what the script checks: only a run against a broken image is.
 #[test]
 fn image_check_script_keeps_exit_1_in_fail_and_loopback_only_ports() {
     if !repo("crates/aranet-service/Cargo.toml").is_file() {
@@ -818,6 +843,27 @@ fn image_check_script_keeps_exit_1_in_fail_and_loopback_only_ports() {
         .lines()
         .map(|line| strip_comment(line).trim())
         .collect();
+
+    // Without errexit a failed command, such as `docker build` or the
+    // `docker compose … config -q` of a broken compose file, would not stop the
+    // script, and it would go on to print that every check passed.
+    assert!(
+        lines.contains(&"set -euo pipefail"),
+        "the script must run under `set -euo pipefail`"
+    );
+    // The EXIT trap replaces the script's exit status with its own: ending in
+    // `exit 0`, or in a command that succeeds, it would turn every failed check
+    // into a success.
+    let cleanup = block(&lines, "cleanup() {", "}");
+    assert_eq!(
+        (cleanup.first(), cleanup.last()),
+        (Some(&"local status=$?"), Some(&r#"exit "$status""#)),
+        "the EXIT trap must end with the status the script was exiting with: {cleanup:#?}"
+    );
+    assert!(
+        lines.contains(&"trap cleanup EXIT"),
+        "the script must install `cleanup` as its EXIT trap"
+    );
 
     // The script's own checks stop it through `fail`. With `exit 0` there, a
     // failed check would end the script, and the job, as a success.
@@ -914,20 +960,6 @@ fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
             .filter(|line| !line.trim().is_empty())
             .take_while(|line| indent(line) > 2)
             .map(|line| line.trim())
-            .collect()
-    }
-
-    /// The lines after `start` up to the next line that is `end`.
-    fn block<'a>(lines: &[&'a str], start: &str, end: &str) -> Vec<&'a str> {
-        let at = lines
-            .iter()
-            .position(|line| *line == start)
-            .unwrap_or_else(|| panic!("no `{start}` line"));
-        lines[at + 1..]
-            .iter()
-            .copied()
-            .take_while(|line| *line != end)
-            .filter(|line| !line.is_empty())
             .collect()
     }
 
