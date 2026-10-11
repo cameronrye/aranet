@@ -499,7 +499,8 @@ fn executable_remedy(program: &Path) -> String {
 }
 
 /// Why the system unit's sandbox would hide `path` from the service, or why
-/// that can't be ruled out. `None` if the service can reach it.
+/// that can't be ruled out. `None` if `path` is in none of the hidden
+/// directories; whether the service may read the file is not checked here.
 ///
 /// `path` is compared with each `HIDDEN_FROM_SERVICE` directory twice, by
 /// whole components:
