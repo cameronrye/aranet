@@ -490,10 +490,15 @@ fn prepare_config(options: &RunOptions, save_generated_key: bool) -> anyhow::Res
 
     let expanded = config::expand_home(&config.storage.path);
     if let Some(legacy) = unexpanded_database(Path::new("."), &config.storage.path, &expanded) {
+        // The store runs in WAL mode: a service that was killed has its last
+        // readings only in `data.db-wal`, and a database moved without it
+        // loses them, or is paired with the `-wal` of the database at the
+        // new path.
         tracing::warn!(
             "Found a database at {}, created by an earlier version that did not expand '~'; \
-             the service now uses {}. To keep the old data, stop the service and move the \
-             old file there (this replaces the database at that path) or merge the two; \
+             the service now uses {}. To keep the old data, stop the service and every other \
+             aranet program, then move the old file there together with its -wal and -shm \
+             files, if any (this replaces the database at that path) or merge the two; \
              otherwise remove the old file",
             legacy.display(),
             expanded.display()
