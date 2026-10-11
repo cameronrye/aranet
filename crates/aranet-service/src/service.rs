@@ -268,7 +268,14 @@ pub fn install(level: Level, options: &aranet_service::RunOptions) -> Result<(),
         Level::System => system_program()?,
         Level::User => get_executable_path()?,
     };
-    let ctx = install_ctx(kind, level, program, options, writable_by_non_root)?;
+    let ctx = install_ctx(
+        kind,
+        level,
+        program,
+        options,
+        writable_by_non_root,
+        canonical_path,
+    )?;
     if matches!(level, Level::System)
         && let Some(reason) = not_runnable_by_service(&ctx.program)
     {
@@ -317,12 +324,14 @@ fn install_with(
 /// run the service unprivileged without any setup. On systemd,
 /// `program_check` must find no way for a non-root user to modify `program`,
 /// and the unit is the hardened `aranet.service` from `render_systemd_unit`.
+/// `canonicalize` is what `systemd_system_args` resolves the config's path with.
 fn install_ctx(
     kind: ServiceManagerKind,
     level: Level,
     program: PathBuf,
     options: &aranet_service::RunOptions,
     program_check: impl Fn(&Path) -> Option<String>,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
 ) -> Result<ServiceInstallCtx, ServiceError> {
     let (args, contents) = match level {
         Level::User => (build_install_args(options)?, None),
@@ -336,7 +345,7 @@ fn install_ctx(
                     reason,
                 });
             }
-            let args = systemd_system_args(options)?;
+            let args = systemd_system_args(options, canonicalize)?;
             let unit = render_systemd_unit(&systemd_exec_start(&program, &args)?);
             (args, Some(unit))
         }
@@ -427,12 +436,14 @@ fn writable_by_non_root(path: &Path) -> Option<String> {
 /// The unit's sandbox must not hide `path`, and because the program is owned
 /// by root, it must be executable, and every directory above it searchable,
 /// by other users. `stat` returns `(uid, gid, mode)`; an error counts as
-/// unrunnable.
+/// unrunnable. `canonicalize` is what `hidden_from_service` resolves `path`
+/// and the hidden directories with.
 fn not_runnable_by_service_with(
     path: &Path,
     stat: impl Fn(&Path) -> std::io::Result<(u32, u32, u32)>,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
 ) -> Option<String> {
-    if let Some(reason) = hidden_from_service(path) {
+    if let Some(reason) = hidden_from_service(path, canonicalize) {
         return Some(reason.to_string());
     }
     for entry in path.ancestors() {
@@ -457,7 +468,7 @@ fn not_runnable_by_service_with(
 
 /// `not_runnable_by_service_with` on the real file system.
 fn not_runnable_by_service(path: &Path) -> Option<String> {
-    not_runnable_by_service_with(path, owner_and_mode)
+    not_runnable_by_service_with(path, owner_and_mode, canonical_path)
 }
 
 /// `(uid, gid, mode)` of `entry`, following symlinks.
@@ -477,6 +488,12 @@ fn owner_and_mode(_entry: &Path) -> std::io::Result<(u32, u32, u32)> {
         std::io::ErrorKind::Unsupported,
         "ownership checks are only implemented on Unix",
     ))
+}
+
+/// `path` with every symlink resolved, on the real file system; an error if
+/// `path` doesn't exist. The path checks take this as `canonicalize`.
+fn canonical_path(path: &Path) -> std::io::Result<PathBuf> {
+    fs::canonicalize(path)
 }
 
 /// The end of the `InsecureExecutable` and `UnrunnableExecutable` messages: how
@@ -517,35 +534,47 @@ fn executable_remedy(program: &Path) -> String {
 ///
 /// A `path` with a `..` component is refused without comparing it: where
 /// `..` leads depends on symlinks in directories that may not exist yet.
-fn hidden_from_service(path: &Path) -> Option<&'static str> {
-    hidden_under(path, &HIDDEN_FROM_SERVICE)
+///
+/// `canonicalize` resolves the symlinks, and fails for a path that doesn't
+/// exist, as `fs::canonicalize` does. Nothing else here reads the file system.
+fn hidden_from_service(
+    path: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Option<&'static str> {
+    hidden_under(path, &HIDDEN_FROM_SERVICE, canonicalize)
 }
 
 /// `hidden_from_service` for the directories in `roots`, each with its reason.
-fn hidden_under<P: AsRef<Path>>(path: &Path, roots: &[(P, &'static str)]) -> Option<&'static str> {
+fn hidden_under<P: AsRef<Path>>(
+    path: &Path,
+    roots: &[(P, &'static str)],
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Option<&'static str> {
     if path.components().any(|c| c == Component::ParentDir) {
         return Some(
             "a path with `..` can't be checked against the directories the unit hides; give it \
              without `..`",
         );
     }
-    let resolved = resolve_existing_part(path);
+    let resolved = resolve_existing_part(path, &canonicalize);
     roots
         .iter()
         .find(|(root, _)| {
             let root = root.as_ref();
             path.starts_with(root)
-                || resolved.starts_with(fs::canonicalize(root).unwrap_or_else(|_| root.into()))
+                || resolved.starts_with(canonicalize(root).unwrap_or_else(|_| root.into()))
         })
         .map(|&(_, reason)| reason)
 }
 
 /// `path` with its symlinks resolved as far as it exists: its nearest ancestor
-/// that exists, canonicalized, then the components below that one as written.
-fn resolve_existing_part(path: &Path) -> PathBuf {
+/// that `canonicalize` resolves, then the components below that one as written.
+fn resolve_existing_part(
+    path: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> PathBuf {
     for ancestor in path.ancestors() {
-        if let (Ok(mut resolved), Ok(below)) =
-            (fs::canonicalize(ancestor), path.strip_prefix(ancestor))
+        if let (Ok(mut resolved), Ok(below)) = (canonicalize(ancestor), path.strip_prefix(ancestor))
         {
             resolved.extend(below);
             return resolved;
@@ -572,12 +601,14 @@ fn systemd_config_path(options: &aranet_service::RunOptions) -> Result<PathBuf, 
 /// refused if `hidden_from_service` finds it in a hidden directory, as written
 /// or with symlinks resolved as far as the path exists, or if it has a `..`
 /// component. The database is compared as written with `/var/lib/aranet` and
-/// must not have a `..` component either.
+/// must not have a `..` component either. `canonicalize` is what
+/// `hidden_from_service` resolves the config's path with.
 fn systemd_system_args(
     options: &aranet_service::RunOptions,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
 ) -> Result<Vec<OsString>, ServiceError> {
     let config = systemd_config_path(options)?;
-    if let Some(reason) = hidden_from_service(&config) {
+    if let Some(reason) = hidden_from_service(&config, canonicalize) {
         return Err(ServiceError::InaccessiblePath {
             path: config,
             reason,
@@ -1097,6 +1128,7 @@ mod tests {
             PathBuf::from(PROGRAM),
             &aranet_service::RunOptions::default(),
             |_| None,
+            canonical_path,
         )
         .unwrap()
     }
@@ -1202,6 +1234,7 @@ mod tests {
                 PathBuf::from(PROGRAM),
                 &aranet_service::RunOptions::default(),
                 panicking_program_check,
+                canonical_path,
             );
             assert!(
                 matches!(result, Err(ServiceError::SystemLevelUnsupported { .. })),
@@ -1215,6 +1248,7 @@ mod tests {
             PathBuf::from(PROGRAM),
             &aranet_service::RunOptions::default(),
             panicking_program_check,
+            canonical_path,
         )
         .unwrap_err()
         .to_string();
@@ -1243,6 +1277,7 @@ mod tests {
                 program.clone(),
                 &options,
                 panicking_program_check,
+                canonical_path,
             )
             .unwrap();
             assert_eq!(ctx.label.to_qualified_name(), expected_label, "{kind:?}");
@@ -1262,6 +1297,7 @@ mod tests {
             program.clone(),
             &aranet_service::RunOptions::default(),
             |_| Some("/opt/aranet is owned by uid 1000".to_string()),
+            canonical_path,
         )
         .unwrap_err();
         assert!(
@@ -1288,6 +1324,7 @@ mod tests {
             PathBuf::from(PROGRAM),
             &aranet_service::RunOptions::default(),
             |_| Some("/usr/local/bin is writable by every user".to_string()),
+            canonical_path,
         )
         .unwrap_err()
         .to_string();
@@ -1540,6 +1577,7 @@ mod tests {
                 PathBuf::from(PROGRAM),
                 &aranet_service::RunOptions::default(),
                 panicking_program_check,
+                canonical_path,
             )
             .unwrap_err()
             .to_string();
@@ -1867,8 +1905,12 @@ mod tests {
             ];
             for (case, program, entries, expected) in cases {
                 assert_eq!(
-                    not_runnable_by_service_with(Path::new(program), fake_stat(&entries))
-                        .as_deref(),
+                    not_runnable_by_service_with(
+                        Path::new(program),
+                        fake_stat(&entries),
+                        canonical_path
+                    )
+                    .as_deref(),
                     expected,
                     "{case}"
                 );
@@ -1883,21 +1925,26 @@ mod tests {
                     database: database.map(PathBuf::from),
                     ..aranet_service::RunOptions::default()
                 };
-            let refused = |run: aranet_service::RunOptions| match systemd_system_args(&run) {
-                Err(ServiceError::InaccessiblePath { path, reason }) => (path, reason),
-                other => panic!("{run:?}: {other:?}"),
-            };
+            let refused =
+                |run: aranet_service::RunOptions| match systemd_system_args(&run, canonical_path) {
+                    Err(ServiceError::InaccessiblePath { path, reason }) => (path, reason),
+                    other => panic!("{run:?}: {other:?}"),
+                };
 
             assert_eq!(
-                systemd_system_args(&aranet_service::RunOptions::default()).unwrap(),
+                systemd_system_args(&aranet_service::RunOptions::default(), canonical_path)
+                    .unwrap(),
                 ["run", "--config", "/var/lib/aranet/server.toml"]
             );
             assert_eq!(
-                systemd_system_args(&aranet_service::RunOptions {
-                    bind: Some("0.0.0.0:9090".to_string()),
-                    no_collector: true,
-                    ..aranet_service::RunOptions::default()
-                })
+                systemd_system_args(
+                    &aranet_service::RunOptions {
+                        bind: Some("0.0.0.0:9090".to_string()),
+                        no_collector: true,
+                        ..aranet_service::RunOptions::default()
+                    },
+                    canonical_path
+                )
                 .unwrap(),
                 [
                     "run",
@@ -1909,10 +1956,13 @@ mod tests {
                 ]
             );
             assert_eq!(
-                systemd_system_args(&options(
-                    Some("/etc/aranet/server.toml"),
-                    Some("/var/lib/aranet/a.db")
-                ))
+                systemd_system_args(
+                    &options(
+                        Some("/etc/aranet/server.toml"),
+                        Some("/var/lib/aranet/a.db")
+                    ),
+                    canonical_path
+                )
                 .unwrap(),
                 [
                     "run",
@@ -1943,11 +1993,14 @@ mod tests {
             // A relative config is made absolute. Where the working directory is
             // under /home (GitHub's Linux runners), the result is then refused.
             let expected = env::current_dir().unwrap().join("server.toml");
-            match systemd_system_args(&options(Some("server.toml"), None)) {
+            match systemd_system_args(&options(Some("server.toml"), None), canonical_path) {
                 Ok(args) => assert_eq!(args[2], expected.into_os_string()),
                 Err(ServiceError::InaccessiblePath { path, .. }) => {
                     assert_eq!(path, expected);
-                    assert!(hidden_from_service(&expected).is_some(), "{path:?}");
+                    assert!(
+                        hidden_from_service(&expected, canonical_path).is_some(),
+                        "{path:?}"
+                    );
                 }
                 Err(e) => panic!("{e:?}"),
             }
@@ -1980,7 +2033,7 @@ mod tests {
             );
 
             let unrunnable = |program: &str, entries: &[Entry]| {
-                not_runnable_by_service_with(Path::new(program), fake_stat(entries))
+                not_runnable_by_service_with(Path::new(program), fake_stat(entries), canonical_path)
             };
             assert_eq!(
                 unrunnable(PROGRAM, &chain(&[("/usr", 0, 0, 0o40750)])).as_deref(),
@@ -2024,7 +2077,11 @@ mod tests {
                 ),
             ];
             for (path, reason) in hidden {
-                assert_eq!(hidden_from_service(Path::new(path)), Some(reason), "{path}");
+                assert_eq!(
+                    hidden_from_service(Path::new(path), canonical_path),
+                    Some(reason),
+                    "{path}"
+                );
             }
             // A name that only starts like a hidden directory's is another
             // directory, and so is a `tmp` further down.
@@ -2038,7 +2095,11 @@ mod tests {
                 "/var/lib/aranet/tmp/server.toml",
                 PROGRAM,
             ] {
-                assert_eq!(hidden_from_service(Path::new(path)), None, "{path}");
+                assert_eq!(
+                    hidden_from_service(Path::new(path), canonical_path),
+                    None,
+                    "{path}"
+                );
             }
 
             // A config in a hidden directory is refused with that directory's reason.
@@ -2056,7 +2117,7 @@ mod tests {
                     config: Some(PathBuf::from(config)),
                     ..aranet_service::RunOptions::default()
                 };
-                match systemd_system_args(&options) {
+                match systemd_system_args(&options, canonical_path) {
                     Err(ServiceError::InaccessiblePath { path, reason }) => {
                         assert_eq!((path.as_path(), reason), (Path::new(config), expected));
                     }
@@ -2067,10 +2128,13 @@ mod tests {
             // The database must be in the state directory itself: not next to
             // it, and not in a directory whose name only starts like its name.
             let with_database = |database: &str| {
-                systemd_system_args(&aranet_service::RunOptions {
-                    database: Some(PathBuf::from(database)),
-                    ..aranet_service::RunOptions::default()
-                })
+                systemd_system_args(
+                    &aranet_service::RunOptions {
+                        database: Some(PathBuf::from(database)),
+                        ..aranet_service::RunOptions::default()
+                    },
+                    canonical_path,
+                )
             };
             for database in ["/var/lib/aranet/data.db", "/var/lib/aranet/old/data.db"] {
                 assert_eq!(
@@ -2165,7 +2229,7 @@ mod tests {
             let wrong: Vec<String> = cases
                 .iter()
                 .filter_map(|(path, expected)| {
-                    let found = hidden_under(&base.join(path), &roots);
+                    let found = hidden_under(&base.join(path), &roots, canonical_path);
                     (found != *expected)
                         .then(|| format!("{path}: found {found:?}, expected {expected:?}"))
                 })
@@ -2174,10 +2238,13 @@ mod tests {
 
             // `service install --config` refuses `..` with the path as given.
             for config in ["/etc/../home/u/server.toml", "/etc/aranet/../server.toml"] {
-                let error = systemd_system_args(&aranet_service::RunOptions {
-                    config: Some(PathBuf::from(config)),
-                    ..aranet_service::RunOptions::default()
-                })
+                let error = systemd_system_args(
+                    &aranet_service::RunOptions {
+                        config: Some(PathBuf::from(config)),
+                        ..aranet_service::RunOptions::default()
+                    },
+                    canonical_path,
+                )
                 .expect_err(config);
                 assert!(
                     matches!(error, ServiceError::InaccessiblePath { .. }),
