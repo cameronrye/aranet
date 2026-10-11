@@ -879,34 +879,46 @@ async fn test_dashboard_keeps_only_the_path_and_reads_the_url_token_first() {
         "let apiToken = takeUrlToken() || window.sessionStorage.getItem('aranet_api_token') || '';"
     ));
 
-    // The statements of takeUrlToken, in the order they run. What they do is
+    // takeUrlToken as a whole, with the lines around it. What it does is
     // checked by the Node cases in the implementation plan (Phase 3b Task 13,
     // Step 28), which are run by hand: cargo has no JavaScript engine. This
     // test only guards the script's text between runs of them. When it fails,
     // run those cases against the new script, then update the text here.
-    let mut script = body.as_str();
-    for statement in [
-        // `?token=` and `#token=` are both read,
-        "for (const part of [window.location.search, window.location.hash]) {",
-        // without the leading `?` or `#`,
-        "for (const param of part.slice(1).split('&')) {",
-        // and `tokenx=` is another parameter.
-        "if (param.startsWith('token=')) values.push(param.slice('token='.length));",
-        // A URL without a token is left as it is.
-        "if (values.length === 0) return '';",
-        // A repeated token is ignored, after it has left the address bar.
-        "window.history.replaceState(null, '', window.location.pathname);",
-        "if (values.length !== 1) return '';",
-        // The token is percent-decoded, and `+` stays `+`.
-        "return decodeURIComponent(values[0]);",
-        // A malformed escape gives the token as it is written.
-        "return values[0];",
-    ] {
-        let Some((_, rest)) = script.split_once(statement) else {
-            panic!("the dashboard script no longer has, in this order: {statement}");
-        };
-        script = rest;
+    //
+    // It is one exact text, from the start of the script. A list of its
+    // statements would still be found after one of them was commented out or
+    // given a prefix, and without the lines before the function the whole of
+    // it could be commented out.
+    const TAKE_URL_TOKEN: &str = r##"<script>
+const API = window.location.origin;
+
+// Take an API key passed as ?token=... or #token=... out of the address bar
+// and the history entry. A repeated token is ignored. decodeURIComponent,
+// unlike URLSearchParams, keeps '+' as '+', so base64 keys work.
+function takeUrlToken() {
+  const values = [];
+  for (const part of [window.location.search, window.location.hash]) {
+    for (const param of part.slice(1).split('&')) {
+      if (param.startsWith('token=')) values.push(param.slice('token='.length));
     }
+  }
+  if (values.length === 0) return '';
+  window.history.replaceState(null, '', window.location.pathname);
+  if (values.length !== 1) return '';
+  try {
+    return decodeURIComponent(values[0]);
+  } catch (_) {
+    return values[0];
+  }
+}
+
+let apiToken = takeUrlToken() || window.sessionStorage.getItem('aranet_api_token') || '';
+"##;
+    assert!(
+        body.contains(TAKE_URL_TOKEN),
+        "the dashboard script no longer starts with this text, takeUrlToken included; run the \
+         Node cases against the new script, then update the text here:\n{TAKE_URL_TOKEN}"
+    );
 }
 
 // ==========================================================================
