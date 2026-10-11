@@ -361,6 +361,11 @@ impl Config {
     /// something to write. The file is replaced atomically and is readable only by its owner
     /// (0600 on Unix).
     ///
+    /// Two cases where a comment is not kept where it was: a comment directly above a key
+    /// that is removed, or at the end of that key's line, is removed with the key. And in a
+    /// file that starts with comments followed by a `[section]`, a first root-level key
+    /// (`device`, say) is written above those comments, not below them.
+    ///
     /// Nothing is written when `change` leaves every saved setting as the file has it, when it
     /// returns an error, or when the file can't be read or doesn't parse (the error is returned).
     pub fn update_at<R>(path: &Path, change: impl FnOnce(&mut Config) -> Result<R>) -> Result<R> {

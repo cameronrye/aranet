@@ -151,6 +151,13 @@ impl<T: Serialize + DeserializeOwned> TomlFile<T> {
     /// as `desired` before it is written, atomically and owner-only, with
     /// [`write_private`]. If it doesn't, the file is left alone and the
     /// [`TomlFileError::Write`] that comes back says why in its source chain.
+    ///
+    /// Two cases where a comment is not kept where it was:
+    ///
+    /// - A comment directly above a key that is removed, or at the end of that
+    ///   key's line, is removed with the key.
+    /// - In a file that starts with comments followed by a `[table]` header, the
+    ///   first root-level key is written above those comments, not below them.
     pub fn save(mut self, desired: &T) -> Result<bool, TomlFileError> {
         let before = toml::Table::try_from(&self.value)?;
         let after = toml::Table::try_from(desired)?;

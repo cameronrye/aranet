@@ -617,7 +617,7 @@ impl Store {
 /// [`Store::prune_history`].
 ///
 /// Each batch is one short write transaction, so other connections to the same
-/// database, such as a running `aranet-service`, get the write lock between
+/// database, such as a running `aranet-service`, can take the write lock between
 /// batches instead of waiting behind one long delete.
 pub const PRUNE_BATCH_ROWS: u32 = 5_000;
 
