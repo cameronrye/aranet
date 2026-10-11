@@ -965,11 +965,13 @@ mod tests {
     }
 
     /// Records every call it gets as `"<method> <label>"`, and reports `status`
-    /// (an error when `None`).
+    /// (an error when `None`). With `stop_fails`, `stop` records its call and
+    /// then fails.
     #[derive(Default)]
     struct FakeManager {
         calls: RefCell<Vec<String>>,
         status: Option<service_manager::ServiceStatus>,
+        stop_fails: bool,
     }
 
     impl FakeManager {
@@ -1004,6 +1006,9 @@ mod tests {
 
         fn stop(&self, ctx: ServiceStopCtx) -> std::io::Result<()> {
             self.record("stop", &ctx.label);
+            if self.stop_fails {
+                return Err(std::io::Error::other("systemctl stop failed"));
+            }
             Ok(())
         }
 
@@ -1435,6 +1440,229 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refusals_and_the_launch_daemon_warning_say_what_to_do_instead() {
+        let cases = [
+            (
+                ServiceManagerKind::Launchd,
+                "launchd",
+                "use `aranet-service service install --user` instead",
+            ),
+            (
+                ServiceManagerKind::Sc,
+                "the Windows service manager",
+                "start `aranet-service run` at logon with Task Scheduler instead",
+            ),
+            (
+                ServiceManagerKind::WinSw,
+                "the Windows service manager",
+                "start `aranet-service run` at logon with Task Scheduler instead",
+            ),
+            (
+                ServiceManagerKind::OpenRc,
+                "OpenRC",
+                "write your own service file that runs `aranet-service run` as an unprivileged user",
+            ),
+            (
+                ServiceManagerKind::Rcd,
+                "rc.d",
+                "write your own rc.d script that runs `aranet-service run` as an unprivileged user",
+            ),
+        ];
+        for (kind, manager, advice) in cases {
+            let message = install_ctx(
+                kind,
+                Level::System,
+                PathBuf::from(PROGRAM),
+                &aranet_service::RunOptions::default(),
+                panicking_program_check,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "System-level services are not supported with {manager}: "
+                )),
+                "{kind:?}: {message}"
+            );
+            assert!(message.contains(advice), "{kind:?}: {message}");
+        }
+
+        // A program the service's user couldn't run gets the same remedy as
+        // one that a non-root user could replace.
+        let hidden = ServiceError::UnrunnableExecutable {
+            path: PathBuf::from("/root/.cargo/bin/aranet-service"),
+            reason: "ProtectHome=yes hides /root from the service".to_string(),
+        }
+        .to_string();
+        assert!(
+            hidden.contains("(ProtectHome=yes hides /root from the service)"),
+            "{hidden}"
+        );
+        assert!(
+            hidden.contains(
+                "sudo install -o root -g root -m 0755 /root/.cargo/bin/aranet-service \
+                 /usr/local/bin/aranet-service"
+            ),
+            "{hidden}"
+        );
+        let in_place = ServiceError::UnrunnableExecutable {
+            path: PathBuf::from(PROGRAM),
+            reason: "/usr/local/bin is not searchable by other users".to_string(),
+        }
+        .to_string();
+        assert!(!in_place.contains("sudo install"), "{in_place}");
+        assert!(
+            in_place.contains("ls -ld / /usr /usr/local /usr/local/bin"),
+            "{in_place}"
+        );
+
+        // The LaunchDaemon can only be removed, never replaced: a system-level
+        // install is refused on macOS.
+        for level in [Level::System, Level::User] {
+            let launchd = legacy_services(ServiceManagerKind::Launchd, level);
+            let (_, warning) = &launchd[0];
+            assert!(warning.contains("runs aranet-service as root"), "{warning}");
+            assert!(
+                warning.contains(
+                    "Remove it with `sudo aranet-service service uninstall`, then use \
+                     `aranet-service service install --user`"
+                ),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_start_quotes_each_special_character_on_its_own() {
+        let exec_start = |program: &str, args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            systemd_exec_start(Path::new(program), &args)
+        };
+
+        // Each of these alone makes systemd split or unescape an unquoted word.
+        for (arg, word) in [
+            (r#"a"b"#, r#""a\"b""#),
+            (r"a\b", r#""a\\b""#),
+            ("a'b", r#""a'b""#),
+            ("a b", r#""a b""#),
+        ] {
+            assert_eq!(
+                exec_start(PROGRAM, &[arg]).unwrap(),
+                format!("{PROGRAM} {word}"),
+                "{arg}"
+            );
+        }
+
+        // systemd refuses each of these in an executable path.
+        for program in [
+            r#"/opt/a"b/aranet-service"#,
+            r"/opt/a\b/aranet-service",
+            "/opt/a'b/aranet-service",
+        ] {
+            match exec_start(program, &["run"]) {
+                Err(ServiceError::InaccessiblePath { path, reason }) => {
+                    assert_eq!(path, Path::new(program));
+                    assert_eq!(
+                        reason,
+                        "systemd refuses executable paths with quotes or backslashes"
+                    );
+                }
+                other => panic!("{program}: {other:?}"),
+            }
+        }
+
+        // An argument that isn't UTF-8 is refused, not written as something else.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let args = [
+                OsString::from("--config"),
+                OsString::from_vec(b"/etc/aranet/\xff.toml".to_vec()),
+            ];
+            match systemd_exec_start(Path::new(PROGRAM), &args) {
+                Err(ServiceError::InaccessiblePath { reason, .. }) => {
+                    assert_eq!(reason, "systemd unit files must be UTF-8");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_unit_is_removed_even_if_stopping_it_fails() {
+        // `systemctl stop` fails for a unit file that systemd hasn't loaded.
+        let dir = unit_dir_with(&["rye-aranet.service"]);
+        let manager = FakeManager {
+            stop_fails: true,
+            ..FakeManager::default()
+        };
+        install_with(&manager, Some(dir.path()), systemd_system_ctx()).unwrap();
+        assert_eq!(
+            manager.calls(),
+            [
+                "stop dev.rye.aranet",
+                "uninstall dev.rye.aranet",
+                "install aranet"
+            ]
+        );
+
+        let dir = unit_dir_with(&["rye-aranet.service"]);
+        let manager = FakeManager {
+            stop_fails: true,
+            ..FakeManager::default()
+        };
+        uninstall_with(&manager, ServiceManagerKind::Systemd, Some(dir.path())).unwrap();
+        assert_eq!(
+            manager.calls(),
+            ["stop dev.rye.aranet", "uninstall dev.rye.aranet"]
+        );
+    }
+
+    /// Reads the rendered unit's text only. It doesn't show what systemd does
+    /// with these lines.
+    #[test]
+    fn unit_has_the_directives_the_refusal_reasons_and_docs_name() {
+        let unit = render_systemd_unit("/usr/local/bin/aranet-service run");
+        let lines: Vec<&str> = unit.lines().collect();
+
+        // Each reason for a hidden directory starts with the directive that
+        // hides it.
+        for (dir, reason) in HIDDEN_FROM_SERVICE {
+            let directive = reason.split(' ').next().unwrap();
+            assert!(
+                lines.contains(&directive),
+                "{dir} is refused because of `{directive}`, which the unit doesn't set:\n{unit}"
+            );
+        }
+
+        // "the service can only write /var/lib/aranet" (a refused database),
+        // and the rustdoc's "`UMask=0077` keeps both owner-only".
+        for expected in [
+            "ProtectSystem=strict",
+            "StateDirectory=aranet",
+            "UMask=0077",
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "missing {expected:?} in:\n{unit}"
+            );
+        }
+
+        // D-Bus (BlueZ), the HTTP API, and listing the interfaces for mDNS.
+        let families = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("RestrictAddressFamilies="))
+            .expect("the unit restricts the address families");
+        for family in ["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"] {
+            assert!(
+                families.split(' ').any(|allowed| allowed == family),
+                "RestrictAddressFamilies={families} leaves out {family}"
+            );
+        }
+    }
+
     /// Checks that rely on Unix paths: on Windows `/usr/...` isn't absolute.
     #[cfg(unix)]
     mod unix_paths {
@@ -1646,6 +1874,153 @@ mod tests {
                     assert!(hidden_from_service(&expected).is_some(), "{path:?}");
                 }
                 Err(e) => panic!("{e:?}"),
+            }
+        }
+
+        #[test]
+        fn program_checks_reach_the_root_directory_and_fail_closed() {
+            // Whoever owns or can write a directory can replace everything
+            // below it, so the check goes all the way up to `/`.
+            let writable = |entries: &[Entry]| {
+                writable_by_non_root_with(Path::new(PROGRAM), fake_stat(entries))
+            };
+            assert_eq!(
+                writable(&chain(&[("/", 501, 0, 0o40755)])).as_deref(),
+                Some("/ is owned by uid 501")
+            );
+            assert_eq!(
+                writable(&chain(&[("/", 0, 0, 0o40757)])).as_deref(),
+                Some("/ is writable by every user")
+            );
+            assert_eq!(
+                writable(&chain(&[("/usr", 0, 50, 0o40775)])).as_deref(),
+                Some("/usr is writable by group 50")
+            );
+            // A relative path doesn't say which directories to check.
+            assert_eq!(
+                writable_by_non_root_with(Path::new("bin/aranet-service"), fake_stat(&chain(&[])))
+                    .as_deref(),
+                Some("bin/aranet-service is not an absolute path")
+            );
+
+            let unrunnable = |program: &str, entries: &[Entry]| {
+                not_runnable_by_service_with(Path::new(program), fake_stat(entries))
+            };
+            assert_eq!(
+                unrunnable(PROGRAM, &chain(&[("/usr", 0, 0, 0o40750)])).as_deref(),
+                Some("/usr is not searchable by other users")
+            );
+            assert_eq!(
+                unrunnable(PROGRAM, &chain(&[("/", 0, 0, 0o40750)])).as_deref(),
+                Some("/ is not searchable by other users")
+            );
+            let reason = unrunnable("/usr/local/bin/other", &chain(&[]))
+                .expect("a stat error counts as unrunnable");
+            assert!(
+                reason.starts_with("can't check /usr/local/bin/other: "),
+                "{reason}"
+            );
+        }
+
+        #[test]
+        fn sandbox_paths_are_matched_by_whole_components() {
+            let hidden = [
+                ("/home", "ProtectHome=yes hides /home from the service"),
+                (
+                    "/home/u/.cargo/bin/aranet-service",
+                    "ProtectHome=yes hides /home from the service",
+                ),
+                (
+                    "/root/aranet-service",
+                    "ProtectHome=yes hides /root from the service",
+                ),
+                (
+                    "/run/user/1000/aranet-service",
+                    "ProtectHome=yes hides /run/user from the service",
+                ),
+                (
+                    "/tmp/aranet-service",
+                    "PrivateTmp=yes gives the service its own /tmp",
+                ),
+                (
+                    "/var/tmp/aranet-service",
+                    "PrivateTmp=yes gives the service its own /var/tmp",
+                ),
+            ];
+            for (path, reason) in hidden {
+                assert_eq!(hidden_from_service(Path::new(path)), Some(reason), "{path}");
+            }
+            // A name that only starts like a hidden directory's is another
+            // directory, and so is a `tmp` further down.
+            for path in [
+                "/homes/u/aranet-service",
+                "/rootfs/aranet-service",
+                "/run/users/aranet-service",
+                "/run/aranet-service",
+                "/tmpfiles/aranet-service",
+                "/var/tmpfiles/aranet-service",
+                "/var/lib/aranet/tmp/server.toml",
+                PROGRAM,
+            ] {
+                assert_eq!(hidden_from_service(Path::new(path)), None, "{path}");
+            }
+
+            // A config in a hidden directory is refused with that directory's reason.
+            for (config, expected) in [
+                (
+                    "/run/user/1000/server.toml",
+                    "ProtectHome=yes hides /run/user from the service",
+                ),
+                (
+                    "/var/tmp/server.toml",
+                    "PrivateTmp=yes gives the service its own /var/tmp",
+                ),
+            ] {
+                let options = aranet_service::RunOptions {
+                    config: Some(PathBuf::from(config)),
+                    ..aranet_service::RunOptions::default()
+                };
+                match systemd_system_args(&options) {
+                    Err(ServiceError::InaccessiblePath { path, reason }) => {
+                        assert_eq!((path.as_path(), reason), (Path::new(config), expected));
+                    }
+                    other => panic!("{config}: {other:?}"),
+                }
+            }
+
+            // The database must be in the state directory itself: not next to
+            // it, and not in a directory whose name only starts like its name.
+            let with_database = |database: &str| {
+                systemd_system_args(&aranet_service::RunOptions {
+                    database: Some(PathBuf::from(database)),
+                    ..aranet_service::RunOptions::default()
+                })
+            };
+            for database in ["/var/lib/aranet/data.db", "/var/lib/aranet/old/data.db"] {
+                assert_eq!(
+                    with_database(database).unwrap(),
+                    [
+                        "run",
+                        "--config",
+                        "/var/lib/aranet/server.toml",
+                        "--database",
+                        database,
+                    ],
+                    "{database}"
+                );
+            }
+            for database in [
+                "/var/lib/data.db",
+                "/var/lib/aranet2/data.db",
+                "/var/lib/aranet.db",
+            ] {
+                match with_database(database) {
+                    Err(ServiceError::InaccessiblePath { path, reason }) => {
+                        assert_eq!(path, Path::new(database));
+                        assert_eq!(reason, "the service can only write /var/lib/aranet");
+                    }
+                    other => panic!("{database}: {other:?}"),
+                }
             }
         }
     }

@@ -5,9 +5,10 @@
 //! the repository. They read the files line by line, without a Dockerfile or
 //! YAML parser, so the compose files must stay in block style. The image itself
 //! is built and started by `scripts/ci/check-docker-image.sh`, in the `docker`
-//! job of `.github/workflows/deployment-files.yml`. The last two tests here read
-//! that workflow and that script, as text too: they pin some of their lines and
-//! run neither.
+//! job of `.github/workflows/deployment-files.yml`. The last three tests here
+//! read that workflow, that script and `scripts/ci/check-systemd-install.sh`
+//! (run by the workflow's `systemd` job), as text too: they pin some of their
+//! lines and run none of them.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -887,5 +888,161 @@ fn image_check_script_keeps_exit_1_in_fail_and_loopback_only_ports() {
          127.0.0.1::8080`: the service in its containers has no authentication, \
          and `-p 8080` would put it on every interface of the machine that runs \
          the script: {open:#?}"
+    );
+}
+
+/// Pins, by text, what lets the workflow's two service jobs and
+/// `scripts/ci/check-systemd-install.sh` fail: the jobs build the binary and
+/// run their checks on the right system with the read-only token, and the
+/// script stops at a failed check, keeps the exposure threshold, requires the
+/// dynamic user and treats an accepted home copy as an error. It reads the
+/// files and runs nothing, so it is not a test of the service, of systemd or
+/// of launchd: only the jobs themselves are.
+#[test]
+fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
+    /// The lines of the job `name`, trimmed: those indented deeper than its
+    /// `  <name>:` line.
+    fn job<'a>(workflow: &[&'a str], name: &str) -> Vec<&'a str> {
+        let key = format!("  {name}:");
+        let start = workflow
+            .iter()
+            .position(|line| *line == key)
+            .unwrap_or_else(|| panic!("the workflow has no `{name}` job"));
+        workflow[start + 1..]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .take_while(|line| indent(line) > 2)
+            .map(|line| line.trim())
+            .collect()
+    }
+
+    /// The lines after `start` up to the next line that is `end`.
+    fn block<'a>(lines: &[&'a str], start: &str, end: &str) -> Vec<&'a str> {
+        let at = lines
+            .iter()
+            .position(|line| *line == start)
+            .unwrap_or_else(|| panic!("no `{start}` line"));
+        lines[at + 1..]
+            .iter()
+            .copied()
+            .take_while(|line| *line != end)
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    if !repo("crates/aranet-service/Cargo.toml").is_file() {
+        return; // not a repository checkout: there is no workflow or script to read
+    }
+    let text = read(".github/workflows/deployment-files.yml");
+    let workflow: Vec<&str> = text.lines().map(strip_comment).collect();
+
+    let systemd = job(&workflow, "systemd");
+    assert!(
+        systemd
+            .iter()
+            .any(|line| line.starts_with("runs-on: ubuntu-")),
+        "the systemd job needs a runner whose init system is systemd: {systemd:#?}"
+    );
+    assert!(
+        systemd
+            .contains(&"run: sudo scripts/ci/check-systemd-install.sh target/debug/aranet-service"),
+        "the systemd job must run scripts/ci/check-systemd-install.sh as root on the \
+         binary it built, the only check that installs and starts the system service: \
+         {systemd:#?}"
+    );
+
+    let launchd = job(&workflow, "launchd-refusal");
+    assert!(
+        launchd
+            .iter()
+            .any(|line| line.starts_with("runs-on: macos-")),
+        "only a macOS runner has launchd, whose system-level install must be refused: \
+         {launchd:#?}"
+    );
+    // The job's three checks. Each must end the step with `exit 1`.
+    for check in [
+        r#"if sudo ./target/debug/aranet-service service install 2> "$err_file"; then"#,
+        r#"if ! grep -qF -- '--user' "$err_file"; then"#,
+        "if [ -e /Library/LaunchDaemons/dev.rye.aranet.plist ]; then",
+    ] {
+        assert_eq!(
+            block(&launchd, check, "fi").last(),
+            Some(&"exit 1"),
+            "the launchd-refusal job must fail when `{check}` holds"
+        );
+    }
+
+    for (name, lines) in [("systemd", &systemd), ("launchd-refusal", &launchd)] {
+        assert!(
+            lines.contains(&"run: cargo build --locked -p aranet-service"),
+            "the {name} job must build the binary it checks, with the committed \
+             Cargo.lock: {lines:#?}"
+        );
+        assert!(
+            lines.contains(&r#"toolchain: "1.90""#),
+            "the {name} job must build with Rust 1.90, the MSRV: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("permissions:")),
+            "the {name} job must keep the workflow's read-only token: a `permissions:` \
+             block of its own could give its steps, which run `sudo`, a token that writes"
+        );
+    }
+
+    let text = read("scripts/ci/check-systemd-install.sh");
+    let script: Vec<&str> = text
+        .lines()
+        .map(|line| strip_comment(line).trim())
+        .collect();
+
+    // Without errexit and pipefail a failing command, such as `systemd-analyze
+    // security` over its threshold in front of `| tail`, would not stop the script.
+    assert!(
+        script.contains(&"set -euo pipefail"),
+        "the script must run under `set -euo pipefail`"
+    );
+    assert_eq!(
+        block(&script, "fail() {", "}").last(),
+        Some(&"exit 1"),
+        "`fail` must end with `exit 1`. With `exit 0` there, a failed check would end \
+         the script as a success"
+    );
+    // The EXIT trap replaces the script's exit status with its own.
+    let on_exit = block(&script, "on_exit() {", "}");
+    assert_eq!(
+        (on_exit.first(), on_exit.last()),
+        (Some(&"local status=$?"), Some(&r#"exit "$status""#)),
+        "the EXIT trap must end with the status the script was exiting with: {on_exit:#?}"
+    );
+    assert!(
+        script.contains(&"trap on_exit EXIT"),
+        "the script must install `on_exit` as its EXIT trap"
+    );
+
+    let scored: Vec<&&str> = script
+        .iter()
+        .filter(|line| line.starts_with("systemd-analyze security "))
+        .collect();
+    assert!(
+        !scored.is_empty() && scored.iter().all(|line| line.contains(" --threshold=50 ")),
+        "`systemd-analyze security` must run with `--threshold=50`, an exposure of at \
+         most 5.0: {scored:#?}"
+    );
+    assert!(
+        script
+            .iter()
+            .any(|line| line.starts_with(r#"[ "$user" = aranet ] || fail "#)),
+        "the script must fail unless the service's main process runs as `aranet`"
+    );
+    assert!(
+        block(
+            &script,
+            r#"if "$home_copy" service install 2> "$work/refusal.err"; then"#,
+            "fi"
+        )
+        .first()
+        .is_some_and(|line| line.starts_with("fail ")),
+        "the script must fail when `service install` accepts the copy of the binary \
+         in the invoking user's home directory"
     );
 }
