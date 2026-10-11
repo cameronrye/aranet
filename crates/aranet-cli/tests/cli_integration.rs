@@ -138,7 +138,15 @@ impl TestEnv {
 
     /// Run `aranet` in this environment, failing the test if it runs too long.
     fn run(&self, args: &[&str]) -> Output {
-        let mut child = self.command(args).spawn().expect("failed to start aranet");
+        self.run_with(args, |_| {})
+    }
+
+    /// [`TestEnv::run`], after `change` has adjusted the command: its working directory, or
+    /// a variable that [`TestEnv::command`] set.
+    fn run_with(&self, args: &[&str], change: impl FnOnce(&mut Command)) -> Output {
+        let mut command = self.command(args);
+        change(&mut command);
+        let mut child = command.spawn().expect("failed to start aranet");
         let stdout = read_in_background(child.stdout.take().expect("stdout is piped"));
         let stderr = read_in_background(child.stderr.take().expect("stderr is piped"));
 
@@ -619,6 +627,58 @@ fn test_cache_info() {
         stdout.contains(&expected),
         "expected {expected:?} in {stdout:?}"
     );
+}
+
+/// An empty `ARANET_DATA_DIR` counts as unset. Taken as a path it is the current directory,
+/// which is where the database and `cli-state.toml` would land.
+///
+/// Unix only: on Windows `dirs` ignores the environment, so the platform directory would be
+/// the real one, and a variable can't be set to an empty value there.
+#[cfg(unix)]
+#[test]
+fn test_empty_data_dir_variable_counts_as_unset() {
+    let env = TestEnv::new();
+    let home = env.root.path().join("home");
+    let cwd = env.root.path().join("cwd");
+    fs::create_dir_all(&cwd).expect("working dir");
+    let run = |args: &[&str]| {
+        env.run_with(args, |command| {
+            command.env("ARANET_DATA_DIR", "").current_dir(&cwd);
+        })
+    };
+
+    // `cache devices` opens the database, which creates it.
+    let output = run(&["cache", "devices"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let left_behind: Vec<_> = fs::read_dir(&cwd)
+        .expect("read working dir")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .collect();
+    assert!(
+        left_behind.is_empty(),
+        "files were created in the working directory: {left_behind:?}"
+    );
+
+    // It is in the platform data directory instead, which `HOME` puts under the test's root.
+    let output = run(&["cache", "info"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    let db_path = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Database path: "))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("no database path in {stdout:?}"));
+    assert!(
+        db_path.starts_with(&home) && db_path.ends_with("aranet/data.db"),
+        "the database is not in the platform data directory under {}: {}",
+        home.display(),
+        db_path.display()
+    );
+    assert!(db_path.exists(), "{} was not created", db_path.display());
 }
 
 #[test]
