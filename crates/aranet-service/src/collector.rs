@@ -859,7 +859,7 @@ mod notifications {
         /// Alert on `reading` from the device at `address`, titled with `name`,
         /// unless it reaches no threshold in `config`, the device's cooldown is
         /// still running, or its last `show()` hasn't returned. Returns true
-        /// when an alert was dispatched.
+        /// when an alert was dispatched, which is also logged at info.
         ///
         /// The cooldown starts when the alert is dispatched, so a `show()` that
         /// fails or hangs isn't retried on every poll. `show()` runs on Tokio's
@@ -903,6 +903,11 @@ mod notifications {
 
             let title = format!("Aranet Alert: {name}");
             let show = Arc::clone(&self.show);
+            // At info: this is at most one line per device per cooldown, and
+            // on macOS a `show()` that delivers nothing reports no error, so
+            // without it the log can't tell an alert that was sent from one
+            // the thresholds or the cooldown held back.
+            tracing::info!("Sending desktop notification for {address}");
             // show() blocks: a D-Bus round trip on Linux, synchronous system
             // calls on macOS and Windows. Keep it off the async workers.
             tokio::task::spawn_blocking(move || {
@@ -1205,6 +1210,33 @@ mod notifications {
                 "device A got no alert after its show() returned"
             );
             assert_eq!(next_alert(&mut alerts).await.0, "Aranet Alert: Office");
+        }
+
+        /// On macOS notify-rust drops delivery errors, so this line is what
+        /// tells an alert that was sent and never appeared from one that the
+        /// thresholds or the cooldown held back.
+        #[tokio::test]
+        async fn dispatched_alert_is_logged_at_info() {
+            let (show, mut alerts) = recording_show();
+            let notifier = Notifier::with_show(show);
+            let config = enabled();
+            let reading = reading_with_co2(1500);
+            let (logs, _guard) = crate::test_support::CapturedLogs::start();
+
+            assert!(notifier.maybe_notify(A, "Office", &reading, &config));
+            next_alert(&mut alerts).await;
+            wait_for_show_job(&notifier, A).await;
+            // Held back by the cooldown: nothing is sent, and nothing says so.
+            assert!(!notifier.maybe_notify(A, "Office", &reading, &config));
+
+            let text = logs.text();
+            let sent: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains(&format!("Sending desktop notification for {A}")))
+                .collect();
+            assert_eq!(sent.len(), 1, "{text}");
+            // The default filter shows this crate at info and hides debug.
+            assert!(sent[0].contains(" INFO "), "{text}");
         }
 
         #[test]
