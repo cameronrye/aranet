@@ -321,9 +321,14 @@ pub struct LoadedConfig {
 }
 
 /// Default log directives for the service binaries: request/response tracing at
-/// debug, everything else in this crate at info. Shared by `init_tracing()` and
-/// its tests so the tests exercise the same filter production runs under.
-const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug";
+/// debug, everything else in this crate at info, and `aranet-store` at warn.
+/// The store writes the config file, and warns when it can't make a file that
+/// holds an API key owner-only. Shared by `init_tracing()` and its tests so
+/// the tests exercise the same filter production runs under.
+///
+/// Each directive replaces a `RUST_LOG` directive for exactly its target: a
+/// known limit, so `RUST_LOG=aranet_store=debug`, for example, has no effect.
+const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug,aranet_store=warn";
 
 /// How long shutdown waits for background tasks after signalling them to
 /// stop, before aborting the ones left.
@@ -914,9 +919,46 @@ mod tests {
             .expect("init_tracing() failed to build its EnvFilter");
         let directives = filter.to_string();
         assert!(
-            directives.contains("aranet_service=info") && directives.contains("tower_http=debug"),
+            directives.contains("aranet_service=info")
+                && directives.contains("tower_http=debug")
+                && directives.contains("aranet_store=warn"),
             "default directives missing from filter: {directives}"
         );
+    }
+
+    /// `aranet-store` writes the config file for the service, and warns when
+    /// it can't make a file that holds an API key owner-only. The Docker
+    /// image, both compose files and the launchd plist set
+    /// `RUST_LOG=aranet_service=info`, which on its own turns every other
+    /// target off.
+    #[test]
+    fn store_warnings_reach_the_service_log() {
+        crate::test_support::register_silent_dispatcher();
+        for rust_log in ["", "aranet_service=info"] {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let filter = with_default_directives(tracing_subscriber::EnvFilter::new(rust_log))
+                .expect("the default directives parse");
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            tracing::warn!(target: "aranet_store::toml_file", "a store warning");
+            tracing::info!(target: "aranet_store::toml_file", "a store info line");
+
+            let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains("WARN aranet_store::toml_file: a store warning"),
+                "RUST_LOG={rust_log:?}: {logs}"
+            );
+            assert!(
+                !logs.contains("a store info line"),
+                "RUST_LOG={rust_log:?}: {logs}"
+            );
+        }
     }
 
     /// A config that monitors one device every 60 s.
