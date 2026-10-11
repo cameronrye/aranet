@@ -209,7 +209,10 @@ async fn run_webhook_dispatcher(
     let cooldown = Duration::from_secs(config.cooldown_secs);
 
     // When each (device_id, event) last reached an endpoint, for the cooldown.
-    let mut last_alert: HashMap<AlertKey, OffsetDateTime> = HashMap::new();
+    // On the monotonic clock: measured on the wall clock, a clock that is set
+    // back (a manual correction, a resumed virtual machine) would hold every
+    // alert of a device that alerted recently back for that long.
+    let mut last_alert: HashMap<AlertKey, tokio::time::Instant> = HashMap::new();
     // Alerts being delivered, by the task delivering them.
     let mut deliveries: JoinSet<bool> = JoinSet::new();
     let mut in_flight: HashMap<tokio::task::Id, AlertKey> = HashMap::new();
@@ -232,7 +235,7 @@ async fn run_webhook_dispatcher(
                 };
                 if let Some((device_id, event)) = in_flight.remove(&id) {
                     if delivered {
-                        last_alert.insert((device_id, event), OffsetDateTime::now_utc());
+                        last_alert.insert((device_id, event), tokio::time::Instant::now());
                     } else {
                         warn!(
                             "All webhook deliveries failed for {} alert on {}",
@@ -246,22 +249,19 @@ async fn run_webhook_dispatcher(
                     Ok(event) => {
                         let alias = configured_alias(&state, &event.device_id).await;
                         let alerts = evaluate_thresholds(&config, &event, alias);
-                        let now = OffsetDateTime::now_utc();
-                        let cooldown_duration = time::Duration::try_from(cooldown)
-                            .unwrap_or(time::Duration::seconds(300));
 
                         for payload in alerts {
                             let key = (payload.device_id.clone(), payload.event.clone());
 
                             // Check cooldown
                             if let Some(last) = last_alert.get(&key) {
-                                let elapsed = now - *last;
-                                if elapsed < cooldown_duration {
+                                let elapsed = last.elapsed();
+                                if elapsed < cooldown {
                                     debug!(
                                         "Skipping {} alert for {} (cooldown: {}s remaining)",
                                         payload.event,
                                         payload.device_id,
-                                        (cooldown_duration - elapsed).whole_seconds()
+                                        cooldown.saturating_sub(elapsed).as_secs()
                                     );
                                     continue;
                                 }
