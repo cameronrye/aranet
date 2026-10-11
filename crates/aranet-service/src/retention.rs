@@ -1,8 +1,10 @@
 //! Optional data retention (`[storage.retention]`).
 //!
 //! With a limit set, [`spawn`] starts a task that deletes readings and cached
-//! history older than the limit at startup and then every hour. Retention is
-//! off by default: the database is shared with the CLI's history cache, and
+//! history older than the limit at startup and then every hour. The limits
+//! apply to every row, whoever stored it. Retention is off by default: unless
+//! the service has its own database, it shares it with the readings that the
+//! `aranet` CLI, TUI and GUI store and with the CLI's history cache, and
 //! aranet keeps data until the user deletes it.
 //!
 //! Rows are deleted [`PRUNE_BATCH_ROWS`] at a time, each batch its own store
