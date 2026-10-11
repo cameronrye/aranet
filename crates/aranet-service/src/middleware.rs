@@ -563,6 +563,10 @@ pub async fn origin_guard(
 /// spent, with `Retry-After` in whole seconds, rounded up.
 /// `config.rate_limit_enabled` switches it on; the limits are the ones `state`
 /// was created with.
+///
+/// A request without a peer address (no [`ConnectInfo`], which
+/// `into_make_service_with_connect_info` supplies) gets 500 Internal Server
+/// Error, whether rate limiting is on or off.
 pub async fn rate_limit(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     State((config, state)): State<(Arc<SecurityConfig>, Arc<RateLimitState>)>,
@@ -1095,6 +1099,37 @@ mod tests {
         let limited = get_from(&app, "192.0.2.1").await;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(limited.headers()["x-ratelimit-limit"], "1");
+    }
+
+    #[test]
+    fn default_state_has_the_default_configs_limits() {
+        let default = RateLimitState::default();
+        let from_config = RateLimitState::new(&SecurityConfig::default());
+        assert_eq!(default.limit, from_config.limit);
+        assert_eq!(default.period, from_config.period);
+        assert_eq!(default.max_entries, from_config.max_entries);
+
+        // The documented defaults: 100 requests per 60 s, and requests sweep
+        // above 10000 tracked clients.
+        assert_eq!(default.limit, 100);
+        assert_eq!(default.period, Duration::from_millis(600));
+        assert_eq!(default.max_entries, 10_000);
+    }
+
+    #[tokio::test]
+    async fn request_without_a_peer_address_gets_500_with_rate_limiting_on_or_off() {
+        // `run()` gives every request its peer address. One that reaches
+        // `rate_limit` without it is refused, never let through unlimited.
+        let mut statuses = Vec::new();
+        for rate_limit_enabled in [true, false] {
+            let app = rate_limited_app(SecurityConfig {
+                rate_limit_enabled,
+                ..Default::default()
+            });
+            let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+            statuses.push(app.oneshot(request).await.unwrap().status());
+        }
+        assert_eq!(statuses, [StatusCode::INTERNAL_SERVER_ERROR; 2]);
     }
 
     #[test]
