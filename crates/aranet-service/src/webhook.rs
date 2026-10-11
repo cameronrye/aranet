@@ -68,7 +68,7 @@ use tracing::{debug, info, warn};
 
 use crate::DropLog;
 use crate::config::{WebhookConfig, WebhookEndpoint};
-use crate::redact::{read_error_body, redact_url};
+use crate::redact::{error_chain, read_error_body, redact_url};
 use crate::state::{AppState, ReadingEvent};
 
 /// Webhook dispatcher that monitors readings and fires alerts.
@@ -538,13 +538,15 @@ async fn send_webhook(
 /// Errors that can occur when sending webhooks.
 ///
 /// Their text is safe to log: a request error converted with `From` carries no
-/// URL, and a stored response body keeps only its first 256 characters,
+/// URL, and its text is followed by its causes (a refused connection, a
+/// failed name lookup, a certificate that was not accepted), cut like a
+/// response body. A stored response body keeps only its first 256 characters,
 /// followed by `…` when it was longer (so 257 at most), with line breaks,
 /// control characters and bidi controls replaced by spaces. For a 3xx answer
 /// the body is a fixed text that says the redirect was not followed.
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
-    #[error("Request failed: {0}")]
+    #[error("Request failed: {}", error_chain(.0))]
     Request(#[source] reqwest::Error),
     #[error("Webhook returned error {status}: {body}")]
     Response { status: u16, body: String },
@@ -796,6 +798,17 @@ mod tests {
                 "the endpoint URL leaked into the error: {text}"
             );
         }
+
+        // reqwest's own text is the same for a refused connection, a DNS
+        // failure, an expired certificate and a timeout. The cause follows it.
+        let text = error.to_string();
+        let cause = text
+            .split_once("error sending request")
+            .map(|(_, cause)| cause);
+        assert!(
+            cause.is_some_and(|cause| cause.contains("os error")),
+            "the error does not say why the request failed: {text}"
+        );
     }
 
     #[tokio::test]
