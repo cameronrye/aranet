@@ -1758,13 +1758,10 @@ impl SensorWorker {
         }
 
         match cmd.output() {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let running = stdout.contains("running");
-                // If we got any output without error, it's installed
-                let installed = output.status.success() || stdout.contains("stopped");
-                (installed, running)
-            }
+            Ok(output) => parse_service_status(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+            ),
             Err(_) => (false, false),
         }
     }
@@ -2253,6 +2250,16 @@ async fn background_polling_task(
     }
 }
 
+/// Read the output of `aranet-service service status` (`success` is its exit
+/// status): whether the service is installed, and whether it is running.
+fn parse_service_status(success: bool, stdout: &str) -> (bool, bool) {
+    let running = stdout.contains("is running");
+    // "aranet-service is not installed" comes with exit status 0.
+    let installed = !stdout.contains("not installed")
+        && (success || stdout.contains("stopped") || stdout.contains("running"));
+    (installed, running)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2290,6 +2297,24 @@ mod tests {
         breaker.record_success();
         assert!(!breaker.is_open());
         assert!(breaker.time_until_retry().is_none());
+    }
+
+    #[test]
+    fn parse_service_status_table() {
+        let cases = [
+            (true, "aranet-service is not installed\n", (false, false)),
+            (true, "aranet-service is running\n", (true, true)),
+            (true, "aranet-service is stopped\n", (true, false)),
+            // `service status` itself failed.
+            (false, "", (false, false)),
+        ];
+        for (success, stdout, expected) in cases {
+            assert_eq!(
+                parse_service_status(success, stdout),
+                expected,
+                "{success} {stdout:?}"
+            );
+        }
     }
 
     #[tokio::test]
