@@ -1043,8 +1043,32 @@ mod tests {
 
     const PROGRAM: &str = "/usr/local/bin/aranet-service";
 
+    /// What `hidden_from_service` says about a path with a `..` component.
+    const DOT_DOT: &str = "a path with `..` can't be checked against the directories the unit \
+                           hides; give it without `..`";
+
     fn panicking_program_check(_: &Path) -> Option<String> {
         panic!("only a system-level systemd install checks the program")
+    }
+
+    /// A `canonicalize` for a file system where every path exists and nothing
+    /// is a symlink: each path resolves to itself. It reads nothing.
+    fn no_symlinks(path: &Path) -> std::io::Result<PathBuf> {
+        Ok(path.to_path_buf())
+    }
+
+    /// A `canonicalize` that knows only `entries` of `(path, what it resolves
+    /// to)`. Any other path doesn't exist for it. It reads nothing.
+    fn fake_canonicalize<'a>(
+        entries: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&Path) -> std::io::Result<PathBuf> + 'a {
+        move |path| {
+            entries
+                .iter()
+                .find(|(entry, _)| Path::new(entry) == path)
+                .map(|(_, resolved)| PathBuf::from(resolved))
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
     }
 
     /// Records every call it gets as `"<method> <label>"`, and reports `status`
@@ -1128,7 +1152,7 @@ mod tests {
             PathBuf::from(PROGRAM),
             &aranet_service::RunOptions::default(),
             |_| None,
-            canonical_path,
+            no_symlinks,
         )
         .unwrap()
     }
@@ -1234,7 +1258,7 @@ mod tests {
                 PathBuf::from(PROGRAM),
                 &aranet_service::RunOptions::default(),
                 panicking_program_check,
-                canonical_path,
+                no_symlinks,
             );
             assert!(
                 matches!(result, Err(ServiceError::SystemLevelUnsupported { .. })),
@@ -1248,7 +1272,7 @@ mod tests {
             PathBuf::from(PROGRAM),
             &aranet_service::RunOptions::default(),
             panicking_program_check,
-            canonical_path,
+            no_symlinks,
         )
         .unwrap_err()
         .to_string();
@@ -1277,7 +1301,7 @@ mod tests {
                 program.clone(),
                 &options,
                 panicking_program_check,
-                canonical_path,
+                no_symlinks,
             )
             .unwrap();
             assert_eq!(ctx.label.to_qualified_name(), expected_label, "{kind:?}");
@@ -1297,7 +1321,7 @@ mod tests {
             program.clone(),
             &aranet_service::RunOptions::default(),
             |_| Some("/opt/aranet is owned by uid 1000".to_string()),
-            canonical_path,
+            no_symlinks,
         )
         .unwrap_err();
         assert!(
@@ -1324,7 +1348,7 @@ mod tests {
             PathBuf::from(PROGRAM),
             &aranet_service::RunOptions::default(),
             |_| Some("/usr/local/bin is writable by every user".to_string()),
-            canonical_path,
+            no_symlinks,
         )
         .unwrap_err()
         .to_string();
@@ -1577,7 +1601,7 @@ mod tests {
                 PathBuf::from(PROGRAM),
                 &aranet_service::RunOptions::default(),
                 panicking_program_check,
-                canonical_path,
+                no_symlinks,
             )
             .unwrap_err()
             .to_string();
@@ -1777,6 +1801,80 @@ mod tests {
         }
     }
 
+    /// The sandbox check on a file system that is only a table, so the answers
+    /// are the same on every host and on Windows: paths are compared by their
+    /// components, and nothing is read. The cases with real symlinks are
+    /// `sandbox_paths_are_matched_with_symlinks_resolved_and_dot_dot_is_refused`.
+    #[test]
+    fn sandbox_paths_are_matched_as_the_resolver_resolves_them() {
+        const HOME: &str = "ProtectHome=yes hides /home from the service";
+        const ROOT: &str = "ProtectHome=yes hides /root from the service";
+        const RUN_USER: &str = "ProtectHome=yes hides /run/user from the service";
+        const TMP: &str = "PrivateTmp=yes gives the service its own /tmp";
+
+        // The paths the resolver knows, and what each resolves to. /home is a
+        // symlink to /var/home (as on Fedora Atomic), /var/run one to /run and
+        // /var/tmp one to /tmp. /root and /run/user don't exist.
+        let file_system = [
+            ("/", "/"),
+            ("/etc", "/etc"),
+            ("/etc/aranet", "/var/home/u/aranet"),
+            ("/home", "/var/home"),
+            ("/home/out", "/etc"),
+            ("/run", "/run"),
+            ("/tmp", "/tmp"),
+            ("/usr/local/bin", "/usr/local/bin"),
+            (
+                "/usr/local/bin/aranet-service",
+                "/var/home/u/.cargo/bin/aranet-service",
+            ),
+            ("/var", "/var"),
+            ("/var/home", "/var/home"),
+            ("/var/run", "/run"),
+            ("/var/tmp", "/tmp"),
+        ];
+
+        let cases = [
+            // Outside the hidden directories. Neither the file nor the
+            // directories above it need to exist.
+            ("/etc/server.toml", None),
+            ("/opt/aranet/new/server.toml", None),
+            ("/usr/local/bin/other", None),
+            // In a hidden directory as written: wherever a symlink inside it
+            // leads, and whether or not the directory exists.
+            ("/home/u/server.toml", Some(HOME)),
+            ("/home/out/server.toml", Some(HOME)),
+            ("/root/server.toml", Some(ROOT)),
+            // Through a symlinked directory, also below it where nothing
+            // exists yet, and through a symlinked file.
+            ("/etc/aranet/server.toml", Some(HOME)),
+            ("/etc/aranet/new/dir/server.toml", Some(HOME)),
+            ("/usr/local/bin/aranet-service", Some(HOME)),
+            // A hidden directory that is a symlink, by the name it resolves
+            // to. A name that only starts like that one is another directory.
+            ("/var/home/u/server.toml", Some(HOME)),
+            ("/var/homes/u/server.toml", None),
+            // A hidden directory that doesn't exist is compared as written,
+            // with the resolved path too.
+            ("/var/run/user/1000/server.toml", Some(RUN_USER)),
+            ("/var/run/users/server.toml", None),
+            // /var/tmp resolves to /tmp, which is the earlier of the two in
+            // the list of hidden directories.
+            ("/var/tmp/server.toml", Some(TMP)),
+            // `..` is refused, wherever it leads.
+            ("/etc/../etc/server.toml", Some(DOT_DOT)),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(path, expected)| {
+                let found = hidden_from_service(Path::new(path), fake_canonicalize(&file_system));
+                (found != *expected)
+                    .then(|| format!("{path}: found {found:?}, expected {expected:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Checks that rely on Unix paths: on Windows `/usr/...` isn't absolute.
     #[cfg(unix)]
     mod unix_paths {
@@ -1908,7 +2006,7 @@ mod tests {
                     not_runnable_by_service_with(
                         Path::new(program),
                         fake_stat(&entries),
-                        canonical_path
+                        no_symlinks
                     )
                     .as_deref(),
                     expected,
@@ -1926,14 +2024,13 @@ mod tests {
                     ..aranet_service::RunOptions::default()
                 };
             let refused =
-                |run: aranet_service::RunOptions| match systemd_system_args(&run, canonical_path) {
+                |run: aranet_service::RunOptions| match systemd_system_args(&run, no_symlinks) {
                     Err(ServiceError::InaccessiblePath { path, reason }) => (path, reason),
                     other => panic!("{run:?}: {other:?}"),
                 };
 
             assert_eq!(
-                systemd_system_args(&aranet_service::RunOptions::default(), canonical_path)
-                    .unwrap(),
+                systemd_system_args(&aranet_service::RunOptions::default(), no_symlinks).unwrap(),
                 ["run", "--config", "/var/lib/aranet/server.toml"]
             );
             assert_eq!(
@@ -1943,7 +2040,7 @@ mod tests {
                         no_collector: true,
                         ..aranet_service::RunOptions::default()
                     },
-                    canonical_path
+                    no_symlinks
                 )
                 .unwrap(),
                 [
@@ -1961,7 +2058,7 @@ mod tests {
                         Some("/etc/aranet/server.toml"),
                         Some("/var/lib/aranet/a.db")
                     ),
-                    canonical_path
+                    no_symlinks
                 )
                 .unwrap(),
                 [
@@ -1993,12 +2090,12 @@ mod tests {
             // A relative config is made absolute. Where the working directory is
             // under /home (GitHub's Linux runners), the result is then refused.
             let expected = env::current_dir().unwrap().join("server.toml");
-            match systemd_system_args(&options(Some("server.toml"), None), canonical_path) {
+            match systemd_system_args(&options(Some("server.toml"), None), no_symlinks) {
                 Ok(args) => assert_eq!(args[2], expected.into_os_string()),
                 Err(ServiceError::InaccessiblePath { path, .. }) => {
                     assert_eq!(path, expected);
                     assert!(
-                        hidden_from_service(&expected, canonical_path).is_some(),
+                        hidden_from_service(&expected, no_symlinks).is_some(),
                         "{path:?}"
                     );
                 }
@@ -2033,7 +2130,7 @@ mod tests {
             );
 
             let unrunnable = |program: &str, entries: &[Entry]| {
-                not_runnable_by_service_with(Path::new(program), fake_stat(entries), canonical_path)
+                not_runnable_by_service_with(Path::new(program), fake_stat(entries), no_symlinks)
             };
             assert_eq!(
                 unrunnable(PROGRAM, &chain(&[("/usr", 0, 0, 0o40750)])).as_deref(),
@@ -2078,7 +2175,7 @@ mod tests {
             ];
             for (path, reason) in hidden {
                 assert_eq!(
-                    hidden_from_service(Path::new(path), canonical_path),
+                    hidden_from_service(Path::new(path), no_symlinks),
                     Some(reason),
                     "{path}"
                 );
@@ -2096,7 +2193,7 @@ mod tests {
                 PROGRAM,
             ] {
                 assert_eq!(
-                    hidden_from_service(Path::new(path), canonical_path),
+                    hidden_from_service(Path::new(path), no_symlinks),
                     None,
                     "{path}"
                 );
@@ -2117,7 +2214,7 @@ mod tests {
                     config: Some(PathBuf::from(config)),
                     ..aranet_service::RunOptions::default()
                 };
-                match systemd_system_args(&options, canonical_path) {
+                match systemd_system_args(&options, no_symlinks) {
                     Err(ServiceError::InaccessiblePath { path, reason }) => {
                         assert_eq!((path.as_path(), reason), (Path::new(config), expected));
                     }
@@ -2133,7 +2230,7 @@ mod tests {
                         database: Some(PathBuf::from(database)),
                         ..aranet_service::RunOptions::default()
                     },
-                    canonical_path,
+                    no_symlinks,
                 )
             };
             for database in ["/var/lib/aranet/data.db", "/var/lib/aranet/old/data.db"] {
@@ -2167,9 +2264,6 @@ mod tests {
         #[test]
         fn sandbox_paths_are_matched_with_symlinks_resolved_and_dot_dot_is_refused() {
             use std::os::unix::fs::symlink;
-
-            const DOT_DOT: &str = "a path with `..` can't be checked against the directories the \
-                                   unit hides; give it without `..`";
 
             // The roots live in a TempDir: `home` is a directory, `root` is a
             // symlink to `real-root` (Fedora Atomic links /home and /root into
@@ -2226,6 +2320,8 @@ mod tests {
                 ("real-root2/server.toml", None),
                 ("run/users/server.toml", None),
             ];
+            // The only test that resolves paths on the real file system: these
+            // directories and symlinks are on disk.
             let wrong: Vec<String> = cases
                 .iter()
                 .filter_map(|(path, expected)| {
@@ -2243,7 +2339,7 @@ mod tests {
                         config: Some(PathBuf::from(config)),
                         ..aranet_service::RunOptions::default()
                     },
-                    canonical_path,
+                    no_symlinks,
                 )
                 .expect_err(config);
                 assert!(
