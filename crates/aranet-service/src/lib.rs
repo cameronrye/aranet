@@ -358,6 +358,8 @@ fn with_default_directives(
 
 /// Request span that records the path only. The default span records the full
 /// URI, which would write `/api/ws?token=<API key>` into the service logs.
+/// The sender chooses the path, so it is recorded as one line of bounded
+/// length (`sanitize_log_text`).
 ///
 /// The target is set to `tower_http::trace::make_span` — the target
 /// `TraceLayer`'s own default span uses — so the `tower_http=debug` directive in
@@ -370,7 +372,7 @@ fn request_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Spa
         target: "tower_http::trace::make_span",
         "request",
         method = %request.method(),
-        path = %request.uri().path(),
+        path = %redact::sanitize_log_text(request.uri().path()),
         version = ?request.version(),
     )
 }
@@ -910,6 +912,42 @@ mod tests {
             !logs.contains("supersecret"),
             "query string leaked into logs: {logs}"
         );
+    }
+
+    /// The span's `path` field is in front of every line logged for a
+    /// request, at the production filter, and the sender chooses the path.
+    #[tokio::test]
+    async fn test_request_span_shows_a_sanitised_bounded_path() {
+        crate::test_support::register_silent_dispatcher();
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let filter = tracing_subscriber::EnvFilter::new(DEFAULT_LOG_DIRECTIVES);
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // A bidi override, then enough to flood a log line.
+        let path = format!("/\u{202e}{}", "a".repeat(399));
+        let app = Router::new()
+            .fallback(|| async { "ok" })
+            .layer(TraceLayer::new_for_http().make_span_with(request_span));
+        let response = app
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let shown = format!("path=/ {}… ", "a".repeat(254));
+        assert!(
+            logs.contains(&shown),
+            "the path was not logged as cut: {logs}"
+        );
+        assert!(!logs.contains('\u{202e}'), "{logs:?}");
+        assert!(!logs.contains(&"a".repeat(255)), "{logs}");
     }
 
     #[test]

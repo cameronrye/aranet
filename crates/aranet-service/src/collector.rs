@@ -93,6 +93,7 @@ use aranet_store::StoredReading;
 use aranet_types::CurrentReading;
 
 use crate::config::DeviceConfig;
+use crate::redact::sanitize_log_text;
 use crate::state::{AppState, DeviceCollectionStats, ReadingEvent};
 
 /// Per-device stagger interval to avoid BLE adapter contention on startup.
@@ -614,7 +615,12 @@ async fn collect_device(
             // Cancelled while waiting for the Bluetooth adapter.
             Ok(None) => break,
             Err(e) => Err(format!("poll task failed: {e}")),
-        };
+        }
+        // The error's text can quote the names of Bluetooth devices in range
+        // ("did you mean …"), which whoever is in range chooses. It is logged
+        // below and served as `last_error`, so it is made one line of bounded
+        // length first.
+        .map_err(|text| sanitize_log_text(&text));
 
         match result {
             Ok((read_started, reading)) => {
@@ -2066,6 +2072,46 @@ mod tests {
             error.contains("timed out"),
             "unexpected last_error: {error}"
         );
+    }
+
+    /// aranet-core's "did you mean …" error quotes the names of the Bluetooth
+    /// devices in range, which whoever is in range chooses. The text is
+    /// logged, and `/api/status` serves it as `last_error`.
+    #[tokio::test(start_paused = true)]
+    async fn failed_poll_error_is_one_bounded_line_in_the_log_and_the_stats() {
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+        let (t, reader, collector) = fake_collector(vec![device(A, 60)]);
+        let forged = format!("Aranet4 17C3C\nforged \u{202e}{}", "x".repeat(400));
+        reader.set_not_found(A, &forged);
+        assert_eq!(collector.start().await, CollectorStartResult::Started);
+        reader.wait_for_reads(1).await;
+        settle().await;
+
+        let error = stat(&t, A).await.last_error.unwrap_or_default();
+        assert!(
+            error.starts_with("Failed to connect: ") && error.contains("Aranet4 17C3C forged  x"),
+            "{error:?}"
+        );
+        assert!(
+            !error.contains('\n') && !error.contains('\u{202e}'),
+            "{error:?}"
+        );
+        assert_eq!(error.chars().count(), 257, "{error:?}");
+        assert!(error.ends_with('…'), "{error:?}");
+
+        let text = logs.text();
+        assert!(!text.contains('\u{202e}'), "{text:?}");
+        let line = text
+            .lines()
+            .find(|line| line.contains(&format!("Failed to poll {A}: ")))
+            .unwrap_or_default();
+        assert!(
+            line.contains("Aranet4 17C3C forged  x")
+                && line.ends_with("… (attempt 1); next attempt in 60s"),
+            "the failed poll's line is not one line that ends with the attempt: {text:?}"
+        );
+
+        collector.stop().await;
     }
 
     #[tokio::test(start_paused = true)]
