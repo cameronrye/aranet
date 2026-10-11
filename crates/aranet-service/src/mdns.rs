@@ -159,8 +159,10 @@ fn first_label(hostname: &str) -> Option<String> {
 }
 
 /// Whether to advertise a service whose listener is bound to `bound`: only a
-/// listener that isn't loopback, with API-key authentication on. An unspecified
-/// address (`0.0.0.0`, `[::]`) is advertised with every interface's addresses.
+/// listener that isn't loopback, with API-key authentication on. Whatever
+/// address it is bound to, an unspecified one (`0.0.0.0`, `[::]`) or one
+/// interface's, the service is announced with every interface's addresses,
+/// those it doesn't listen on included.
 pub(crate) fn should_advertise(bound: SocketAddr, security: &SecurityConfig) -> bool {
     !bound.ip().to_canonical().is_loopback() && security.api_key_enabled
 }
@@ -209,7 +211,8 @@ pub(crate) fn mdns_instance_name(hostname: &str) -> String {
 }
 
 /// Service info for `instance_name` under this machine's `hostname`, as the
-/// OS reports it, with the addresses of every interface.
+/// OS reports it, with the addresses of every interface, whatever address the
+/// listener is bound to.
 fn build_service_info(
     service_type: &str,
     instance_name: &str,

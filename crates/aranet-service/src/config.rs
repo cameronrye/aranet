@@ -80,9 +80,10 @@ impl Config {
     /// differ from what the file holds.
     ///
     /// Comments, key order and keys this version doesn't know are kept, and
-    /// settings still at their defaults are not added. The file is replaced
-    /// atomically and is readable only by its owner (0600 on Unix). A file that
-    /// doesn't parse is an error and is left unchanged.
+    /// settings still at their defaults are not added. A missing file is
+    /// created only when something differs from the defaults. The file is
+    /// replaced atomically and is readable only by its owner (0600 on Unix). A
+    /// file that doesn't parse is an error and is left unchanged.
     ///
     /// Everything in `self` that differs from the file is written, including
     /// command-line overrides held in a running configuration. A running service
@@ -451,6 +452,8 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allow_unauthenticated_network: bool,
     /// Enable rate limiting, per client: an IPv4 address or an IPv6 /64.
+    /// IPv6 clients on one network share one budget, and so do all
+    /// link-local clients (`fe80::/64`): each group is one /64.
     pub rate_limit_enabled: bool,
     /// Requests a client may send at once. After that, one more request is
     /// allowed every `rate_limit_window_secs / rate_limit_requests`, so a
@@ -493,6 +496,8 @@ pub struct SecurityConfig {
     /// refused with `421 Misdirected Request`, so a web page can't reach the
     /// service through DNS rebinding. `localhost` and `*.localhost`, IP
     /// addresses, this machine's name and `<name>.local` are always allowed.
+    /// This machine's name is the first label of its host name (`server1` for
+    /// `server1.example.com`), so a fully qualified name has to be listed.
     /// List bare host names, without scheme, port, spaces or wildcards: for
     /// example `["aranet-service"]` for a Docker Compose service name.
     /// `["*"]` disables the check; the service warns about it at startup.
@@ -876,7 +881,9 @@ fn is_forbidden_text_char(c: char) -> bool {
 ///
 /// Backslashes are refused because InfluxDB 1.x and 2.x can't store one in a
 /// tag faithfully: they keep an escaped `\\` as two backslashes, and they read a
-/// separator after any backslash as escaped.
+/// separator after any backslash as escaped. InfluxDB 3 Core also stores a
+/// value that ends in a backslash wrongly. The [`crate::influxdb`] module docs
+/// have what was measured on each.
 fn validate_device_text(field: String, what: &str, value: &str, errors: &mut Vec<ValidationError>) {
     if value.chars().any(is_forbidden_text_char) {
         errors.push(ValidationError {
@@ -970,10 +977,10 @@ impl DeviceConfig {
 pub struct NotificationConfig {
     /// Whether desktop notifications are enabled.
     pub enabled: bool,
-    /// CO2 threshold in ppm (notify when exceeded).
+    /// CO2 threshold in ppm (notify when reached or exceeded).
     #[serde(default = "default_co2_threshold")]
     pub co2_threshold: u16,
-    /// Radon threshold in Bq/m³ (notify when exceeded).
+    /// Radon threshold in Bq/m³ (notify when reached or exceeded).
     #[serde(default = "default_radon_threshold")]
     pub radon_threshold: u32,
     /// Minimum interval between notifications per device (in seconds).
@@ -1205,7 +1212,9 @@ impl InfluxDbConfig {
                     );
                 }
                 // InfluxDB 1.x and 2.x can't store a backslash in a measurement
-                // faithfully (see `validate_device_text`).
+                // faithfully, and 3 Core also stores one that ends in a
+                // backslash wrongly (see `validate_device_text` and the
+                // `influxdb` module docs).
                 if self.measurement.contains('\\') {
                     validate!(
                         errors,
@@ -1277,10 +1286,11 @@ fn config_file_error(path: &Path, error: aranet_store::TomlFileError) -> ConfigE
         TomlFileError::Parse { path, source } => ConfigError::Parse { path, source },
         TomlFileError::Serialize(source) => ConfigError::Serialize(source),
         TomlFileError::Write { path, source } => ConfigError::Write { path, source },
-        // `TomlFileError` is `#[non_exhaustive]`.
+        // `TomlFileError` is `#[non_exhaustive]`. The error itself, not its
+        // text, so a future variant keeps its chain of sources.
         other => ConfigError::Write {
             path: path.to_path_buf(),
-            source: std::io::Error::other(other.to_string()),
+            source: std::io::Error::other(other),
         },
     }
 }

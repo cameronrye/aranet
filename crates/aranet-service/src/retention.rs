@@ -10,10 +10,11 @@
 //! Rows are deleted [`PRUNE_BATCH_ROWS`] at a time, each batch its own store
 //! write on the blocking pool. The writer lock is first-come first-served, so
 //! a collector insert that queues during a batch runs before the next batch,
-//! and other processes never wait long for the database. After shutdown is
-//! signalled, no new batch starts, so a long first pass doesn't hold up a
-//! restart. The service never runs `VACUUM`, so the file stops growing but
-//! doesn't shrink.
+//! and other processes can take the database's write lock between batches.
+//! (Nothing puts another process next in line: that it gets the lock in time
+//! holds by timing, not by construction.) After shutdown is signalled, no new
+//! batch starts, so a long first pass doesn't hold up a restart. The service
+//! never runs `VACUUM`, so the file stops growing but doesn't shrink.
 
 use std::sync::Arc;
 use std::time::Duration;

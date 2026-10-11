@@ -76,7 +76,8 @@
 //! api_key = "your-secure-random-key-at-least-32-chars"
 //!
 //! # Rate limit each IPv4 address or IPv6 /64: a burst of 100 requests, then
-//! # one more every 60 / 100 seconds
+//! # one more every 60 / 100 seconds. IPv6 clients on one network share one
+//! # budget, and so do all link-local clients: each group is one /64.
 //! rate_limit_enabled = true
 //! rate_limit_requests = 100   # burst size, and requests per window
 //! rate_limit_window_secs = 60 # time to refill the whole burst (at most 86400)
@@ -537,6 +538,12 @@ fn prepare_config(options: &RunOptions, save_generated_key: bool) -> anyhow::Res
     if let Some(key) = generated_key {
         // Only this key is written: comments, other settings and the
         // --bind/--database overrides are left as they are.
+        //
+        // The save error is flattened to its `Display` text on purpose.
+        // Attached as a source, `main`'s `Error: {:?}` would print its whole
+        // chain, and when the save was refused because its text did not read
+        // back, that chain holds a parse error that quotes a line of the
+        // rendered file: possibly the `api_key` line, with the new key.
         Config::update_file(&path, |file| file.security.api_key = Some(key)).map_err(|e| {
             anyhow::anyhow!(
                 "authentication is enabled but security.api_key is not set, and a generated key \

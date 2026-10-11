@@ -21,6 +21,11 @@ pub fn router() -> Router<Arc<AppState>> {
 /// `Referer` header of the requests the page makes. `Cache-Control: no-store`
 /// keeps the browser from storing the response under that URL in its HTTP
 /// cache, where it would outlive the script's clean-up of the address bar.
+///
+/// `no-referrer` also makes browsers send `Origin: null` on a POST from the
+/// page that isn't a CORS request, such as a form, and the origin guard
+/// refuses `null`. The page makes only GET requests and a WebSocket
+/// connection today.
 async fn dashboard_page() -> impl IntoResponse {
     (
         [
