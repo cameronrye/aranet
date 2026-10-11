@@ -63,7 +63,7 @@ async fn reset_manager() {
 }
 
 use crate::error::{Error, Result};
-use crate::util::create_identifier;
+use crate::util::{create_identifier, peripheral_name};
 use crate::uuid::{MANUFACTURER_ID, SAF_TEHNIKA_SERVICE_NEW, SAF_TEHNIKA_SERVICE_OLD};
 use aranet_types::DeviceType;
 
@@ -532,7 +532,7 @@ async fn process_peripheral(
 
     let id = peripheral.id();
     let address = properties.address.to_string();
-    let name = properties.local_name.clone();
+    let name = peripheral_name(&properties).map(str::to_owned);
     let rssi = properties.rssi;
 
     // Check if this is an Aranet device
@@ -586,7 +586,7 @@ fn is_aranet_device(properties: &btleplug::api::PeripheralProperties) -> bool {
     }
 
     // Check device name for Aranet
-    if let Some(name) = &properties.local_name {
+    if let Some(name) = peripheral_name(properties) {
         let name_lower = name.to_lowercase();
         if name_lower.contains("aranet") {
             return true;
@@ -879,7 +879,9 @@ struct KnownPeripheral {
     peripheral_id: String,
     /// The Bluetooth address; `00:00:00:00:00:00` on macOS.
     address: String,
-    /// The advertised name.
+    /// The device's name as `peripheral_name` gives it: the advertised name,
+    /// or on macOS CoreBluetooth's own name for a peripheral that advertised
+    /// none.
     name: Option<String>,
 }
 
@@ -1046,7 +1048,7 @@ async fn search_known_peripherals(adapter: &Adapter, query: &str) -> Result<Sear
                 identifier: create_identifier(&address, &id),
                 peripheral_id: id.to_string(),
                 address,
-                name: props.local_name,
+                name: peripheral_name(&props).map(str::to_owned),
             });
             peripherals.push(peripheral);
         }
@@ -1623,6 +1625,38 @@ mod tests {
             })) => assert_eq!(identifier, "Aranet4 12345"),
             other => panic!("attempt 3 of 3: {other:?}"),
         }
+    }
+
+    // ==================== Aranet Detection Tests ====================
+
+    /// Properties that carry nothing but the two names btleplug reports.
+    fn named(local_name: &str, advertisement_name: &str) -> btleplug::api::PeripheralProperties {
+        btleplug::api::PeripheralProperties {
+            local_name: Some(local_name.to_string()),
+            advertisement_name: Some(advertisement_name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_aranet_device_recognises_a_sensor_by_its_name_alone() {
+        // No manufacturer data and no service: the name is all there is. Both
+        // fields hold it, as every backend reports a named sensor that has no
+        // BlueZ alias, so the answer is the same on every host.
+        assert!(is_aranet_device(&named("Aranet4 12345", "Aranet4 12345")));
+        assert!(is_aranet_device(&named("ARANET2 2751B", "ARANET2 2751B")));
+        assert!(!is_aranet_device(&named("Standing desk", "Standing desk")));
+        let unnamed = btleplug::api::PeripheralProperties::default();
+        assert!(!is_aranet_device(&unnamed));
+    }
+
+    #[test]
+    fn is_aranet_device_takes_the_name_from_peripheral_name() {
+        // As BlueZ reports a sensor that the user has renamed: the first name
+        // is the alias, the second the sensor's own.
+        assert!(is_aranet_device(&named("Kitchen", "Aranet4 12345")));
+        // A device that the user has named after a sensor is not one.
+        assert!(!is_aranet_device(&named("Aranet shelf", "Standing desk")));
     }
 
     // ==================== Device Lookup Tests ====================

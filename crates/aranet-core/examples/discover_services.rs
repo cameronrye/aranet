@@ -77,7 +77,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             std::process::exit(1);
         }
     };
-    let name = p.properties().await?.and_then(|props| props.local_name);
+    let name = p
+        .properties()
+        .await?
+        .as_ref()
+        .and_then(aranet_core::peripheral_name)
+        .map(str::to_owned);
 
     println!("\nFound: {}", name.as_deref().unwrap_or(&identifier));
 

@@ -1468,7 +1468,9 @@ async fn known_peripheral(device: &str) -> Option<btleplug::platform::Peripheral
             .await
             .ok()
             .flatten()
-            .and_then(|props| props.local_name);
+            .as_ref()
+            .and_then(aranet_core::peripheral_name)
+            .map(str::to_owned);
         let id = aranet_core::create_identifier(&p.address().to_string(), &p.id());
         let is_device = |n: &str| {
             n.eq_ignore_ascii_case(device)
