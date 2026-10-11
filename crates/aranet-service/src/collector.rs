@@ -56,7 +56,10 @@
 //! A poll that overruns its interval is followed by one poll straight away, and
 //! the interval counts from there
 //! ([`MissedTickBehavior::Delay`](tokio::time::MissedTickBehavior::Delay)), so
-//! missed ticks never fire back to back.
+//! missed ticks never fire back to back. A poll that waited a whole interval
+//! or longer for the Bluetooth adapter, behind another device's poll, is not
+//! followed by one straight away: the sensor was read only just now, so the
+//! interval counts from the start of that read.
 //!
 //! Failures are logged at WARN for the first three attempts, at ERROR on the
 //! fourth ("reducing log frequency") and on every 12th after that (about hourly
@@ -549,6 +552,8 @@ async fn watch_for_reload(
 /// Collect readings from a single device every `poll_interval` while polls
 /// succeed, the first time after `first_poll`, until `cancel` is cancelled.
 /// After a failed poll, the next attempt waits for `backoff_delay` instead.
+/// After a poll that waited `poll_interval` or longer for the Bluetooth
+/// adapter, the next one comes `poll_interval` after its read started.
 /// The module docs' Error Handling section has the details.
 async fn collect_device(
     state: Arc<AppState>,
@@ -570,7 +575,8 @@ async fn collect_device(
     let mut ticker = tokio::time::interval_at(Instant::now() + first_poll, poll_interval);
     // A poll that overran the interval is followed by one poll straight away,
     // and the interval counts from there, instead of every missed tick firing
-    // back to back (the default, `Burst`).
+    // back to back (the default, `Burst`). The loop below takes that one poll
+    // away again where the overrun was a wait for the adapter.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_failures = 0u32;
 
@@ -602,15 +608,24 @@ async fn collect_device(
         };
         let poll_duration = started.elapsed();
         let result = match outcome {
-            Ok(Some(result)) => result.map_err(|e| e.to_string()),
+            Ok(Some((read_started, result))) => result
+                .map(|reading| (read_started, reading))
+                .map_err(|e| e.to_string()),
             // Cancelled while waiting for the Bluetooth adapter.
             Ok(None) => break,
             Err(e) => Err(format!("poll task failed: {e}")),
         };
 
         match result {
-            Ok(reading) => {
+            Ok((read_started, reading)) => {
                 consecutive_failures = 0;
+                // The poll waited a whole interval or longer for the adapter,
+                // so a tick fell due before the sensor was read, and `Delay`
+                // would fire it now: a second connect and a duplicate reading
+                // straight after this one. Count the interval from the read.
+                if read_started.duration_since(started) >= poll_interval {
+                    ticker.reset_at(read_started + poll_interval);
+                }
                 debug!(
                     "Collected reading from {}: CO2={} (took {:.1}s)",
                     address,
@@ -684,20 +699,24 @@ where
 /// waits for the adapter. Once the read has started it runs until it finishes
 /// or `BLE_POLL_TIMEOUT` passes, even if `cancel` fires, so the device is
 /// disconnected and a reading that arrives is stored.
+///
+/// The instant returned with the result is when the wait for the adapter
+/// ended and the read started.
 async fn poll_once(
     state: Arc<AppState>,
     address: String,
     cancel: CancellationToken,
-) -> Option<Result<StoredReading, CollectorError>> {
+) -> Option<(Instant, Result<StoredReading, CollectorError>)> {
     // Serialize BLE adapter access — only one device at a time
     let permit = tokio::select! {
         biased;
         _ = cancel.cancelled() => return None,
         permit = state.ble_semaphore.acquire() => match permit {
             Ok(permit) => permit,
-            Err(_) => return Some(Err(CollectorError::BleBusy)),
+            Err(_) => return Some((Instant::now(), Err(CollectorError::BleBusy))),
         },
     };
+    let read_started = Instant::now();
 
     // Connect, read and disconnect, within the time limit
     let read = tokio::time::timeout(
@@ -710,8 +729,10 @@ async fn poll_once(
     drop(permit);
     let reading = match read {
         Ok(Ok(reading)) => reading,
-        Ok(Err(e)) => return Some(Err(e)),
-        Err(_) => return Some(Err(CollectorError::Timeout(BLE_POLL_TIMEOUT))),
+        Ok(Err(e)) => return Some((read_started, Err(e))),
+        Err(_) => {
+            return Some((read_started, Err(CollectorError::Timeout(BLE_POLL_TIMEOUT))));
+        }
     };
 
     // Store the reading
@@ -723,7 +744,7 @@ async fn poll_once(
         .await
         .map(|row_id| StoredReading::from_reading_with_id(&address, &reading, row_id))
         .map_err(CollectorError::Store);
-    Some(stored)
+    Some((read_started, stored))
 }
 
 /// Collector errors.
@@ -1962,12 +1983,26 @@ mod tests {
     async fn hung_poll_times_out_and_frees_the_adapter() {
         let (t, reader, collector) = fake_collector(vec![device(A, 60), device(B, 60)]);
         reader.hold(A); // A never answers
+        let t0 = tokio::time::Instant::now();
         assert_eq!(collector.start().await, CollectorStartResult::Started);
         tokio::time::sleep(BLE_POLL_TIMEOUT + Duration::from_secs(60)).await;
 
         assert!(
             !reader.reads_of(B).is_empty(),
             "B never got the Bluetooth adapter"
+        );
+        // B's poll waited for the adapter from 5 s until A's timed out at
+        // 180 s, past B's ticks at 65 and 125 s. B is read once then, and not
+        // a second time straight after for a tick that fell due meanwhile.
+        let b_starts = start_secs(&reader.reads_of(B), t0);
+        let first_minute: Vec<f64> = b_starts
+            .iter()
+            .copied()
+            .filter(|start| *start < 239.0)
+            .collect();
+        assert!(
+            first_minute.len() == 1 && (first_minute[0] - 180.0).abs() <= 1.0,
+            "B was read at {b_starts:?} s, expected once at 180 s and not again within 59 s"
         );
         let a = stat(&t, A).await;
         assert_eq!(a.failure_count, 1);
