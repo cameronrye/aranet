@@ -838,21 +838,19 @@ fn legacy_services(kind: ServiceManagerKind, level: Level) -> Vec<(PathBuf, &'st
     services
 }
 
-/// Printed after a system-level install, which only succeeds on systemd.
-const SYSTEM_INSTALL_NOTES: &[&str] = &[
-    "aranet.service runs as the unprivileged dynamic user `aranet`. Its config and database",
-    "are in /var/lib/aranet, which systemd creates when the service first starts.",
-    "  Start it:     sudo systemctl start aranet",
-    "  Add sensors:  sudoedit /var/lib/aranet/server.toml, then sudo systemctl restart aranet",
-    "  Logs:         journalctl -u aranet",
-];
-
-/// Printed after `SYSTEM_INSTALL_NOTES` when a root service from 0.2.1 or
-/// earlier left its config in /root. The globs run in `sh -c` because the
-/// invoking user's shell can't list /root or /var/lib/aranet.
+/// Printed after the notes of a system-level install when a root service from
+/// 0.2.1 or earlier left its config in /root. The globs run in `sh -c` because
+/// the invoking user's shell can't list /root or /var/lib/aranet.
+///
+/// The steps are for one time only: step 3 deletes the database in
+/// /var/lib/aranet, which is the service's live one from then on. So the header
+/// says when to do them, and step 8 moves the file whose presence prints them.
 const MOVE_ROOT_FILES_NOTES: &[&str] = &[
     "",
-    "Earlier versions ran the service as root with its files under /root. To keep them:",
+    "Earlier versions ran the service as root with its files under /root. To keep them, do",
+    "these steps once, right after the first install. Step 3 deletes the new service's",
+    "database, which is still empty then: once the service has stored readings of its own,",
+    "do not run the steps again.",
     "  1. sudo systemctl start aranet && sudo systemctl stop aranet  (creates /var/lib/aranet)",
     "  2. sudo cp /root/.config/aranet/server.toml /var/lib/aranet/",
     "  3. sudo sh -c 'rm -f /var/lib/aranet/data.db*'",
@@ -860,17 +858,61 @@ const MOVE_ROOT_FILES_NOTES: &[&str] = &[
     "  5. sudo chown -R --reference=/var/lib/aranet /var/lib/aranet/",
     "  6. If /var/lib/aranet/server.toml sets storage.path under /root, delete that line",
     "  7. sudo systemctl start aranet",
+    "  8. sudo mv /root/.config/aranet /root/.config/aranet.moved  (these steps are then no longer printed)",
 ];
 
-/// What to print after a system-level install.
-pub fn system_install_notes() -> String {
-    render_system_install_notes(Path::new(LEGACY_ROOT_CONFIG).exists())
+/// What to print after a system-level install, which only succeeds on systemd.
+/// `options` are the ones the install was given.
+pub fn system_install_notes(options: &aranet_service::RunOptions) -> String {
+    // The install resolved the same path a moment ago, so this doesn't fail here.
+    let config = systemd_config_path(options).unwrap_or_else(|_| SYSTEMD_CONFIG_PATH.into());
+    render_system_install_notes(&config, Path::new(LEGACY_ROOT_CONFIG).exists())
 }
 
-fn render_system_install_notes(legacy_root_config: bool) -> String {
-    let mut lines = SYSTEM_INSTALL_NOTES.to_vec();
+/// The notes for a unit that reads `config`, with the steps for moving a root
+/// service's files when `legacy_root_config` is set.
+///
+/// `config` is named wherever the notes send the user to the config file. The
+/// unit can write only its state directory, so for a config outside it the notes
+/// say what the service then can't do: save sensors added through the API, or
+/// the API key it would generate.
+fn render_system_install_notes(config: &Path, legacy_root_config: bool) -> String {
+    let config_shown = config.display();
+    let mut lines = Vec::new();
+    if config == Path::new(SYSTEMD_CONFIG_PATH) {
+        lines.extend([
+            "aranet.service runs as the unprivileged dynamic user `aranet`. Its config and database"
+                .to_string(),
+            "are in /var/lib/aranet, which systemd creates when the service first starts."
+                .to_string(),
+        ]);
+    } else {
+        lines.extend([
+            "aranet.service runs as the unprivileged dynamic user `aranet`. Its database is in"
+                .to_string(),
+            "/var/lib/aranet, which systemd creates when the service first starts. Its config is"
+                .to_string(),
+            format!("{config_shown}."),
+        ]);
+    }
+    if !is_within(config, Path::new(SYSTEMD_STATE_DIR)) {
+        lines.extend([
+            format!("The service can read {config_shown} but not change it:"),
+            "add sensors by editing the file, and if you set `security.api_key_enabled = true`, set"
+                .to_string(),
+            "`security.api_key` there yourself.".to_string(),
+        ]);
+    }
+    lines.extend([
+        // `start` does nothing to a service that is already running, which it is
+        // when the install replaced an earlier one.
+        "  Start it:     sudo systemctl start aranet  (after a re-install: sudo systemctl restart aranet)"
+            .to_string(),
+        format!("  Add sensors:  sudoedit {config_shown}, then sudo systemctl restart aranet"),
+        "  Logs:         journalctl -u aranet".to_string(),
+    ]);
     if legacy_root_config {
-        lines.extend_from_slice(MOVE_ROOT_FILES_NOTES);
+        lines.extend(MOVE_ROOT_FILES_NOTES.iter().map(|line| line.to_string()));
     }
     let mut notes = lines.join("\n");
     notes.push('\n');
@@ -1492,25 +1534,76 @@ mod tests {
 
     #[test]
     fn system_install_notes_table() {
-        let fresh = render_system_install_notes(false);
-        for expected in [
-            "dynamic user `aranet`",
-            "sudo systemctl start aranet",
-            "sudoedit /var/lib/aranet/server.toml",
-            "journalctl -u aranet",
-        ] {
-            assert!(
-                fresh.contains(expected),
-                "missing {expected:?} in:\n{fresh}"
-            );
-        }
-        assert!(!fresh.contains("/root"), "{fresh}");
+        let lines = |notes: &str| -> Vec<String> { notes.lines().map(str::to_string).collect() };
+        let start_and_logs = |config: &str| {
+            [
+                "  Start it:     sudo systemctl start aranet  (after a re-install: sudo systemctl restart aranet)".to_string(),
+                format!("  Add sensors:  sudoedit {config}, then sudo systemctl restart aranet"),
+                "  Logs:         journalctl -u aranet".to_string(),
+            ]
+        };
 
-        let upgrade = render_system_install_notes(true);
-        assert!(upgrade.starts_with(&fresh), "{upgrade}");
-        // The seven steps end the notes, word for word and in this order.
-        // Documentation that repeats them has to match.
-        let steps = [
+        // The unit's default config, in the state directory.
+        let fresh = render_system_install_notes(Path::new(SYSTEMD_CONFIG_PATH), false);
+        let mut expected = vec![
+            "aranet.service runs as the unprivileged dynamic user `aranet`. Its config and database"
+                .to_string(),
+            "are in /var/lib/aranet, which systemd creates when the service first starts."
+                .to_string(),
+        ];
+        expected.extend(start_and_logs("/var/lib/aranet/server.toml"));
+        assert_eq!(lines(&fresh), expected);
+        assert!(fresh.ends_with('\n'), "{fresh:?}");
+
+        // `--config` with a file elsewhere in the state directory: the service can
+        // replace it, so nothing is said about editing it by hand.
+        let other = render_system_install_notes(Path::new("/var/lib/aranet/other.toml"), false);
+        let mut expected = vec![
+            "aranet.service runs as the unprivileged dynamic user `aranet`. Its database is in"
+                .to_string(),
+            "/var/lib/aranet, which systemd creates when the service first starts. Its config is"
+                .to_string(),
+            "/var/lib/aranet/other.toml.".to_string(),
+        ];
+        expected.extend(start_and_logs("/var/lib/aranet/other.toml"));
+        assert_eq!(lines(&other), expected);
+
+        // `--config` outside the state directory, which is all the unit can write.
+        // Nothing may send the user to /var/lib/aranet/server.toml, a file the
+        // service never reads.
+        for outside in ["/etc/aranet/server.toml", "/var/lib/aranet2/server.toml"] {
+            let notes = render_system_install_notes(Path::new(outside), false);
+            let mut expected = vec![
+                "aranet.service runs as the unprivileged dynamic user `aranet`. Its database is in"
+                    .to_string(),
+                "/var/lib/aranet, which systemd creates when the service first starts. Its config is"
+                    .to_string(),
+                format!("{outside}."),
+                format!("The service can read {outside} but not change it:"),
+                "add sensors by editing the file, and if you set `security.api_key_enabled = true`, set"
+                    .to_string(),
+                "`security.api_key` there yourself.".to_string(),
+            ];
+            expected.extend(start_and_logs(outside));
+            assert_eq!(lines(&notes), expected);
+            assert!(!notes.contains("/var/lib/aranet/server.toml"), "{notes}");
+        }
+
+        for notes in [&fresh, &other] {
+            assert!(!notes.contains("/root"), "{notes}");
+            assert!(!notes.contains("but not change it"), "{notes}");
+        }
+
+        // After an upgrade from a root service, the same notes and then how to move
+        // its files: a header that says when, and the eight steps, word for word and
+        // in this order. Documentation that repeats them has to match.
+        let upgrade = render_system_install_notes(Path::new(SYSTEMD_CONFIG_PATH), true);
+        let moving = [
+            "",
+            "Earlier versions ran the service as root with its files under /root. To keep them, do",
+            "these steps once, right after the first install. Step 3 deletes the new service's",
+            "database, which is still empty then: once the service has stored readings of its own,",
+            "do not run the steps again.",
             "  1. sudo systemctl start aranet && sudo systemctl stop aranet  (creates /var/lib/aranet)",
             "  2. sudo cp /root/.config/aranet/server.toml /var/lib/aranet/",
             "  3. sudo sh -c 'rm -f /var/lib/aranet/data.db*'",
@@ -1518,12 +1611,13 @@ mod tests {
             "  5. sudo chown -R --reference=/var/lib/aranet /var/lib/aranet/",
             "  6. If /var/lib/aranet/server.toml sets storage.path under /root, delete that line",
             "  7. sudo systemctl start aranet",
+            "  8. sudo mv /root/.config/aranet /root/.config/aranet.moved  (these steps are then no longer printed)",
         ];
-        let lines: Vec<&str> = upgrade.lines().collect();
-        assert!(
-            lines.ends_with(&steps),
-            "the upgrade notes must end with these steps:\n{steps:#?}\nbut they are:\n{upgrade}"
-        );
+        let mut expected = lines(&fresh);
+        expected.extend(moving.map(str::to_string));
+        assert_eq!(lines(&upgrade), expected);
+        // Step 8 moves the file whose presence makes these steps appear.
+        assert!(Path::new(LEGACY_ROOT_CONFIG).starts_with("/root/.config/aranet"));
     }
 
     #[test]
