@@ -35,10 +35,11 @@ services:
       # so the container still reaches a restarted dbus-daemon.
       - /run/dbus:/run/dbus:ro
     # If the log shows org.freedesktop.DBus.Error.AccessDenied, the host's AppArmor
-    # or SELinux filters D-Bus. Relax it for this container instead of using
-    # privileged mode:
+    # or SELinux filters D-Bus, or BlueZ admits only the host's bluetooth group.
+    # Use the line that fits for this container instead of privileged mode:
     # security_opt: ["apparmor=unconfined"]  # Ubuntu, if BlueZ calls fail with AccessDenied
     # security_opt: ["label=disable"]  # SELinux (Fedora, RHEL)
+    # group_add: ["<gid of the host's bluetooth group>"]  # if BlueZ admits only the bluetooth group
     environment:
       - RUST_LOG=aranet_service=info
     healthcheck:
