@@ -712,6 +712,38 @@ fn compose_files_set_privileged_to_nothing_but_false() {
     );
 }
 
+/// `docker stop` and `docker compose down` kill a container that is still
+/// running after 10 s, unless its service sets `stop_grace_period`. The
+/// service's own shutdown can take 20 s: 5 s for the collector's tasks to
+/// stop, 5 s for a Bluetooth poll in flight to disconnect, and 10 s for the
+/// background tasks, which write what they still hold.
+#[test]
+fn compose_files_give_the_service_time_to_shut_down() {
+    for file in COMPOSE_FILES {
+        let text = read(file);
+        let lines: Vec<&str> = text.lines().map(strip_comment).collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == "  aranet-service:")
+            .unwrap_or_else(|| panic!("{file}: no `aranet-service:` service"));
+        // The service's own keys: one level below its name.
+        let grace: Vec<&str> = lines[at + 1..]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .take_while(|line| indent(line) > indent(lines[at]))
+            .filter(|line| indent(line) == indent(lines[at]) + 2)
+            .filter_map(|line| line.trim().strip_prefix("stop_grace_period:"))
+            .map(|value| value.trim().trim_matches(['"', '\'']))
+            .collect();
+        assert_eq!(
+            grace,
+            ["30s"],
+            "{file}: the aranet-service service must set `stop_grace_period: 30s`. With \
+             Docker's default of 10 s the service is killed in the middle of its shutdown"
+        );
+    }
+}
+
 #[test]
 fn deployment_workflow_runs_the_image_check_for_main_and_deploy_file_changes() {
     let text = read(".github/workflows/deployment-files.yml");
