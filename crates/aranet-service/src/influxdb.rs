@@ -50,7 +50,10 @@
 //! and so on up to 5 minutes, so the queue carries readings through an
 //! outage. A reading that arrives while the queue is full is dropped, with a
 //! warning at most once a minute. Lines that InfluxDB rejects with any other
-//! 4xx are dropped. Lines still queued when the service stops are not written.
+//! 4xx are dropped. So are lines that it answers with a 3xx: a redirect is
+//! never followed, because it could send the readings to another host, so set
+//! `url` to InfluxDB's final address. Lines still queued when the service
+//! stops are not written.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,7 +65,7 @@ use tracing::{debug, info, warn};
 
 use crate::DropLog;
 use crate::config::InfluxDbConfig;
-use crate::redact::{redact_url, sanitize_body};
+use crate::redact::{read_error_body, redact_url};
 use crate::state::{AppState, ReadingEvent};
 
 /// InfluxDB writer that exports readings to InfluxDB.
@@ -151,16 +154,17 @@ impl Default for InfluxSettings {
 /// minute. The writer sends up to `settings.batch_lines` lines per request.
 /// A batch that failed with a request error, a 5xx, 408 or 429 is sent again
 /// after `settings.base_backoff`, doubling up to `settings.max_backoff`;
-/// InfluxDB rejects the lines of any other failure for good, so that batch is
-/// dropped. On shutdown the writer stops at once and warns how many queued
-/// lines were not written; this function returns after it.
+/// any other failure (another 4xx, or a 3xx, which is never followed) would
+/// only repeat, so that batch is dropped. On shutdown the writer stops at
+/// once and warns how many queued lines were not written; this function
+/// returns after it.
 async fn run_influxdb_writer(
     state: Arc<AppState>,
     config: InfluxDbConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     settings: InfluxSettings,
 ) {
-    let client = match Client::builder().timeout(settings.request_timeout).build() {
+    let client = match crate::sink_client(settings.request_timeout) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create HTTP client for InfluxDB: {e}");
@@ -420,10 +424,9 @@ async fn write_lines(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         return Err(InfluxDbError::Response {
             status: status.as_u16(),
-            body: sanitize_body(&body),
+            body: read_error_body(response).await,
         });
     }
 
@@ -432,7 +435,8 @@ async fn write_lines(
 
 /// Whether a failed write may work when sent again: the request failed
 /// (InfluxDB unreachable or too slow) or InfluxDB answered 5xx, 408 or 429.
-/// Any other status means InfluxDB rejected the lines themselves.
+/// Any other 4xx means InfluxDB rejected the lines themselves, and a 3xx is a
+/// redirect, which is never followed and would be answered the same again.
 fn is_transient(e: &InfluxDbError) -> bool {
     match e {
         InfluxDbError::Request(_) => true,
@@ -508,7 +512,8 @@ fn escape_line_protocol(s: &str, special: &[char]) -> String {
 /// Their text is safe to log: a request error converted with `From` carries no
 /// URL, and a stored response body keeps only its first 256 characters,
 /// followed by `…` when it was longer (so 257 at most), with line breaks,
-/// control characters and bidi controls replaced by spaces.
+/// control characters and bidi controls replaced by spaces. For a 3xx answer
+/// the body is a fixed text that says the redirect was not followed.
 #[derive(Debug, thiserror::Error)]
 pub enum InfluxDbError {
     #[error("Request failed: {0}")]
@@ -751,10 +756,7 @@ mod tests {
             url: closed_port_url("/influxdb-SECRET").await,
             ..Default::default()
         };
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
+        let client = crate::sink_client(Duration::from_secs(10)).unwrap();
 
         let error = write_lines(
             &client,
@@ -893,6 +895,80 @@ mod tests {
                 .await
                 .expect("the writer stops within 5 s of shutdown")
                 .expect("the writer does not panic");
+        }
+
+        /// The writer's client, with this request timeout.
+        fn client(timeout: Duration) -> Client {
+            crate::sink_client(timeout).unwrap()
+        }
+
+        #[tokio::test]
+        async fn influxdb_redirect_is_not_followed_and_is_not_retried() {
+            // InfluxDB's address answers the write with a redirect to another
+            // server. 308 keeps the method and the body, so a client that
+            // follows it sends the readings there, and that server's 204
+            // would count them as written.
+            let target = RecordingServer::start(vec![("/elsewhere", Reply::Status(204))]).await;
+            let influx = RecordingServer::start(vec![(
+                WRITE,
+                Reply::Redirect(308, target.url("/elsewhere")),
+            )])
+            .await;
+            let config = influx_config(&influx).influxdb;
+
+            let result = write_lines(
+                &client(Duration::from_secs(10)),
+                &config,
+                &[line_of(&test_event(DEVICE, 801))],
+            )
+            .await;
+
+            assert!(
+                target.requests().is_empty(),
+                "the redirect was followed: {:?}",
+                target.requests()
+            );
+            let error = result.expect_err("a redirect counts as a failed write");
+            assert!(
+                matches!(&error, InfluxDbError::Response { status: 308, .. }),
+                "{error:?}"
+            );
+            assert!(
+                error.to_string().contains("redirect not followed"),
+                "{error}"
+            );
+            // Sending the batch again would only be redirected again.
+            assert!(!is_transient(&error), "a redirected write is retried");
+            assert_eq!(influx.requests().len(), 1, "{:?}", influx.requests());
+        }
+
+        #[tokio::test]
+        async fn influxdb_error_body_is_read_only_up_to_a_limit() {
+            // InfluxDB answers 500 with a body that never ends.
+            let server = RecordingServer::start(vec![(WRITE, Reply::EndlessBody(500))]).await;
+            let config = influx_config(&server).influxdb;
+            let timeout = Duration::from_secs(2);
+
+            let started = std::time::Instant::now();
+            let error = write_lines(
+                &client(timeout),
+                &config,
+                &[line_of(&test_event(DEVICE, 801))],
+            )
+            .await
+            .expect_err("a 500 is a failed write");
+            let waited = started.elapsed();
+
+            // The start of the body, cut for the log, without waiting for a
+            // body whose end never comes.
+            assert_eq!(
+                error.to_string(),
+                format!("InfluxDB returned error 500: {}…", "x".repeat(256))
+            );
+            assert!(
+                waited < timeout,
+                "reading the error body took {waited:?}, the whole request timeout"
+            );
         }
 
         #[tokio::test]

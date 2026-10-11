@@ -759,6 +759,23 @@ pub(crate) async fn stop_background_work(state: &Arc<AppState>, background: Vec<
     collector::join_or_abort("background task", background, SHUTDOWN_GRACE).await;
 }
 
+/// The HTTP client that the webhook dispatcher, the InfluxDB writer and the
+/// push gateway client send with. A request, connecting included, ends after
+/// `timeout`, and a redirect is never followed.
+///
+/// These requests carry readings, and for webhooks the configured custom
+/// headers. A client that follows redirects would let the endpoint, or
+/// anyone on the path to an `http://` endpoint, send them to another host,
+/// the service's own API included: 307 and 308 repeat the POST with its body.
+/// The 3xx answer comes back to the sink as it is, and the sink counts it as
+/// a failure.
+pub(crate) fn sink_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// Counts what a sink had to drop, and says when to warn about it: at most
 /// once a minute, so an outage that drops data on every reading can't flood
 /// the log.

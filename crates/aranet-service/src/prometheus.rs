@@ -12,6 +12,10 @@
 //! push_interval = 60  # seconds
 //! ```
 //!
+//! A redirect is never followed: it could send the metrics to another host. A
+//! gateway that answers 3xx counts as a failed push, so set `push_gateway` to
+//! the gateway's final address.
+//!
 //! # Metrics Pushed
 //!
 //! The same metrics exposed by `/metrics` endpoint are pushed:
@@ -39,7 +43,7 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
 use crate::config::PrometheusConfig;
-use crate::redact::{redact_url, sanitize_body};
+use crate::redact::{read_error_body, redact_url};
 use crate::state::AppState;
 
 /// Prometheus push gateway client.
@@ -102,7 +106,7 @@ async fn run_prometheus_pusher(
     push_gateway: String,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let client = match Client::builder().timeout(Duration::from_secs(30)).build() {
+    let client = match crate::sink_client(Duration::from_secs(30)) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create HTTP client for Prometheus pusher: {e}");
@@ -397,10 +401,9 @@ async fn push_metrics(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         return Err(PushError::Response {
             status: status.as_u16(),
-            body: sanitize_body(&body),
+            body: read_error_body(response).await,
         });
     }
 
@@ -430,7 +433,8 @@ fn escape_label_value(s: &str) -> String {
 /// Their text is safe to log: a request error converted with `From` carries no
 /// URL, and a stored response body keeps only its first 256 characters,
 /// followed by `…` when it was longer (so 257 at most), with line breaks,
-/// control characters and bidi controls replaced by spaces.
+/// control characters and bidi controls replaced by spaces. For a 3xx answer
+/// the body is a fixed text that says the redirect was not followed.
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("Request failed: {0}")]
@@ -656,14 +660,14 @@ mod tests {
             "http://user:SECRET@",
             1,
         );
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
-
-        let error = push_metrics(&client, &gateway, "aranet-service", "")
-            .await
-            .expect_err("nothing listens on the gateway port");
+        let error = push_metrics(
+            &client(Duration::from_secs(10)),
+            &gateway,
+            "aranet-service",
+            "",
+        )
+        .await
+        .expect_err("nothing listens on the gateway port");
         for text in [error.to_string(), format!("{error:?}")] {
             assert!(
                 !text.contains("SECRET"),
@@ -738,5 +742,72 @@ mod tests {
         );
         assert!(logs.contains(&logged), "{logs:?}");
         assert!(!logs.contains('\u{202e}'), "{logs:?}");
+    }
+
+    /// The path the pusher posts to on its gateway.
+    const PUSH: &str = "/metrics/job/aranet-service";
+
+    /// The pusher's client, with this request timeout.
+    fn client(timeout: Duration) -> Client {
+        crate::sink_client(timeout).unwrap()
+    }
+
+    #[tokio::test]
+    async fn push_redirect_is_not_followed() {
+        // The gateway's address answers the push with a redirect to another
+        // server. 307 keeps the method and the body, so a client that follows
+        // it sends the metrics there.
+        let target = RecordingServer::start(vec![("/elsewhere", Reply::Status(204))]).await;
+        let gateway =
+            RecordingServer::start(vec![(PUSH, Reply::Redirect(307, target.url("/elsewhere")))])
+                .await;
+
+        let result = push_metrics(
+            &client(Duration::from_secs(10)),
+            &gateway.url(""),
+            "aranet-service",
+            "aranet_collector_running 1\n",
+        )
+        .await;
+
+        assert!(
+            target.requests().is_empty(),
+            "the redirect was followed: {:?}",
+            target.requests()
+        );
+        let error = result.expect_err("a redirect counts as a failed push");
+        assert!(
+            matches!(&error, PushError::Response { status: 307, .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("redirect not followed"),
+            "{error}"
+        );
+        assert_eq!(gateway.requests().len(), 1, "{:?}", gateway.requests());
+    }
+
+    #[tokio::test]
+    async fn push_error_body_is_read_only_up_to_a_limit() {
+        // The gateway answers 500 with a body that never ends.
+        let server = RecordingServer::start(vec![(PUSH, Reply::EndlessBody(500))]).await;
+        let timeout = Duration::from_secs(2);
+
+        let started = std::time::Instant::now();
+        let error = push_metrics(&client(timeout), &server.url(""), "aranet-service", "")
+            .await
+            .expect_err("a 500 is a failed push");
+        let waited = started.elapsed();
+
+        // The start of the body, cut for the log, without waiting for a body
+        // whose end never comes.
+        assert_eq!(
+            error.to_string(),
+            format!("Push gateway returned error 500: {}…", "x".repeat(256))
+        );
+        assert!(
+            waited < timeout,
+            "reading the error body took {waited:?}, the whole request timeout"
+        );
     }
 }

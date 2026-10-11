@@ -33,6 +33,10 @@
 //! endpoint. When the service stops, deliveries still running get 5 s to
 //! finish.
 //!
+//! A redirect is never followed: it could send the alert and the endpoint's
+//! custom headers to another host. An endpoint that answers 3xx counts as
+//! failed, so set `url` to the endpoint's final address.
+//!
 //! # Payload Format
 //!
 //! Webhooks send a JSON POST with the following structure:
@@ -64,7 +68,7 @@ use tracing::{debug, info, warn};
 
 use crate::DropLog;
 use crate::config::{WebhookConfig, WebhookEndpoint};
-use crate::redact::{redact_url, sanitize_body};
+use crate::redact::{read_error_body, redact_url};
 use crate::state::{AppState, ReadingEvent};
 
 /// Webhook dispatcher that monitors readings and fires alerts.
@@ -193,7 +197,7 @@ async fn run_webhook_dispatcher(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     settings: WebhookSettings,
 ) {
-    let client = match Client::builder().timeout(settings.request_timeout).build() {
+    let client = match crate::sink_client(settings.request_timeout) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create HTTP client for webhooks: {e}");
@@ -522,10 +526,9 @@ async fn send_webhook(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         return Err(WebhookError::Response {
             status: status.as_u16(),
-            body: sanitize_body(&body),
+            body: read_error_body(response).await,
         });
     }
 
@@ -537,7 +540,8 @@ async fn send_webhook(
 /// Their text is safe to log: a request error converted with `From` carries no
 /// URL, and a stored response body keeps only its first 256 characters,
 /// followed by `…` when it was longer (so 257 at most), with line breaks,
-/// control characters and bidi controls replaced by spaces.
+/// control characters and bidi controls replaced by spaces. For a 3xx answer
+/// the body is a fixed text that says the redirect was not followed.
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
     #[error("Request failed: {0}")]
@@ -715,11 +719,9 @@ mod tests {
         }
     }
 
+    /// The dispatcher's client, so these tests send under its redirect policy.
     fn test_client() -> Client {
-        Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap()
+        crate::sink_client(Duration::from_secs(10)).unwrap()
     }
 
     #[tokio::test]
@@ -831,6 +833,89 @@ mod tests {
         );
         assert!(logs.contains(&logged), "{logs:?}");
         assert!(!logs.contains('\u{202e}'), "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn webhook_redirect_is_not_followed() {
+        // The endpoint answers the alert with a redirect to another server,
+        // as an attacker's endpoint would to make the service post to its own
+        // API or to a host on the user's network. 307 keeps the method and the
+        // body, so a client that follows it sends the alert there.
+        let target = RecordingServer::start(vec![("/elsewhere/SECRET", Reply::Status(204))]).await;
+        let endpoint = RecordingServer::start(vec![(
+            "/hook",
+            Reply::Redirect(307, target.url("/elsewhere/SECRET")),
+        )])
+        .await;
+        let url = endpoint.url("/hook");
+        let (client, headers, payload) = (test_client(), HashMap::new(), co2_payload());
+
+        let (logs, _g) = CapturedLogs::start();
+        let result = send_webhook(&client, &url, &headers, &payload).await;
+        let policy = RetryPolicy {
+            attempts: 2,
+            base_delay: Duration::ZERO,
+        };
+        let label = endpoint_label(0, &url);
+        let delivered =
+            send_webhook_with_retry(&client, &label, &url, &headers, &payload, policy).await;
+
+        assert!(
+            target.requests().is_empty(),
+            "the redirect was followed: {:?}",
+            target.requests()
+        );
+        let error = result.expect_err("a redirect counts as a failed delivery");
+        assert!(
+            matches!(&error, WebhookError::Response { status: 307, .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("redirect not followed"),
+            "{error}"
+        );
+        assert!(!delivered, "an alert that was redirected counts as sent");
+        // One request from `send_webhook` and two attempts with retry.
+        assert_eq!(endpoint.requests().len(), 3, "{:?}", endpoint.requests());
+        // The log says why, and never where the redirect pointed.
+        let logs = logs.text();
+        assert!(
+            logs.contains(
+                "failed after 2 attempts: Webhook returned error 307: redirect not followed"
+            ),
+            "{logs}"
+        );
+        assert!(!logs.contains("SECRET"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn webhook_error_body_is_read_only_up_to_a_limit() {
+        // The endpoint answers 500 with a body that never ends.
+        let server = RecordingServer::start(vec![("/hook", Reply::EndlessBody(500))]).await;
+        let timeout = Duration::from_secs(2);
+        let client = crate::sink_client(timeout).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = send_webhook(
+            &client,
+            &server.url("/hook"),
+            &HashMap::new(),
+            &co2_payload(),
+        )
+        .await
+        .expect_err("a 500 is a failed delivery");
+        let waited = started.elapsed();
+
+        // The start of the body, cut for the log, without waiting for a body
+        // whose end never comes.
+        assert_eq!(
+            error.to_string(),
+            format!("Webhook returned error 500: {}…", "x".repeat(256))
+        );
+        assert!(
+            waited < timeout,
+            "reading the error body took {waited:?}, the whole request timeout"
+        );
     }
 
     /// The dispatcher against a loopback endpoint, on real time. A module of
