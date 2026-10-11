@@ -1996,11 +1996,14 @@ impl eframe::App for AranetApp {
 impl AranetApp {
     /// Save the GUI settings to the config file, leaving every other setting as the file has it.
     ///
+    /// `gui.service_url` and `gui.service_api_key` are also kept as the file has them: the GUI
+    /// has no control for either, so its own copy of them is as old as its start-up.
+    ///
     /// A config file that doesn't parse is left untouched, and the failure is logged.
     pub(crate) fn save_gui_config(&self) {
         let gui = self.gui_config.clone();
         if let Err(e) = Config::update(move |c| {
-            c.gui = gui;
+            c.set_gui_settings(gui);
             Ok(())
         }) {
             warn!("Failed to save GUI settings: {e:#}");
