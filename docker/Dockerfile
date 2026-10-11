@@ -1,96 +1,71 @@
-# Aranet Service Dockerfile
-# Build: docker build -t aranet-service -f docker/Dockerfile .
-# Run: docker run -d --name aranet -p 8080:8080 -v aranet-data:/data aranet-service
+# aranet-service container image
+#
+# Build from the repository root (BuildKit, the default builder since Docker 23):
+#   docker build -f docker/Dockerfile -t aranet-service .
+# Run without Bluetooth (API, dashboard and integrations only):
+#   docker run -d --name aranet -p 127.0.0.1:8080:8080 -v aranet-data:/data aranet-service --no-collector
+#
+# The service always reads /app/server.toml, a copy of docker/server.toml. To use
+# another config, mount it over that path (-v "$PWD/server.toml:/app/server.toml:ro").
+# `--config` after the image name fails, because ENTRYPOINT already passes it.
+# Arguments after the image name replace only CMD (`run`), so `--no-collector`
+# keeps the config.
+#
+# Bluetooth needs a Linux host with BlueZ and the host's /run/dbus mounted
+# read-only (-v /run/dbus:/run/dbus:ro); see docker-compose.yml at the
+# repository root. No privileged mode, host network or devices are needed.
 
 FROM rust:1.90-slim-bookworm AS builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libdbus-1-dev \
-    libssl-dev \
+# libssl-dev: the MQTT client in the `full` feature set uses native-tls (OpenSSL).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libdbus-1-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock ./
-COPY crates/aranet-types/Cargo.toml crates/aranet-types/
-COPY crates/aranet-core/Cargo.toml crates/aranet-core/
-COPY crates/aranet-store/Cargo.toml crates/aranet-store/
-COPY crates/aranet-service/Cargo.toml crates/aranet-service/
-COPY crates/aranet-cli/Cargo.toml crates/aranet-cli/
-COPY crates/aranet-tui/Cargo.toml crates/aranet-tui/
-COPY crates/aranet-gui/Cargo.toml crates/aranet-gui/
+# The whole workspace: Cargo loads every member's manifest and targets, even to
+# build one package. .dockerignore keeps target directories and docs out.
+COPY . .
 
-# Create dummy files for dependency caching
-RUN mkdir -p crates/aranet-types/src && echo "pub fn dummy() {}" > crates/aranet-types/src/lib.rs && \
-    mkdir -p crates/aranet-core/src && echo "pub fn dummy() {}" > crates/aranet-core/src/lib.rs && \
-    mkdir -p crates/aranet-store/src && echo "pub fn dummy() {}" > crates/aranet-store/src/lib.rs && \
-    mkdir -p crates/aranet-service/src && echo "fn main() {}" > crates/aranet-service/src/main.rs && echo "pub fn dummy() {}" > crates/aranet-service/src/lib.rs && \
-    mkdir -p crates/aranet-cli/src && echo "fn main() {}" > crates/aranet-cli/src/main.rs && echo "pub fn dummy() {}" > crates/aranet-cli/src/lib.rs && \
-    mkdir -p crates/aranet-tui/src && echo "fn main() {}" > crates/aranet-tui/src/main.rs && \
-    mkdir -p crates/aranet-gui/src && echo "fn main() {}" > crates/aranet-gui/src/main.rs
+# The cache mounts keep downloaded crates and compiled dependencies between
+# builds. They are not part of the image, so the binary is copied out of the
+# target directory in the same step.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked -p aranet-service --features full \
+    && cp target/release/aranet-service /usr/local/bin/aranet-service
 
-# Build dependencies only (may fail for dummy sources, that's expected)
-RUN cargo build --release -p aranet-service --features full 2>/dev/null; exit 0
-
-# Copy actual source code
-COPY crates/aranet-types/src crates/aranet-types/src
-COPY crates/aranet-core/src crates/aranet-core/src
-COPY crates/aranet-store/src crates/aranet-store/src
-COPY crates/aranet-service/src crates/aranet-service/src
-
-# Touch source files to invalidate cache
-RUN touch crates/aranet-types/src/lib.rs && \
-    touch crates/aranet-core/src/lib.rs && \
-    touch crates/aranet-store/src/lib.rs && \
-    touch crates/aranet-service/src/lib.rs && \
-    touch crates/aranet-service/src/main.rs
-
-# Build the actual service
-RUN cargo build --release -p aranet-service --features full
-
-# Runtime image
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    libdbus-1-3 \
-    libssl3 \
-    ca-certificates \
-    curl \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libdbus-1-3 libssl3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -r -s /bin/false aranet
-
-# Create data directory
-RUN mkdir -p /data && chown aranet:aranet /data
+# uid and gid 999 are what `useradd -r` gave earlier images, so existing
+# aranet-data volumes stay writable. The home directory is the data volume.
+RUN groupadd --system --gid 999 aranet \
+    && useradd --system --uid 999 --gid 999 --no-create-home --home-dir /data \
+        --shell /usr/sbin/nologin aranet \
+    && mkdir -p /data \
+    && chown aranet:aranet /data
 
 WORKDIR /app
 
-# Copy binary
-COPY --from=builder /app/target/release/aranet-service /app/aranet-service
+COPY --from=builder /usr/local/bin/aranet-service /app/aranet-service
+# 0644 whatever the mode in the checkout: the service (uid 999) must read it.
+COPY --chmod=0644 docker/server.toml /app/server.toml
 
-# Copy default config (optional)
-COPY docker/server.toml.example /app/server.toml.example
-
-# Switch to non-root user
 USER aranet
 
-# Expose port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/api/health || exit 1
-
-# Default environment
 ENV RUST_LOG=aranet_service=info
 
-# Run the service
-# Note: In Docker, Bluetooth is not available. Use --no-collector for API-only mode
-# or mount the host's Bluetooth socket for BLE access.
-ENTRYPOINT ["/app/aranet-service"]
-CMD ["--bind", "0.0.0.0:8080", "--database", "/data/aranet.db"]
+# 127.0.0.1 because the service answers an IP address in Host without a
+# security.allowed_hosts entry. Assumes the port in docker/server.toml.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/api/health || exit 1
+
+ENTRYPOINT ["/app/aranet-service", "--config", "/app/server.toml"]
+CMD ["run"]
