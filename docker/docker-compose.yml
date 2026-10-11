@@ -23,6 +23,9 @@ services:
       dockerfile: docker/Dockerfile
     container_name: aranet-service
     restart: unless-stopped
+    # The service can take 20 s to shut down cleanly (a Bluetooth poll in flight
+    # disconnects, then the background tasks finish). Docker's default kills it after 10 s.
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
