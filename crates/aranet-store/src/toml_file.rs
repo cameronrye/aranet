@@ -6,6 +6,7 @@
 //! and keys the program doesn't know about survive. [`write_private`] replaces the
 //! file atomically and keeps it readable only by its owner.
 
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -78,12 +79,23 @@ pub enum TomlFileError {
 /// file.save(&settings)?;
 /// # Ok::<(), aranet_store::TomlFileError>(())
 /// ```
-#[derive(Debug)]
+///
+/// Its `Debug` output names the path and shows nothing the file holds: a
+/// configuration file can contain API keys and passwords.
 pub struct TomlFile<T> {
     path: PathBuf,
     original: String,
     doc: DocumentMut,
     value: T,
+}
+
+// Not derived: `original`, `doc` and `value` are the file's contents.
+impl<T> fmt::Debug for TomlFile<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TomlFile")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: Serialize + DeserializeOwned> TomlFile<T> {
@@ -783,10 +795,13 @@ value = 1
     /// converted it to CRLF (the repository has no `.gitattributes`), and the tests
     /// compare it with text written with LF. It is read at run time, not with
     /// `include_str!`: the published crate has no `docker/`, and its tests must
-    /// still compile there. `None` outside a repository checkout.
+    /// still compile there. Outside a repository checkout it returns `None` and prints
+    /// the skip line of the test that asked, so a moved crate doesn't turn these tests
+    /// into ones that pass without checking anything, unnoticed.
     fn shipped_server_toml() -> Option<String> {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         if !repo.join("crates/aranet-store/Cargo.toml").is_file() {
+            eprintln!("skipped: not a repository checkout, so there is no docker/server.toml");
             return None;
         }
         let text = fs::read_to_string(repo.join("docker/server.toml"))
@@ -1086,10 +1101,41 @@ value = 4
         );
     }
 
+    /// A config file holds API keys and passwords, so `Debug` shows where the file is and
+    /// nothing that is in it.
+    #[test]
+    fn debug_shows_the_path_and_nothing_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fixtures, not credentials: a value `Settings` reads, one in a key it doesn't
+        // know, and a comment. The failure message names the fixture, not the output.
+        let path = write_settings(
+            dir.path(),
+            "# COMMENT-TEXT\nname = \"VALUE-OF-A-KNOWN-KEY\"\napi_key = \"VALUE-OF-AN-UNKNOWN-KEY\"\n",
+        );
+        let file = TomlFile::<Settings>::open(&path).unwrap();
+        assert_eq!(file.value().name.as_deref(), Some("VALUE-OF-A-KNOWN-KEY"));
+
+        let compact = format!("{file:?}");
+        let pretty = format!("{file:#?}");
+        for text in [&compact, &pretty] {
+            for from_the_file in [
+                "VALUE-OF-A-KNOWN-KEY",
+                "VALUE-OF-AN-UNKNOWN-KEY",
+                "COMMENT-TEXT",
+            ] {
+                assert!(
+                    !text.contains(from_the_file),
+                    "Debug shows {from_the_file} from the file"
+                );
+            }
+        }
+        assert_eq!(compact, format!("TomlFile {{ path: {path:?}, .. }}"));
+    }
+
     #[test]
     fn removing_the_only_array_entry_restores_original_bytes() {
         let Some(shipped) = shipped_server_toml() else {
-            return; // not a repository checkout: the published crate has no docker/
+            return; // the published crate has no docker/; the helper printed the skip line
         };
         let dir = tempfile::tempdir().unwrap();
         let path = write_settings(dir.path(), &shipped);
@@ -1107,7 +1153,7 @@ value = 4
     #[test]
     fn removing_the_first_array_entry_keeps_comments_of_the_table_above() {
         let Some(shipped) = shipped_server_toml() else {
-            return; // not a repository checkout: the published crate has no docker/
+            return; // the published crate has no docker/; the helper printed the skip line
         };
         let dir = tempfile::tempdir().unwrap();
         let path = write_settings(dir.path(), &shipped);
@@ -1328,7 +1374,12 @@ value = 4
                 eprintln!("skipped: needs root to create a file owned by another user");
                 return;
             }
-            chown(&path, Some(4242), Some(4242)).unwrap();
+            // Root in a user namespace that maps a single uid (rootless podman) can't
+            // give a file to a uid outside the mapping.
+            if let Err(e) = chown(&path, Some(4242), Some(4242)) {
+                eprintln!("skipped: this root can't give a file to another user: {e}");
+                return;
+            }
 
             write_private(&path, b"x = 2\n").unwrap();
 
