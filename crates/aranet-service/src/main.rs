@@ -183,6 +183,10 @@ fn run_service_action(action: ServiceAction, run_options: RunOptions) -> anyhow:
                     println!("aranet-service is stopped");
                     return Ok(());
                 }
+                Ok(ServiceStatus::NotInstalled) => {
+                    println!("aranet-service is not installed");
+                    return Ok(());
+                }
                 Err(e) => {
                     eprintln!("Failed to get status: {}", e);
                     return Err(e.into());

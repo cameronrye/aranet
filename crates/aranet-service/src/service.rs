@@ -893,19 +893,32 @@ pub fn status(level: Level) -> Result<ServiceStatus, ServiceError> {
     let kind = native_kind()?;
     let manager = get_manager(kind, level)?;
 
-    // Use the service manager's status method
-    match manager.status(ServiceStatusCtx { label: label(kind) }) {
+    Ok(status_with(
+        manager.as_ref(),
+        label(kind),
+        is_service_reachable,
+    ))
+}
+
+/// The status `manager` reports for `label`. If it can't tell, a reachable
+/// HTTP API (`reachable`) counts as running.
+fn status_with(
+    manager: &dyn ServiceManager,
+    label: ServiceLabel,
+    reachable: impl FnOnce() -> bool,
+) -> ServiceStatus {
+    match manager.status(ServiceStatusCtx { label }) {
         Ok(status) => match status {
-            service_manager::ServiceStatus::Running => Ok(ServiceStatus::Running),
-            service_manager::ServiceStatus::Stopped(_) => Ok(ServiceStatus::Stopped),
-            service_manager::ServiceStatus::NotInstalled => Ok(ServiceStatus::Stopped),
+            service_manager::ServiceStatus::Running => ServiceStatus::Running,
+            service_manager::ServiceStatus::Stopped(_) => ServiceStatus::Stopped,
+            service_manager::ServiceStatus::NotInstalled => ServiceStatus::NotInstalled,
         },
         Err(_) => {
             // Fall back to checking if the API is reachable
-            if is_service_reachable() {
-                Ok(ServiceStatus::Running)
+            if reachable() {
+                ServiceStatus::Running
             } else {
-                Ok(ServiceStatus::Stopped)
+                ServiceStatus::Stopped
             }
         }
     }
@@ -932,10 +945,11 @@ fn is_service_reachable() -> bool {
 }
 
 /// Service status
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceStatus {
     Running,
     Stopped,
+    NotInstalled,
 }
 
 #[cfg(test)]
@@ -950,10 +964,12 @@ mod tests {
         panic!("only a system-level systemd install checks the program")
     }
 
-    /// Records every call it gets as `"<method> <label>"`.
+    /// Records every call it gets as `"<method> <label>"`, and reports `status`
+    /// (an error when `None`).
     #[derive(Default)]
     struct FakeManager {
         calls: RefCell<Vec<String>>,
+        status: Option<service_manager::ServiceStatus>,
     }
 
     impl FakeManager {
@@ -999,11 +1015,11 @@ mod tests {
             Ok(())
         }
 
-        fn status(
-            &self,
-            _ctx: ServiceStatusCtx,
-        ) -> std::io::Result<service_manager::ServiceStatus> {
-            unreachable!("install and uninstall never ask for the status")
+        fn status(&self, ctx: ServiceStatusCtx) -> std::io::Result<service_manager::ServiceStatus> {
+            self.record("status", &ctx.label);
+            self.status
+                .clone()
+                .ok_or_else(|| std::io::Error::other("systemctl status failed"))
         }
     }
 
@@ -1375,6 +1391,47 @@ mod tests {
         assert!(
             upgrade.contains("sudo cp /root/.config/aranet/server.toml /var/lib/aranet/"),
             "{upgrade}"
+        );
+    }
+
+    #[test]
+    fn status_reports_not_installed() {
+        let cases = [
+            (
+                service_manager::ServiceStatus::NotInstalled,
+                ServiceStatus::NotInstalled,
+            ),
+            (
+                service_manager::ServiceStatus::Running,
+                ServiceStatus::Running,
+            ),
+            (
+                service_manager::ServiceStatus::Stopped(None),
+                ServiceStatus::Stopped,
+            ),
+        ];
+        for (reported, expected) in cases {
+            let manager = FakeManager {
+                status: Some(reported.clone()),
+                ..FakeManager::default()
+            };
+            let status = status_with(&manager, label(ServiceManagerKind::Systemd), || {
+                panic!("the API is only probed when the service manager fails")
+            });
+            assert_eq!(status, expected, "{reported:?}");
+            assert_eq!(manager.calls(), ["status aranet"]);
+        }
+
+        // The service manager failed: fall back to the API.
+        let manager = FakeManager::default();
+        let systemd = label(ServiceManagerKind::Systemd);
+        assert_eq!(
+            status_with(&manager, systemd.clone(), || true),
+            ServiceStatus::Running
+        );
+        assert_eq!(
+            status_with(&manager, systemd, || false),
+            ServiceStatus::Stopped
         );
     }
 
