@@ -50,6 +50,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::DropLog;
 use crate::config::MqttConfig;
+use crate::redact::redact_url;
 use crate::state::{AppState, ReadingEvent};
 
 /// MQTT publisher that forwards readings to an MQTT broker.
@@ -82,7 +83,11 @@ impl MqttPublisher {
             return None;
         }
 
-        info!("Starting MQTT publisher to {}", mqtt_config.broker);
+        // The broker URL may carry `user:password@`.
+        info!(
+            "Starting MQTT publisher to {}",
+            redact_url(&mqtt_config.broker)
+        );
 
         let state = Arc::clone(&self.state);
         let shutdown_rx = self.state.subscribe_shutdown();
@@ -139,9 +144,12 @@ async fn run_mqtt_publisher(
     let mut readings_rx = state.readings_tx.subscribe();
     let mut reload_rx = state.collector.subscribe_reload();
 
+    // Not "connected": the event loop below connects, and logs it when the
+    // broker has answered.
     info!(
-        "MQTT publisher connected to {} with prefix '{}'",
-        config.broker, config.topic_prefix
+        "MQTT publisher started for {} with prefix '{}'",
+        redact_url(&config.broker),
+        config.topic_prefix
     );
 
     // Spawn event loop handler (keep handle so we can abort on shutdown)
@@ -552,6 +560,8 @@ async fn publish_ha_discovery(
 }
 
 /// Parse an MQTT broker URL into (host, port, use_tls).
+///
+/// The error text never quotes `url`, so it is safe to log.
 fn parse_broker_url(url: &str) -> Result<(String, u16, bool), String> {
     let (scheme, rest) = if let Some(stripped) = url.strip_prefix("mqtt://") {
         ("mqtt", stripped)
@@ -566,9 +576,9 @@ fn parse_broker_url(url: &str) -> Result<(String, u16, bool), String> {
 
     // Parse host:port
     let (host, port) = if let Some((h, p)) = rest.rsplit_once(':') {
-        let port = p
-            .parse::<u16>()
-            .map_err(|_| format!("Invalid port: {}", p))?;
+        // The text is not quoted: in `mqtt://user:password@host`, which has
+        // no port, it is the password, and the caller logs this error.
+        let port = p.parse::<u16>().map_err(|_| "Invalid port".to_string())?;
         (h.to_string(), port)
     } else {
         (rest.to_string(), default_port)
@@ -638,6 +648,70 @@ mod tests {
     #[test]
     fn test_parse_broker_url_empty_host() {
         assert!(parse_broker_url("mqtt://:1883").is_err());
+    }
+
+    #[test]
+    fn parse_broker_url_error_does_not_quote_the_url() {
+        // Without a port, the text after the last colon is the password.
+        // The publisher logs this error.
+        for url in [
+            "mqtt://user:SECRET@host",
+            "mqtt://host:SECRET",
+            "SECRET://host:1883",
+        ] {
+            let error = parse_broker_url(url).expect_err("no valid broker URL");
+            assert!(!error.contains("SECRET"), "{error}");
+        }
+        assert_eq!(
+            parse_broker_url("mqtt://user:SECRET@host").unwrap_err(),
+            "Invalid port"
+        );
+    }
+
+    #[tokio::test]
+    async fn mqtt_start_log_hides_userinfo() {
+        let broker = crate::test_support::closed_port_url("").await.replacen(
+            "http://",
+            "mqtt://user:SECRET@",
+            1,
+        );
+        let shown = broker.replacen("user:SECRET@", "", 1);
+        let t = crate::test_support::TestState::with_config(crate::config::Config {
+            mqtt: MqttConfig {
+                enabled: true,
+                broker,
+                ..MqttConfig::default()
+            },
+            ..crate::config::Config::default()
+        });
+
+        let (logs, _guard) = crate::test_support::CapturedLogs::start();
+        let publisher = MqttPublisher::new(Arc::clone(&t.state))
+            .start()
+            .await
+            .expect("MQTT is enabled");
+        // Signalled before the publisher's task first runs, so the task logs
+        // its start and stops before its event loop is ever polled: nothing
+        // looks the host up or connects.
+        t.state.signal_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), publisher)
+            .await
+            .expect("the publisher stops within 5 s of shutdown")
+            .expect("the publisher does not panic");
+
+        let text = logs.text();
+        assert!(
+            !text.contains("SECRET"),
+            "the broker password reached the logs:\n{text}"
+        );
+        for line in [
+            format!("Starting MQTT publisher to {shown}\n"),
+            format!("MQTT publisher started for {shown} with prefix 'aranet'\n"),
+        ] {
+            assert!(text.contains(&line), "missing {line:?} in:\n{text}");
+        }
+        // Nothing has connected at that point, and the log must not say so.
+        assert!(!text.contains("connected"), "{text}");
     }
 
     #[test]
