@@ -219,11 +219,18 @@ impl CollectorState {
         }
     }
 
-    /// A collector state whose collector reads devices through `reader`.
+    /// A collector state whose collector reads devices through `reader`, and
+    /// whose alerts go nowhere: a test whose fake reading reaches a threshold
+    /// must not show a notification on the developer's desktop. Use
+    /// `with_notifier` to see the alerts.
     #[cfg(test)]
     pub(crate) fn with_reader(reader: Arc<dyn DeviceReader>) -> Self {
         Self {
             reader,
+            #[cfg(feature = "notifications")]
+            notifier: crate::collector::Notifier::with_show(Arc::new(
+                |_title: String, _body: String| -> Result<(), String> { Ok(()) },
+            )),
             ..Self::new()
         }
     }
@@ -252,6 +259,15 @@ impl CollectorState {
             (true, false) => self.started_at.store(0, Ordering::SeqCst),
             _ => {}
         }
+    }
+
+    /// Pretend the collector has been running since `timestamp` (Unix
+    /// seconds). The start time is the wall clock in whole seconds, so a test
+    /// can't tell one that was kept from one that was cleared and set again
+    /// within the same second unless it plants a time that isn't now.
+    #[cfg(test)]
+    pub(crate) fn set_started_at(&self, timestamp: u64) {
+        self.started_at.store(timestamp, Ordering::SeqCst);
     }
 
     /// Get the collector start time.
@@ -825,6 +841,12 @@ mod store_tests {
         // writer, so what matters is that the read doesn't queue behind the
         // waiting write: that write holds the writer until SQLite gives up on
         // the lock after 5 s, well past this bound.
+        //
+        // Those 5 s (SQLite's busy timeout) bound the whole test, and no
+        // bound here can be raised past them: from the write's start to the
+        // `COMMIT` below, everything has to happen before the write gives
+        // up, or the test fails on `write.is_finished()` or on the write's
+        // "database is locked".
         let devices = tokio::time::timeout(
             Duration::from_secs(2),
             t.state.with_store_read(|store| store.list_devices()),
