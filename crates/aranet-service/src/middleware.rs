@@ -952,6 +952,146 @@ mod tests {
     }
 
     #[test]
+    fn requests_sweep_only_above_max_entries() {
+        // A burst of 10, one request back every 6 s; sweep above 2 clients.
+        let (state, clock) = limiter(10, 60, 2);
+        assert_eq!(state.check(ip("10.0.0.1")), Ok(())); // TAT 6 s
+        clock.advance(Duration::from_secs(20));
+
+        // t = 20 s: 10.0.0.1 is idle (6 s <= 20 s - 6 s), but two tracked
+        // clients are not more than max_entries, so nothing sweeps.
+        assert_eq!(state.check(ip("10.0.0.2")), Ok(()));
+        assert_eq!(state.len(), 2, "swept at max_entries, not above it");
+
+        // A third client takes the map over max_entries, and the sweep
+        // forgets 10.0.0.1.
+        assert_eq!(state.check(ip("10.0.0.3")), Ok(()));
+        assert_eq!(state.len(), 2);
+    }
+
+    #[test]
+    fn refused_request_does_not_sweep() {
+        // A burst of 2, one request back every 30 s; sweep above 1 client.
+        let (state, clock) = limiter(2, 60, 1);
+        assert_eq!(state.check(ip("10.0.0.1")), Ok(())); // TAT 30 s
+        clock.advance(Duration::from_secs(31));
+        // t = 31 s: a second client takes the map over the cap. The sweep
+        // finds nobody idle (30 s > 31 s - 30 s).
+        assert_eq!(state.check(ip("10.0.0.2")), Ok(())); // TAT 61 s
+        clock.advance(Duration::from_secs(19));
+        // t = 50 s: a third client spends its burst. The last sweep was 19 s
+        // ago, so these requests don't sweep.
+        let throttled = ip("10.0.0.3");
+        assert_eq!(state.check(throttled), Ok(())); // TAT 80 s
+        assert_eq!(state.check(throttled), Ok(())); // TAT 110 s
+        assert_eq!(state.len(), 3);
+        clock.advance(Duration::from_secs(11));
+
+        // t = 61 s: over the cap, a period after the last sweep, and
+        // 10.0.0.1 is idle (30 s <= 61 s - 30 s). The refused request leaves
+        // the sweep ...
+        assert_eq!(state.check(throttled), Err(Duration::from_secs(19)));
+        assert_eq!(state.len(), 3, "a refused request swept");
+        // ... to the next allowed one.
+        assert_eq!(state.check(ip("10.0.0.2")), Ok(()));
+        assert_eq!(state.len(), 2);
+    }
+
+    #[test]
+    fn request_does_not_wait_for_another_requests_sweep() {
+        // A burst of 10, one request back every 6 s; sweep above 1 client.
+        let (state, clock) = limiter(10, 60, 1);
+        assert_eq!(state.check(ip("10.0.0.1")), Ok(())); // TAT 6 s
+        clock.advance(Duration::from_secs(20)); // 10.0.0.1 is idle now
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            // Another request is in the middle of a sweep: it holds the lock.
+            let sweeping = state.last_sweep.lock().unwrap();
+            scope.spawn(|| done_tx.send(state.check(ip("10.0.0.2"))));
+            // The limit turns a request that waits for the lock into a
+            // failure instead of a hung test.
+            let checked = done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the request waited for the sweep in progress");
+            assert_eq!(checked, Ok(()));
+            assert_eq!(state.len(), 2, "a second sweep ran at the same time");
+            drop(sweeping);
+        });
+
+        // With the lock free again, the next request over the cap sweeps.
+        assert_eq!(state.check(ip("10.0.0.3")), Ok(()));
+        assert_eq!(state.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_counts_each_client_address_separately() {
+        let app = rate_limited_app(SecurityConfig {
+            rate_limit_enabled: true,
+            rate_limit_requests: 1,
+            rate_limit_window_secs: 60,
+            ..Default::default()
+        });
+        assert_eq!(get_from(&app, "192.0.2.1").await.status(), StatusCode::OK);
+        assert_eq!(
+            get_from(&app, "192.0.2.1").await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Another address has a budget of its own ...
+        assert_eq!(get_from(&app, "192.0.2.2").await.status(), StatusCode::OK);
+        // ... and the first one's IPv4-mapped form doesn't.
+        assert_eq!(
+            get_from(&app, "::ffff:192.0.2.1").await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_is_never_zero() {
+        // One request per second: a refused request has less than a second
+        // left to wait, which rounding down would report as 0.
+        let app = rate_limited_app(SecurityConfig {
+            rate_limit_enabled: true,
+            rate_limit_requests: 1,
+            rate_limit_window_secs: 1,
+            ..Default::default()
+        });
+        // Of two requests in a row the second is refused, unless the test
+        // machine stalled for a second between them: then the next one is.
+        let mut limited = None;
+        for _ in 0..20 {
+            let response = get_from(&app, "192.0.2.1").await;
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                limited = Some(response);
+                break;
+            }
+        }
+        let limited = limited.expect("none of 20 requests in a row was refused");
+        assert_eq!(limited.headers()["retry-after"], "1");
+        let body = axum::body::to_bytes(limited.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["retry_after"], 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_header_reports_the_burst_the_limiter_enforces() {
+        // Enabled without validation: a `rate_limit_requests` of 0 counts
+        // as 1.
+        let app = rate_limited_app(SecurityConfig {
+            rate_limit_enabled: true,
+            rate_limit_requests: 0,
+            ..Default::default()
+        });
+        assert_eq!(get_from(&app, "192.0.2.1").await.status(), StatusCode::OK);
+
+        let limited = get_from(&app, "192.0.2.1").await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers()["x-ratelimit-limit"], "1");
+    }
+
+    #[test]
     fn test_constant_time_eq_different_lengths() {
         // Different lengths should still return false without leaking length
         assert!(!constant_time_eq(b"abc", b"abcd"));
