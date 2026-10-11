@@ -35,7 +35,7 @@ fn test_app_with_config(mut config: Config) -> (axum::Router, Arc<AppState>, Tem
     let store = Store::open_in_memory().unwrap();
     let security_config = Arc::new(config.security.clone());
     let state = AppState::with_config_path(store, config, dir.path().join("server.toml"));
-    let rate_limit_state = Arc::new(RateLimitState::new());
+    let rate_limit_state = Arc::new(RateLimitState::new(&security_config));
     let router = app(Arc::clone(&state), security_config, rate_limit_state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
     (router, state, dir)
@@ -442,7 +442,7 @@ async fn test_add_device_fails_when_config_cannot_be_saved() {
     let config_path = dir.path().join("not-a-dir").join("server.toml");
     let state = AppState::with_config_path(store, config.clone(), config_path);
     let security_config = Arc::new(config.security.clone());
-    let rate_limit_state = Arc::new(RateLimitState::new());
+    let rate_limit_state = Arc::new(RateLimitState::new(&security_config));
     let app = app(Arc::clone(&state), security_config, rate_limit_state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
 
@@ -1033,7 +1033,7 @@ fn app_for_config_file(path: &std::path::Path) -> (axum::Router, Arc<AppState>) 
     let store = Store::open_in_memory().unwrap();
     let state = AppState::with_config_path(store, config.clone(), path.to_path_buf());
     let security_config = Arc::new(config.security.clone());
-    let rate_limit_state = Arc::new(RateLimitState::new());
+    let rate_limit_state = Arc::new(RateLimitState::new(&security_config));
     let router = app(Arc::clone(&state), security_config, rate_limit_state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
     (router, state)
