@@ -100,6 +100,10 @@ impl MqttPublisher {
     }
 }
 
+/// Messages the MQTT client's queue holds while they wait to be sent. A
+/// reading that doesn't fit is dropped.
+pub(crate) const MQTT_QUEUE_MESSAGES: usize = 100;
+
 /// Run the MQTT publisher loop.
 async fn run_mqtt_publisher(
     state: Arc<AppState>,
@@ -138,7 +142,7 @@ async fn run_mqtt_publisher(
     };
 
     // Create MQTT client
-    let (client, mut eventloop) = AsyncClient::new(mqtt_options, 100);
+    let (client, mut eventloop) = AsyncClient::new(mqtt_options, MQTT_QUEUE_MESSAGES);
 
     // Subscribe to readings broadcast
     let mut readings_rx = state.readings_tx.subscribe();
@@ -712,6 +716,14 @@ mod tests {
         }
         // Nothing has connected at that point, and the log must not say so.
         assert!(!text.contains("connected"), "{text}");
+    }
+
+    /// The module docs, the changelog and the documentation quote these
+    /// numbers, so a change here needs a change there.
+    #[test]
+    fn mqtt_limits_are_the_documented_numbers() {
+        assert_eq!(MQTT_QUEUE_MESSAGES, 100);
+        assert_eq!(HA_DISCOVERY_TIMEOUT, Duration::from_secs(10));
     }
 
     #[test]

@@ -1163,6 +1163,13 @@ mod tests {
         assert!(stuck_rx.await.is_err(), "the stuck task was not aborted");
     }
 
+    /// The changelog and the documentation quote this number, so a change
+    /// here needs a change there.
+    #[test]
+    fn shutdown_grace_is_the_documented_number() {
+        assert_eq!(SHUTDOWN_GRACE, Duration::from_secs(10));
+    }
+
     #[test]
     fn drop_log_warns_at_most_once_a_minute() {
         let mut drops = DropLog::default();
