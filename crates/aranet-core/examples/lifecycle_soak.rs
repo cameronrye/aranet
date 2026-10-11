@@ -245,16 +245,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, St
     Ok(Some(parsed))
 }
 
-/// Whether `name` is `query`, ignoring case, or either half of CoreBluetooth's
-/// combined `"<GAP name> [<advertised name>]"`.
+/// Whether `name` is `query`, ignoring case. Only the whole name counts.
 fn name_matches(name: &str, query: &str) -> bool {
     name.eq_ignore_ascii_case(query)
-        || name
-            .strip_suffix(']')
-            .and_then(|rest| rest.split_once(" ["))
-            .is_some_and(|(gap, advertised)| {
-                gap.eq_ignore_ascii_case(query) || advertised.eq_ignore_ascii_case(query)
-            })
 }
 
 /// Which driver a link cut or an event belongs to.
@@ -1334,12 +1327,12 @@ mod tests {
     }
 
     #[test]
-    fn name_matching_is_exact_but_accepts_either_half_of_a_corebluetooth_name() {
+    fn name_matching_is_exact_apart_from_case() {
         assert!(name_matches("Aranet2 2751B", "aranet2 2751b"));
         assert!(!name_matches("Aranet2 2751B", "2751B"));
-        assert!(name_matches("Kitchen [Aranet4 1A2B3]", "Aranet4 1A2B3"));
-        assert!(name_matches("Kitchen [Aranet4 1A2B3]", "kitchen"));
-        assert!(!name_matches("Kitchen [Aranet4 1A2B3]", "Aranet4"));
+        // A bracketed part is part of the name like any other.
+        assert!(name_matches("Hall [Aranet2 2751B]", "hall [aranet2 2751b]"));
+        assert!(!name_matches("Hall [Aranet2 2751B]", "hall"));
     }
 
     #[test]
