@@ -1,4 +1,9 @@
-target/
+# Build context of docker/Dockerfile (`docker build -f docker/Dockerfile .`),
+# which copies everything not listed here. Patterns match paths from the
+# context root: `**/target/` is every target directory, including those of
+# nested checkouts such as the worktrees under .claude/.
+**/target/
+.claude/
 .git/
 *.md
 !crates/aranet-service/README.md
@@ -8,4 +13,9 @@ dashboards/
 scripts/
 distribution/
 .github/
-tests/
+# Local files that .gitignore keeps out too: secrets and coverage output.
+**/.env*
+**/*.profraw
+**/*.profdata
+coverage/
+lcov.info

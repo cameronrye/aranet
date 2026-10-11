@@ -1,7 +1,17 @@
 # Aranet Service Configuration for Docker
 #
-# This is the default configuration for running aranet-service in Docker.
-# Mount this file to /app/server.toml in the container.
+# docker/Dockerfile bakes this file into the image as /app/server.toml, the
+# path the service always reads. To change the configuration, mount a file
+# over /app/server.toml (both compose files mount this one, read-only) and
+# restart the container. The service runs as uid 999, so a mounted file must
+# be readable by that uid.
+#
+# The service can't write the baked copy or a read-only mount, so adding,
+# changing or removing a sensor through the API, the dashboard, the TUI or the
+# GUI fails in the container: edit the file on the host instead. For the same
+# reason, if you set security.api_key_enabled = true, also set
+# security.api_key yourself: the service can't save a generated key here and
+# would stop at startup.
 
 [server]
 # Bind to all interfaces for Docker networking
@@ -79,11 +89,9 @@ enabled = false
 # precision = "s"
 
 # Devices to monitor
-# Note: Bluetooth is not available in Docker by default.
-# For BLE access, you need to:
-# 1. Run container with --privileged
-# 2. Mount /var/run/dbus from host
-# 3. Use Linux host with Bluetooth adapter
+# Bluetooth needs a Linux host with BlueZ and the host's /run/dbus mounted
+# read-only into the container (docker-compose.yml at the repository root
+# does). Privileged mode, host networking and devices are not needed.
 
 # [[devices]]
 # address = "Aranet4 XXXXX"
