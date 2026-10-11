@@ -5,8 +5,9 @@
 //! the repository. They read the files line by line, without a Dockerfile or
 //! YAML parser, so the compose files must stay in block style. The image itself
 //! is built and started by `scripts/ci/check-docker-image.sh`, in the `docker`
-//! job of `.github/workflows/deployment-files.yml`. The last test here reads
-//! that workflow: it must keep running the script.
+//! job of `.github/workflows/deployment-files.yml`. The last two tests here read
+//! that workflow and that script, as text too: they pin some of their lines and
+//! run neither.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -418,14 +419,29 @@ fn compose_build_dockerfiles_exist() {
 // only with Docker: each fails for a one-line change that the tests above let
 // through.
 
+/// Whether `instruction`, one of `dockerfile()`'s, is a `keyword` instruction.
+/// Docker reads instruction names without regard to case, so `user root` is a
+/// `USER` instruction too.
+fn is_instruction(instruction: &str, keyword: &str) -> bool {
+    instruction
+        .split(' ')
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+}
+
 #[test]
 fn dockerfile_user_entrypoint_and_cmd_are_the_image_contract() {
     let instructions = dockerfile();
     let users: Vec<&String> = instructions
         .iter()
-        .filter(|instruction| instruction.starts_with("USER "))
+        .filter(|instruction| is_instruction(instruction, "USER"))
         .collect();
-    assert_eq!(users, ["USER aranet"], "the service must not run as root");
+    assert_eq!(
+        users,
+        ["USER aranet"],
+        "the service must not run as root, and the last USER instruction is the \
+         one that counts"
+    );
     let useradd = instructions
         .iter()
         .find(|instruction| instruction.contains("useradd "))
@@ -464,7 +480,7 @@ fn dockerfile_user_entrypoint_and_cmd_are_the_image_contract() {
 fn dockerfile_pins_its_base_images_and_uses_the_built_in_frontend() {
     let stages: Vec<String> = dockerfile()
         .into_iter()
-        .filter(|instruction| instruction.starts_with("FROM "))
+        .filter(|instruction| is_instruction(instruction, "FROM"))
         .collect();
     assert_eq!(
         stages,
@@ -475,13 +491,19 @@ fn dockerfile_pins_its_base_images_and_uses_the_built_in_frontend() {
         "the builder names its Rust version and both stages the same Debian \
          release, so the binary finds the libraries it was linked against"
     );
+    // Docker reads a parser directive without regard to case or to spaces and
+    // tabs around its name, so `#syntax=…` and `# SYNTAX = …` count too.
+    let directives: Vec<String> = read("docker/Dockerfile")
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix('#'))
+        .map(|comment| comment.replace([' ', '\t'], "").to_ascii_lowercase())
+        .filter(|comment| comment.starts_with("syntax="))
+        .collect();
     assert!(
-        !read("docker/Dockerfile")
-            .lines()
-            .any(|line| line.trim_start().starts_with("# syntax=")),
-        "a `# syntax=` line would pull an unpinned Dockerfile frontend image; \
-         BuildKit's built-in frontend already supports the cache mounts and \
-         `COPY --chmod`"
+        directives.is_empty(),
+        "a `# syntax=` line, however it is spelled, would pull an unpinned \
+         Dockerfile frontend image; BuildKit's built-in frontend already supports \
+         the cache mounts and `COPY --chmod`: {directives:?}"
     );
 }
 
@@ -489,7 +511,9 @@ fn dockerfile_pins_its_base_images_and_uses_the_built_in_frontend() {
 fn dockerfile_run_steps_stop_at_the_first_failing_command() {
     let unchecked: Vec<String> = dockerfile()
         .into_iter()
-        .filter(|instruction| instruction.starts_with("RUN ") && instruction.contains([';', '|']))
+        .filter(|instruction| {
+            is_instruction(instruction, "RUN") && instruction.contains([';', '|'])
+        })
         .collect();
     assert!(
         unchecked.is_empty(),
@@ -501,7 +525,7 @@ fn dockerfile_run_steps_stop_at_the_first_failing_command() {
 }
 
 #[test]
-fn dockerignore_excludes_env_files_and_coverage_output() {
+fn dockerignore_excludes_env_files_coverage_output_docs_and_the_website() {
     let text = read(".dockerignore");
     let patterns: Vec<&str> = text
         .lines()
@@ -522,6 +546,16 @@ fn dockerignore_excludes_env_files_and_coverage_output() {
              matches only the context root): {patterns:?}"
         );
     }
+    // docker/Dockerfile's comment on `COPY . .` says that .dockerignore keeps
+    // the docs out.
+    for pattern in ["docs/", "website/"] {
+        assert!(
+            patterns.contains(&pattern),
+            ".dockerignore must list {pattern}, or `COPY . .` sends the docs or the \
+             website to the builder, and with the website a developer's \
+             website/node_modules: {patterns:?}"
+        );
+    }
 }
 
 #[test]
@@ -537,9 +571,10 @@ fn expose_healthchecks_and_published_port_are_loopback_8080() {
             .any(|instruction| instruction == "EXPOSE 8080"),
         "docker/Dockerfile must EXPOSE 8080"
     );
+    // The last one, which is the one Docker uses.
     let healthcheck = instructions
         .iter()
-        .find(|instruction| instruction.starts_with("HEALTHCHECK "))
+        .rfind(|instruction| is_instruction(instruction, "HEALTHCHECK"))
         .expect("docker/Dockerfile has no HEALTHCHECK");
     assert!(
         healthcheck.ends_with(&format!(" CMD curl -fsS {url} || exit 1")),
@@ -548,17 +583,37 @@ fn expose_healthchecks_and_published_port_are_loopback_8080() {
          {healthcheck}"
     );
     let runtime = instructions
-        .rsplit(|instruction| instruction.starts_with("FROM "))
+        .rsplit(|instruction| is_instruction(instruction, "FROM"))
         .next()
         .unwrap_or_default();
-    assert!(
-        runtime.iter().any(|instruction| {
-            instruction.starts_with("RUN apt-get ")
-                && instruction.split(' ').any(|word| word == "curl")
-        }),
-        "the final stage must install curl, which every healthcheck runs inside \
-         the container: {runtime:#?}"
-    );
+    let installed: Vec<&str> = runtime
+        .iter()
+        .filter(|instruction| {
+            is_instruction(instruction, "RUN") && instruction.contains("apt-get install ")
+        })
+        .flat_map(|instruction| instruction.split(' '))
+        .collect();
+    for (package, why) in [
+        (
+            "libdbus-1-3",
+            "the binary is linked against libdbus, which is how it reaches BlueZ",
+        ),
+        (
+            "libssl3",
+            "the binary is linked against OpenSSL, which the MQTT client uses",
+        ),
+        (
+            "ca-certificates",
+            "without it the MQTT client can't verify a broker's certificate, and \
+             no check makes a TLS connection, so nothing else would notice",
+        ),
+        ("curl", "every healthcheck runs it inside the container"),
+    ] {
+        assert!(
+            installed.contains(&package),
+            "the final stage must install {package}: {why}: {runtime:#?}"
+        );
+    }
 
     for file in COMPOSE_FILES {
         let text = read(file);
@@ -675,6 +730,7 @@ fn deployment_workflow_runs_the_image_check_for_main_and_deploy_file_changes() {
         ".dockerignore",
         "Cargo.toml",
         "Cargo.lock",
+        "distribution/systemd/**",
         "scripts/ci/**",
         ".github/workflows/deployment-files.yml",
     ] {
@@ -683,4 +739,153 @@ fn deployment_workflow_runs_the_image_check_for_main_and_deploy_file_changes() {
             "a pull request that changes {path} must run the workflow: {paths:?}"
         );
     }
+
+    // The token, the checkout's credentials and the action pins. zizmor reports
+    // a change to any of them, but no workflow runs it. Only the top-level
+    // `permissions:` is read: a job that asks for more in a block of its own
+    // passes.
+    let raw: Vec<&str> = text.lines().map(strip_comment).collect();
+    let permissions: Vec<&str> = raw
+        .iter()
+        .skip_while(|line| **line != "permissions:")
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .take_while(|line| indent(line) > 0)
+        .map(|line| line.trim())
+        .collect();
+    assert_eq!(
+        permissions,
+        ["contents: read"],
+        "the workflow's top-level `permissions:` must be a block with `contents: \
+         read` and nothing else. With more, or without the block (the token then \
+         gets the repository's default permissions), a job's token could write"
+    );
+    let mut checkouts = 0;
+    for (i, line) in raw.iter().enumerate() {
+        let entry = line.trim_start();
+        let key = entry.strip_prefix("- ").map_or(entry, str::trim_start);
+        let Some(action) = key.strip_prefix("uses:") else {
+            continue;
+        };
+        let action = action.trim().trim_matches(['"', '\'']);
+        assert!(
+            action.rsplit_once('@').is_some_and(|(_, commit)| {
+                commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            "`uses: {action}` must name a commit by its SHA, 40 hexadecimal digits \
+             after `@`: a tag or a branch can be moved to other code"
+        );
+        if !action.to_ascii_lowercase().starts_with("actions/checkout@") {
+            continue;
+        }
+        checkouts += 1;
+        // The rest of the step: the lines indented at least as far as `uses`.
+        let column = line.len() - key.len();
+        let step: Vec<&str> = raw[i + 1..]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .take_while(|line| indent(line) >= column)
+            .map(|line| line.trim())
+            .collect();
+        assert!(
+            step.contains(&"persist-credentials: false"),
+            "the checkout step must set `persist-credentials: false` below its \
+             `uses:` line, or the checkout keeps the token where the job's later \
+             steps can use it: {step:?}"
+        );
+    }
+    assert!(
+        checkouts > 0,
+        "no step uses actions/checkout, so no job has the script to run"
+    );
+}
+
+/// Pins two things in the text of `scripts/ci/check-docker-image.sh`, the two
+/// whose loss would be worst: `fail` ends with `exit 1`, and container ports
+/// are published on 127.0.0.1 only. It reads the script and runs nothing, so
+/// it is not a test of what the script checks: only a run against a broken
+/// image is.
+#[test]
+fn image_check_script_keeps_exit_1_in_fail_and_loopback_only_ports() {
+    if !repo("crates/aranet-service/Cargo.toml").is_file() {
+        return; // not a repository checkout: there is no scripts/ci/ to read
+    }
+    let script = read("scripts/ci/check-docker-image.sh");
+    // The script's comments are whole lines or start with ` #`, like the YAML
+    // comments `strip_comment` is for.
+    let lines: Vec<&str> = script
+        .lines()
+        .map(|line| strip_comment(line).trim())
+        .collect();
+
+    // The script's own checks stop it through `fail`. With `exit 0` there, a
+    // failed check would end the script, and the job, as a success.
+    let start = lines
+        .iter()
+        .position(|line| *line == "fail() {")
+        .expect("the script has no `fail() {` line");
+    let body: Vec<&str> = lines[start + 1..]
+        .iter()
+        .copied()
+        .take_while(|line| *line != "}")
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        body.last(),
+        Some(&"exit 1"),
+        "`fail` must end with `exit 1`. With `exit 0` there, a failed check would \
+         end the script as a success: {body:#?}"
+    );
+
+    // Every port that a `docker run` or `docker create` publishes: `-p` and
+    // `--publish` with their address, `-P` and `--publish-all` with none.
+    // Continuation lines are joined first.
+    let commands = lines.join("\n").replace("\\\n", " ");
+    let mut published = Vec::new();
+    for command in commands.lines() {
+        let words: Vec<&str> = command.split_whitespace().collect();
+        if !words.iter().any(|word| word.ends_with("docker"))
+            || !(words.contains(&"run") || words.contains(&"create"))
+        {
+            continue;
+        }
+        for (i, word) in words.iter().enumerate() {
+            // A group of short options, such as `-p` or `-dp`.
+            let short = word.strip_prefix('-').filter(|letters| {
+                !letters.is_empty() && letters.bytes().all(|byte| byte.is_ascii_alphabetic())
+            });
+            let address =
+                if *word == "--publish" || short.is_some_and(|letters| letters.ends_with('p')) {
+                    words.get(i + 1).copied().unwrap_or_default()
+                } else if word.starts_with("--publish-all")
+                    || short.is_some_and(|letters| letters.contains('P'))
+                {
+                    ""
+                } else if let Some(address) = word
+                    .strip_prefix("--publish=")
+                    .or_else(|| word.strip_prefix("-p"))
+                {
+                    address
+                } else {
+                    continue;
+                };
+            published.push((address.trim_matches(['"', '\'']), command));
+        }
+    }
+    assert!(
+        !published.is_empty(),
+        "the script publishes no container port with `-p` or `--publish`. If it \
+         reaches its containers another way now, this test must check that way"
+    );
+    let open: Vec<&(&str, &str)> = published
+        .iter()
+        .filter(|(address, _)| !address.starts_with("127.0.0.1:"))
+        .collect();
+    assert!(
+        open.is_empty(),
+        "the script must publish container ports on 127.0.0.1 only, as in `-p \
+         127.0.0.1::8080`: the service in its containers has no authentication, \
+         and `-p 8080` would put it on every interface of the machine that runs \
+         the script: {open:#?}"
+    );
 }
