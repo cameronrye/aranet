@@ -26,12 +26,12 @@ A service daemon that continuously monitors Aranet devices and exposes sensor da
 - **MQTT publisher** - Broadcast readings to MQTT brokers for IoT integration and Home Assistant auto-discovery
 - **Webhook notifications** - Send HTTP alerts for CO2, radon, and battery thresholds
 - **InfluxDB export** - Stream readings to InfluxDB v2 using line protocol
-- **mDNS discovery** - Advertise `_aranet._tcp.local.` and `_http._tcp.local.` on the LAN
+- **mDNS discovery** - Advertise `_aranet._tcp.local.` and `_http._tcp.local.` on the LAN, as `Aranet Service on <name>` at `aranet-<name>.local.`, when the service listens on a network address with API-key authentication
 - **Embedded dashboard** - Serve a built-in monitoring UI at `/` and `/dashboard`
 - **Local persistence** - Store readings in SQLite via aranet-store
 - **Configurable** - TOML-based configuration for devices, intervals, and server settings
 - **Health endpoint** - Monitor service status for integration with monitoring systems
-- **Service management** - Install as system service (launchd/systemd/Windows Service)
+- **Service management** - Install as a per-user service (launchd on macOS, systemd on Linux) or as an unprivileged systemd system service
 
 ## Installation
 
@@ -54,20 +54,28 @@ aranet-service
 # Specify a custom config file
 aranet-service --config /path/to/config.toml
 
-# Specify bind address and port
-aranet-service --bind 0.0.0.0:8080
+# Listen on another address (an IP address and port)
+aranet-service --bind 127.0.0.1:9090
 ```
+
+Listening on a network address such as `0.0.0.0:8080` requires API-key authentication (`api_key_enabled = true` under `[security]`), or `security.allow_unauthenticated_network = true` when a firewall or an authenticating proxy protects the port. Without either, the service refuses to start. The service also refuses host names such as `localhost:8080`: use `127.0.0.1:8080`.
 
 ## Configuration
 
-Create a configuration file at `~/.config/aranet/server.toml`:
+Create a configuration file at `~/.config/aranet/server.toml` (macOS: `~/Library/Application Support/aranet/server.toml`), or pass one with `--config`:
 
 ```toml
 [server]
 bind = "127.0.0.1:8080"
 
 [storage]
-path = "~/.local/share/aranet/data.db"
+path = "~/.local/share/aranet/data.db"  # `~/` is your home directory
+
+# Optional: delete old data at startup and hourly (off by default).
+# history_days also prunes the history that `aranet sync` cached.
+# [storage.retention]
+# readings_days = 90
+# history_days = 365
 
 [[devices]]
 address = "AA:BB:CC:DD:EE:FF"
@@ -140,7 +148,7 @@ precision = "s"
 
 The dashboard shell routes `/` and `/dashboard` are public so browsers can load the UI. API, WebSocket, and metrics requests still honor the configured security settings.
 
-If API key authentication is enabled, WebSocket clients can use `X-API-Key` or the `token` query parameter for `/api/ws`.
+If API key authentication is enabled, send the key as `X-API-Key` or `Authorization: Bearer <key>`; WebSocket clients can also use the `token` query parameter for `/api/ws`. A repeated `X-API-Key` or `Authorization` header, or an `X-API-Key` that isn't plain text, is never read as a key, so a request that sends its key that way is refused. While authentication is off, the service answers only local host names, IP addresses, this machine's name and `security.allowed_hosts` (421 otherwise), and rejects browser requests from origins other than its own and `security.cors_origins` (403).
 
 ### Query Parameters
 
@@ -150,8 +158,10 @@ For `/readings` and `/history` endpoints:
 |-----------|------|-------------|
 | `since` | Unix timestamp | Filter records after this time |
 | `until` | Unix timestamp | Filter records before this time |
-| `limit` | Integer | Maximum number of records |
-| `offset` | Integer | Skip this many records (pagination) |
+| `limit` | Integer | Maximum number of records, 1 to 10000 (default 1000) |
+| `offset` | Integer | Skip this many records, at most 1000000 (default 0) |
+
+Records come newest first. Without `limit`, a response holds at most 1000 of them; `pagination.has_more` says whether there are more, and `pagination.limit` is the page size that was used. `limit=0`, a `limit` above 10000 and an `offset` above 1000000 are rejected with `400`; to go further back, narrow the range with `since` and `until`.
 
 ## Example Requests
 
@@ -198,8 +208,8 @@ When enabled, the `/metrics` endpoint exports sensor data in Prometheus format:
 
 - `aranet_collector_running` - Collector status (1=running, 0=stopped)
 - `aranet_collector_uptime_seconds` - Collector uptime
-- `aranet_device_poll_success_total` - Successful polls per device
-- `aranet_device_poll_failure_total` - Failed polls per device
+- `aranet_device_poll_success_total` - Successful polls per device since the service started
+- `aranet_device_poll_failure_total` - Failed polls per device since the service started
 - `aranet_device_poll_duration_ms` - Duration of the last poll in milliseconds
 
 > **Note:** Sensor metrics are only emitted for capabilities a device actually has.
@@ -230,10 +240,10 @@ Where `{prefix}` is the configured topic prefix (default: "aranet") and `{device
 
 ## Service Management
 
-Install and manage aranet-service as a system service:
+Install and manage aranet-service as a background service:
 
 ```bash
-# Install as user service
+# Install as a user service (a LaunchAgent on macOS, a systemd user service on Linux)
 aranet-service service install --user
 
 # Start/stop/status
@@ -241,9 +251,14 @@ aranet-service service start --user
 aranet-service service stop --user
 aranet-service service status --user
 
-# Install as system service (requires root/admin)
-sudo aranet-service service install
+# Linux with systemd only: install the unprivileged system service aranet.service.
+# The binary must be one that only root can change, such as /usr/local/bin/aranet-service.
+sudo install -o root -g root -m 0755 ~/.cargo/bin/aranet-service /usr/local/bin/aranet-service
+sudo /usr/local/bin/aranet-service service install
+sudo systemctl start aranet
 ```
+
+The system service runs as a dynamic `aranet` user without extra capabilities, with its config (`server.toml`) and database in `/var/lib/aranet`; `journalctl -u aranet` shows its log. System-level installs are refused on macOS, Windows, OpenRC and rc.d, where the service would run as root. See the [deployment guide](https://cameronrye.github.io/aranet/docs/service/deployment/) for Bluetooth group access, running `aranet server` under the unit, and Windows.
 
 ## Related Crates
 
