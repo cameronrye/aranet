@@ -9,7 +9,7 @@ aranet-service can publish sensor readings to MQTT and optionally register suppo
 
 ## Prerequisites
 
-- `aranet-service` running with MQTT enabled
+- `aranet-service` built with MQTT support, running with MQTT enabled: the binary from `cargo install aranet-service --features full`, or the Docker image. `aranet server` from the released `aranet` CLI has no MQTT
 - A reachable MQTT broker such as Mosquitto or EMQX
 - Home Assistant with the MQTT integration configured
 
@@ -155,6 +155,10 @@ automation:
 ```
 
 ## Troubleshooting
+
+### Nothing is published
+
+A build with MQTT support logs `Starting MQTT publisher to …` or `MQTT publisher is disabled` when it starts. If the log has neither line, the binary has no MQTT support: `aranet server` from the released `aranet` CLI doesn't, and neither does `aranet-service` built without the `mqtt` feature, which `--features full` includes. `[mqtt]` settings are accepted there but do nothing.
 
 ### Entities do not appear
 

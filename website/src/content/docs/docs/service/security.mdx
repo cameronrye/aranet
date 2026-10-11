@@ -153,7 +153,7 @@ Example response body:
 
 ## Host Names
 
-While API-key authentication is off, the service answers only requests whose `Host` header is `localhost` (or a name ending in `.localhost`), an IP address, this machine's host name (`name` or `name.local`), or a name listed in `security.allowed_hosts`. Other names get `421 Misdirected Request`. This blocks DNS rebinding, where a web page on a domain the attacker controls points that domain at your machine to reach the API through your browser. The port in `Host` doesn't matter, and a request without a `Host` header is allowed.
+While API-key authentication is off, the service answers only requests whose `Host` header is `localhost` (or a name ending in `.localhost`), an IP address, this machine's host name (`name` or `name.local`), or a name listed in `security.allowed_hosts`. Other names get `421 Misdirected Request`. This blocks DNS rebinding, where a web page on a domain the attacker controls points that domain at your machine to reach the API through your browser. The port in `Host` doesn't matter, and a request without a `Host` header is allowed. This machine's `name` is the first label of its host name (`server1` for `server1.example.com`): list a fully qualified name in `security.allowed_hosts`.
 
 ```toml
 [security]

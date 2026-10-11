@@ -6,7 +6,7 @@ description: Deploy aranet-service as a background system service.
 import { Aside, Steps, Tabs, TabItem, Badge, Code } from '@astrojs/starlight/components';
 import { CURRENT_RELEASE } from '../../../../site-config.mjs';
 
-This guide covers running aranet-service as a persistent background service. The `aranet` CLI from the [downloads](/aranet/docs/downloads/) runs the same service as `aranet server`. The standalone `aranet-service` binary, which can also install itself as a service, comes from `cargo install aranet-service --features full`.
+This guide covers running aranet-service as a persistent background service. The `aranet` CLI from the [downloads](/aranet/docs/downloads/) runs the service as `aranet server`: the API, the dashboard, the WebSocket, `/metrics`, webhooks, InfluxDB export, mDNS and retention. It has no MQTT (so no Home Assistant discovery), no Prometheus push gateway and no desktop notifications: their settings are accepted in `server.toml` but do nothing there. For those, use the standalone `aranet-service` binary from `cargo install aranet-service --features full`, which can also install itself as a service, or the Docker image, which is built the same way (a container has no desktop for notifications to appear on).
 
 ## Deployment Options
 
@@ -48,7 +48,7 @@ On macOS the service runs as a LaunchAgent: as you, while you're logged in, with
 
 The agent reads `~/Library/Application Support/aranet/server.toml`. To use another file, name it when you install: `aranet-service service install --user --config /path/to/server.toml`. If polls fail because Bluetooth access is denied, allow `aranet-service` under **System Settings → Privacy & Security → Bluetooth**. Remove the agent with `aranet-service service uninstall --user`.
 
-A system-level install (`sudo aranet-service service install`) is refused on macOS, because launchd would run the service as root.
+A system-level install (`sudo aranet-service service install`) is refused on macOS, because launchd would run the service as root. A LaunchDaemon that 0.2.x installed keeps running the service as root after an upgrade: remove it with `sudo aranet-service service uninstall`, then run `aranet-service service install --user`. Every `aranet-service service` command prints a warning while it is still there.
 
 ### Manual Configuration
 
@@ -106,6 +106,8 @@ The system service is `aranet.service`. It runs aranet-service as a dynamic, unp
    ```
    Or install the unit from the repository yourself: `sudo install -m 0644 distribution/systemd/aranet.service /etc/systemd/system/aranet.service`, then `sudo systemctl daemon-reload` and `sudo systemctl enable --now aranet`.
 
+   After a re-install over a running service, use `sudo systemctl restart aranet`: `start` does nothing to a service that is already running.
+
 3. Add your sensors, then restart
    ```bash
    sudoedit /var/lib/aranet/server.toml
@@ -119,7 +121,9 @@ The system service is `aranet.service`. It runs aranet-service as a dynamic, unp
    ```
 </Steps>
 
-`service install --config <file>` makes the unit read another config file. A path that contains `..`, or that lies in `/home`, `/root`, `/run/user`, `/tmp` or `/var/tmp` (also when a symlink leads there), is refused at install time, because the unit hides those directories from the service.
+`service install --config <file>` makes the unit read another config file. A path that contains `..`, or that lies in `/home`, `/root`, `/run/user`, `/tmp` or `/var/tmp` (also when a symlink leads there), is refused at install time, because the unit hides those directories from the service. The service can read a config outside `/var/lib/aranet` but not change it: add sensors by editing the file, and if you set `security.api_key_enabled = true`, set `security.api_key` there yourself. `service install --database <file>` is refused unless the file is in `/var/lib/aranet`, the only directory the service can write.
+
+The unit reads environment settings from `/etc/default/aranet` if that file exists. It is the place for `RUST_LOG` and other variables, one `NAME=value` per line, for example `RUST_LOG=aranet_core=info`; restart the service after changing it.
 
 If the journal shows that BlueZ refused access (`org.freedesktop.DBus.Error.AccessDenied`), let the service use the `bluetooth` group with a drop-in:
 
@@ -132,14 +136,15 @@ sudo systemctl restart aranet
 
 To remove the service, stop it first: `sudo aranet-service service stop`, then `sudo aranet-service service uninstall`.
 
-The system service has no desktop session, so desktop notifications (the `notifications` feature) don't reach anyone from it: use webhooks or MQTT there, or a [user service](#user-service).
+The system service has no desktop session, so desktop notifications (the `notifications` feature) don't reach anyone from it: use webhooks or MQTT there, or a [user service](#user-service). With the released `aranet` binary under this unit (next section), alerts go out by webhooks only: `aranet server` has no MQTT.
 
 #### Running the released `aranet` binary
 
-The release downloads contain `aranet`, not `aranet-service`, and `aranet server` runs the same service. To run it under this unit, copy it where only root can change it, install the unit, and replace the unit's command with a drop-in:
+The release downloads contain `aranet`, not `aranet-service`. `aranet server` runs the service without MQTT, the Prometheus push gateway and desktop notifications (see the top of this page), so its alerts go out by webhooks. To run it under this unit, copy it where only root can change it, install the unit from a clone of the repository, and replace the unit's command with a drop-in:
 
 ```bash
 sudo install -o root -g root -m 0755 ~/.cargo/bin/aranet /usr/local/bin/aranet
+# The next line needs a clone of the repository: git clone https://github.com/cameronrye/aranet
 sudo install -m 0644 distribution/systemd/aranet.service /etc/systemd/system/aranet.service
 sudo mkdir -p /etc/systemd/system/aranet.service.d
 printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/aranet server --config /var/lib/aranet/server.toml\nEnvironment=RUST_LOG=aranet_service=info\n' \
@@ -150,7 +155,7 @@ sudo systemctl enable --now aranet
 
 #### Upgrading from a 0.2.x system service
 
-Earlier versions installed the system service as `rye-aranet.service`, running as root. Every `aranet-service service` command warns while that unit is still installed; `sudo aranet-service service install` stops and removes it (or `sudo aranet-service service uninstall` removes it without installing the new one). Its config and database stay where they were, by default `/root/.config/aranet/server.toml` and `/root/.local/share/aranet/data.db`. To keep them, copy them into `/var/lib/aranet` after the first start of `aranet.service`, and give them to the service's user. `sudo aranet-service service install` prints these steps when it finds the old config:
+Earlier versions installed the system service as `rye-aranet.service`, running as root. Every `aranet-service service` command warns while that unit is still installed; `sudo aranet-service service install` stops and removes it (or `sudo aranet-service service uninstall` removes it without installing the new one). Its config and database stay where they were, by default `/root/.config/aranet/server.toml` and `/root/.local/share/aranet/data.db`. To keep them, do these steps once, right after the first install. The third one deletes the new service's database, which is still empty then: once the service has stored readings of its own, do not run the steps again. `sudo aranet-service service install` prints them for as long as it finds the old config:
 
 ```bash
 sudo systemctl start aranet && sudo systemctl stop aranet    # creates /var/lib/aranet
@@ -160,9 +165,10 @@ sudo sh -c 'cp /root/.local/share/aranet/data.db* /var/lib/aranet/'
 sudo chown -R --reference=/var/lib/aranet /var/lib/aranet/
 sudoedit /var/lib/aranet/server.toml    # if storage.path points under /root, delete that line
 sudo systemctl start aranet
+sudo mv /root/.config/aranet /root/.config/aranet.moved    # the steps are then no longer printed
 ```
 
-The `rm` removes the empty database that the first start created, with its `-wal` and `-shm` files, so none of them is applied to the old database. The `cp` copies the old database together with its own `-wal` and `-shm` files, if any, so no reading that is still only in the write-ahead log is lost. The globs run in `sh -c` because your own shell can't list `/root` or `/var/lib/aranet`. Without a `storage.path`, the service uses the database in `/var/lib/aranet`.
+The `rm` removes the empty database that the first start created, with its `-wal` and `-shm` files, so none of them is applied to the old database. The `cp` copies the old database together with its own `-wal` and `-shm` files, if any, so no reading that is still only in the write-ahead log is lost. The globs run in `sh -c` because your own shell can't list `/root` or `/var/lib/aranet`. Without a `storage.path`, the service uses the database in `/var/lib/aranet`. The last line moves the old config directory away, because its `server.toml` is what makes the installer print the steps.
 
 ### User Service
 
@@ -185,11 +191,11 @@ It runs while you're logged in; `loginctl enable-linger "$USER"` keeps it runnin
 schtasks /create /tn "Aranet Service" /tr "\"%USERPROFILE%\.cargo\bin\aranet.exe\" server" /sc onlogon /ru "%USERNAME%" /it
 ```
 
-With `aranet-service` from `cargo install`, use `"\"%USERPROFILE%\.cargo\bin\aranet-service.exe\" run"` as the `/tr` value instead. The task runs as you, with `%APPDATA%\aranet\server.toml` and your own database, in a console window that stays open while the service runs. Remove it with `schtasks /delete /tn "Aranet Service"`, also from an administrator prompt. Without administrator rights, put a shortcut to `aranet.exe server` (or `aranet-service.exe run`) in your Startup folder (Win+R, `shell:startup`) instead.
+With `aranet-service` from `cargo install`, use `"\"%USERPROFILE%\.cargo\bin\aranet-service.exe\" run"` as the `/tr` value instead. The task runs as you, with `%APPDATA%\aranet\server.toml` and your own database, in a console window that stays open while the service runs. Under `aranet server`, alerts go out by webhooks: the released `aranet` has no MQTT and no desktop notifications. Remove it with `schtasks /delete /tn "Aranet Service"`, also from an administrator prompt. Without administrator rights, put a shortcut to `aranet.exe server` (or `aranet-service.exe run`) in your Startup folder (Win+R, `shell:startup`) instead.
 
 ## Docker
 
-`docker/Dockerfile` builds an image that runs aranet-service as an unprivileged user (uid and gid 999) and always reads `/app/server.toml`. The image holds a copy of [`docker/server.toml`](https://github.com/cameronrye/aranet/blob/main/docker/server.toml), and both compose files mount that file over it. A config that fails validation stops the container; `docker logs aranet-service` shows why.
+`docker/Dockerfile` builds an image that runs aranet-service as an unprivileged user (uid and gid 999) and always reads `/app/server.toml`. The image holds a copy of [`docker/server.toml`](https://github.com/cameronrye/aranet/blob/main/docker/server.toml), and both compose files mount that file over it. An image built after you put an API key, an MQTT password or a webhook URL into that file contains them: don't push or share such an image, or keep them in a config outside the checkout and mount that. A config that fails validation stops the container; `docker logs aranet-service` shows why.
 
 ### Quick Start
 
@@ -222,11 +228,11 @@ sudo chown 999:999 server.toml
 # in the compose file: - ./server.toml:/app/server.toml
 ```
 
-The service then rewrites that file in place, keeping its comments. It can't replace a single mounted file, so an interrupted write can leave it incomplete: keep a copy.
+The service then rewrites that file in place, keeping its comments. It can't replace a single mounted file, so an interrupted write can leave it incomplete: keep a copy. Its first write also makes the file readable only by its owner, uid 999, so reading or editing it on the host then needs `sudo`.
 
 ### Bluetooth in Docker
 
-Bluetooth works on a Linux host running BlueZ: mount the host's `/run/dbus` read-only (`/run/dbus:/run/dbus:ro`), and the service talks to BlueZ over the system bus. No privileged mode, host networking or device nodes are needed. Docker Desktop on macOS and Windows can't reach the host's Bluetooth adapter; run the service natively there.
+Bluetooth works on a Linux host running BlueZ: mount the host's `/run/dbus` read-only (`/run/dbus:/run/dbus:ro`), and the service talks to BlueZ over the system bus. No privileged mode, host networking or device nodes are needed. The mount gives the container the host's whole system bus, with the rights of uid 999 on the host: BlueZ (pairing and removing devices, switching the adapter off) and every other service on the bus that admits that uid. `:ro` only keeps the container from changing the directory: it can still send requests through the socket in it. Docker Desktop on macOS and Windows can't reach the host's Bluetooth adapter; run the service natively there.
 
 If the log shows `AccessDenied` for `org.bluez` or the system bus:
 
@@ -250,7 +256,7 @@ docker run -d --name aranet-service \
   aranet-service
 ```
 
-Build from the repository root with `-f docker/Dockerfile`; there is no `Dockerfile` at the root any more. The Dockerfile needs BuildKit (it uses cache mounts and `COPY --chmod`), the default builder since Docker 23 when the buildx plugin is installed (on Debian and Raspberry Pi OS, the `docker-buildx` package). An older engine may build it with `DOCKER_BUILDKIT=1 docker build …`; if that fails on `--chmod`, update Docker. `docker compose` needs the Compose v2 plugin. The mounted `server.toml` must be readable by uid 999 (`chmod 644 server.toml`, or `sudo chown 999:999 server.toml` if it holds secrets). Arguments after the image name replace the default `run` command and still read `/app/server.toml`, for example `docker run … aranet-service run --no-collector`.
+Build from the repository root with `-f docker/Dockerfile`; there is no `Dockerfile` at the root any more. The Dockerfile needs BuildKit (it uses cache mounts and `COPY --chmod`), the default builder since Docker 23 when the buildx plugin is installed (on Debian and Raspberry Pi OS, the `docker-buildx` package). An older engine may build it with `DOCKER_BUILDKIT=1 docker build …`; if that fails on `--chmod`, update Docker. `docker compose` needs the Compose v2 plugin. The mounted `server.toml` must be readable by uid 999 (`chmod 644 server.toml`, or `sudo chown 999:999 server.toml` if it holds secrets). Arguments after the image name replace the default `run` command and still read `/app/server.toml`, for example `docker run … aranet-service run --no-collector`. The image passes `--config /app/server.toml` itself, so `docker run … aranet-service --config <file>` stops with a usage error (`the argument '--config <CONFIG>' cannot be used multiple times`): mount your file over `/app/server.toml` instead.
 
 ### Production Deployment
 
@@ -262,6 +268,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     restart: always
+    stop_grace_period: 30s  # a clean shutdown can take up to 20 s; Docker's default is 10 s
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -294,10 +301,10 @@ bind = "127.0.0.1:8080"
 [storage]
 path = "~/.local/share/aranet/data.db"
 
-# Optional: delete old data (off by default)
-[storage.retention]
-readings_days = 90
-history_days = 365
+# Optional: delete old data at startup and hourly (off by default)
+# [storage.retention]
+# readings_days = 90
+# history_days = 365
 
 [prometheus]
 enabled = true
@@ -310,7 +317,7 @@ poll_interval = 60
 
 - `server.bind` is an IP address and port. Host names such as `localhost:8080` are rejected: use `127.0.0.1:8080`. Listening on a network address (`0.0.0.0`, `[::]` or a LAN address) needs API-key authentication; see [API Security](/aranet/docs/service/security/).
 - `storage.path` may start with `~/`, meaning your home directory. Earlier versions created a directory literally named `~` in the working directory instead. If you used such a path, the service logs a warning that names both paths at every start, until the old file is moved or removed. To keep that data, stop the service first, then move `./~/.local/share/aranet/data.db` (with its `data.db-wal` and `data.db-shm` files, if any) to `~/.local/share/aranet/`. The move replaces the database the service has created there since the upgrade, which on Linux is also the `aranet` CLI's cache: if that database holds data you want, merge the two instead. Leave `storage.path` out under the systemd system service, which keeps its database in `/var/lib/aranet`.
-- `[storage.retention]` makes the service delete readings older than `readings_days` and history records older than `history_days` (1 to 36500 days each), at startup and then every hour, in small batches, and logs what it deleted (`Retention: deleted N readings and M history records older than the retention limits`). Leave it out to keep everything; a change takes effect when the service restarts. `history_days` also deletes the history that `aranet sync` cached in the same database, so the next `aranet sync` may download those records from the sensor again. Deleting rows doesn't shrink the file: stop the service, then run `sqlite3 <database> 'VACUUM;'` to give the space back (`aranet cache prune --vacuum` also deletes cached history, and readings unless you add `--history-only`, older than its `--older-than` age).
+- `[storage.retention]` makes the service delete readings older than `readings_days` and history records older than `history_days` (1 to 36500 days each), at startup and then every hour, in small batches, and logs what it deleted (`Retention: deleted N readings and M history records older than the retention limits`). Leave it out to keep everything; a change takes effect when the service restarts. Both limits apply to everything in the database, including readings that the `aranet` CLI, TUI and GUI stored there: they share the database unless the service has its own, as under the systemd system service and in Docker. `history_days` also deletes the history that `aranet sync` cached in the same database, so the next `aranet sync` may download those records from the sensor again. Deleting rows doesn't shrink the file: stop the service, then run `sqlite3 <database> 'VACUUM;'` to give the space back (`aranet cache prune --vacuum` also deletes cached history, and readings unless you add `--history-only`, older than its `--older-than` age).
 - Device addresses and aliases can be up to 64 characters long and can't contain control characters or backslashes.
 
 The service writes this file only when you add, change or remove a device through the API (the TUI and GUI service panels use it) or when it generates an API key. It changes only those keys, keeps your comments and layout, never writes command-line overrides such as `--bind` or default values into it, and never overwrites a file it can't parse. It writes atomically and owner-only (mode `0600`), and keeps the file's owner. Sensors you add to the file by hand while the service runs take effect after a restart, and a device change made through the API meanwhile replaces the file's device list with the service's.
@@ -371,7 +378,7 @@ Each webhook POST sends a JSON payload:
 
 Valid event types: `co2_high`, `radon_high`, `battery_low`.
 
-Deliveries run in the background, up to 16 at a time, so a slow or unreachable endpoint doesn't hold up other alerts. Each request times out after 10 s and is tried up to 3 times, 2 s apart and then longer. An alert's cooldown starts once it has been delivered. When 16 deliveries are already running, new alerts are dropped with a warning and come back with a later reading. The log names each endpoint by its position, `endpoint #1` for the first `[[webhooks.endpoints]]` entry, followed by its scheme, host and port only (`https://hooks.slack.com/…`), because many webhook URLs contain their secret. Validation errors count from 0 instead: `webhooks.endpoints[0]` is the same entry.
+Deliveries run in the background, up to 16 at a time, so a slow or unreachable endpoint doesn't hold up other alerts. Each request times out after 10 s and is tried up to 3 times, 2 s apart and then longer. A redirect is never followed: an endpoint that answers `301`, `302`, `307` or `308` counts as failed, so give the endpoint's final URL. An alert's cooldown starts once it has been delivered. When 16 deliveries are already running, new alerts are dropped with a warning and come back with a later reading. The log names each endpoint by its position, `endpoint #1` for the first `[[webhooks.endpoints]]` entry, followed by its scheme, host and port only (`https://hooks.slack.com/…`), because many webhook URLs contain their secret. Validation errors count from 0 instead: `webhooks.endpoints[0]` is the same entry.
 
 ### InfluxDB Export
 
@@ -390,7 +397,7 @@ precision = "s"             # s, ms, us, or ns
 
 Data is written using the InfluxDB v2 line protocol: `aranet,device=office,address=Aranet4\ AAAAA co2=450i,temperature=22.50,humidity=45i,pressure=1013.50,battery=85i`. Tag values and the measurement name are escaped, and `measurement` can't start with `_` or `#` or contain control characters or backslashes. A `measurement` whose spaces or commas were escaped by hand (`air\ quality`) must now be written plain (`air quality`): the service escapes it, and readings continue in the same measurement.
 
-Lines are sent in batches of up to 500. While InfluxDB is unreachable, or answers with a server error, `408` or `429`, the service keeps up to 10000 lines queued and retries with a growing delay, from 1 s up to 5 minutes. When the queue is full, new readings are dropped, with a warning at most once a minute. A batch that InfluxDB rejects with another `4xx` error is dropped, and lines still queued when the service stops are lost. The log shows the InfluxDB URL as `scheme://host[:port]/…` only.
+Lines are sent in batches of up to 500. While InfluxDB is unreachable, or answers with a server error, `408` or `429`, the service keeps up to 10000 lines queued and retries with a growing delay, from 1 s up to 5 minutes. When the queue is full, new readings are dropped, with a warning at most once a minute. A batch that InfluxDB rejects with another `4xx` error is dropped. So is one that it answers with a redirect, which the service never follows: set `url` to InfluxDB's final address. Lines still queued when the service stops are lost. The log shows the InfluxDB URL as `scheme://host[:port]/…` only.
 
 ### mDNS Service Discovery
 
@@ -436,7 +443,7 @@ export RUST_LOG=aranet_service=info
 export ARANET_DATA_DIR=/var/lib/aranet
 ```
 
-There is no environment variable for the service's config file: pass it with `--config`, as in `aranet-service --config /path/to/server.toml` or `aranet server --config /path/to/server.toml`.
+The systemd system service doesn't see variables exported in a shell: set them in `/etc/default/aranet` (see [System Service](#system-service)). There is no environment variable for the service's config file: pass it with `--config`, as in `aranet-service --config /path/to/server.toml` or `aranet server --config /path/to/server.toml`.
 
 ## Prometheus Integration
 
