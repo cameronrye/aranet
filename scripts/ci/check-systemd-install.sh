@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # Check `aranet-service service install` against a real systemd:
 #
-# - `service status` reports a service that isn't installed.
+# - `service status` reports a service that isn't installed, and writes
+#   nothing to stderr while no service from 0.2.1 is left.
 # - The unit it writes is distribution/systemd/aranet.service (with this
 #   machine's program path), passes `systemd-analyze verify` and scores at
 #   most 5.0 in `systemd-analyze security`.
 # - It replaces a running rye-aranet.service, the unit 0.2.1 installed, and
 #   `service status` warns about that unit until then.
 # - The service answers /api/health, runs as the dynamic user `aranet` and
-#   creates its database in /var/lib/aranet.
-# - A copy of the binary in the invoking user's home directory is refused.
+#   creates its database in /var/lib/aranet, and `service status` reports it
+#   as running.
+# - A copy of the binary in the invoking user's home directory is refused, and
+#   so is a root-owned copy in /root, which the unit's sandbox hides.
+# - An install whose config would serve the API to the network without
+#   authentication is refused, whether the bind comes from `--bind` or from
+#   /var/lib/aranet/server.toml, the config the unit reads.
+# - No refused install changes the unit or stops the service.
 # - `service uninstall` removes the unit.
 #
 # Usage, from the repository root:
@@ -40,6 +47,8 @@ health=http://127.0.0.1:8080/api/health
 invoking_user=${SUDO_USER:-root}
 user_home=$(getent passwd "$invoking_user" | cut -d: -f6)
 home_copy="$user_home/aranet-service"
+root_copy=/root/aranet-service
+state_config=/var/lib/aranet/server.toml
 work=$(mktemp -d)
 
 on_exit() {
@@ -48,7 +57,7 @@ on_exit() {
     systemctl status --no-pager aranet.service rye-aranet.service || true
     journalctl --no-pager -n 100 -u aranet.service || true
   fi
-  rm -rf "$work" "$home_copy"
+  rm -rf "$work" "$home_copy" "$root_copy"
   exit "$status"
 }
 trap on_exit EXIT
@@ -57,9 +66,13 @@ echo "== Install the binary where only root can change it"
 install -o root -g root -m 0755 "$built" "$program"
 
 echo "== Nothing is installed yet"
-"$program" service status | tee "$work/status.out"
+"$program" service status 2> "$work/status.err" | tee "$work/status.out"
 grep -qx 'aranet-service is not installed' "$work/status.out" ||
   fail "service status doesn't report the missing service"
+if [ -s "$work/status.err" ]; then
+  cat "$work/status.err"
+  fail "service status wrote to stderr although no service from 0.2.1 is installed"
+fi
 
 echo "== systemd-analyze verify the shipped unit"
 # verify checks that the ExecStart= program exists, and the shipped unit runs
@@ -105,18 +118,21 @@ systemd-analyze security --offline=true --threshold=50 --no-pager "$unit" | tail
 echo "== The service runs as the dynamic user aranet"
 systemctl start aranet.service
 for _ in $(seq 1 30); do
-  if curl -fsS "$health" > /dev/null 2>&1; then
+  if curl -fsS --max-time 5 "$health" > /dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-curl -fsS "$health" > /dev/null || fail "$health did not answer within 30 s"
+curl -fsS --max-time 5 "$health" > /dev/null || fail "$health did not answer within 30 s"
 pid=$(systemctl show -p MainPID --value aranet.service)
 [ "$pid" -gt 0 ] || fail "aranet.service has no main process"
 user=$(ps -o user= -p "$pid" | tr -d ' ')
 echo "aranet.service runs as $user, uid $(ps -o uid= -p "$pid" | tr -d ' ')"
 [ "$user" = aranet ] || fail "aranet.service runs as $user, not as aranet"
 [ -f /var/lib/private/aranet/data.db ] || fail "/var/lib/private/aranet/data.db was not created"
+"$program" service status | tee "$work/status.out"
+grep -qx 'aranet-service is running' "$work/status.out" ||
+  fail "service status doesn't report the running service"
 
 echo "== A copy in $user_home is refused"
 install -o "$invoking_user" -m 0755 "$built" "$home_copy"
@@ -129,11 +145,50 @@ grep -qF "sudo install -o root -g root -m 0755 $home_copy /usr/local/bin/aranet-
 cmp "$work/aranet.service" "$unit" || fail "the refused install changed $unit"
 systemctl is-active --quiet aranet.service || fail "the refused install stopped aranet.service"
 
+echo "== A root-owned copy in /root is refused"
+# Only root can change this copy, but ProtectHome=yes hides /root from the service.
+install -o root -g root -m 0755 "$built" "$root_copy"
+if "$root_copy" service install 2> "$work/refusal.err"; then
+  fail "service install accepted $root_copy"
+fi
+cat "$work/refusal.err"
+grep -qF 'ProtectHome=yes' "$work/refusal.err" ||
+  fail "the refusal doesn't say that ProtectHome=yes hides the binary"
+cmp "$work/aranet.service" "$unit" || fail "the refused install changed $unit"
+systemctl is-active --quiet aranet.service || fail "the refused install stopped aranet.service"
+
+echo "== service install --bind 0.0.0.0:8080 is refused without authentication"
+cp "$unit" "$work/unit.before"
+if "$program" service install --bind 0.0.0.0:8080 2> "$work/refusal.err"; then
+  fail "service install accepted --bind 0.0.0.0:8080 without authentication"
+fi
+cat "$work/refusal.err"
+grep -qF 'Invalid configuration' "$work/refusal.err" ||
+  fail "the refusal doesn't say that the configuration is invalid"
+cmp "$work/unit.before" "$unit" || fail "the refused install changed $unit"
+systemctl is-active --quiet aranet.service || fail "the refused install stopped aranet.service"
+
+echo "== The same bind in $state_config is refused"
+# The install must check the config the unit reads, not the one in root's own
+# config directory: that is the default without --config, and the service
+# never sees it.
+[ ! -e "$state_config" ] || fail "$state_config exists: run this only on a throwaway machine"
+printf '%s\n' '[server]' 'bind = "0.0.0.0:8080"' > "$state_config"
+if "$program" service install 2> "$work/refusal.err"; then
+  fail "service install accepted the unauthenticated network bind in $state_config"
+fi
+rm "$state_config"
+cat "$work/refusal.err"
+grep -qF 'Invalid configuration' "$work/refusal.err" ||
+  fail "the refusal doesn't say that the configuration is invalid"
+cmp "$work/unit.before" "$unit" || fail "the refused install changed $unit"
+systemctl is-active --quiet aranet.service || fail "the refused install stopped aranet.service"
+
 echo "== service uninstall"
 "$program" service stop
 "$program" service uninstall
 [ ! -e "$unit" ] || fail "$unit is still there"
-if curl -fsS "$health" > /dev/null 2>&1; then
+if curl -fsS --max-time 5 "$health" > /dev/null 2>&1; then
   fail "the service still answers after uninstall"
 fi
 

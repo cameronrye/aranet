@@ -895,9 +895,9 @@ fn image_check_script_keeps_exit_1_in_fail_and_loopback_only_ports() {
 /// `scripts/ci/check-systemd-install.sh` fail: the jobs build the binary and
 /// run their checks on the right system with the read-only token, and the
 /// script stops at a failed check, keeps the exposure threshold, requires the
-/// dynamic user and treats an accepted home copy as an error. It reads the
-/// files and runs nothing, so it is not a test of the service, of systemd or
-/// of launchd: only the jobs themselves are.
+/// dynamic user, treats an accepted home copy as an error and limits the time
+/// of every `curl` call. It reads the files and runs nothing, so it is not a
+/// test of the service, of systemd or of launchd: only the jobs themselves are.
 #[test]
 fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
     /// The lines of the job `name`, trimmed: those indented deeper than its
@@ -1045,4 +1045,30 @@ fn service_jobs_run_their_checks_and_the_systemd_script_can_fail() {
         "the script must fail when `service install` accepts the copy of the binary \
          in the invoking user's home directory"
     );
+
+    // A connection that is accepted and never answered would otherwise hold
+    // the job until its own timeout.
+    let curls: Vec<&&str> = script
+        .iter()
+        .filter(|line| line.split_whitespace().any(|word| word == "curl"))
+        .collect();
+    assert!(
+        !curls.is_empty(),
+        "the script has no `curl` call. If it reaches the service another way now, \
+         this test must require that way's time limit"
+    );
+    for line in curls {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let limit = words
+            .iter()
+            .position(|word| *word == "--max-time")
+            .and_then(|at| words.get(at + 1))
+            .and_then(|seconds| seconds.parse::<u32>().ok());
+        assert!(
+            limit.is_some_and(|seconds| seconds > 0),
+            "every `curl` call must have a time limit, as in `--max-time 5`. Without \
+             one, a connection that is accepted and never answered holds the job until \
+             its 30-minute timeout: {line}"
+        );
+    }
 }
