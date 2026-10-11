@@ -1416,6 +1416,12 @@ fn test_startup_warns_about_database_in_tilde_directory() {
 /// started binary shows it: with `rate_limit_requests = 1`, its second
 /// request is refused.
 ///
+/// The same goes for what else `run()` starts from the configuration and its
+/// options. Without the retention task, a `[storage.retention]` table still
+/// validates and nothing is ever deleted, and no other test fails. So the
+/// service's log must say that retention is on, that the collector is off
+/// (`--no-collector`) and that a loopback listener is not advertised.
+///
 /// Unix only: the service is started without the test's environment, with a
 /// `HOME` and a `TMPDIR` inside the `TempDir`, and `dirs` takes every default
 /// path from `HOME` there. So even a service that ignored `--config` or
@@ -1458,19 +1464,29 @@ fn service_enforces_the_rate_limits_in_its_config_file() {
         });
     }
 
+    /// Add the lines the service has written since to `output`. Waits up to
+    /// `wait` for more, or until both of its pipes are at their end.
+    fn read_more(lines: &mpsc::Receiver<String>, output: &mut String, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        while let Ok(line) = lines.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            output.push_str(&line);
+            output.push('\n');
+        }
+    }
+
     /// `GET /api/health` on a connection of its own: the status and the
     /// `Retry-After` header of the answer.
-    fn get_health(addr: SocketAddr) -> (StatusCode, Option<String>) {
-        let mut stream = TcpStream::connect_timeout(&addr, REQUEST_LIMIT).unwrap();
-        stream.set_read_timeout(Some(REQUEST_LIMIT)).unwrap();
-        stream.set_write_timeout(Some(REQUEST_LIMIT)).unwrap();
+    fn get_health(addr: SocketAddr) -> std::io::Result<(StatusCode, Option<String>)> {
+        let mut stream = TcpStream::connect_timeout(&addr, REQUEST_LIMIT)?;
+        stream.set_read_timeout(Some(REQUEST_LIMIT))?;
+        stream.set_write_timeout(Some(REQUEST_LIMIT))?;
         write!(
             stream,
             "GET /api/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
+        )?;
         let mut answer = Vec::new();
-        stream.read_to_end(&mut answer).unwrap();
+        stream.read_to_end(&mut answer)?;
         let answer = String::from_utf8_lossy(&answer);
 
         let mut head = answer.split("\r\n\r\n").next().unwrap_or_default().lines();
@@ -1478,13 +1494,32 @@ fn service_enforces_the_rate_limits_in_its_config_file() {
             .next()
             .and_then(|status_line| status_line.split(' ').nth(1))
             .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("not an HTTP answer: {answer:?}"));
+            .ok_or_else(|| std::io::Error::other(format!("not an HTTP answer: {answer:?}")))?;
         let retry_after = head.find_map(|header| {
             let (name, value) = header.split_once(':')?;
             name.eq_ignore_ascii_case("retry-after")
                 .then(|| value.trim().to_owned())
         });
-        (status, retry_after)
+        Ok((status, retry_after))
+    }
+
+    /// [`get_health`], for a service that is expected to answer. When it
+    /// doesn't, the service has usually stopped, and its last lines say why:
+    /// the failure shows them, not only the I/O error.
+    fn health(
+        addr: SocketAddr,
+        lines: &mpsc::Receiver<String>,
+        output: &mut String,
+    ) -> (StatusCode, Option<String>) {
+        let answer = get_health(addr);
+        // What the service has logged up to this request, for this failure
+        // message and for the assertions on the answer.
+        read_more(lines, output, Duration::ZERO);
+        answer.unwrap_or_else(|error| {
+            // Give a service that is stopping a moment to say why.
+            read_more(lines, output, Duration::from_secs(2));
+            panic!("GET /api/health failed: {error}; the service's output:\n{output}")
+        })
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -1492,15 +1527,18 @@ fn service_enforces_the_rate_limits_in_its_config_file() {
     std::fs::create_dir_all(&home).unwrap();
     let config = dir.path().join("server.toml");
 
-    // Start the service on `addr` and wait until it listens there. `None`
-    // when it couldn't, because something else had the port.
-    let start = |addr: SocketAddr| -> Option<Service> {
+    // Start the service on `addr` and wait until it listens there: the
+    // service, the lines it writes from then on, and its output so far.
+    // `None` when it couldn't listen, because something else had the port.
+    let start = |addr: SocketAddr| -> Option<(Service, mpsc::Receiver<String>, String)> {
         // The address is given twice, so that neither a lost file nor a lost
-        // override makes the service listen on its default port.
+        // override makes the service listen on its default port. Retention
+        // works on the empty database in the `TempDir`.
         std::fs::write(
             &config,
             format!(
                 "[server]\nbind = \"{addr}\"\n\n\
+                 [storage.retention]\nreadings_days = 1\n\n\
                  [security]\nrate_limit_requests = 1\nrate_limit_window_secs = 3600\n"
             ),
         )
@@ -1538,7 +1576,7 @@ fn service_enforces_the_rate_limits_in_its_config_file() {
                     output.push_str(&line);
                     output.push('\n');
                     if line.trim_end().ends_with(&listening) {
-                        return Some(service);
+                        return Some((service, lines, output));
                     }
                 }
                 // Both pipes are at their end: the service has stopped.
@@ -1565,23 +1603,57 @@ fn service_enforces_the_rate_limits_in_its_config_file() {
     // `server.bind` can't name port 0, so the test asks the system for a free
     // loopback port and gives it back for the service to listen on. Something
     // else can take the port in between, and then another one is tried.
-    let (_service, addr) = (0..3)
+    let (_service, lines, mut output, addr) = (0..3)
         .find_map(|_| {
             let addr = TcpListener::bind("127.0.0.1:0")
                 .unwrap()
                 .local_addr()
                 .unwrap();
-            start(addr).map(|service| (service, addr))
+            start(addr).map(|(service, lines, output)| (service, lines, output, addr))
         })
         .expect("three free ports in a row were taken before the service listened on them");
 
-    let (first, _) = get_health(addr);
-    assert_eq!(first, StatusCode::OK, "the first request");
-    let (second, retry_after) = get_health(addr);
+    // After "Listening on", `run()` opens the database and starts the
+    // retention task, the collector, the sinks and the mDNS advertiser, in
+    // that order. The advertiser's line is the last of them.
+    let advertiser = "Not advertising over mDNS";
+    let deadline = Instant::now() + START_LIMIT;
+    while !output.contains(advertiser) {
+        match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => {
+                output.push_str(&line);
+                output.push('\n');
+            }
+            // `_service` stops the service when the panic unwinds.
+            Err(_) => panic!(
+                "aranet-service stopped, or did not log {advertiser:?} within \
+                 {START_LIMIT:?} of listening; its output:\n{output}"
+            ),
+        }
+    }
+    for started in [
+        "Retention: readings are deleted after 1 day".to_string(),
+        "Background collector disabled".to_string(),
+        format!("Not advertising over mDNS: the service listens on {addr} only"),
+    ] {
+        assert!(
+            output.contains(&started),
+            "the service's output does not say {started:?}:\n{output}"
+        );
+    }
+
+    let (first, _) = health(addr, &lines, &mut output);
+    assert_eq!(
+        first,
+        StatusCode::OK,
+        "the first request; the service's output:\n{output}"
+    );
+    let (second, retry_after) = health(addr, &lines, &mut output);
     assert_eq!(
         second,
         StatusCode::TOO_MANY_REQUESTS,
-        "the second request, with rate_limit_requests = 1 in the config file"
+        "the second request, with rate_limit_requests = 1 in the config file; the service's \
+         output:\n{output}"
     );
     // The wait is the configured window's, an hour, and not the default
     // window's, a minute.
