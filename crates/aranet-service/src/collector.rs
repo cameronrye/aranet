@@ -1058,9 +1058,11 @@ mod notifications {
             (show, rx)
         }
 
-        /// Application state whose collector sends its alerts to `show`.
+        /// Application state whose collector sends its alerts to `show` and
+        /// reads devices through a fake, never over Bluetooth.
         fn state_with(config: Config, show: ShowFn) -> TestState {
-            let collector = CollectorState::new().with_notifier(Notifier::with_show(show));
+            let collector = CollectorState::with_reader(FakeReader::new())
+                .with_notifier(Notifier::with_show(show));
             TestState::with_collector(config, collector)
         }
 
@@ -1089,10 +1091,17 @@ mod notifications {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn notification_does_not_block_config_writers() {
             let (tx, mut alerts) = mpsc::unbounded_channel::<(String, String)>();
-            // Like a notification service that takes 2 s to answer.
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let released = std::sync::Mutex::new(Some(released));
+            // Like a notification service that doesn't answer: show() blocks
+            // until the test releases it, or gives up (at most 30 s, well
+            // past the bounds below).
             let show: ShowFn = Arc::new(move |title: String, body: String| -> Result<(), String> {
+                let released = released.lock().unwrap().take();
                 tx.send((title, body)).map_err(|e| e.to_string())?;
-                std::thread::sleep(Duration::from_secs(2));
+                if let Some(released) = released {
+                    released.recv_timeout(Duration::from_secs(30)).ok();
+                }
                 Ok(())
             });
             let t = state_with(config_with_alias("Office"), show);
@@ -1105,15 +1114,20 @@ mod notifications {
             next_alert(&mut alerts).await;
 
             // Adding, editing or removing a device through the API takes this lock.
-            let guard = timeout(Duration::from_millis(500), t.state.config.write())
+            let guard = timeout(Duration::from_secs(5), t.state.config.write())
                 .await
                 .expect("a config write waited for the desktop notification");
             drop(guard);
-            // show() is still asleep, so returning now means it runs elsewhere.
-            timeout(Duration::from_millis(500), notify)
+            // show() is still blocked, so returning now means it runs elsewhere.
+            timeout(Duration::from_secs(5), notify)
                 .await
                 .expect("notify_if_needed waited for show()")
                 .expect("notify_if_needed did not panic");
+
+            // Let show() return, and wait until its job has ended, so the
+            // test leaves no blocked thread behind.
+            release.send(()).expect("show() is still waiting");
+            wait_for_show_job(&t.state.collector.notifier, A).await;
         }
 
         #[tokio::test]
@@ -2165,16 +2179,20 @@ mod tests {
         reader.hold(A);
         assert_eq!(collector.start().await, CollectorStartResult::Started);
         reader.wait_for_reads(1).await;
-        let before = t.state.collector.started_at();
-        assert!(before.is_some());
+        assert!(t.state.collector.started_at().is_some());
+        // The start time is the wall clock in whole seconds, so one that the
+        // edit cleared and set again would equal the original. Pretend the
+        // collector has been running since 2023-11-14.
+        const STARTED: u64 = 1_700_000_000;
+        t.state.collector.set_started_at(STARTED);
 
         t.state.config.write().await.devices[0].alias = Some("Kitchen".to_string());
         t.state.on_devices_changed().await;
         settle().await;
 
         assert_eq!(
-            t.state.collector.started_at(),
-            before,
+            t.state.collector.started_at().map(|at| at.unix_timestamp()),
+            Some(STARTED as i64),
             "the alias edit reset the collector uptime"
         );
         assert!(collector.is_running());

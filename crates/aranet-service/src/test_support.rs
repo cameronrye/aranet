@@ -213,9 +213,26 @@ impl FakeReader {
             .collect()
     }
 
-    /// Wait until at least `n` reads have started.
+    /// Wait until at least `n` reads have started. Panics after one day on
+    /// the tokio clock, naming `n` and the reads so far.
+    ///
+    /// For `start_paused` tests, where a day passes at once when nothing else
+    /// is left to run. Without the limit, a collector that stopped polling
+    /// would hang the test, and with it the whole test run, instead of
+    /// failing it.
     pub(crate) async fn wait_for_reads(&self, n: usize) {
-        self.wait_until(|state| state.records.len() >= n).await;
+        let waited = tokio::time::timeout(
+            Duration::from_secs(24 * 60 * 60),
+            self.wait_until(|state| state.records.len() >= n),
+        )
+        .await;
+        if waited.is_err() {
+            panic!(
+                "waited a day (tokio clock) for {n} reads to start; {} started: {:?}",
+                self.reads().len(),
+                self.reads()
+            );
+        }
     }
 
     async fn wait_until(&self, done: impl Fn(&FakeReaderState) -> bool) {
