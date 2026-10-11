@@ -1623,6 +1623,15 @@ mod tests {
         assert_eq!(stats[0].success_count, 0);
     }
 
+    /// The module docs, the changelog and the documentation quote these
+    /// numbers, so a change here needs a change there.
+    #[test]
+    fn collector_limits_are_the_documented_numbers() {
+        assert_eq!(BLE_POLL_TIMEOUT, Duration::from_secs(180));
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(300));
+        assert_eq!(POLL_DRAIN_TIMEOUT, Duration::from_secs(5));
+    }
+
     #[test]
     fn test_collector_error_timeout_display() {
         let err = CollectorError::Timeout(BLE_POLL_TIMEOUT);

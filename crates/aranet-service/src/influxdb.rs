@@ -878,6 +878,18 @@ mod tests {
         );
     }
 
+    /// The module docs, the changelog and the documentation quote these
+    /// numbers, so a change here needs a change there.
+    #[test]
+    fn influxdb_defaults_are_the_documented_numbers() {
+        let settings = InfluxSettings::default();
+        assert_eq!(settings.queue_lines, 10_000);
+        assert_eq!(settings.batch_lines, 500);
+        assert_eq!(settings.base_backoff, Duration::from_secs(1));
+        assert_eq!(settings.max_backoff, Duration::from_secs(300));
+        assert_eq!(settings.request_timeout, Duration::from_secs(30));
+    }
+
     #[test]
     fn influxdb_queue_drops_when_full_or_closed() {
         let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(2);

@@ -675,6 +675,20 @@ mod tests {
         assert_eq!(alerts[0].alias, Some("Office".to_string()));
     }
 
+    /// The module docs, the changelog and the documentation quote these
+    /// numbers, so a change here needs a change there.
+    #[test]
+    fn webhook_defaults_are_the_documented_numbers() {
+        let settings = WebhookSettings::default();
+        assert_eq!(MAX_IN_FLIGHT_DELIVERIES, 16);
+        assert_eq!(settings.max_in_flight, 16);
+        assert_eq!(settings.request_timeout, Duration::from_secs(10));
+        assert_eq!(settings.shutdown_grace, Duration::from_secs(5));
+        // Three attempts, 2 s and then 4 s apart.
+        assert_eq!(settings.retry.attempts, 3);
+        assert_eq!(settings.retry.base_delay, Duration::from_secs(2));
+    }
+
     #[test]
     fn test_webhook_payload_serialization() {
         let payload = WebhookPayload {
