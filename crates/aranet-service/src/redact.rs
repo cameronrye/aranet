@@ -4,10 +4,19 @@
 //! Webhook URLs often carry their secret in the path (Slack, Discord) or are
 //! the secret (an ntfy topic), and any sink URL can carry `user:password@`.
 //! Log a sink URL only through [`redact_url`], and a response body only
-//! through [`sanitize_body`].
+//! through [`sanitize_body`]. Read the body of a sink's error response only
+//! with [`read_error_body`], which also limits how much of it is read.
 
 /// The most characters of a response body kept in an error or log line.
 pub(crate) const MAX_LOGGED_BODY_CHARS: usize = 256;
+
+/// The most bytes of an error response's body that [`read_error_body`] reads.
+/// More than [`MAX_LOGGED_BODY_CHARS`] characters of any encoding.
+const MAX_ERROR_BODY_BYTES: usize = 4096;
+
+/// What a sink reports in place of the body of a 3xx answer.
+pub(crate) const REDIRECT_NOT_FOLLOWED: &str =
+    "redirect not followed; set the URL to its final address";
 
 /// `scheme://host[:port]` of `url`, followed by `/…` when it had a path other
 /// than `/`, a query or a fragment.
@@ -52,6 +61,35 @@ pub(crate) fn sanitize_body(body: &str) -> String {
         sanitized.push('…');
     }
     sanitized
+}
+
+/// The body of a sink's error `response`, fit for one log line (see
+/// [`sanitize_body`]).
+///
+/// The endpoint decides how long its answer is, so only the first
+/// [`MAX_ERROR_BODY_BYTES`] bytes are read. The rest is never received: the
+/// connection is closed instead. A body that ends early, or fails part-way,
+/// gives what had arrived.
+///
+/// For a 3xx answer nothing is read and the result is
+/// [`REDIRECT_NOT_FOLLOWED`]. The sinks' client never follows a redirect (see
+/// `sink_client`), and the `Location` header never reaches a log: it is a URL
+/// like the sink's own, which may hold a secret.
+pub(crate) async fn read_error_body(mut response: reqwest::Response) -> String {
+    if response.status().is_redirection() {
+        return REDIRECT_NOT_FOLLOWED.to_string();
+    }
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_ERROR_BODY_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let wanted = MAX_ERROR_BODY_BYTES - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(wanted)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    sanitize_body(&String::from_utf8_lossy(&bytes))
 }
 
 /// Whether `c` could split a log line or change how it reads: the control

@@ -376,6 +376,12 @@ pub(crate) enum Reply {
     /// Never. The request is recorded and then left waiting until the client
     /// gives up or the test ends.
     Hang,
+    /// This redirect status code with this `Location` header and an empty
+    /// body, every time.
+    Redirect(u16, String),
+    /// This status code, and then a response body that never ends: 1 KiB of
+    /// `x` every 10 ms, until the client closes the connection.
+    EndlessBody(u16),
 }
 
 /// One request that a [`RecordingServer`] route received.
@@ -429,6 +435,28 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// What a [`RecordingServer`] route sends with its status code.
+#[derive(Clone)]
+enum Extra {
+    Nothing,
+    /// This response body.
+    Body(String),
+    /// This `Location` header.
+    Location(String),
+    /// [`endless_body`].
+    EndlessBody,
+}
+
+/// A response body that never ends: 1 KiB of `x` every 10 ms. The server
+/// drops it when the client closes the connection.
+fn endless_body()
+-> impl futures::Stream<Item = Result<Vec<u8>, std::convert::Infallible>> + Send + 'static {
+    futures::stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Some((Ok(vec![b'x'; 1024]), ()))
+    })
+}
+
 impl RecordingServer {
     /// Serve `routes`, each a path and its reply, on `127.0.0.1:0`.
     pub(crate) async fn start(routes: Vec<(&'static str, Reply)>) -> Self {
@@ -442,15 +470,20 @@ impl RecordingServer {
         for (path, reply) in routes {
             let status =
                 |code| axum::http::StatusCode::from_u16(code).expect("a valid status code");
-            // The body sent with every answer, for the reply that has one.
-            let response_body = match &reply {
-                Reply::StatusWithBody(_, body) => Some(body.clone()),
-                _ => None,
+            // What every answer carries besides its status code.
+            let extra = match &reply {
+                Reply::StatusWithBody(_, body) => Extra::Body(body.clone()),
+                Reply::Redirect(_, location) => Extra::Location(location.clone()),
+                Reply::EndlessBody(_) => Extra::EndlessBody,
+                _ => Extra::Nothing,
             };
             // The answer to each request in turn, the last one repeating for
             // every later request. `None` leaves the request waiting.
             let script: Arc<Vec<Option<axum::http::StatusCode>>> = Arc::new(match reply {
-                Reply::Status(code) | Reply::StatusWithBody(code, _) => vec![Some(status(code))],
+                Reply::Status(code)
+                | Reply::StatusWithBody(code, _)
+                | Reply::Redirect(code, _)
+                | Reply::EndlessBody(code) => vec![Some(status(code))],
                 Reply::Sequence(codes) => {
                     assert!(!codes.is_empty(), "a Reply::Sequence needs a status");
                     codes.into_iter().map(|code| Some(status(code))).collect()
@@ -472,10 +505,16 @@ impl RecordingServer {
                         body,
                     });
                 notify.notify_waiters();
-                match (script[turn.min(script.len() - 1)], response_body) {
-                    (Some(status), Some(text)) => (status, text).into_response(),
-                    (Some(status), None) => status.into_response(),
+                match (script[turn.min(script.len() - 1)], extra) {
                     (None, _) => std::future::pending().await,
+                    (Some(status), Extra::Nothing) => status.into_response(),
+                    (Some(status), Extra::Body(text)) => (status, text).into_response(),
+                    (Some(status), Extra::Location(location)) => {
+                        (status, [(axum::http::header::LOCATION, location)]).into_response()
+                    }
+                    (Some(status), Extra::EndlessBody) => {
+                        (status, axum::body::Body::from_stream(endless_body())).into_response()
+                    }
                 }
             };
             router = router.route(path, axum::routing::post(handler));
