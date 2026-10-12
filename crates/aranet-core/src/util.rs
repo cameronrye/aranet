@@ -277,13 +277,20 @@ mod peripheral_name_tests {
     /// passes: the test double of a peripheral (`link/fake.rs`) sets them
     /// that way.
     ///
+    /// Two kinds of read get past it. A pattern that takes a field out of
+    /// the struct (`PeripheralProperties { local_name, .. }`) has no dot
+    /// before the name. And this file is skipped as a whole, so a second read
+    /// in it, outside `name_from`, passes too. There is neither today, and
+    /// only a review keeps it so.
+    ///
     /// It searches `src` only. The `discover_services` example and the
     /// hardware tests' `known_peripheral` take the name from `peripheral_name`
     /// too, but they are outside `src`, and this test does not read them.
     #[test]
     fn only_peripheral_name_reads_the_name_fields() {
-        // Each in two halves, so that this test is not itself an occurrence of
-        // the texts it searches for.
+        // Each in two halves, so that a text search of the crate for them
+        // finds only the two reads in `name_from`. The test itself does not
+        // need the split: it skips this file.
         let field_reads = [
             [".local", "_name"].concat(),
             [".advertisement", "_name"].concat(),
