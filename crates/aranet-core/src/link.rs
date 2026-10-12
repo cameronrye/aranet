@@ -52,9 +52,12 @@ pub(crate) trait GattLink: Clone + Send + Sync + 'static {
         &self,
     ) -> impl Future<Output = btleplug::Result<Option<PeripheralProperties>>> + Send;
 
-    /// Whether the Bluetooth stack reports the link as up. On macOS nobody
-    /// answers this once CoreBluetooth has dropped the peripheral, so callers
-    /// use this module's time-limited `is_connected` function instead.
+    /// Whether the Bluetooth stack reports the link as up. Callers use this
+    /// module's time-limited `is_connected` function instead, as a guard
+    /// against a stack that doesn't answer. On macOS, btleplug 0.11.8 gave no
+    /// answer once its CoreBluetooth backend had forgotten the peripheral;
+    /// 0.13.5 answers "not connected" at once
+    /// (`src/corebluetooth/internal.rs:1318-1332`).
     fn is_connected(&self) -> impl Future<Output = btleplug::Result<bool>> + Send;
 
     /// Whether the connection goes through BlueZ. There `connect` doesn't
@@ -438,6 +441,12 @@ pub(crate) async fn connect<L: GattLink>(
 ///    and discover once more ("reconnect to device", "rediscover services").
 ///    If that discovery finds none either, fail with a retryable
 ///    `Error::ConnectionFailed` ("the device reported no GATT services").
+///    On macOS the retry doesn't help: the disconnect makes btleplug 0.13.5
+///    forget the peripheral, so the reconnect on the same handle fails at
+///    once with a retryable `Error::Bluetooth` ("Peripheral no longer
+///    available", `src/corebluetooth/internal.rs:1300-1304`), unless a scan
+///    has found the sensor again during the pause. A caller that retries
+///    then searches for the sensor again.
 /// 5. Read the properties, giving up after `read_timeout`.
 ///
 /// On BlueZ, a connect (the first one or the retry's) can end while BlueZ is
@@ -494,6 +503,19 @@ async fn connect_and_discover<L: GattLink>(
     // If service discovery returned nothing, BlueZ may have stale state
     // from a previous failed connection (e.g., auth failure during GATT
     // discovery). Disconnect, wait, and retry once with a clean connection.
+    //
+    // On macOS, btleplug 0.11.8 never returned an empty set: its connect
+    // didn't return when the discovery found no services. btleplug 0.13.5
+    // does, in two ways. A discovery that CoreBluetooth ends with no error
+    // and no services succeeds with none
+    // (`src/corebluetooth/internal.rs:364-365`), and a "services changed"
+    // callback during a discovery can end it with only the services that
+    // are left, which may be none (`:968-985`). The retry doesn't help
+    // there: the disconnect makes btleplug forget the peripheral (`:1175`),
+    // so the reconnect on this handle fails at once with "Peripheral no
+    // longer available" (`:1300-1304`), unless a scan has found the sensor
+    // again during the pause. That error is retryable, and a caller that
+    // retries searches for the sensor again.
     if services.is_empty() {
         warn!("Service discovery returned 0 services — retrying with fresh connection");
         if let Err(e) = disconnect(link).await {
@@ -1272,8 +1294,11 @@ mod tests {
         .await;
     }
 
-    /// A connection-state query that the stack never answers (CoreBluetooth
-    /// after the sensor has gone) reports `false` after `validation_timeout`.
+    /// A connection-state query that the stack never answers reports `false`
+    /// after `validation_timeout`. The limit is a guard against a stack that
+    /// has stopped answering. btleplug 0.11.8 gave no answer on macOS once it
+    /// had forgotten the peripheral; 0.13.5 answers "not connected" at once
+    /// there (`src/corebluetooth/internal.rs:1318-1332`).
     #[tokio::test(start_paused = true)]
     async fn is_connected_reports_false_when_the_stack_never_answers() {
         within(Duration::from_secs(600), async {

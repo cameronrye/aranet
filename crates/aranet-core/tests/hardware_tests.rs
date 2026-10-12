@@ -1491,7 +1491,9 @@ async fn find_peripheral(device: &str) -> btleplug::platform::Peripheral {
 
 /// Whether the Bluetooth stack reports `device` as connected. `false` when the
 /// adapter doesn't know it (see `known_peripheral`) or doesn't answer within
-/// 5 s: btleplug never answers for a peripheral that CoreBluetooth has dropped.
+/// 5 s. The limit is a guard: btleplug 0.13.5 answers "not connected" at once
+/// for a peripheral that its CoreBluetooth backend has forgotten
+/// (`src/corebluetooth/internal.rs:1318-1332`), where 0.11.8 gave no answer.
 async fn peripheral_connected(device: &str) -> bool {
     let Some(p) = known_peripheral(device).await else {
         return false;
