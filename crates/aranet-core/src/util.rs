@@ -115,14 +115,23 @@ fn name_from(properties: &PeripheralProperties, or_local_name: bool) -> Option<&
 
 #[cfg(test)]
 mod tests {
-    // Note: We can't easily create PeripheralId in tests, so we test the logic
-    // rather than calling the functions directly.
+    // Note: `test_create_identifier_with_valid_address` and
+    // `test_create_identifier_with_zero_address` don't call `create_identifier`
+    // or `format_peripheral_id`. Both functions take btleplug's PeripheralId,
+    // and a test that runs on every platform can't make one. btleplug 0.13.5
+    // makes one from a UUID on macOS (`src/corebluetooth/peripheral.rs:672`)
+    // and from a BDAddr on Windows (`src/winrtble/peripheral.rs:732`), but on
+    // Linux only from a bluez_async::DeviceId (`src/bluez/peripheral.rs:358`).
+    // aranet-core can't name that type: btleplug doesn't re-export bluez-async,
+    // and aranet-core doesn't depend on it directly. So the two tests only
+    // compare an address with the all-zero one, as `create_identifier` does.
     #[allow(unused_imports)]
     use super::*;
 
     #[test]
     fn test_create_identifier_with_valid_address() {
-        // We can't easily create a PeripheralId in tests, but we can test the logic
+        // No PeripheralId here (see the note on PeripheralId in this module),
+        // so this only compares the address with the all-zero one.
         let address = "AA:BB:CC:DD:EE:FF";
         // When address is valid, it should be used directly
         assert_ne!(address, "00:00:00:00:00:00");

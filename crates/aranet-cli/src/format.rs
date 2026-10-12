@@ -1530,8 +1530,13 @@ mod tests {
     // ========================================================================
 
     // Note: DiscoveredDevice tests only run on macOS because:
-    // - Linux: bluez-async's DeviceId/AdapterId constructors are private
-    // - Windows: btleplug's PeripheralId constructor is not publicly accessible
+    // - Linux: PeripheralId is made from a bluez_async::DeviceId (btleplug
+    //   0.13.5 `src/bluez/peripheral.rs:358`), and these tests can't name that
+    //   type: btleplug doesn't re-export bluez-async, and aranet-cli doesn't
+    //   depend on it directly
+    // - Windows: PeripheralId can be made from a btleplug::api::BDAddr
+    //   (btleplug 0.13.5 `src/winrtble/peripheral.rs:732`), but no helper like
+    //   `make_test_peripheral_id` has been written for it
     // The formatting logic is still tested on macOS where PeripheralId can be created from UUID.
 
     /// Create a test PeripheralId for macOS (uses UUID)
