@@ -5,8 +5,10 @@ This project provides feature parity with [Aranet4-Python](https://github.com/An
 
 > **Dependency Policy**: Always use the **latest stable versions** of all libraries, frameworks, and tools.
 > Ask for the major version of a dependency, or for the minor version of a 0.x crate (`thiserror = "2"`, `tracing = "0.1"`).
-> Ask for a later release only when the code needs something that release added, and say why in a comment above the
-> requirement (`btleplug = "0.13.5"`). Run `cargo update` regularly.
+> Ask for a later release only when the code needs something that release added or fixed, and say why in a comment
+> above the requirement (`btleplug = "0.13.5"`). Requirements that name a later release without a comment
+> (`tempfile = "3.10"`, `proptest = "1.9.0"`) are older than this rule; give each its reason when it is next changed.
+> Run `cargo update` regularly.
 > Check [crates.io](https://crates.io) and [lib.rs](https://lib.rs) for current versions before adding dependencies.
 
 ---
