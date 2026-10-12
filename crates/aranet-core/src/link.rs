@@ -445,15 +445,17 @@ pub(crate) async fn connect<L: GattLink>(
 ///    forget the peripheral, so the reconnect on the same handle fails at
 ///    once with a retryable `Error::Bluetooth` ("Peripheral no longer
 ///    available", `src/corebluetooth/internal.rs:1300-1304`), unless a scan
-///    has found the sensor again during the pause. A caller that retries
-///    then searches for the sensor again.
+///    has found the sensor again during the pause. aranet's own callers that
+///    retry connect by identifier, so they search for the sensor again. A
+///    retry on the same handle (`Device::from_peripheral` and its variants)
+///    is refused in the same way until a scan has found the sensor.
 /// 5. Read the properties, giving up after `read_timeout`.
 ///
 /// On BlueZ, a connect (the first one or the retry's) can end while BlueZ is
 /// still discovering the services on the live link. BlueZ answers
 /// `Device1.Connect` only once the ATT channel is up, a few seconds after the
-/// link, and bluez-async then waits 30 s for the services (bluez-async 0.9.0
-/// `src/lib.rs:61`). It waited 5 s before btleplug 0.13.5
+/// link, and bluez-async then waits up to 30 s for the services
+/// (bluez-async 0.9.0 `src/lib.rs:61`). It waited 5 s before btleplug 0.13.5
 /// (<https://github.com/deviceplug/btleplug/issues/496>). So under a
 /// `connection_timeout` of 30 s or less, the 15 s default included, a connect
 /// whose discovery is unfinished at that limit runs out of time first, and
@@ -506,16 +508,22 @@ async fn connect_and_discover<L: GattLink>(
     //
     // On macOS, btleplug 0.11.8 never returned an empty set: its connect
     // didn't return when the discovery found no services. btleplug 0.13.5
-    // does, in two ways. A discovery that CoreBluetooth ends with no error
+    // does, in three ways. A discovery that CoreBluetooth ends with no error
     // and no services succeeds with none
-    // (`src/corebluetooth/internal.rs:364-365`), and a "services changed"
+    // (`src/corebluetooth/internal.rs:364-365`). A "services changed"
     // callback during a discovery can end it with only the services that
-    // are left, which may be none (`:968-985`). The retry doesn't help
-    // there: the disconnect makes btleplug forget the peripheral (`:1175`),
-    // so the reconnect on this handle fails at once with "Peripheral no
-    // longer available" (`:1300-1304`), unless a scan has found the sensor
-    // again during the pause. That error is retryable, and a caller that
-    // retries searches for the sensor again.
+    // are left, which may be none (`internal.rs:968-985`). And every such
+    // callback, during a discovery or just after one, empties the set that
+    // this handle keeps (`internal.rs:986-993`,
+    // `src/corebluetooth/peripheral.rs:175-177`), which can happen before
+    // the set is read here. The retry doesn't help there: the disconnect
+    // makes btleplug forget the peripheral (`internal.rs:1175`), so the
+    // reconnect on this handle fails at once with "Peripheral no longer
+    // available" (`internal.rs:1300-1304`), unless a scan has found the
+    // sensor again during the pause. That error is retryable. aranet's own
+    // callers that retry connect by identifier, so they search for the
+    // sensor again; a retry on the same handle is refused in the same way
+    // until a scan has found the sensor.
     if services.is_empty() {
         warn!("Service discovery returned 0 services — retrying with fresh connection");
         if let Err(e) = disconnect(link).await {
@@ -558,8 +566,10 @@ async fn connect_and_discover<L: GattLink>(
 /// it on as `btleplug::Error::Other` (btleplug 0.13.5
 /// `src/bluez/adapter.rs:182-186`). No other btleplug backend produces it.
 /// aranet-core can't name bluez-async's type (it isn't a dependency), so this
-/// matches the message. A connect gets it only under a `connection_timeout`
-/// longer than those 30 s; a shorter limit ends the call first.
+/// matches the message. The first call of a connect gets it only under a
+/// `connection_timeout` above those 30 s, and a call made again during the
+/// wait only under a `discovery_timeout` above them
+/// (`wait_for_bluez_discovery`); a limit of 30 s or less ends the call first.
 const BLUEZ_DISCOVERY_TIMED_OUT: &str = "Service discovery timed out";
 
 /// The least time a connect waits for BlueZ to finish discovering the services
@@ -758,8 +768,11 @@ async fn discover<L: GattLink>(
 /// If the link has dropped, a `Device1.Connect` made after the drop opens a
 /// new one, as the caller's own retry would. A call that is already waiting
 /// for the services does not notice a drop (bluez-async 0.9.0
-/// `src/lib.rs:711-726`), so at the default limits a link that drops during
-/// the wait is not reopened.
+/// `src/lib.rs:711-726`), and at the default limits its 30 s outlast the
+/// wait. So there a link that drops after BlueZ has accepted a call of the
+/// wait is not reopened. One that drops earlier, while BlueZ still refuses
+/// with `In Progress` (below), is: the next call BlueZ accepts opens a new
+/// link.
 ///
 /// After a connect timeout (`BluezWaitReason::ConnectTimedOut`), BlueZ may not
 /// have answered the timed-out `Device1.Connect` yet, and until it does it
@@ -1760,8 +1773,8 @@ mod tests {
 /// connect then waits for BlueZ by asking it to connect again. bluez-async
 /// gives up before the connect's limit only when that limit is longer than
 /// its 30 s; the tests of that path set such a limit (`LONG_CONNECT_LIMIT`,
-/// or `ConnectionConfig::challenging_environment()`). Either way BlueZ keeps
-/// discovering on the live link.
+/// 90 s, or `ConnectionConfig::challenging_environment()`). Either way BlueZ
+/// keeps discovering on the live link.
 ///
 /// The fake's `fake::BLUEZ_ASYNC_WAIT` models bluez-async's wait, and its
 /// doc says how a first connect must be scripted.
@@ -1793,8 +1806,8 @@ mod bluez_discovery_tests {
     /// (`BLUEZ_ASYNC_WAIT`). Only under such a limit can bluez-async's own
     /// "Service discovery timed out" end a first connect: under the default
     /// 15 s, and under `aranet watch`'s 30 s, the connect's limit ends it
-    /// first. The tests of the paths that start with the library's timeout
-    /// use this limit.
+    /// first. Most tests of the paths that start with the library's timeout
+    /// use this limit; the others set a longer one of their own.
     const LONG_CONNECT_LIMIT: Duration = Duration::from_secs(45);
 
     /// Connect `fake` with `config` and the test's runtime for cleanup, and
@@ -1854,7 +1867,7 @@ mod bluez_discovery_tests {
                 .await
                 .expect("the connect should wait for BlueZ's service discovery");
 
-            // The library gives up at 30 s. The wait then lasts until 100 s
+            // The library gives up at 30 s. The wait's limit is then 100 s
             // (30 + 70): the first re-ask gives up at 60 s (30 + 30) and the
             // second succeeds at once.
             assert_eq!(start.elapsed(), 2 * BLUEZ_ASYNC_WAIT);
@@ -2144,8 +2157,9 @@ mod bluez_discovery_tests {
     /// before, with the "connect to device" timeout, and disconnects without
     /// waiting. The link may never have come up, or it came up and dropped
     /// while bluez-async was still waiting for the services: bluez-async
-    /// does not watch the link during that wait. Neither case is asked again
-    /// inside the connect.
+    /// does not watch the link during that wait (bluez-async 0.9.0
+    /// `src/lib.rs:711-726`). Neither case is asked again inside the
+    /// connect.
     #[tokio::test(start_paused = true)]
     async fn a_connect_timeout_with_the_link_down_fails_on_bluez() {
         within(Duration::from_secs(600), async {
@@ -2485,7 +2499,10 @@ mod bluez_discovery_tests {
     /// with the link down fails with its own timeout and is not asked again
     /// inside the connect. That covers a link that came up and dropped while
     /// bluez-async was waiting for the services: under a limit of 30 s or
-    /// less nothing re-dials it here, and the caller's own retry does.
+    /// less nothing re-dials it inside the connect. A caller that retries,
+    /// as `aranet watch` and the service do, dials again with its next
+    /// attempt. `aranet read` and the other one-shot commands do not retry:
+    /// for them the command fails with the connect's timeout.
     #[tokio::test(start_paused = true)]
     async fn a_30_s_connect_timeout_with_the_link_down_is_not_asked_again() {
         within(Duration::from_secs(600), async {
@@ -2516,9 +2533,10 @@ mod bluez_discovery_tests {
     /// and a 30 s `discovery_timeout`), bluez-async gives up first, 30 s in.
     /// The wait asks again, and BlueZ resolves the services 6 s later. No
     /// connection-state query is made: bluez-async's timeout itself shows
-    /// that BlueZ had answered `Device1.Connect`. Under such a limit this is
-    /// also how a link that dropped during bluez-async's wait is dialled
-    /// again: the re-ask makes BlueZ open a new one.
+    /// that BlueZ had answered `Device1.Connect` (bluez-async 0.9.0
+    /// `src/lib.rs:759-760`). Under such a limit this is also how a link
+    /// that dropped during bluez-async's wait is dialled again: the re-ask
+    /// makes BlueZ open a new one.
     #[tokio::test(start_paused = true)]
     async fn bluez_async_gives_up_first_under_a_long_connect_limit() {
         within(Duration::from_secs(600), async {
@@ -2542,7 +2560,8 @@ mod bluez_discovery_tests {
         .await;
     }
 
-    /// bluez-async gives each D-Bus call 30 s. When BlueZ sends no reply to
+    /// bluez-async gives the `Device1.Connect` call 30 s (bluez-async 0.9.0
+    /// `src/lib.rs:57`, `:748-751`). When BlueZ sends no reply to
     /// `Device1.Connect` in that time, a connect whose own limit is longer
     /// fails with bluez-async's error, "Timeout waiting for reply". That is
     /// not a timeout of the connect itself, so no connection-state query is
