@@ -2036,11 +2036,15 @@ mod tests {
     }
 
     // ==================== DiscoveredDevice Tests ====================
-    // Note: DiscoveredDevice tests are removed because PeripheralId from btleplug
-    // has platform-specific implementations that cannot be easily mocked in tests.
-    // - macOS: PeripheralId wraps a UUID
-    // - Linux: PeripheralId wraps bluez_async::DeviceId (not directly accessible)
-    // - Windows: PeripheralId wraps a u64
+    // Note: this module has no test that builds a DiscoveredDevice. Its `id` is
+    // btleplug's PeripheralId, which wraps a different type on each platform
+    // (btleplug 0.13.5):
+    // - macOS: PeripheralId wraps a UUID (`src/corebluetooth/peripheral.rs:46`)
+    // - Linux: PeripheralId wraps bluez_async::DeviceId
+    //   (`src/bluez/peripheral.rs:49`). btleplug doesn't re-export bluez-async
+    //   and aranet-core doesn't depend on it directly, so this crate can't name
+    //   that type to make one
+    // - Windows: PeripheralId wraps a BDAddr (`src/winrtble/peripheral.rs:57`)
     //
     // The DiscoveredDevice struct derives Clone and Debug, so these traits are
     // guaranteed to work correctly by the compiler.
