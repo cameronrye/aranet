@@ -22,7 +22,7 @@ pub(super) enum Outcome {
     Fail,
     /// Never answer. It stands for two things. One is a BlueZ `connect` that
     /// is still waiting when aranet's own limit ends: bluez-async waits up to
-    /// 30 s for BlueZ's reply to `Device1.Connect` and then 30 s for the
+    /// 30 s for BlueZ's reply to `Device1.Connect` and then up to 30 s for the
     /// services (bluez-async 0.9.0 `src/lib.rs:57`, `:61`), so under the 15 s
     /// default limit this is how a slow first connect is scripted. The other
     /// is a call that the stack never answers, such as a CoreBluetooth
@@ -33,8 +33,9 @@ pub(super) enum Outcome {
     /// `btleplug::Error::Other("Service discovery timed out")`. The wait
     /// starts at the call, as if BlueZ answered `Device1.Connect` at once,
     /// which it does when a wait asks again on a live link. The caller sees
-    /// this outcome only if its own limit is longer than `BLUEZ_ASYNC_WAIT`;
-    /// that constant's doc says how to script a first connect.
+    /// this outcome only if its own limit is `BLUEZ_ASYNC_WAIT` or longer;
+    /// that constant's doc says why a limit of exactly that length must be
+    /// scripted with `Hang`.
     DiscoveryTimedOut,
     /// Fail at once as BlueZ refuses a `Device1.Connect` while an earlier one
     /// to the same device is still pending (`org.bluez.Error.InProgress`),
@@ -59,15 +60,20 @@ pub(super) enum Outcome {
 /// before it fails (`SERVICE_DISCOVERY_TIMEOUT`, bluez-async 0.9.0
 /// `src/lib.rs:61`). It was 5 s before btleplug 0.13.5.
 ///
-/// Never script `Outcome::DiscoveryTimedOut` for a first connect whose
-/// `connection_timeout` is 30 s: script `Outcome::Hang`. bluez-async starts
-/// this wait only once BlueZ has answered `Device1.Connect`, so on a real
-/// host its timeout comes more than 30 s after the call, and a connect limit
-/// of 30 s or less always ends first. This fake starts the wait at the call.
-/// With a limit of exactly 30 s both would end at the same instant of the
-/// paused clock, `tokio::time::timeout` polls the call before its own timer,
-/// and the test would see the library's timeout first: an order that cannot
-/// happen. Under a shorter limit the fake keeps the real order.
+/// Never script `Outcome::DiscoveryTimedOut` for a call whose own limit is
+/// exactly 30 s: script `Outcome::Hang`. Such a call is a first connect or
+/// the zero-services retry's reconnect under a 30 s `connection_timeout`
+/// (`aranet watch`'s default), or a call made again in a wait that has
+/// exactly 30 s left, as the first one can have under a 30 s
+/// `discovery_timeout` (`ConnectionConfig::challenging_environment()`).
+/// bluez-async starts this wait only once BlueZ has answered
+/// `Device1.Connect`, so on a real host its timeout comes more than 30 s
+/// after the call, and a limit of 30 s or less always ends first. This fake
+/// starts the wait at the call. With a limit of exactly 30 s both would end
+/// at the same instant of the paused clock, tokio's `timeout` and
+/// `timeout_at` poll the call before their own timer, and the test would
+/// see the library's timeout first: an order that cannot happen. Under a
+/// shorter limit the fake keeps the real order.
 pub(super) const BLUEZ_ASYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long bluez-async waits for BlueZ's reply to a D-Bus method call, such
