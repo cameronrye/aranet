@@ -1092,6 +1092,42 @@ mod tests {
         .await;
     }
 
+    /// A reconnect that is refused at once during the zero-services retry
+    /// fails the connect with that Bluetooth error as soon as the retry's 2 s
+    /// pause is over, and disconnects before the error returns. This is what
+    /// the retry meets on macOS with btleplug 0.13.5: the disconnect before
+    /// the pause makes btleplug forget the peripheral, and a connect on the
+    /// same handle then fails at once with "Peripheral no longer available"
+    /// (`src/corebluetooth/internal.rs:1300-1304`). The test pins what the
+    /// caller gets in that case. It adds no code path: the retry is the one
+    /// that `failed_reconnect_during_retry_disconnects` covers for a
+    /// reconnect that never answers, and it is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_refused_during_retry_fails_after_the_pause() {
+        within(Duration::from_secs(600), async {
+            let fake = FakeGatt::new();
+            fake.service_rounds([BTreeSet::new()]);
+            fake.script_connect([Outcome::Ok, Outcome::Fail]);
+            let start = Instant::now();
+
+            let error = failed_connect(&fake).await;
+
+            assert!(matches!(error, Error::Bluetooth(_)), "got {error:?}");
+            assert_eq!(
+                fake.calls(),
+                [
+                    Call::Connect,
+                    Call::Discover,
+                    Call::Disconnect,
+                    Call::Connect,
+                    Call::Disconnect,
+                ]
+            );
+            assert_eq!(start.elapsed(), Duration::from_secs(2));
+        })
+        .await;
+    }
+
     /// The rediscovery of the zero-services retry is limited by
     /// `discovery_timeout`, and running out is reported as "rediscover
     /// services".
