@@ -1,5 +1,6 @@
-//! The log filter that the `aranet` commands and the GUI use when the user has chosen
-//! none.
+//! The default log filter of the `aranet` commands and the GUI: the CLI uses it under
+//! `--quiet` and when neither `--verbose` nor `RUST_LOG` chooses a filter, the GUI when
+//! `RUST_LOG` is unset or empty.
 //!
 //! This file is a module of two crates. The library compiles it for the GUI (feature
 //! `gui`), and the `aranet` binary compiles it again for the CLI (feature `cli`): the
@@ -26,8 +27,9 @@
 /// line.
 const BTLEPLUG_DISCONNECT_ERROR_OFF: &str = "btleplug::corebluetooth::peripheral=off";
 
-/// The filter directives to use when neither a flag nor `RUST_LOG` chooses the filter:
-/// `level` for every target, without btleplug's disconnect error.
+/// The directives of the default filter: `level` for every target, without btleplug's
+/// disconnect error. The CLI builds its default and its `--quiet` filter from them, the
+/// GUI the filter it uses when `RUST_LOG` is unset or empty.
 pub(crate) fn default_directives(level: &str) -> String {
     format!("{level},{BTLEPLUG_DISCONNECT_ERROR_OFF}")
 }
@@ -80,8 +82,9 @@ pub(crate) mod testing {
     ///
     /// btleplug logs through the `log` crate. The bridge that the subscriber's `init`
     /// installs asks the subscriber about each record with the record's own target
-    /// (tracing-log 0.2.0 `src/lib.rs:227-242`), so a filter treats these events as it
-    /// treats btleplug's lines.
+    /// (tracing-log 0.2.0 `src/log_tracer.rs:170-201`, with the metadata that
+    /// `src/lib.rs:227-242` builds), so a filter treats these events as it treats
+    /// btleplug's lines.
     pub(crate) fn lines_shown_by(filter: EnvFilter) -> Vec<String> {
         register_silent_dispatcher();
         let captured = Captured::default();
