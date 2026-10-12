@@ -116,3 +116,8 @@ pub mod tui;
 // GUI module - publicly exposed for aranet-gui crate to use
 #[cfg(feature = "gui")]
 pub mod gui;
+
+// The default log filter. The library needs it only for the GUI; the `aranet` binary
+// compiles the same file for the CLI. The file's own comment says why.
+#[cfg(feature = "gui")]
+mod log_filter;

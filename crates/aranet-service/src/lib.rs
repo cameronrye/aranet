@@ -329,7 +329,23 @@ pub struct LoadedConfig {
 ///
 /// Each directive replaces a `RUST_LOG` directive for exactly its target: a
 /// known limit, so `RUST_LOG=aranet_store=debug`, for example, has no effect.
-const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug,aranet_store=warn";
+///
+/// The last directive turns off the log target of btleplug's CoreBluetooth
+/// peripheral module. On macOS, btleplug 0.13.5 logs `Shouldn't get anything
+/// but Ok!` at error level for every disconnect that CoreBluetooth confirms,
+/// and then returns `Ok` (btleplug 0.13.5
+/// `src/corebluetooth/peripheral.rs:468-476`): the disconnect's own reply is
+/// answered with "Device disconnected", like every other pending operation
+/// (`src/corebluetooth/internal.rs:678-698`). The collector disconnects after
+/// every poll, so the line would be logged once per poll per device. It is
+/// that module's only warning or error. The cost is the limit above: no
+/// `RUST_LOG` directive for that target, or for a shorter one such as
+/// `btleplug=trace`, can show the module's lines (one error, one info and
+/// four trace statements). btleplug has the module only on Apple platforms,
+/// so the directive does nothing on Linux and Windows. Remove it when aranet
+/// moves to a btleplug release that no longer logs the line.
+const DEFAULT_LOG_DIRECTIVES: &str = "aranet_service=info,tower_http=debug,aranet_store=warn,\
+    btleplug::corebluetooth::peripheral=off";
 
 /// How long shutdown waits for background tasks after signalling them to
 /// stop, before aborting the ones left.
@@ -1007,6 +1023,58 @@ mod tests {
             );
             assert!(
                 !logs.contains("a store info line"),
+                "RUST_LOG={rust_log:?}: {logs}"
+            );
+        }
+    }
+
+    /// On macOS, btleplug 0.13.5 logs `Shouldn't get anything but Ok!` at error
+    /// level for every disconnect that CoreBluetooth confirms, and the
+    /// collector disconnects after every poll. The default directives turn
+    /// that module's log target off: no `RUST_LOG` directive for that target,
+    /// or for a shorter one such as `btleplug=trace`, can show its lines.
+    /// btleplug's other modules and this crate's own lines are left alone.
+    #[test]
+    fn btleplugs_disconnect_error_stays_out_of_the_service_log() {
+        crate::test_support::register_silent_dispatcher();
+        for rust_log in [
+            "",
+            "warn",
+            "btleplug=trace",
+            "error,btleplug::corebluetooth::peripheral=trace",
+        ] {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let filter = with_default_directives(tracing_subscriber::EnvFilter::new(rust_log))
+                .expect("the default directives parse");
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            tracing::error!(
+                target: "btleplug::corebluetooth::peripheral",
+                "Shouldn't get anything but Ok!"
+            );
+            tracing::error!(
+                target: "btleplug::corebluetooth::internal",
+                "another btleplug error"
+            );
+            tracing::info!("a service info line");
+
+            let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains("ERROR btleplug::corebluetooth::internal: another btleplug error"),
+                "RUST_LOG={rust_log:?}: {logs}"
+            );
+            assert!(
+                logs.contains("INFO aranet_service::tests: a service info line"),
+                "RUST_LOG={rust_log:?}: {logs}"
+            );
+            assert!(
+                !logs.contains("btleplug::corebluetooth::peripheral"),
                 "RUST_LOG={rust_log:?}: {logs}"
             );
         }
