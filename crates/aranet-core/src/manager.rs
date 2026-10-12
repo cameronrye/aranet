@@ -883,9 +883,9 @@ impl<L: SensorLink> ManagerCore<L> {
         };
 
         // The link has left the manager: say so before the close, as `detach`
-        // does. The close can fail (on macOS, closing a link that dropped on
-        // its own times out) or go on in the background if this future is
-        // dropped, and nothing would send the event later.
+        // does. The close can fail (it gives up when the Bluetooth stack
+        // doesn't confirm the disconnect in time) or go on in the background
+        // if this future is dropped, and nothing would send the event later.
         self.events.send(DeviceEvent::Disconnected {
             device: DeviceId::new(identifier),
             reason: DisconnectReason::UserRequested,
@@ -2696,10 +2696,10 @@ mod lifecycle_tests {
     }
 
     /// A disconnect sends `Disconnected` once it has taken the link out of
-    /// the manager, even if closing the link then fails (as closing a link
-    /// that dropped on its own does on macOS): the manager reports the device
-    /// as disconnected from then on, and nothing sends the event later. The
-    /// error is still returned.
+    /// the manager, even if closing the link then fails (as it does when the
+    /// Bluetooth stack doesn't confirm the disconnect in time): the manager
+    /// reports the device as disconnected from then on, and nothing sends
+    /// the event later. The error is still returned.
     #[tokio::test(start_paused = true)]
     async fn disconnects_send_disconnected_even_if_the_close_fails() {
         within(TEST_LIMIT, async {

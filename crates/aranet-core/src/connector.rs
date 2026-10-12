@@ -62,17 +62,39 @@ pub(crate) async fn release_link<L: SensorLink, H: Send + 'static>(
     .map_err(std::io::Error::from)?
 }
 
-/// Whether closing a link that has already dropped on its own times out on
-/// this platform. Where it does, a close that times out usually means only
-/// that the link had dropped, not that the sensor is still connected. True
-/// only on macOS: once CoreBluetooth reports a link down, btleplug's
-/// CoreBluetooth backend forgets the peripheral and never answers a disconnect
-/// for it, so the close runs into its time limit. Links to unpaired sensors
-/// can drop on their own there a few minutes after they come up.
+/// Whether a close that times out counts as expected on this platform. It
+/// only sets the log level of a failed `release_link` in
+/// `log_failed_release`, which `ReconnectingDevice` and `DeviceManager`
+/// call: debug where this is true and the close timed out, a warning in
+/// every other case. True only on macOS.
 ///
-/// Workaround for btleplug 0.11.8
-/// (<https://github.com/deviceplug/btleplug/issues/494>); re-check when
-/// upgrading btleplug.
+/// It was written for btleplug 0.11.8. Once CoreBluetooth reports a link
+/// down, btleplug's CoreBluetooth backend forgets the peripheral, and 0.11.8
+/// never answered a disconnect for a peripheral it had forgotten. So closing
+/// a link that had already dropped on its own always ran into its time
+/// limit, and a close that timed out usually meant only that the link had
+/// dropped, not that the sensor was still connected. With 0.11.8, links to
+/// unpaired sensors were seen to drop on their own on macOS a few minutes
+/// after they came up.
+///
+/// btleplug 0.13.5 still forgets the peripheral
+/// (`src/corebluetooth/internal.rs:1156-1181`), but it answers that
+/// disconnect with `Ok` at once for as long as it has no entry for the
+/// sensor (`src/corebluetooth/internal.rs:1307-1316`). By its source,
+/// closing a link that has dropped on its own therefore no longer times
+/// out. The source can't settle one case: a scan finds the sensor again
+/// before the old handle is closed. btleplug then has a new entry for the
+/// sensor, and the close asks CoreBluetooth to cancel that entry's
+/// connection and waits for the disconnect callback
+/// (`src/corebluetooth/internal.rs:1309-1312`). Whether CoreBluetooth sends
+/// that callback for a peripheral that isn't connected is not in btleplug's
+/// source.
+///
+/// Hardware check H2 of the btleplug 0.13.5 upgrade (2026-10-11, on macOS: a
+/// sensor whose link had ended and that a scan had found again) saw the
+/// close through the old handle get no answer before its time limit. So the
+/// classifier still has one real case: a close of a dropped link after a
+/// scan has found the sensor again.
 const CLOSES_TIME_OUT_AFTER_DROP: bool = cfg!(target_os = "macos");
 
 /// Whether `error`, from a failed `release_link`, is expected and so no sign

@@ -198,6 +198,16 @@ pub struct ConnectionConfig {
     pub write_timeout: Duration,
     /// Timeout for service discovery after connection.
     ///
+    /// On macOS this limits the service discovery itself. With btleplug
+    /// 0.13.5 a connect ends when the link is up
+    /// (`src/corebluetooth/peripheral.rs:433-456`) and the services are
+    /// discovered in a step of their own (`:479-500`), so the link has
+    /// `connection_timeout` to come up and the discovery has this limit. A
+    /// discovery that takes longer fails the connect with a "discover
+    /// services" timeout. With btleplug 0.11.8 the discovery ran inside the
+    /// connect, under `connection_timeout`, and this limit had no effect on
+    /// macOS.
+    ///
     /// On Linux, when BlueZ is still discovering the services of a device it
     /// has just connected (a first connection to a sensor with many
     /// characteristics, such as an Aranet4), a connect waits for BlueZ to
@@ -638,8 +648,10 @@ impl Device {
     ///
     /// Returns `false` if the Bluetooth stack reports an error or doesn't answer
     /// within the connection's `validation_timeout` (3 s by default, set with
-    /// [`ConnectionConfig::validation_timeout`]). On macOS the stack stops
-    /// answering once the sensor has dropped the connection.
+    /// [`ConnectionConfig::validation_timeout`]). On macOS the limit is only a
+    /// guard: once the sensor has dropped the connection, btleplug 0.13.5
+    /// answers `false` at once (`src/corebluetooth/internal.rs:1318-1332`),
+    /// where 0.11.8 gave no answer.
     ///
     /// Note: This only checks the BLE stack's connection state, which may be stale,
     /// especially on macOS. For a more reliable check, use [`Self::validate_connection`].

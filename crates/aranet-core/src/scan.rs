@@ -241,11 +241,16 @@ async fn cached_adapter() -> Result<Adapter> {
 
 /// Whether the cached adapter's CoreBluetooth thread still takes requests.
 ///
-/// btleplug's CoreBluetooth thread can panic (for example when services are
-/// discovered after a connect has timed out). Every later request on that
-/// adapter then fails with "Channel closed", so it has to be replaced. A reply
-/// that is merely slow keeps the adapter: only a closed channel proves the
-/// thread is gone.
+/// btleplug's CoreBluetooth thread runs a loop that never returns (btleplug
+/// 0.13.5 `src/corebluetooth/internal.rs:2030-2038`), so it stops only if it
+/// panics. btleplug 0.11.8 panicked on a discovery callback that came late,
+/// for a service it no longer knew or with no connect waiting; 0.13.5
+/// ignores those (`:397-400`, `:534-538`). This check stays as a guard
+/// against any other panic: every later request on an adapter whose thread
+/// has stopped fails with "Channel closed"
+/// (`src/corebluetooth/peripheral.rs:678-682`), so the adapter has to be
+/// replaced. A reply that is merely slow keeps the adapter: only a closed
+/// channel proves the thread is gone.
 async fn adapter_thread_is_running(adapter: &Adapter) -> bool {
     let adapter = adapter.clone();
     // Run on aranet-core's runtime so the timeout works even if the caller's
@@ -606,24 +611,37 @@ fn aranet_service_filter() -> ScanFilter {
 
 /// Whether every scan window of a device search asks the Bluetooth stack only for
 /// devices that advertise an Aranet service (see `search_filter`). Only on macOS:
-/// btleplug's CoreBluetooth backend keeps every device a scan reports for the
-/// rest of the process and leaks a little memory for every advertisement it
-/// receives, so unfiltered searches near many Bluetooth devices make a
-/// long-running program grow by 1-2 MB an hour. Leaving only a search's last
-/// window unfiltered wasn't enough: in a 12 h macOS soak, the 8.5% of the
-/// service's polls whose search reached that window added about 106 kB each
-/// (about 80% of the growth, against about 2 kB for a search that ended
-/// earlier), and a sensor out of range runs it on every poll, about 6 MB an hour.
+/// btleplug's CoreBluetooth backend keeps every device a scan reports (its
+/// `CBPeripheral`, an entry in the adapter's list and a task of its own) until
+/// the device disconnects after a connection, Bluetooth is switched off or
+/// `clear_peripherals()` is called (btleplug 0.13.5
+/// `src/corebluetooth/internal.rs:1010-1013`; removed at `:1175`, `:1153` and
+/// `:1924`). aranet never calls `clear_peripherals()` and shares one adapter for
+/// the life of the process, so a device that is only scanned stays until
+/// Bluetooth is switched off or the process ends. With the filter, a device
+/// search adds only Aranet sensors to that list.
+///
+/// The filter was added on btleplug 0.11.8, which also leaked a little memory
+/// for every advertisement it received, and the figures here were measured on
+/// it. Unfiltered searches near many Bluetooth devices made a long-running
+/// program grow by 1-2 MB an hour. Leaving only a search's last window
+/// unfiltered wasn't enough: in a 12 h macOS soak, the 8.5% of the service's
+/// polls whose search reached that window added about 106 kB each (about 80% of
+/// the growth, against about 2 kB for a search that ended earlier), and a
+/// sensor out of range ran it on every poll, about 6 MB an hour.
+///
+/// btleplug 0.13.5 drains an autorelease pool for every message on its
+/// CoreBluetooth thread (`src/corebluetooth/internal.rs:1990-2014`,
+/// `:2034-2036`), which by its source ends the growth per advertisement
+/// (<https://github.com/deviceplug/btleplug/issues/494>). That has not been
+/// measured, and the list of kept devices is as it was, so the filter stays
+/// unchanged until a memory measurement on 0.13.5 says otherwise.
 ///
 /// The cost: a macOS search doesn't find a sensor that advertises neither Aranet
 /// service UUID. All four current Aranet sensor types advertise 0xFCE0; older
 /// firmware is untested. `aranet scan`, `scan_with_options` and the passive
 /// monitor still see every device. Linux and Windows searches ask for every
 /// device.
-///
-/// Workaround for btleplug 0.11.8
-/// (<https://github.com/deviceplug/btleplug/issues/494>); re-check when
-/// upgrading btleplug.
 const FILTER_SEARCH_WINDOWS: bool = cfg!(target_os = "macos");
 
 /// The scan filter of every window of a device search: with `aranet_only`, it

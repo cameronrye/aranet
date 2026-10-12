@@ -643,8 +643,10 @@ impl Snapshot {
 /// connected, each with the identifier it matched. A sensor that the adapter
 /// doesn't list, or whose query doesn't answer within 2 s, counts as not
 /// connected: on macOS a disconnect removes the peripheral from the adapter's
-/// list until a scan finds it again, and a handle kept from before the
-/// disconnect gets no answer. `Err` means the adapter couldn't list its
+/// list until a scan finds it again, and until then a handle kept from before
+/// the disconnect is answered "not connected" at once (btleplug 0.13.5
+/// `src/corebluetooth/internal.rs:1318-1332`; 0.11.8 gave it no answer). The
+/// 2 s limit is a guard. `Err` means the adapter couldn't list its
 /// peripherals.
 async fn connected_peripherals(ids: &[String]) -> Result<Vec<(String, Peripheral)>, String> {
     let adapter = get_adapter()
