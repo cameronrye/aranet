@@ -64,11 +64,11 @@ Download binaries directly from GitHub Releases:
 
 ## Docker
 
-Run aranet-service in a container (requires BLE access on the host):
+Run aranet-service in a container, from a clone of the repository. Bluetooth in Docker needs a Linux host with BlueZ:
 
 ```bash
 docker compose up -d
-# Dashboard: http://localhost:8080/dashboard
+# Dashboard: http://127.0.0.1:8080/dashboard (published on this machine only)
 ```
 
 Or use the full monitoring stack with Prometheus and Grafana:

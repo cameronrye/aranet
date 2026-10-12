@@ -5,17 +5,21 @@ description: Configure authentication, rate limiting, and CORS for aranet-servic
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-aranet-service includes optional API-key authentication plus enabled-by-default rate limiting and localhost-only CORS defaults.
+aranet-service has optional API-key authentication and rate limiting that is on by default. While authentication is off, it also keeps other web pages and the network out.
 
 ## Security Defaults
 
 | Feature | Default | Notes |
 |---------|---------|-------|
-| API key authentication | Disabled | Enable with `security.api_key_enabled = true` |
-| Rate limiting | Enabled | Defaults to `100` requests per `60` seconds per IP |
-| Rate-limit IP cache | `10000` entries | Controlled by `security.rate_limit_max_entries` |
-| CORS | `http://localhost`, `http://127.0.0.1` | Override with `security.cors_origins` |
-| Device ID sanitization | Always enabled | Used for API-facing identifiers and dashboard output |
+| API key authentication | Off | Enable with `security.api_key_enabled = true`; a key is generated and saved if you don't set one. Send it as `X-API-Key` or `Authorization: Bearer` |
+| Listening on the network | Refused without authentication | `0.0.0.0`, `[::]` or a LAN address needs an API key, or `security.allow_unauthenticated_network = true` if a firewall or authenticating proxy protects the port |
+| Host check | On while authentication is off | `localhost`, IP addresses, this machine's name and `security.allowed_hosts` (421 otherwise) |
+| Cross-origin browser requests | Rejected while authentication is off | The service's own pages and `security.cors_origins` only (403 otherwise) |
+| CORS | No origins | `security.cors_origins` |
+| Rate limiting | Enabled | A burst of `100` requests, then one every 0.6 s (`100` per `60` seconds), per IPv4 address or IPv6 /64 |
+| Rate-limit client table | Swept above `10000` entries | `security.rate_limit_max_entries`; clients whose budget has refilled are forgotten early |
+| Device addresses and aliases | Validated | At most 64 characters, no control characters or backslashes |
+| Config files | Owner-only (`0600`) | Written atomically; comments are kept |
 
 <Aside type="caution" title="Breaking change in v0.2.0">
   `GET /api/devices/:id/current` now returns a `CurrentReadingResponse` wrapper with `age_seconds` and `stale` fields alongside the reading payload.
@@ -23,28 +27,29 @@ aranet-service includes optional API-key authentication plus enabled-by-default 
 
 ## Configuration
 
-Add a `[security]` section to `~/.config/aranet/server.toml`:
+Add a `[security]` section to `server.toml` (see [Server Configuration](/aranet/docs/service/deployment/#server-configuration) for where it is):
 
 ```toml
 [security]
 api_key_enabled = true
-api_key = "replace-with-a-random-string-at-least-32-characters"
+# Leave api_key out and the service generates one and saves it here.
+# api_key = "replace-with-a-random-string-at-least-32-characters"
 
 rate_limit_enabled = true
 rate_limit_requests = 100
 rate_limit_window_secs = 60
 rate_limit_max_entries = 10000
 
-cors_origins = [
-  "http://localhost",
-  "http://127.0.0.1",
-  "https://dashboard.example.com",
-]
+cors_origins = ["https://dashboard.example.com"]
+
+# Only used while api_key_enabled = false:
+allowed_hosts = []
+allow_unauthenticated_network = false
 ```
 
 ## Authentication
 
-When API key authentication is enabled, protected requests must include `X-API-Key`.
+When API key authentication is enabled, protected requests must include the key, either as `X-API-Key: <key>` or as `Authorization: Bearer <key>`. Send the header once: a repeated `X-API-Key` or `Authorization` header, or an `X-API-Key` that isn't plain text (visible ASCII), is never read as a key, so a request that sends its key that way is refused.
 
 Public routes:
 
@@ -60,8 +65,10 @@ Protected routes include the REST API, `/metrics`, and `/api/ws`.
 export ARANET_API_KEY="replace-with-your-api-key"
 
 curl -H "X-API-Key: $ARANET_API_KEY" http://localhost:8080/api/devices
-curl -H "X-API-Key: $ARANET_API_KEY" http://localhost:8080/metrics
+curl -H "Authorization: Bearer $ARANET_API_KEY" http://localhost:8080/metrics
 ```
+
+Prometheus sends the key as a bearer token with an `authorization` block in its scrape config (see [Prometheus Integration](/aranet/docs/service/deployment/#prometheus-integration)).
 
 ### WebSocket Requests
 
@@ -75,26 +82,40 @@ const ws = new WebSocket(`ws://localhost:8080/api/ws?token=${encodeURIComponent(
 URL-encode the key as shown. A key pasted in unencoded also works: `+`, `/` and `=` in the token are read literally, so `+` is never turned into a space.
 
 <Aside type="note">
-  The `token` query parameter is accepted only for `/api/ws`. REST endpoints still require the `X-API-Key` header.
+  The `token` query parameter is accepted only for `/api/ws`. REST endpoints require the `X-API-Key` or `Authorization: Bearer` header.
 </Aside>
+
+### Dashboard
+
+The dashboard asks for the key and keeps it for the browser tab. You can also hand the key over once in the URL, as `http://127.0.0.1:8080/dashboard?token=<key>` (URL-encoded; `#token=` works too): the dashboard reads it, removes it from the address bar and the tab's history, and never sends it in a `Referer` header. The browser's global history still records the address you opened, so typing the key at the prompt is safer.
 
 ### Error Response
 
 ```json
 {
   "error": "Invalid or missing API key",
-  "hint": "Provide a valid API key in the X-API-Key header, or use the 'token' query parameter only for /api/ws"
+  "hint": "Provide the API key in the X-API-Key header or as Authorization: Bearer <key>, or use the 'token' query parameter only for /api/ws"
 }
 ```
 
-## API Key Requirements
+## API Keys
+
+If `api_key_enabled = true` and `api_key` isn't set, the service generates a key when it starts (32 random bytes, written as 64 hex characters), saves it as `security.api_key` in `server.toml`, and logs the file's path but never the key. Read the key from the file:
+
+```bash
+grep '^api_key' /path/to/server.toml
+```
+
+If the file can't be written, for example a read-only config in Docker, the service doesn't start and names the file: set the key yourself.
+
+A key you set yourself:
 
 - Use a cryptographically random value.
 - The key must be at least 32 characters.
-- Store it in the config file with restrictive permissions or inject it via deployment tooling.
+- Keep it in `server.toml`, which aranet writes owner-only, or inject it with your deployment tooling.
 
 ```bash
-openssl rand -base64 32
+openssl rand -hex 32
 ```
 
 ## Rate Limiting
@@ -109,38 +130,50 @@ rate_limit_window_secs = 60
 rate_limit_max_entries = 10000
 ```
 
+Each client may send a burst of `rate_limit_requests` requests. After that it gets one more request every `rate_limit_window_secs / rate_limit_requests` seconds (0.6 s with these values), so it can keep up `rate_limit_requests` requests per window. A client that starts with a full budget can therefore send about twice `rate_limit_requests` in its first window. A client is an IPv4 address, or the /64 network of an IPv6 address, so a host gains nothing by switching IPv6 addresses. IPv6 clients on the service's own network therefore share one budget (they are normally all in one /64), and so do all link-local clients (`fe80::/64`), while each IPv4 client has its own. `rate_limit_max_entries` (at least 1) is a sweep threshold, not a hard cap: while the service tracks more clients than that, it sweeps early and forgets clients whose budget has refilled. A client that is being limited is never forgotten early. `rate_limit_window_secs` can be at most 86400 (one day).
+
+Behind a reverse proxy, or Docker's published ports, requests come from the proxy's address, so all clients share one budget.
+
 When a client exceeds the limit, the service returns `429 Too Many Requests` with these headers:
 
 | Header | Description |
 |--------|-------------|
-| `X-RateLimit-Limit` | Maximum requests per window |
-| `X-RateLimit-Remaining` | Remaining requests in the current window |
-| `Retry-After` | Seconds until the next window |
+| `X-RateLimit-Limit` | Requests a client may send at once (`rate_limit_requests`) |
+| `X-RateLimit-Remaining` | `0` |
+| `Retry-After` | Seconds until the next request is allowed, rounded up (at least 1) |
 
 Example response body:
 
 ```json
 {
   "error": "Too many requests",
-  "retry_after": 45
+  "retry_after": 1
 }
 ```
 
-## CORS
+## Host Names
 
-By default, only localhost origins are allowed:
-
-```toml
-[security]
-cors_origins = ["http://localhost", "http://127.0.0.1"]
-```
-
-To allow a deployed web frontend:
+While API-key authentication is off, the service answers only requests whose `Host` header is `localhost` (or a name ending in `.localhost`), an IP address, this machine's host name (`name` or `name.local`), or a name listed in `security.allowed_hosts`. Other names get `421 Misdirected Request`. This blocks DNS rebinding, where a web page on a domain the attacker controls points that domain at your machine to reach the API through your browser. The port in `Host` doesn't matter, and a request without a `Host` header is allowed. This machine's `name` is the first label of its host name (`server1` for `server1.example.com`): list a fully qualified name in `security.allowed_hosts`.
 
 ```toml
 [security]
-cors_origins = ["https://dashboard.example.com"]
+allowed_hosts = ["aranet.home.arpa", "aranet-service"]
 ```
+
+Entries are bare host names. An entry with a scheme, port, path, space or wildcard (such as `*.home.arpa`) could never match a `Host` name, so the service refuses to start with it; IP addresses never need listing. The one exception is the entry `"*"`: `["*"]` turns the check off, and while authentication is off the service logs a warning about it at startup. With authentication on, the service doesn't check `Host`.
+
+## CORS and Cross-Origin Requests
+
+`security.cors_origins` is empty by default: only the service's own pages, such as the dashboard, can use the API from a browser. To allow another web front end, list its exact origin (scheme, host and port):
+
+```toml
+[security]
+cors_origins = ["https://dashboard.example.com", "http://localhost:3000"]
+```
+
+The list sets the CORS headers, so browsers let those pages read API responses. While authentication is off, it also decides which pages may send `POST`, `PUT` and `DELETE` requests or open `/api/ws`, which CORS alone doesn't protect: a browser request whose `Origin` is neither the service's own nor listed gets `403 Forbidden`. That includes pages opened from a file, which send `Origin: null`. Clients that send no `Origin`, such as curl, scripts, Prometheus, the TUI and the GUI, aren't affected.
+
+Earlier versions wrote their default, `cors_origins = ["http://localhost", "http://127.0.0.1"]`, into `server.toml` whenever they saved it after a device change. Such a line stays in effect; delete it unless you need those origins. While authentication is off, the service logs a warning at startup until you do.
 
 To allow every origin:
 
@@ -150,17 +183,39 @@ cors_origins = ["*"]
 ```
 
 <Aside type="caution">
-  Allowing `["*"]` is convenient for testing but weakens browser-side protections for production deployments.
+  With `["*"]`, any web page you open can use the API while authentication is off, and the service logs a warning at startup. Use it only for testing.
 </Aside>
+
+## Behind a Reverse Proxy
+
+Turn on API-key authentication for anything other machines can reach. If the service stays unauthenticated behind a proxy on the same machine, for example because the proxy authenticates users itself, the Host and Origin checks see what the proxy forwards:
+
+- **nginx** replaces `Host` with its upstream by default (`proxy_set_header Host $proxy_host`), so the service sees `Host: 127.0.0.1:8080`, which it accepts. The browser's `Origin` is still the public one, such as `https://aranet.example.com`, and no longer matches `Host`: add that origin to `security.cors_origins`, or the dashboard's live updates and any `POST` from the page get `403`.
+- **Caddy** and **Traefik** forward the original `Host`, such as `aranet.example.com`: add that name to `security.allowed_hosts`, or every request gets `421`. The browser's `Origin` then matches `Host`, so `cors_origins` needs nothing.
+- All clients share the proxy's rate-limit budget (see [Rate Limiting](#rate-limiting)).
+
+With authentication on, the dashboard sends the key to `/api/ws` as `?token=`, so a proxy's access log can record it. Leave the query string out of the proxy's log format, or turn access logging off for `/api/ws`.
+
+## Config Files
+
+`server.toml` and the CLI's `config.toml` can hold API keys and passwords. aranet writes them atomically and owner-only: mode `0600` from the moment a file is created, and `0700` for directories it creates. Edits keep your comments and layout. A file that an earlier version left at `0644` becomes `0600` the next time aranet writes it; `chmod 600` fixes it now.
+
+When the service can't save a device change because `server.toml` no longer parses, the API's `500` response only names the file; the parse error goes to the service log, and it can quote the line of `server.toml` it failed on. Give the log the same care as the file.
+
+On Windows, files inherit the permissions of their folder, and the default locations under your profile are private to your account. If you keep the files somewhere else, make that folder private (in Command Prompt):
+
+```text
+icacls <dir> /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
+```
 
 ## Production Checklist
 
 <Steps>
-1. Generate a random API key and store it securely.
-2. Enable `api_key_enabled = true`.
-3. Keep `rate_limit_enabled = true` unless you are terminating traffic behind a trusted internal proxy.
-4. Restrict `cors_origins` to the exact frontends that need browser access.
-5. Bind the service to `127.0.0.1:8080` and publish it through HTTPS at the reverse proxy.
+1. Enable `api_key_enabled = true`, and let the service generate the key or set a random one of at least 32 characters.
+2. Keep `rate_limit_enabled = true`.
+3. Keep `cors_origins` to the exact front ends that need browser access.
+4. Bind the service to `127.0.0.1:8080` and publish it through HTTPS at a reverse proxy, or listen on the network only with authentication on.
+5. Keep `server.toml` owner-only (`0600`).
 </Steps>
 
 ## Example Production Config

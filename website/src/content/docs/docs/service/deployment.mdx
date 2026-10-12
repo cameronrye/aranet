@@ -6,20 +6,23 @@ description: Deploy aranet-service as a background system service.
 import { Aside, Steps, Tabs, TabItem, Badge, Code } from '@astrojs/starlight/components';
 import { CURRENT_RELEASE } from '../../../../site-config.mjs';
 
-This guide covers deploying aranet-service as a persistent background service on various platforms.
+This guide covers running aranet-service as a persistent background service. The `aranet` CLI from the [downloads](/aranet/docs/downloads/) runs the service as `aranet server`: the API, the dashboard, the WebSocket, `/metrics`, webhooks, InfluxDB export, mDNS and retention. It has no MQTT (so no Home Assistant discovery), no Prometheus push gateway and no desktop notifications: their settings are accepted in `server.toml` but do nothing there. For those, use the standalone `aranet-service` binary from `cargo install aranet-service --features full`, which can also install itself as a service, or the Docker image, which is built the same way (a container has no desktop for notifications to appear on).
 
 ## Deployment Options
 
-| Platform | Service Manager | Config Location |
-|----------|----------------|-----------------|
-| macOS | launchd | `~/Library/LaunchAgents/` |
-| Linux | systemd | `/etc/systemd/system/` |
-| Docker | docker-compose | Container orchestration |
-| Windows | NSSM | Windows Service |
+| Platform | Service Manager | Installed as |
+|----------|----------------|--------------|
+| macOS | launchd (per-user LaunchAgent) | `~/Library/LaunchAgents/dev.rye.aranet.plist` |
+| Linux | systemd (system service) | `/etc/systemd/system/aranet.service` |
+| Linux | systemd (user service) | `~/.config/systemd/user/aranet.service` |
+| Docker | Docker Compose | `docker-compose.yml` or `docker/docker-compose.yml` |
+| Windows | Task Scheduler | A task that starts the service at logon |
+
+`sudo aranet-service service install` installs a system-level service only on Linux with systemd, where the service runs as an unprivileged user. On macOS, Windows, OpenRC and rc.d it refuses, because the service would run as root there. Use `aranet-service service install --user` on macOS, Task Scheduler on Windows (see [Windows](#windows)), and an init script of your own that runs `aranet-service run` as an unprivileged user on OpenRC and rc.d.
 
 ## macOS (launchd)
 
-### User-Level Service
+On macOS the service runs as a LaunchAgent: as you, while you're logged in, with your own config and database.
 
 <Steps>
 1. Install aranet-service
@@ -27,7 +30,7 @@ This guide covers deploying aranet-service as a persistent background service on
    cargo install aranet-service --features full
    ```
 
-2. Install as user service
+2. Install the LaunchAgent
    ```bash
    aranet-service service install --user
    ```
@@ -43,9 +46,13 @@ This guide covers deploying aranet-service as a persistent background service on
    ```
 </Steps>
 
+The agent reads `~/Library/Application Support/aranet/server.toml`. To use another file, name it when you install: `aranet-service service install --user --config /path/to/server.toml`. If polls fail because Bluetooth access is denied, allow `aranet-service` under **System Settings → Privacy & Security → Bluetooth**. Remove the agent with `aranet-service service uninstall --user`.
+
+A system-level install (`sudo aranet-service service install`) is refused on macOS, because launchd would run the service as root. A LaunchDaemon that 0.2.x installed keeps running the service as root after an upgrade: remove it with `sudo aranet-service service uninstall`, then run `aranet-service service install --user`. Every `aranet-service service` command prints a warning while it is still there.
+
 ### Manual Configuration
 
-Create `~/Library/LaunchAgents/dev.rye.aranet.plist`:
+The agent that `service install --user` writes doesn't keep a log. For a log file, write the agent yourself instead, and don't also run `service install --user`, which uses the same label. Create `~/Library/LaunchAgents/dev.rye.aranet.plist`, replacing `/Users/you` with your home directory (launchd doesn't expand `~`):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -56,7 +63,7 @@ Create `~/Library/LaunchAgents/dev.rye.aranet.plist`:
     <string>dev.rye.aranet</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/aranet-service</string>
+        <string>/Users/you/.cargo/bin/aranet-service</string>
         <string>run</string>
     </array>
     <key>RunAtLoad</key>
@@ -64,118 +71,142 @@ Create `~/Library/LaunchAgents/dev.rye.aranet.plist`:
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/usr/local/var/log/aranet.log</string>
+    <string>/Users/you/Library/Logs/aranet-service.log</string>
     <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/aranet.err</string>
-    <key>WorkingDirectory</key>
-    <string>/usr/local/var/aranet</string>
+    <string>/Users/you/Library/Logs/aranet-service.log</string>
 </dict>
 </plist>
 ```
 
-Load the service:
+Load it, and unload it when you no longer want it:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/dev.rye.aranet.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.rye.aranet.plist
+launchctl bootout "gui/$(id -u)/dev.rye.aranet"
 ```
 
 ## Linux (systemd)
 
-### System-Level Service
+### System Service
+
+The system service is `aranet.service`. It runs aranet-service as a dynamic, unprivileged `aranet` user with no extra capabilities, reads `/var/lib/aranet/server.toml` and keeps its database in `/var/lib/aranet`. You don't create the user or the directory: systemd does when the service starts. (With a dynamic user, systemd keeps the directory at `/var/lib/private/aranet` and links `/var/lib/aranet` to it; as root, either path works.)
 
 <Steps>
-1. Build and install
+1. Install aranet-service where only root can change it
    ```bash
-   cargo build --release -p aranet-service --features full
-   sudo cp target/release/aranet-service /usr/local/bin/
+   cargo install aranet-service --features full
+   sudo install -o root -g root -m 0755 ~/.cargo/bin/aranet-service /usr/local/bin/aranet-service
+   ```
+   The installer refuses a program that a non-root user could replace, such as `~/.cargo/bin/aranet-service` itself or a build in `target/`.
+
+2. Install and start the service
+   ```bash
+   sudo /usr/local/bin/aranet-service service install
+   sudo systemctl start aranet
+   ```
+   Or install the unit from the repository yourself: `sudo install -m 0644 distribution/systemd/aranet.service /etc/systemd/system/aranet.service`, then `sudo systemctl daemon-reload` and `sudo systemctl enable --now aranet`.
+
+   After a re-install over a running service, use `sudo systemctl restart aranet`: `start` does nothing to a service that is already running.
+
+3. Add your sensors, then restart
+   ```bash
+   sudoedit /var/lib/aranet/server.toml
+   sudo systemctl restart aranet
    ```
 
-2. Create service user
+4. Check status and logs
    ```bash
-   sudo useradd -r -s /bin/false aranet
-   sudo mkdir -p /var/lib/aranet
-   sudo chown aranet:aranet /var/lib/aranet
-   ```
-
-3. Install the service file
-   ```bash
-   aranet-service service install
-   # Or manually: sudo cp distribution/systemd/aranet.service /etc/systemd/system/
-   ```
-
-4. Enable and start
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now dev.rye.aranet
+   systemctl status aranet
+   journalctl -u aranet -f
    ```
 </Steps>
 
-### Service File
+`service install --config <file>` makes the unit read another config file. A path that contains `..`, or that lies in `/home`, `/root`, `/run/user`, `/tmp` or `/var/tmp` (also when a symlink leads there), is refused at install time, because the unit hides those directories from the service. The service can read a config outside `/var/lib/aranet` but not change it: add sensors by editing the file, and if you set `security.api_key_enabled = true`, set `security.api_key` there yourself. `service install --database <file>` is refused unless the file is in `/var/lib/aranet`, the only directory the service can write.
 
-Create `/etc/systemd/system/aranet.service`:
+The unit reads environment settings from `/etc/default/aranet` if that file exists. It is the place for `RUST_LOG` and other variables, one `NAME=value` per line, for example `RUST_LOG=aranet_core=info`; restart the service after changing it.
 
-```ini
-[Unit]
-Description=Aranet Sensor Collector Service
-Documentation=https://github.com/cameronrye/aranet
-After=network-online.target bluetooth.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=aranet
-Group=aranet
-ExecStart=/usr/local/bin/aranet-service run
-Restart=on-failure
-RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
-# Paths
-WorkingDirectory=/var/lib/aranet
-ReadWritePaths=/var/lib/aranet
-
-# Security hardening
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-NoNewPrivileges=true
-
-# Bluetooth access
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### User-Level Service
+If the journal shows that BlueZ refused access (`org.freedesktop.DBus.Error.AccessDenied`), let the service use the `bluetooth` group with a drop-in:
 
 ```bash
-# Create user service directory
-mkdir -p ~/.config/systemd/user
-
-# Copy service file
-cp distribution/systemd/aranet.service ~/.config/systemd/user/
-
-# Edit to remove User/Group and adjust paths
-# Then enable
-systemctl --user daemon-reload
-systemctl --user enable --now dev.rye.aranet
+sudo mkdir -p /etc/systemd/system/aranet.service.d
+printf '[Service]\nSupplementaryGroups=bluetooth\n' | sudo tee /etc/systemd/system/aranet.service.d/bluetooth.conf
+sudo systemctl daemon-reload
+sudo systemctl restart aranet
 ```
+
+To remove the service, stop it first: `sudo aranet-service service stop`, then `sudo aranet-service service uninstall`.
+
+The system service has no desktop session, so desktop notifications (the `notifications` feature) don't reach anyone from it: use webhooks or MQTT there, or a [user service](#user-service). With the released `aranet` binary under this unit (next section), alerts go out by webhooks only: `aranet server` has no MQTT.
+
+#### Running the released `aranet` binary
+
+The release downloads contain `aranet`, not `aranet-service`. `aranet server` runs the service without MQTT, the Prometheus push gateway and desktop notifications (see the top of this page), so its alerts go out by webhooks. To run it under this unit, copy it where only root can change it, install the unit from a clone of the repository, and replace the unit's command with a drop-in:
+
+```bash
+sudo install -o root -g root -m 0755 ~/.cargo/bin/aranet /usr/local/bin/aranet
+# The next line needs a clone of the repository: git clone https://github.com/cameronrye/aranet
+sudo install -m 0644 distribution/systemd/aranet.service /etc/systemd/system/aranet.service
+sudo mkdir -p /etc/systemd/system/aranet.service.d
+printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/aranet server --config /var/lib/aranet/server.toml\nEnvironment=RUST_LOG=aranet_service=info\n' \
+  | sudo tee /etc/systemd/system/aranet.service.d/aranet-cli.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now aranet
+```
+
+#### Upgrading from a 0.2.x system service
+
+Earlier versions installed the system service as `rye-aranet.service`, running as root. Every `aranet-service service` command warns while that unit is still installed; `sudo aranet-service service install` stops and removes it (or `sudo aranet-service service uninstall` removes it without installing the new one). Its config and database stay where they were, by default `/root/.config/aranet/server.toml` and `/root/.local/share/aranet/data.db`. To keep them, do these steps once, right after the first install. The third one deletes the new service's database, which is still empty then: once the service has stored readings of its own, do not run the steps again. `sudo aranet-service service install` prints them for as long as it finds the old config:
+
+```bash
+sudo systemctl start aranet && sudo systemctl stop aranet    # creates /var/lib/aranet
+sudo cp /root/.config/aranet/server.toml /var/lib/aranet/
+sudo sh -c 'rm -f /var/lib/aranet/data.db*'
+sudo sh -c 'cp /root/.local/share/aranet/data.db* /var/lib/aranet/'
+sudo chown -R --reference=/var/lib/aranet /var/lib/aranet/
+sudoedit /var/lib/aranet/server.toml    # if storage.path points under /root, delete that line
+sudo systemctl start aranet
+sudo mv /root/.config/aranet /root/.config/aranet.moved    # the steps are then no longer printed
+```
+
+The `rm` removes the empty database that the first start created, with its `-wal` and `-shm` files, so none of them is applied to the old database. The `cp` copies the old database together with its own `-wal` and `-shm` files, if any, so no reading that is still only in the write-ahead log is lost. The globs run in `sh -c` because your own shell can't list `/root` or `/var/lib/aranet`. Without a `storage.path`, the service uses the database in `/var/lib/aranet`. The last line moves the old config directory away, because its `server.toml` is what makes the installer print the steps.
+
+### User Service
+
+A user service runs as you, with `~/.config/aranet/server.toml` and your own database, and needs no root:
+
+```bash
+aranet-service service install --user
+aranet-service service start --user
+aranet-service service status --user
+journalctl --user -u aranet -f
+```
+
+It runs while you're logged in; `loginctl enable-linger "$USER"` keeps it running after you log out. A user service that 0.2.x installed as `rye-aranet.service` is stopped and removed when you install the new one.
+
+## Windows
+
+`aranet-service service install` doesn't support Windows yet: the program can't run as a Windows service. Start the service at logon with Task Scheduler instead. Creating a logon task needs a Command Prompt opened with **Run as administrator**; `/ru` and `/it` keep the task running as you, in your session. For the `aranet` CLI from the installer:
+
+```text
+schtasks /create /tn "Aranet Service" /tr "\"%USERPROFILE%\.cargo\bin\aranet.exe\" server" /sc onlogon /ru "%USERNAME%" /it
+```
+
+With `aranet-service` from `cargo install`, use `"\"%USERPROFILE%\.cargo\bin\aranet-service.exe\" run"` as the `/tr` value instead. The task runs as you, with `%APPDATA%\aranet\server.toml` and your own database, in a console window that stays open while the service runs. Under `aranet server`, alerts go out by webhooks: the released `aranet` has no MQTT and no desktop notifications. Remove it with `schtasks /delete /tn "Aranet Service"`, also from an administrator prompt. Without administrator rights, put a shortcut to `aranet.exe server` (or `aranet-service.exe run`) in your Startup folder (Win+R, `shell:startup`) instead.
 
 ## Docker
 
-A multi-stage `Dockerfile` and `docker-compose.yml` are provided at the repository root. BLE access requires privileged mode and D-Bus passthrough.
+`docker/Dockerfile` builds an image that runs aranet-service as an unprivileged user (uid and gid 999) and always reads `/app/server.toml`. The image holds a copy of [`docker/server.toml`](https://github.com/cameronrye/aranet/blob/main/docker/server.toml), and both compose files mount that file over it. An image built after you put an API key, an MQTT password or a webhook URL into that file contains them: don't push or share such an image, or keep them in a config outside the checkout and mount that. A config that fails validation stops the container; `docker logs aranet-service` shows why.
 
 ### Quick Start
 
 ```bash
-# Standalone service with BLE
+# Standalone service, from the repository root
 docker compose up -d
 
-# Dashboard: http://localhost:8080/dashboard
+# Dashboard: http://127.0.0.1:8080/dashboard
 ```
+
+The compose files publish their ports on `127.0.0.1` only, so the dashboard and API (and Prometheus and Grafana in the monitoring stack) are reachable from this machine but not from the network.
 
 ### Full Monitoring Stack
 
@@ -185,57 +216,83 @@ Use the `docker/` directory for a Prometheus + Grafana stack:
 docker compose -f docker/docker-compose.yml up -d
 ```
 
+For Bluetooth, uncomment the `/run/dbus:/run/dbus:ro` volume of `aranet-service` in `docker/docker-compose.yml`. Grafana is at http://127.0.0.1:3000 (user `admin`, password `changeme` unless you set `GRAFANA_ADMIN_PASSWORD`).
+
+### Editing the Configuration
+
+Edit `docker/server.toml` and restart the container (`docker compose restart aranet-service`). The compose files mount it read-only, so adding, changing or removing a sensor through the API, the TUI or the GUI fails with `500 Internal Server Error`. To manage sensors that way, mount a writable copy that uid 999 can write, without `:ro`:
+
+```bash
+cp docker/server.toml server.toml
+sudo chown 999:999 server.toml
+# in the compose file: - ./server.toml:/app/server.toml
+```
+
+The service then rewrites that file in place, keeping its comments. It can't replace a single mounted file, so an interrupted write can leave it incomplete: keep a copy. Its first write also makes the file readable only by its owner, uid 999, so reading or editing it on the host then needs `sudo`.
+
+### Bluetooth in Docker
+
+Bluetooth works on a Linux host running BlueZ: mount the host's `/run/dbus` read-only (`/run/dbus:/run/dbus:ro`), and the service talks to BlueZ over the system bus. No privileged mode, host networking or device nodes are needed. The mount gives the container the host's whole system bus, with the rights of uid 999 on the host: BlueZ (pairing and removing devices, switching the adapter off) and every other service on the bus that admits that uid. `:ro` only keeps the container from changing the directory: it can still send requests through the socket in it. Docker Desktop on macOS and Windows can't reach the host's Bluetooth adapter; run the service natively there.
+
+If the log shows `AccessDenied` for `org.bluez` or the system bus:
+
+- BlueZ may accept only members of the host's `bluetooth` group. Add its group id (`getent group bluetooth`) to the service with `group_add: ["<gid>"]`.
+- AppArmor (Ubuntu) or SELinux (Fedora, RHEL) may block the container's D-Bus messages. Lifting that confinement for this one container is the way out; the root `docker-compose.yml` has both lines, commented out:
+
+  ```yaml
+      security_opt: ["apparmor=unconfined"]  # Ubuntu and other AppArmor hosts
+      # security_opt: ["label=disable"]      # SELinux hosts (Fedora, RHEL)
+  ```
+
 ### Build from Source
 
 ```bash
-docker build -t aranet-service .
+docker build -f docker/Dockerfile -t aranet-service .
 docker run -d --name aranet-service \
-  --privileged --network host \
-  -v /var/run/dbus:/var/run/dbus \
+  -p 127.0.0.1:8080:8080 \
+  -v /run/dbus:/run/dbus:ro \
   -v aranet-data:/data \
-  -v ./server.toml:/app/server.toml:ro \
-  -e RUST_LOG=aranet_service=info \
+  -v "$PWD/server.toml:/app/server.toml:ro" \
   aranet-service
 ```
+
+Build from the repository root with `-f docker/Dockerfile`; there is no `Dockerfile` at the root any more. The Dockerfile needs BuildKit (it uses cache mounts and `COPY --chmod`), the default builder since Docker 23 when the buildx plugin is installed (on Debian and Raspberry Pi OS, the `docker-buildx` package). An older engine may build it with `DOCKER_BUILDKIT=1 docker build …`; if that fails on `--chmod`, update Docker. `docker compose` needs the Compose v2 plugin. The mounted `server.toml` must be readable by uid 999 (`chmod 644 server.toml`, or `sudo chown 999:999 server.toml` if it holds secrets). Arguments after the image name replace the default `run` command and still read `/app/server.toml`, for example `docker run … aranet-service run --no-collector`. The image passes `--config /app/server.toml` itself, so `docker run … aranet-service --config <file>` stops with a usage error (`the argument '--config <CONFIG>' cannot be used multiple times`): mount your file over `/app/server.toml` instead.
 
 ### Production Deployment
 
 ```yaml
-# docker-compose.prod.yml
+# docker-compose.prod.yml, in the repository root
 services:
   aranet-service:
-    build: .
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     restart: always
+    stop_grace_period: 30s  # a clean shutdown can take up to 20 s; Docker's default is 10 s
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - aranet-data:/data
       - ./server.toml:/app/server.toml:ro
-      - /var/run/dbus:/var/run/dbus
-    privileged: true
-    network_mode: host
+      - /run/dbus:/run/dbus:ro
     environment:
       - RUST_LOG=aranet_service=info
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
 
 volumes:
   aranet-data:
 ```
 
+The image has its own health check on `/api/health`.
+
 <Aside type="caution">
-  Docker containers cannot access Bluetooth by default. BLE support requires privileged mode with D-Bus socket passthrough (`/var/run/dbus`) and host networking.
+  Inside the container the service must listen on `0.0.0.0`, a network address, which it refuses without API-key authentication. `docker/server.toml` therefore sets `security.allow_unauthenticated_network = true`: the compose files publish the port on `127.0.0.1` only, and Prometheus reaches the service over the compose network. It also lists `aranet-service`, the name Prometheus uses, in `security.allowed_hosts`. Keep both settings in your own `server.toml`, or turn on API-key authentication, which you must do before publishing the port on any other address. With authentication on, give Prometheus the key with an `authorization` block (see [Prometheus Integration](#prometheus-integration)), and set `api_key` yourself: the service can't save a generated key to a read-only file.
 </Aside>
 
 ## Configuration
 
 ### Server Configuration
 
-Create `~/.config/aranet/server.toml`:
+The service reads `server.toml` from `~/.config/aranet/` on Linux, `~/Library/Application Support/aranet/` on macOS and `%APPDATA%\aranet\` on Windows, or the file you pass with `--config`. The systemd system service uses `/var/lib/aranet/server.toml`, and the Docker image `/app/server.toml`.
 
 ```toml
 [server]
@@ -243,6 +300,11 @@ bind = "127.0.0.1:8080"
 
 [storage]
 path = "~/.local/share/aranet/data.db"
+
+# Optional: delete old data at startup and hourly (off by default)
+# [storage.retention]
+# readings_days = 90
+# history_days = 365
 
 [prometheus]
 enabled = true
@@ -253,14 +315,23 @@ alias = "office"
 poll_interval = 60
 ```
 
+- `server.bind` is an IP address and port. Host names such as `localhost:8080` are rejected: use `127.0.0.1:8080`. Listening on a network address (`0.0.0.0`, `[::]` or a LAN address) needs API-key authentication; see [API Security](/aranet/docs/service/security/).
+- `storage.path` may start with `~/`, meaning your home directory. Earlier versions created a directory literally named `~` in the working directory instead. If you used such a path, the service logs a warning that names both paths at every start, until the old file is moved or removed. To keep that data, stop the service first, then move `./~/.local/share/aranet/data.db` (with its `data.db-wal` and `data.db-shm` files, if any) to `~/.local/share/aranet/`. The move replaces the database the service has created there since the upgrade, which on Linux is also the `aranet` CLI's cache: if that database holds data you want, merge the two instead. Leave `storage.path` out under the systemd system service, which keeps its database in `/var/lib/aranet`.
+- `[storage.retention]` makes the service delete readings older than `readings_days` and history records older than `history_days` (1 to 36500 days each), at startup and then every hour, in small batches, and logs what it deleted (`Retention: deleted N readings and M history records older than the retention limits`). Leave it out to keep everything; a change takes effect when the service restarts. Both limits apply to everything in the database, including readings that the `aranet` CLI, TUI and GUI stored there: they share the database unless the service has its own, as under the systemd system service and in Docker. `history_days` also deletes the history that `aranet sync` cached in the same database, so the next `aranet sync` may download those records from the sensor again. Deleting rows doesn't shrink the file: stop the service, then run `sqlite3 <database> 'VACUUM;'` to give the space back (`aranet cache prune --vacuum` also deletes cached history, and readings unless you add `--history-only`, older than its `--older-than` age).
+- Device addresses and aliases can be up to 64 characters long and can't contain control characters or backslashes.
+
+The service writes this file only when you add, change or remove a device through the API (the TUI and GUI service panels use it) or when it generates an API key. It changes only those keys, keeps your comments and layout, never writes command-line overrides such as `--bind` or default values into it, and never overwrites a file it can't parse. It writes atomically and owner-only (mode `0600`), and keeps the file's owner. Sensors you add to the file by hand while the service runs take effect after a restart, and a device change made through the API meanwhile replaces the file's device list with the service's.
+
+If the file no longer parses when a device is added, changed or removed through the API, the request fails with `500 Internal Server Error` and the file stays as it is. The response names the file and says it is not valid TOML (see the service log); the parse error itself goes only to the service log. It can quote the line of `server.toml` it failed on, so treat the log with the same care as the file.
+
 ### Security Configuration
 
-For production deployments, enable API authentication and rate limiting:
+For production deployments, enable API authentication and keep rate limiting on:
 
 ```toml
 [security]
 api_key_enabled = true
-api_key = "your-secure-random-key-at-least-32-chars"
+# Leave api_key out and the service generates one and saves it here.
 rate_limit_enabled = true
 rate_limit_requests = 100
 rate_limit_window_secs = 60
@@ -307,6 +378,8 @@ Each webhook POST sends a JSON payload:
 
 Valid event types: `co2_high`, `radon_high`, `battery_low`.
 
+Deliveries run in the background, up to 16 at a time, so a slow or unreachable endpoint doesn't hold up other alerts. Each request times out after 10 s and is tried up to 3 times, 2 s apart and then longer. A redirect is never followed: an endpoint that answers `301`, `302`, `307` or `308` counts as failed, so give the endpoint's final URL. An alert's cooldown starts once it has been delivered. When 16 deliveries are already running, new alerts are dropped with a warning and come back with a later reading. The log names each endpoint by its position, `endpoint #1` for the first `[[webhooks.endpoints]]` entry, followed by its scheme, host and port only (`https://hooks.slack.com/…`), because many webhook URLs contain their secret. Validation errors count from 0 instead: `webhooks.endpoints[0]` is the same entry.
+
 ### InfluxDB Export
 
 Export sensor readings to InfluxDB v2 in real time:
@@ -322,17 +395,20 @@ measurement = "aranet"
 precision = "s"             # s, ms, us, or ns
 ```
 
-Data is written using the InfluxDB v2 line protocol: `aranet,device=office,address=Aranet4+AAAAA co2=450i,temperature=22.50,humidity=45i,pressure=1013.50,battery=85i`.
+Data is written using the InfluxDB v2 line protocol: `aranet,device=office,address=Aranet4\ AAAAA co2=450i,temperature=22.50,humidity=45i,pressure=1013.50,battery=85i`. Tag values and the measurement name are escaped, and `measurement` can't start with `_` or `#` or contain control characters or backslashes. A `measurement` whose spaces or commas were escaped by hand (`air\ quality`) must now be written plain (`air quality`): the service escapes it, and readings continue in the same measurement.
+
+Lines are sent in batches of up to 500. While InfluxDB is unreachable, or answers with a server error, `408` or `429`, the service keeps up to 10000 lines queued and retries with a growing delay, from 1 s up to 5 minutes. When the queue is full, new readings are dropped, with a warning at most once a minute. A batch that InfluxDB rejects with another `4xx` error is dropped. So is one that it answers with a redirect, which the service never follows: set `url` to InfluxDB's final address. Lines still queued when the service stops are lost. The log shows the InfluxDB URL as `scheme://host[:port]/…` only.
 
 ### mDNS Service Discovery
 
-When running, aranet-service automatically advertises itself on the local network via mDNS:
+When the service listens on a network address with API-key authentication on, it advertises itself on the local network via mDNS:
 
 - Service type: `_aranet._tcp.local.`
 - HTTP service: `_http._tcp.local.`
+- Instance and host: `Aranet Service on <name>` at `aranet-<name>.local.`, where `<name>` is the first label of this machine's host name (for example `aranet-raspberrypi.local.`), with the port the service listens on
 - Properties: `version`, `path` (`/api`), `dashboard` (`/dashboard`)
 
-Clients can discover the service without manual IP configuration:
+It doesn't advertise a loopback address such as `127.0.0.1`, or a network address served without authentication (`security.allow_unauthenticated_network = true`). Clients can then find the service without manual IP configuration:
 
 ```bash
 # macOS
@@ -363,9 +439,11 @@ The dashboard includes panels for:
 # Log level
 export RUST_LOG=aranet_service=info
 
-# Config file location
-export ARANET_CONFIG=/path/to/server.toml
+# Directory of the default database (data.db); the CLI also keeps cli-state.toml there
+export ARANET_DATA_DIR=/var/lib/aranet
 ```
+
+The systemd system service doesn't see variables exported in a shell: set them in `/etc/default/aranet` (see [System Service](#system-service)). There is no environment variable for the service's config file: pass it with `--config`, as in `aranet-service --config /path/to/server.toml` or `aranet server --config /path/to/server.toml`.
 
 ## Prometheus Integration
 
@@ -382,6 +460,22 @@ scrape_configs:
     scrape_interval: 60s
 ```
 
+With API-key authentication on, `/metrics` needs the key too. Prometheus sends it as a bearer token:
+
+```yaml
+scrape_configs:
+  - job_name: 'aranet'
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/aranet-api-key
+    static_configs:
+      - targets: ['aranet.example.com:8080']
+    metrics_path: /metrics
+    scrape_interval: 60s
+```
+
+`credentials_file` holds only the key; `credentials: '<key>'` also works. Without authentication, the service answers only host names it knows (see [Host Names](/aranet/docs/service/security/#host-names)): a target other than `localhost`, an IP address or this machine's name must be listed in `security.allowed_hosts`.
+
 ### Available Metrics
 
 | Metric | Type | Description |
@@ -394,8 +488,8 @@ scrape_configs:
 | `aranet_reading_age_seconds` | gauge | Time since last reading |
 | `aranet_collector_running` | gauge | Collector status (1/0) |
 | `aranet_collector_uptime_seconds` | gauge | Collector uptime |
-| `aranet_device_poll_success_total` | counter | Successful polls |
-| `aranet_device_poll_failure_total` | counter | Failed polls |
+| `aranet_device_poll_success_total` | counter | Successful polls since the service started |
+| `aranet_device_poll_failure_total` | counter | Failed polls since the service started |
 | `aranet_device_poll_duration_ms` | gauge | Per-device poll duration |
 
 ## Multi-Device Setup
@@ -458,11 +552,14 @@ For sensors spread across multiple locations:
 ### View Logs
 
 ```bash
-# systemd
+# systemd system service
 journalctl -u aranet -f
 
-# launchd
-tail -f /usr/local/var/log/aranet.log
+# systemd user service
+journalctl --user -u aranet -f
+
+# launchd, with the manual LaunchAgent above
+tail -f ~/Library/Logs/aranet-service.log
 
 # Docker
 docker logs -f aranet-service
@@ -487,19 +584,31 @@ curl http://localhost:8080/api/health/detailed
 curl http://localhost:8080/metrics
 ```
 
+### Reading Stored Data
+
+`/api/readings`, `/api/devices/{id}/readings` and `/api/devices/{id}/history` return the newest rows first, 1000 at a time unless you pass `limit` (at most 10000). `pagination.has_more` says whether older rows remain, and `pagination.limit` is the page size used. Page with `offset`, up to 1000000; beyond that, or to jump to a time range, use `since` and `until` (Unix timestamps). `limit=0`, a larger `limit` and a larger `offset` are rejected with `400 Bad Request`.
+
+```bash
+curl "http://localhost:8080/api/readings?since=1767225600&limit=500"
+```
+
 ## Troubleshooting
 
 ### Service Won't Start
 
-1. Check logs for errors
-2. Verify configuration file syntax: `toml-cli check server.toml`
-3. Ensure Bluetooth permissions (Linux: CAP_NET_ADMIN)
+1. Read the error: `journalctl -u aranet` for the system service, `docker logs aranet-service` in Docker, or run `aranet-service --config <file> run` in a terminal.
+2. A config file that doesn't parse is reported with its path and the position of the error. Fix it by hand: aranet never overwrites a file it can't parse.
+3. `server.bind` must be an IP address and port: `127.0.0.1:8080`, not `localhost:8080`.
+4. On a network address (`0.0.0.0`, `[::]` or a LAN address) without API-key authentication, the service refuses to start. Enable `security.api_key_enabled`, bind to `127.0.0.1`, or set `security.allow_unauthenticated_network = true` if a firewall or an authenticating proxy protects the port.
+5. With `security.api_key_enabled = true` and no `api_key`, the service generates a key and must save it in `server.toml`. If it can't write the file, as with a read-only mount in Docker, set `api_key` yourself.
+6. A port that is already in use is reported before the service opens its database or uses Bluetooth.
 
 ### No Bluetooth Access
 
-- **Linux**: Add user to `bluetooth` group: `sudo usermod -aG bluetooth $USER`
-- **macOS**: Grant Bluetooth permission in System Preferences
-- **Docker**: Run with `--privileged` or mount `/var/run/dbus`
+- **Linux (system service)**: if the journal shows `AccessDenied` for `org.bluez`, add `SupplementaryGroups=bluetooth` with a drop-in (see [System Service](#system-service))
+- **Linux (desktop or user service)**: add your user to the `bluetooth` group with `sudo usermod -aG bluetooth $USER`, then log in again
+- **macOS**: allow the terminal app, or `aranet-service` when it runs as a LaunchAgent, under **System Settings → Privacy & Security → Bluetooth**
+- **Docker**: on a Linux host with BlueZ, mount `/run/dbus` read-only; see [Bluetooth in Docker](#bluetooth-in-docker). Docker Desktop on macOS and Windows can't reach the host's Bluetooth adapter
 
 ### Connection Timeouts
 
