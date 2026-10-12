@@ -1335,6 +1335,7 @@ mod tests {
         // A bracketed part is part of the name like any other.
         assert!(name_matches("Hall [Aranet2 2751B]", "hall [aranet2 2751b]"));
         assert!(!name_matches("Hall [Aranet2 2751B]", "hall"));
+        assert!(!name_matches("Hall [Aranet2 2751B]", "aranet2 2751b"));
     }
 
     #[test]
