@@ -4,7 +4,9 @@ Technical architecture and reference documentation for the Aranet Rust implement
 This project provides feature parity with [Aranet4-Python](https://github.com/Anrijs/Aranet4-Python) and beyond.
 
 > **Dependency Policy**: Always use the **latest stable versions** of all libraries, frameworks, and tools.
-> Pin to major versions only (e.g., `btleplug = "0.11"` not `"0.11.4"`). Run `cargo update` regularly.
+> Ask for the major version of a dependency, or for the minor version of a 0.x crate (`thiserror = "2"`, `tracing = "0.1"`).
+> Ask for a later release only when the code needs something that release added, and say why in a comment above the
+> requirement (`btleplug = "0.13.5"`). Run `cargo update` regularly.
 > Check [crates.io](https://crates.io) and [lib.rs](https://lib.rs) for current versions before adding dependencies.
 
 ---
@@ -25,7 +27,7 @@ This project provides feature parity with [Aranet4-Python](https://github.com/An
 
 ### What's Working Now
 
-- **aranet-core**: Complete BLE stack with btleplug 0.11 - scan, connect, device info, current readings,
+- **aranet-core**: Complete BLE stack with btleplug 0.13 - scan, connect, device info, current readings,
   history download (V1+V2), settings read/write, auto-reconnection, streaming, notifications, RSSI,
   multi-device manager, event system, validation, thresholds, metrics, mock device
 - **aranet-types**: Shared types for CurrentReading, DeviceInfo, HistoryRecord, Status, DeviceType, all UUIDs
@@ -236,7 +238,7 @@ path = ""                 # Empty = use default platform path
 
 | Dependency | Purpose | Min Version | Check Latest |
 |------------|---------|-------------|--------------|
-| `btleplug` | Cross-platform BLE | 0.11+ | [crates.io/crates/btleplug](https://crates.io/crates/btleplug) |
+| `btleplug` | Cross-platform BLE | 0.13.5+ | [crates.io/crates/btleplug](https://crates.io/crates/btleplug) |
 | `tokio` | Async runtime | 1.0+ | [crates.io/crates/tokio](https://crates.io/crates/tokio) |
 | `thiserror` | Error handling | 2.0+ | [crates.io/crates/thiserror](https://crates.io/crates/thiserror) |
 | `bytes` | Binary parsing | 1.0+ | [crates.io/crates/bytes](https://crates.io/crates/bytes) |
@@ -902,8 +904,8 @@ Before building, learn from existing implementations:
 
 | Crate | Strengths | Weaknesses | btleplug Version |
 |-------|-----------|------------|------------------|
-| `aranet` (m1guelpf) | Clean API, modern deps, device info | No history, no scanning | 0.11.4 (current) |
-| `aranet-btle` (DDRBoxman) | BLE advertisement scanning | No device info, no history | 0.11 (current) |
+| `aranet` (m1guelpf) | Clean API, modern deps, device info | No history, no scanning | 0.11.4 |
+| `aranet-btle` (DDRBoxman) | BLE advertisement scanning | No device info, no history | 0.11 |
 | `aranet4` (lpraneis) | Historical data support | Uses OLD UUID only! | 0.9.1 (outdated) |
 | `aranet4-cli` (quentinms) | Multi-device, JSON output | CLI only, not a library | 0.9 (outdated) |
 
