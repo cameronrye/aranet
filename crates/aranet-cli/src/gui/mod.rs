@@ -36,6 +36,7 @@ use aranet_store::default_db_path;
 use eframe::egui::{self, IconData};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use tracing_subscriber::EnvFilter;
 
 use aranet_core::messages::{Command, SensorEvent};
 
@@ -95,6 +96,35 @@ impl GuiOptions {
     }
 }
 
+/// The GUI's log filter: `rust_log`, the value of `RUST_LOG`, when it holds anything, and
+/// otherwise errors only.
+///
+/// That is the filter `tracing_subscriber::fmt::init()` builds, with one line taken out
+/// of the default: the error that btleplug 0.13.5 logs on macOS for every disconnect
+/// that CoreBluetooth confirms. `crate::log_filter` says where the line comes from. A
+/// `RUST_LOG` of the user's own is used as it is and still shows the line.
+///
+/// When aranet moves to a btleplug release that no longer logs the line, the branch for
+/// an empty `RUST_LOG` goes, and this function is `EnvFilter::new(rust_log)` again.
+fn gui_log_filter(rust_log: &str) -> EnvFilter {
+    if rust_log.is_empty() {
+        EnvFilter::new(crate::log_filter::default_directives("error"))
+    } else {
+        EnvFilter::new(rust_log)
+    }
+}
+
+/// Start logging to stdout, with the filter that `gui_log_filter` builds from `RUST_LOG`.
+///
+/// This is `tracing_subscriber::fmt::init()` written out, so that the filter can differ
+/// from the library's. Like `init()`, it panics if a global logger is already installed.
+fn init_logging() {
+    let rust_log = std::env::var(EnvFilter::DEFAULT_ENV).unwrap_or_default();
+    tracing_subscriber::fmt()
+        .with_env_filter(gui_log_filter(&rust_log))
+        .init();
+}
+
 /// Run the GUI application.
 ///
 /// This is the main entry point for the GUI. It:
@@ -103,7 +133,7 @@ impl GuiOptions {
 /// 3. Spawns the background sensor worker
 /// 4. Runs the egui/eframe main loop
 pub fn run() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging();
 
     // Load config to get service URL
     let config = Config::load_or_default()?;
@@ -276,7 +306,7 @@ pub fn run() -> Result<()> {
 ///
 /// This allows running in demo mode with mock data for screenshots.
 pub fn run_with_options(options: GuiOptions) -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging();
 
     if options.demo {
         info!("Running in demo mode with mock data");
@@ -486,4 +516,41 @@ pub fn run_with_options(options: GuiOptions) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::log_filter::testing::{
+        lines_shown_by, shows_disconnect_error, without_disconnect_error,
+    };
+
+    /// With `RUST_LOG` unset or empty the GUI logs errors only, as `fmt::init()` did,
+    /// without the error that btleplug logs on macOS for every disconnect.
+    #[test]
+    fn the_default_gui_log_leaves_out_btleplugs_disconnect_error() {
+        let errors = lines_shown_by(EnvFilter::new("error"));
+        assert!(shows_disconnect_error(&errors), "{errors:?}");
+
+        assert_eq!(
+            lines_shown_by(gui_log_filter("")),
+            without_disconnect_error(errors)
+        );
+    }
+
+    /// A `RUST_LOG` of the user's own is used as it is, as `fmt::init()` used it, so it
+    /// still shows the line that the default hides.
+    #[test]
+    fn rust_log_replaces_the_default_gui_log_filter() {
+        for rust_log in ["warn", "btleplug=trace", "aranet_core=debug"] {
+            assert_eq!(
+                lines_shown_by(gui_log_filter(rust_log)),
+                lines_shown_by(EnvFilter::new(rust_log)),
+                "RUST_LOG={rust_log}"
+            );
+        }
+        let shown = lines_shown_by(gui_log_filter("warn"));
+        assert!(shows_disconnect_error(&shown), "{shown:?}");
+    }
 }

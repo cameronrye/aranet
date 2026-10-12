@@ -17,6 +17,9 @@ mod cli;
 mod commands;
 #[cfg(feature = "cli")]
 mod format;
+// Also a module of the library, for the GUI. The file's own comment says why.
+#[cfg(feature = "cli")]
+mod log_filter;
 #[cfg(feature = "cli")]
 mod style;
 #[cfg(feature = "cli")]
@@ -128,13 +131,8 @@ async fn main() -> Result<()> {
     let mut config = Config::load_or_default()?;
 
     // Initialize tracing (write to stderr so stdout is clean for data)
-    let filter = if cli.quiet {
-        EnvFilter::new("warn")
-    } else if cli.verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
-    };
+    let rust_log = std::env::var(EnvFilter::DEFAULT_ENV).ok();
+    let filter = cli_log_filter(cli.quiet, cli.verbose, rust_log.as_deref());
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -364,6 +362,31 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The log filter of a CLI command.
+///
+/// `--quiet` and `--verbose` each fix the filter. Without them a `RUST_LOG` that parses is
+/// used as it is, and otherwise the filter is the default: warnings and errors.
+///
+/// `--quiet` and the default leave out one line, through `log_filter::default_directives`:
+/// the error that btleplug 0.13.5 logs on macOS for every disconnect that CoreBluetooth
+/// confirms, which would follow every successful command that connects. `--verbose` and a
+/// `RUST_LOG` of the user's own still show it.
+///
+/// When aranet moves to a btleplug release that no longer logs the line, both calls of
+/// `log_filter::default_directives` go back to `"warn"`.
+#[cfg(feature = "cli")]
+fn cli_log_filter(quiet: bool, verbose: bool, rust_log: Option<&str>) -> EnvFilter {
+    if quiet {
+        EnvFilter::new(log_filter::default_directives("warn"))
+    } else if verbose {
+        EnvFilter::new("debug")
+    } else {
+        rust_log
+            .and_then(|directives| EnvFilter::try_new(directives).ok())
+            .unwrap_or_else(|| EnvFilter::new(log_filter::default_directives("warn")))
+    }
 }
 
 #[cfg(feature = "cli")]
@@ -674,6 +697,10 @@ fn print_examples() {
 mod tests {
     use super::*;
 
+    use crate::log_filter::testing::{
+        lines_shown_by, shows_disconnect_error, without_disconnect_error,
+    };
+
     // ========================================================================
     // resolve_format_with_config tests
     // ========================================================================
@@ -847,5 +874,56 @@ mod tests {
             toml::Table::try_from(&expected).unwrap(),
             "{text}"
         );
+    }
+
+    // ========================================================================
+    // cli_log_filter tests
+    // ========================================================================
+
+    /// `--quiet` and the default show warnings and errors, without the error that
+    /// btleplug logs on macOS for every disconnect. `--quiet` ignores `RUST_LOG` and wins
+    /// over `--verbose`; a `RUST_LOG` that does not parse gives the default.
+    #[test]
+    fn test_cli_log_filter_quiet_and_default_hide_btleplugs_disconnect_error() {
+        let warnings = lines_shown_by(EnvFilter::new("warn"));
+        assert!(shows_disconnect_error(&warnings), "{warnings:?}");
+        let expected = without_disconnect_error(warnings);
+
+        for (quiet, verbose, rust_log) in [
+            (true, false, None),
+            (true, false, Some("debug")),
+            (true, true, None),
+            (false, false, None),
+            (false, false, Some("aranet_core=loud")),
+        ] {
+            assert_eq!(
+                lines_shown_by(cli_log_filter(quiet, verbose, rust_log)),
+                expected,
+                "quiet={quiet} verbose={verbose} RUST_LOG={rust_log:?}"
+            );
+        }
+    }
+
+    /// `--verbose` and a `RUST_LOG` of the user's own are used as they are, so both
+    /// still show the line that the default hides.
+    #[test]
+    fn test_cli_log_filter_verbose_and_rust_log_show_btleplugs_disconnect_error() {
+        for (verbose, rust_log, same_as) in [
+            (true, None, "debug"),
+            (true, Some("error"), "debug"),
+            (false, Some("warn"), "warn"),
+            (false, Some("btleplug=trace"), "btleplug=trace"),
+        ] {
+            let shown = lines_shown_by(cli_log_filter(false, verbose, rust_log));
+            assert!(
+                shows_disconnect_error(&shown),
+                "verbose={verbose} RUST_LOG={rust_log:?}: {shown:?}"
+            );
+            assert_eq!(
+                shown,
+                lines_shown_by(EnvFilter::new(same_as)),
+                "verbose={verbose} RUST_LOG={rust_log:?}"
+            );
+        }
     }
 }
