@@ -1657,8 +1657,10 @@ mod tests {
     #[test]
     fn is_aranet_device_recognises_a_sensor_by_its_name_alone() {
         // No manufacturer data and no service: the name is all there is. Both
-        // fields hold it, as every backend reports a named sensor that has no
-        // BlueZ alias, so the answer is the same on every host.
+        // fields hold it, as btleplug 0.13.5 reports a named sensor on BlueZ
+        // while no alias is set, on CoreBluetooth once a name has been
+        // advertised, and on WinRT before a connect, so the answer is the same
+        // on every host.
         assert!(is_aranet_device(&named("Aranet4 12345", "Aranet4 12345")));
         assert!(is_aranet_device(&named("ARANET2 2751B", "ARANET2 2751B")));
         assert!(!is_aranet_device(&named("Standing desk", "Standing desk")));
