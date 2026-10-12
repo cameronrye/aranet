@@ -73,6 +73,8 @@ aranet read --passive
 aranet watch --passive
 ```
 
+6. **Use the full name or address** - Since aranet 0.3.0, `--device`, `ARANET_DEVICE`, aliases and the default device set with `aranet config set device` must match one device exactly: its full name, MAC address or UUID as `aranet scan` shows it (a MAC address works with or without colons, and case doesn't matter). A partial name such as `2751B` fails with a "did you mean 'Aranet2 2751B'?" error instead of connecting. With `--passive` (item 5), give the name or address exactly as `aranet scan` shows it, case included.
+
 </div>
 </details>
 
@@ -148,7 +150,6 @@ Create `/etc/dbus-1/system.d/aranet.conf`:
   "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <policy user="YOUR_USERNAME">
-    <allow own="org.bluez"/>
     <allow send_destination="org.bluez"/>
     <allow send_interface="org.bluez.GattCharacteristic1"/>
     <allow send_interface="org.bluez.GattDescriptor1"/>
@@ -157,6 +158,8 @@ Create `/etc/dbus-1/system.d/aranet.conf`:
   </policy>
 </busconfig>
 ```
+
+Don't allow your user to own `org.bluez` (if you copied an earlier version of this policy, delete its `allow own` line): owning that name is never needed, and it would let any of your processes impersonate BlueZ.
 
   </TabItem>
   <TabItem label="Windows">
@@ -169,6 +172,63 @@ Windows typically doesn't require special permissions for Bluetooth, but:
 
   </TabItem>
 </Tabs>
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Service discovery timed out on Linux</summary>
+<div class="faq-content">
+
+**Symptoms:** on Linux, connecting to an Aranet4 fails with `Bluetooth error: Service discovery timed out`, usually the first time this computer connects to it, or after `bluetoothctl remove`. On a slow link, where the connection itself takes more than about 10 seconds to come up, such a connect can fail with `Operation 'connect to device' timed out` instead.
+
+**Cause:** when BlueZ connects to a sensor whose services it hasn't stored yet, it first reads them from the sensor, and an Aranet4 can take up to about 20 seconds for that. aranet 0.2.1 and earlier gave BlueZ only 5 seconds, or less when the connection itself was slow to come up, because the connect as a whole has a time limit too. By default (`Cache = always` in `/etc/bluetooth/main.conf`) BlueZ stores the services it has read. With `Cache = yes` it stores them only for paired sensors, and with `Cache = no` never, so there an unpaired sensor can fail like this on every connect.
+
+**Solutions:**
+
+1. **Update to aranet 0.3.0 or later.** While BlueZ is still reading the services, aranet waits for it, also when the connection was slow to come up, for at least 20 seconds (or for `ConnectionConfig::discovery_timeout`, if a program using the library sets it longer). A first connection to an Aranet4 can therefore take about 20-35 seconds, plus the pairing (up to about 40 seconds) when aranet pairs a sensor that isn't paired yet (see Pairing on Linux). The GUI gives a connection 30 seconds in all, and a first connection it gives up on is cancelled, pairing included, so the next attempt starts again from the beginning and can time out the same way: connect to a sensor for the first time on Linux with `aranet read --device <MAC>` (or pair it by hand, see Pairing on Linux), then use it in the GUI. With `--verbose`, aranet logs `BlueZ is still discovering services; waiting up to 20s in all`. If BlueZ doesn't finish in time, the connect fails with `Operation 'discover services' timed out` and aranet disconnects from the sensor.
+
+2. **Keep the Bluetooth adapter away from USB 3 devices.** USB 3 ports, cables and disks interfere with 2.4 GHz radio, which slows down every exchange with the sensor, setting up the connection included. If a USB Bluetooth dongle sits next to a USB 3 disk or port, move it away, for example on a USB 2 extension cable.
+
+3. **With aranet 0.2.1 and earlier,** a failed attempt can leave the sensor connected to the computer until BlueZ drops the link, so the phone app can't connect to it. Release it with:
+```bash
+bluetoothctl disconnect <MAC>
+```
+
+</div>
+</details>
+
+<details class="faq-item">
+<summary>Pairing on Linux</summary>
+<div class="faq-content">
+
+**How it works:** since aranet 0.3.0, the first time aranet connects to a sensor that isn't paired yet, it pairs the sensor and logs `Paired with <address>`. aranet can't enter a PIN, though: a sensor that wants its PIN has to be paired by hand once (solution 2), and aranet then uses that pairing. aranet doesn't register a system-wide Bluetooth agent: its agent exists only while it pairs that sensor and approves nothing else, so the desktop's Bluetooth settings keep working while aranet runs. (aranet 0.2.1 and earlier register BlueZ's default agent for as long as they run instead.) Sensors that are already paired are used as they are. `aranet` logs pairing failures by default and `Paired with` only with `--verbose`; for `aranet-service` or `aranet server`, set `RUST_LOG=aranet_core=info` to see pairing messages, including failures.
+
+**Symptoms:** aranet logs a warning that pairing failed or timed out, then connects anyway. This usually happens after the sensor was reset or paired with a phone. If the sensor refuses to pair (it may want its PIN), aranet doesn't try again for 10 minutes; after other failures it tries again at the next connection. Until the sensor is paired, its reads can time out on a server without a desktop Bluetooth agent: stop `aranet-service` or `aranet server` and any other aranet command that uses the sensor, then pair it by hand in an interactive `bluetoothctl` session (solution 2), entering its PIN if asked (a connect during the pairing cancels it). The one-line `bluetoothctl pair <MAC>` registers no agent, so on a server it can't ask for the PIN.
+
+A sensor that wants its PIN can also seem to pair: an Aranet2 with BlueZ 5.82, for example, completes aranet's pairing without the PIN (aranet logs `Paired with <address>`) and then rejects that pairing, so every later connection to it fails. Removing the pairing and letting aranet pair again (solution 1) only repeats this: pair such a sensor by hand, with its PIN (solution 2).
+
+**Solutions:**
+
+1. **Remove the old pairing and connect again** (for a sensor that wants its PIN, use solution 2 instead):
+```bash
+bluetoothctl remove <MAC>
+aranet read --device <MAC>
+```
+While `aranet-service` or `aranet server` runs, skip the `aranet read`: the service pairs the sensor again at its next poll, and a connect from a second aranet process during that pairing cancels it. If the sensor refused to pair, the service waits until the 10 minutes are up, or tries at once if you restart it.
+
+2. **Or pair by hand in `bluetoothctl`**, then connect again. A sensor that wants its PIN has to be paired by hand: this way, or in your desktop's Bluetooth settings. First stop `aranet-service` or `aranet server` and any other aranet command that uses the sensor: a connect during the pairing cancels it. Remove the old pairing if there is one, start a scan, wait until the sensor's MAC address is listed (after `remove`, BlueZ has to find the sensor again before it can pair it), stop the scan, and pair. The sensor may show a PIN on its screen: type it when `bluetoothctl` asks for it.
+```bash
+bluetoothctl
+# then, at the [bluetooth]# prompt:
+remove <MAC>
+# (if this computer has no record of the sensor, remove says so: go on)
+scan on
+# wait until a line with the sensor's MAC address appears, then:
+scan off
+pair <MAC>
+quit
+```
 
 </div>
 </details>

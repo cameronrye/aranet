@@ -27,6 +27,10 @@ Common unit flags:
 | `--inhg` / `--hpa` | Override pressure units |
 | `--bq` / `--pci` | Override radon units |
 
+<Aside type="note" title="Device identifiers match exactly">
+  Since aranet 0.3.0, `-d, --device`, `ARANET_DEVICE`, the addresses saved in aliases and the default device set with `aranet config set device` must identify one device exactly: its MAC address (with or without colons), its device UUID on macOS, or its full name as `aranet scan` shows it, such as `Aranet2 2751B`. Case doesn't matter. A partial name such as `Aranet2` or `2751B` fails with a "did you mean" suggestion instead of connecting to whichever device the scan found first, and a name that two nearby devices share fails as ambiguous: use the address, or an alias for it. With `--passive`, `aranet read` and `aranet watch` need the name, address or identifier exactly as `aranet scan` prints it, case included.
+</Aside>
+
 ## scan
 
 Discover nearby Aranet devices via Bluetooth.
@@ -57,7 +61,7 @@ aranet read [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-d, --device <ADDRESS>` | Device address or alias; can be repeated or comma-separated |
+| `-d, --device <ADDRESS>` | Device address, UUID, full name (exact) or alias; can be repeated or comma-separated |
 | `-T, --timeout <SECONDS>` | Connection timeout per device |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
 | `--passive` | Read from BLE advertisements without connecting |
@@ -83,7 +87,7 @@ aranet status [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-d, --device <ADDRESS>` | Device address or alias |
+| `-d, --device <ADDRESS>` | Device address, UUID, full name (exact) or alias |
 | `-T, --timeout <SECONDS>` | Connection timeout |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
 | `--brief` | Emit a compact single-line summary |
@@ -104,7 +108,7 @@ aranet history [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-d, --device <ADDRESS>` | Device address or alias |
+| `-d, --device <ADDRESS>` | Device address, UUID, full name (exact) or alias |
 | `-T, --timeout <SECONDS>` | Connection timeout |
 | `-c, --count <N>` | Number of records to retrieve (`0` means all) |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
@@ -129,7 +133,7 @@ aranet info [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-d, --device <ADDRESS>` | Device address or alias |
+| `-d, --device <ADDRESS>` | Device address, UUID, full name (exact) or alias |
 | `-T, --timeout <SECONDS>` | Connection timeout |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
 | `--no-header` | Omit the CSV header row |
@@ -154,7 +158,7 @@ aranet set [OPTIONS] <SUBCOMMAND>
 
 | Option | Description |
 |--------|-------------|
-| `-d, --device <ADDRESS>` | Device address or alias |
+| `-d, --device <ADDRESS>` | Device address, UUID, full name (exact) or alias |
 | `-T, --timeout <SECONDS>` | Connection timeout |
 | `-f, --force` | Skip the confirmation prompt |
 
@@ -174,7 +178,7 @@ aranet watch [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-d, --device <ADDRESS>` | Device address or alias |
+| `-d, --device <ADDRESS>` | Device address, UUID, full name (exact) or alias |
 | `-T, --timeout <SECONDS>` | Connection timeout |
 | `-i, --interval <SECONDS>` | Poll interval |
 | `-n, --count <N>` | Stop after `N` samples (`0` means unlimited) |
@@ -248,7 +252,7 @@ aranet sync [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-d, --device <ADDRESS>` | Device address or alias |
+| `-d, --device <ADDRESS>` | Device address, UUID, full name (exact) or alias |
 | `-T, --timeout <SECONDS>` | Connection timeout |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `csv` |
 | `--full` | Re-download all history instead of syncing incrementally |
