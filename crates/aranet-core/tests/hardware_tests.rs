@@ -308,12 +308,20 @@ async fn test_concurrent_scans_are_serialised() {
 /// either search starts, and the test skips.
 ///
 /// When a scan ends, the scanning search's post-scan check and the waiting
-/// search's re-check run at the same moment. Rarely, CoreBluetooth reports the
-/// sensor just after the stop, and only one of the two checks sees it. If the
-/// scanning search misses it, it finds the sensor in its next attempt's
-/// re-check, both searches end with `CacheHit`, and the test passes. If the
-/// waiting search misses it, it scans for itself and the test fails: rerun it
-/// once. Without the re-check the test fails on every run.
+/// search's re-check run at the same moment, and a sensor reported in the
+/// scan's last moment can reach the adapter's list between the two, so that
+/// only one of them sees it. This was rare on btleplug 0.11.8, where
+/// CoreBluetooth could also report the sensor just after the stop. btleplug
+/// 0.13.5 drops a report that its CoreBluetooth thread takes up after the stop
+/// (`src/corebluetooth/internal.rs:1776-1784`; the reason is at `:723-728`).
+/// That leaves less room for the rare case but does not remove it: `stop_scan`
+/// returns as soon as the stop is queued for that thread
+/// (`src/corebluetooth/adapter.rs:176-182`), and a second task adds each
+/// reported sensor to the list (`adapter.rs:59-82`). If the scanning search
+/// misses the sensor, it finds it in its next attempt's re-check, both searches
+/// end with `CacheHit`, and the test passes. If the waiting search misses it,
+/// it scans for itself and the test fails: rerun it once. Without the re-check
+/// the test fails on every run.
 #[tokio::test]
 #[ignore = "requires BLE hardware: Aranet devices advertising nearby"]
 async fn test_concurrent_finds_share_one_scan() {
