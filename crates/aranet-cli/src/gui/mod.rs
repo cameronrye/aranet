@@ -103,6 +103,9 @@ impl GuiOptions {
 /// of the default: the error that btleplug 0.13.5 logs on macOS for every disconnect
 /// that CoreBluetooth confirms. `crate::log_filter` says where the line comes from. A
 /// `RUST_LOG` of the user's own is used as it is and still shows the line.
+/// So does one that holds no valid directive: `EnvFilter::new` then falls back to errors
+/// only by itself, as `fmt::init()` did, and that fallback does not carry the directive.
+/// (The CLI treats a `RUST_LOG` that does not parse as unset.)
 ///
 /// When aranet moves to a btleplug release that no longer logs the line, the branch for
 /// an empty `RUST_LOG` goes, and this function is `EnvFilter::new(rust_log)` again.
@@ -552,5 +555,9 @@ mod tests {
         }
         let shown = lines_shown_by(gui_log_filter("warn"));
         assert!(shows_disconnect_error(&shown), "{shown:?}");
+        // No valid directive: the library's own fallback to errors only, with the line.
+        let shown = lines_shown_by(gui_log_filter("aranet_core=loud"));
+        assert!(shows_disconnect_error(&shown), "{shown:?}");
+        assert_eq!(shown, lines_shown_by(EnvFilter::new("error")));
     }
 }
