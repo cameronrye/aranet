@@ -27,9 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The runners dist uses for these targets (the plan's artifacts_matrix).
+          # The runners dist uses for these targets (the plan's artifacts_matrix;
+          # aarch64's is set by github-custom-runners in Cargo.toml).
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-apple-darwin
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}

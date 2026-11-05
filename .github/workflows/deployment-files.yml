@@ -70,7 +70,8 @@ jobs:
 
   launchd-refusal:
     name: launchd system install is refused
-    runs-on: macos-14
+    # macos-15: GitHub retired the macos-14 image on 2026-11-02.
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
