@@ -113,6 +113,11 @@ publish-prereleases = true
 # live release (release-verify.yml) and update the Homebrew tap (homebrew.yml).
 post-announce-jobs = ["./release-verify", "./homebrew"]
 
+# dist 0.31.0 builds aarch64-apple-darwin on macos-14, which GitHub retired on
+# 2026-11-02. release-macos-app.yml builds the app DMG on the same runner.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # Permissions for the custom jobs. dist gives publish jobs `id-token: write` and
 # `packages: write` by default; none of these jobs needs more than read access.
 [workspace.metadata.dist.github-custom-job-permissions]
