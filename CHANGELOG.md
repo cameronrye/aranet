@@ -113,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Webhook, InfluxDB and push gateway requests no longer follow HTTP redirects** — a redirect could send an alert, a batch of readings or custom webhook headers to another host, including the service's own API. An endpoint that answers 301, 302, 307 or 308 (http to https, a trailing slash) now counts as failed, with a log line that says so, and the InfluxDB lines sent to it are dropped rather than retried: configure its final URL
 - **DNS rebinding and cross-site requests** — while API-key authentication is off, the service rejects requests whose `Host` isn't local, an IP address, this machine's name or listed in the new `security.allowed_hosts` (421), and browser requests from other origins, including WebSocket connections (403)
 - **Dashboard** — an API key passed as `?token=` (or `#token=`) is removed from the address bar and history entry, never sent as a `Referer`, and keys containing `+` work
+- **Dependencies updated** to clear the 6 RustSec vulnerability advisories that affect 0.2.1's lockfile: `rustls` (RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349), `rustls-webpki` (RUSTSEC-2026-0382) and `webpki-roots` (RUSTSEC-2026-0381). These three are the TLS stack of webhooks, InfluxDB export, the Prometheus push gateway and the TUI/GUI service client. This also replaces `tokio` 1.53.1, which RUSTSEC-2026-0386 marks unsound, and the yanked `async-executor` 1.14.0, `clipboard-win` 5.4.1 and `yoke-derive` 0.8.3
 
 ## [0.2.1] - 2026-09-26
 
